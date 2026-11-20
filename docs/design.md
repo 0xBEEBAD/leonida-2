@@ -70,25 +70,25 @@ add a source file, add it to `runtime\CMakeLists.txt` and to the file list in `b
 
 | Asset | State | Where |
 |---|---|---|
-| Archive data | Carved without the encrypted tables of contents. Most archives are 93–99% plain zlib (`levels.rpf` 98.3%, 1.1M files). Not zlib: `audio.rpf` (99.9%), about half of `story000.rpf` and `shared_minigame000.rpf`. | `G:\gta6-work\carve\<archive>\`, `coverage.json` |
+| Archive data | Carved without the encrypted tables of contents. Most archives are 93–99% plain zlib (`levels.rpf` 98.3%, 1.1M files). Not zlib: `audio.rpf` (99.9%), about half of `story000.rpf` and `shared_minigame000.rpf`. | `<work>\carve\<archive>\`, `coverage.json` |
 | Videos | 797 Bink 2 files (`KB2n`), cut out whole. | `*.bk2` in the carve folders |
-| Shaders | 26,503 carved from `shaders.rpf`, native RDNA2 code unpacked (`FSSM`), and disassembly working. | `G:\gta6-work\shaders\` (`.dxbc`, `fssm\`, `disasm\`) |
-| Textures | **Solved.** Headers are in CPU segments: GPU pointer at q[k], u16 width/height/depth and DXGI format at q[k+4], mip count at byte 2 of q[k+5]. Data is AMD `SW_4K_S` tiled, largest mip first. The GPU segment is the blob run after the CPU blob. On 200 samples, 173 decode at least 1.5× smoother detiled than untiled (median 2.56×). Exports the top mip, slice 0, as DDS. **22,342 exported (1.23 GiB)**: every header whose GPU data follows its CPU blob. World and model textures in `levels.rpf` have the same blocker as meshes. GPU offsets must be 256-byte aligned, which drops the false headers in `navmeshes`/`anim`. | `tools\tex_headers.py`, `tools\tex_export.py`, `G:\gta6-work\textures\` |
-| Models | **Exporting** with `tools\rpf9dump` (built on breadbbbb/rpf9-explorer's Core; see below). Resources are found at page offset +16 after 16 zero bytes, followed by a zlib system blob with a drawable/fragment header and then the following zlib blocks as graphics data. Positions are quantized: `bias + scale * ((q >> 8) & 0xFFFFFF)`. Output is OBJ (positions, UVs, indices) plus a manifest with real model names (e.g. `cvar_int_grg2b_toys_1`), bounds, per-mesh shader index and material texture references (parameter hash, name hash, 64-bit asset key). My earlier `0x1380`/`0x1601` descriptor notes stand, but the "data not located" blocker was wrong. | `G:\gta6-work\assets\<archive>\models\` |
-| Texture dictionaries | Same tool: TXD resources become DDS per texture. | `G:\gta6-work\assets\<archive>\textures\` |
-| World textures (TTPF) | `data\ttdb\**\*.ttpf` (57 pools, 58 GiB) are loose RDS5 texture pools, **not** inside RPFs. rpf9-explorer's `TtpfReader` reads the catalog and detiles them; checked visually (`ttdb_graphics`: scope reticles, clean lines). Names are generated (`texture_N_<assetkey>`); models reference textures by asset key. Some rows are skipped (BCPack or unmapped shards). | `G:\gta6-work\assets\ttpf\<pool>\` + `manifest.json` |
-| Audio | `audio.rpf` holds raw (not zlib) **AWC** banks: Opus (codec 0x0B) and XMA2 streams. Exported as whole `.awc` files plus `audio_manifest.json` (stream ids, codec, channels, rate, duration). **Done: 7,162 banks, 27 GiB, 1,603,231 streams, about 1,324 hours** (codec 0x0B Opus 1,601,167; 5: 1,818; 2: 227; 0 PCM: 19). Decoding to WAV is a later step. | `G:\gta6-work\assets\audio\awc\` |
+| Shaders | 26,503 carved from `shaders.rpf`, native RDNA2 code unpacked (`FSSM`), and disassembly working. | `<work>\shaders\` (`.dxbc`, `fssm\`, `disasm\`) |
+| Textures | **Solved.** Headers are in CPU segments: GPU pointer at q[k], u16 width/height/depth and DXGI format at q[k+4], mip count at byte 2 of q[k+5]. Data is AMD `SW_4K_S` tiled, largest mip first. The GPU segment is the blob run after the CPU blob. On 200 samples, 173 decode at least 1.5× smoother detiled than untiled (median 2.56×). Exports the top mip, slice 0, as DDS. **22,342 exported (1.23 GiB)**: every header whose GPU data follows its CPU blob. World and model textures in `levels.rpf` have the same blocker as meshes. GPU offsets must be 256-byte aligned, which drops the false headers in `navmeshes`/`anim`. | `tools\tex_headers.py`, `tools\tex_export.py`, `<work>\textures\` |
+| Models | **Exporting** with `tools\rpf9dump` (built on breadbbbb/rpf9-explorer's Core; see below). Resources are found at page offset +16 after 16 zero bytes, followed by a zlib system blob with a drawable/fragment header and then the following zlib blocks as graphics data. Positions are quantized: `bias + scale * ((q >> 8) & 0xFFFFFF)`. Output is OBJ (positions, UVs, indices) plus a manifest with real model names (e.g. `cvar_int_grg2b_toys_1`), bounds, per-mesh shader index and material texture references (parameter hash, name hash, 64-bit asset key). My earlier `0x1380`/`0x1601` descriptor notes stand, but the "data not located" blocker was wrong. | `<work>\assets\<archive>\models\` |
+| Texture dictionaries | Same tool: TXD resources become DDS per texture. | `<work>\assets\<archive>\textures\` |
+| World textures (TTPF) | `data\ttdb\**\*.ttpf` (57 pools, 58 GiB) are loose RDS5 texture pools, **not** inside RPFs. rpf9-explorer's `TtpfReader` reads the catalog and detiles them; checked visually (`ttdb_graphics`: scope reticles, clean lines). Names are generated (`texture_N_<assetkey>`); models reference textures by asset key. Some rows are skipped (BCPack or unmapped shards). | `<work>\assets\ttpf\<pool>\` + `manifest.json` |
+| Audio | `audio.rpf` holds raw (not zlib) **AWC** banks: Opus (codec 0x0B) and XMA2 streams. Exported as whole `.awc` files plus `audio_manifest.json` (stream ids, codec, channels, rate, duration). **Done: 7,162 banks, 27 GiB, 1,603,231 streams, about 1,324 hours** (codec 0x0B Opus 1,601,167; 5: 1,818; 2: 227; 0 PCM: 19). Decoding to WAV is a later step. | `<work>\assets\audio\awc\` |
 
 ### rpf9dump (bulk export)
 
-`tools\rpf9dump` is a small CLI over the Core library from https://github.com/breadbbbb/rpf9-explorer (a friend's tool; source at `G:\ref\rpf9-explorer-src`, audited: no keys, no network, no custom build targets). It decrypts nothing. It carves validated resources, as `rpf9_carve.py` does, but with working model and texture decoders.
+`tools\rpf9dump` is a small CLI over the Core library from https://github.com/breadbbbb/rpf9-explorer (a friend's tool; source at `third_party\rpf9-explorer`, audited: no keys, no network, no custom build targets). It decrypts nothing. It carves validated resources, as `rpf9_carve.py` does, but with working model and texture decoders.
 
 ```
-dotnet build tools\rpf9dump\rpf9dump.csproj -c Release -o G:\gta6-work\tools\rpf9dump
-rpf9dump models|textures <archive.rpf> G:\gta6-work\assets
-rpf9dump ttpf <pool.ttpf> G:\gta6-work\assets\ttpf
-rpf9dump audio <audio.rpf> G:\gta6-work\assets
-bash scripts/dump_assets.sh      # everything, log in G:\gta6-work\assets\dump.log
+dotnet build tools\rpf9dump\rpf9dump.csproj -c Release -o <work>\tools\rpf9dump
+rpf9dump models|textures <archive.rpf> <work>\assets
+rpf9dump ttpf <pool.ttpf> <work>\assets\ttpf
+rpf9dump audio <audio.rpf> <work>\assets
+bash scripts/dump_assets.sh      # everything, log in <work>\assets\dump.log
 ```
 
 Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the rpf9-explorer GUI opens these archives with complete listings instead of its 16 MiB preview scan.
@@ -96,14 +96,14 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
 ## Other prepared pieces
 
 - `tools\shader_profile.py`: across the corpus there are 551 distinct RDNA mnemonics, and 204 of them cover 99% of
-  all instructions (`G:\gta6-work\shaders\profile.json`).
+  all instructions (`<work>\shaders\profile.json`).
 - `tools\shader_ir.py`: parses every disassembled instruction into opcode, typed operands (s/v registers and
   ranges, NSA register lists, constants, literals, export targets, interpolation attributes), modifiers and
   encoding bytes. On 1,000 shaders, 12 of 2.2M operands were left untyped before the last fix. This is the front end
   for an RDNA→SPIR-V translator.
 - `tools\rtti_scan.py`: MSVC x64 RTTI scanner (class names, bases, vtables). Tested on the bundled DLLs; run it on
   the exe first.
-- `tools\hashdict.py`: joaat hash→name dictionary (`G:\gta6-work\hashes.json`, 1.9M entries, checked against
+- `tools\hashdict.py`: joaat hash→name dictionary (`<work>\hashes.json`, 1.9M entries, checked against
   `adder` = 0xB779A091). On day one, rerun with `--extra <exe>` so PSO field and type names resolve. Without the exe
   only about 1% do.
 - Runtime shims: all of `xmem.dll` is shimmed (`XMemAlloc`, `XMemFree`, `XMemVirtualQuery`,
@@ -120,7 +120,7 @@ runs one lane per invocation, keeps VGPRs and SGPRs as uint arrays with exact bi
 all-ones, and covers branch-free vertex and pixel shaders with no memory loads: common float and integer ALU ops
 and exports to `gl_Position`, params and MRTs. Unsupported instructions are reported by name, never guessed.
 `VS_Passthrough` and `VS_BlurFilter` translate and validate. Coverage across the corpus and the blocking
-instructions are in `G:\gta6-work\shaders\spirv_run.log`. The next steps are structured branches (EXEC masks) and
+instructions are in `<work>\shaders\spirv_run.log`. The next steps are structured branches (EXEC masks) and
 the descriptor/binding model for `s_load`, `s_buffer_load`, `buffer_*` and `image_*`.
 
 Also handled now: 64-bit scalar moves, EXEC reads (all-ones), whole-quad mode on EXEC, `m0`, SCC, vector and scalar
@@ -132,7 +132,7 @@ float MODE register (`s_setreg`) is skipped, so Vulkan's default denormal and ro
 
 `runtime\test\vk_harness.cpp` (build: `runtime\build\test\build_harness.cmd`, MSVC + the Vulkan 1.4 headers from
 Hookshot's CPM cache, loading `vulkan-1.dll` at runtime) draws one triangle with a given VS + FS into an RGBA32F
-target and dumps the floats. Test shaders are in `G:\gta6-work\gputest`.
+target and dumps the floats. Test shaders are in `<work>\gputest`.
 
 - **`VS_Passthrough` (translated) is bit-exact.** All 64×64 pixels are written, and `param0.xy` = (u, 1 − v) with max
   error **0**, with zw = (0, 1) as exported. This covers the VertexIndex input, integer/float ALU, inline constants,
@@ -165,7 +165,7 @@ barycentrics and so on). GPU re-test against the final SPIR-V: `VS_Passthrough` 
 rounding (1.3e-5), and **400/400** arithmetic-only PS finite and identical across two runs. Mesh (9,282), compute (2,689) and geometry (195) shaders aren't
 attempted yet. Of the remaining ~580 VS/PS: 288 use 16-bit shifts (`v_lshrrev_b16`, and whether the destination's
 high half is kept or cleared needs confirming), 155 contain words LLVM can't decode, and 62 write `vcc_hi`. Output:
-`G:\gta6-work\shaders\spirv\` (`.spvasm` + `.spv`), and the log is `G:\gta6-work\shaders\spirv_run.log`.
+`<work>\shaders\spirv\` (`.spvasm` + `.spv`), and the log is `<work>\shaders\spirv_run.log`.
 
 How the generated SPIR-V expects the runtime to work:
 

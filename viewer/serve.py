@@ -3,7 +3,7 @@
 Usage:
     python -I serve.py [--world DIR] [--port 8765]
 
-`--world` is the folder holding world.json and the .glb chunks (default G:\\gta6-work\\world). It's served at
+`--world` is the folder holding world.json and the .glb chunks (default <work>\\world). It's served at
 /world/ so game-derived files never need to live in this repo. Without it, the viewer shows test terrain.
 """
 import argparse
@@ -33,7 +33,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--world", default=r"G:\gta6-work\world")
+    ap.add_argument("--world", default=r"<work>\world")
     ap.add_argument("--port", type=int, default=8765)
     a = ap.parse_args()
     Handler.world = a.world if os.path.isdir(a.world) else None
