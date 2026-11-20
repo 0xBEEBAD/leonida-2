@@ -1,12 +1,17 @@
-"""Build the PC port from your own copy of the game.
+r"""Build the PC port from your own copy of the game.
 
-    python -I make_game.py --game "D:\\path\\to\\your\\package" --out "D:\\Games\\Leonida"
+    Build.bat                                                   # double-click: finds your copy and builds
+    python -I make_game.py                                      # same, from a terminal
+    python -I make_game.py --find                               # list the copies found on this PC
+    python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida"
     python -I make_game.py --game "..." --check                 # only check the copy, build nothing
-    python -I make_game.py --game "..." --out "..." --stages shaders,assets
+    python -I make_game.py --stages shaders,assets              # only some stages
 
 The game folder is your own Xbox Series package, version 1.0.2.1, with its files already readable on disk
-(see game/xbox-1.0.2.1.json for the file list). This script never decrypts, downloads or works around anything:
-it reads plain files and writes everything it makes under --out. Never share what it makes.
+(see game/xbox-1.0.2.1.json for the file list). It is found automatically in Downloads, Desktop, Documents,
+Games, your home folder and the top of each drive (two folder levels down). This script never decrypts or
+works around anything: it reads plain files and writes everything it makes under --out. The only thing it
+downloads is the third_party/rpf9-explorer submodule, when it is missing. Never share what it makes.
 
 Stages, in order (each skips work that is already done, so a stopped build continues where it left off):
     check     file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
@@ -71,18 +76,160 @@ def need(exe: str, hint: str) -> str:
 
 
 # ---------------------------------------------------------------- check
-def load_version(game: str) -> dict:
+def versions() -> list:
+    out = []
     for name in sorted(os.listdir(VERSIONS)):
-        if not name.endswith(".json"):
-            continue
-        with open(os.path.join(VERSIONS, name), encoding="utf-8") as f:
-            v = json.load(f)
-        probe = "MicrosoftGame.Config"
-        p = os.path.join(game, probe)
-        if probe in v["files"] and os.path.isfile(p) and os.path.getsize(p) == v["files"][probe]["size"]:
+        if name.endswith(".json"):
+            with open(os.path.join(VERSIONS, name), encoding="utf-8") as f:
+                out.append(json.load(f))
+    return out
+
+
+# Small files checked by size to recognise a version without reading anything large.
+PROBES = ("MicrosoftGame.Config", "Catalog000.bin", "appdata0.rpf")
+
+
+def match_version(game: str):
+    """The supported version this folder is, or None. Only names and sizes are read."""
+    for v in versions():
+        probes = [p for p in PROBES if p in v["files"]]
+        if probes and all(os.path.isfile(os.path.join(game, p)) and
+                          os.path.getsize(os.path.join(game, p)) == v["files"][p]["size"] for p in probes):
             return v
-    fail("This doesn't look like a supported version of the game. Supported: "
-         + ", ".join(n[:-5] for n in os.listdir(VERSIONS) if n.endswith(".json")))
+    return None
+
+
+def load_version(game: str) -> dict:
+    v = match_version(game)
+    if v is None:
+        fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
+             "MicrosoftGame.Config and the .rpf archives. Supported: "
+             + ", ".join(f"{x['title']} {x['version']}" for x in versions()))
+    return v
+
+
+def find_dumps() -> list:
+    """Folders on this PC that hold a supported version: Downloads, Desktop, Documents, the home folder and the
+    top of each drive, up to two folder levels down. Only folder names and a few file sizes are read."""
+    home = os.path.expanduser("~")
+    roots = [os.path.join(home, d) for d in ("Downloads", "Desktop", "Documents", "Games")] + [home]
+    if os.name == "nt":
+        import string
+        roots += [f"{d}:\\" for d in string.ascii_uppercase if os.path.isdir(f"{d}:\\")]
+    else:
+        roots += ["/mnt", "/media"]
+    skip = {"windows", "program files", "program files (x86)", "programdata", "appdata", "$recycle.bin",
+            "system volume information", "node_modules", ".git"}
+    seen, found = set(), []
+
+    def visit(d: str, depth: int) -> None:
+        try:
+            real = os.path.realpath(d)
+        except OSError:
+            return
+        if real.lower() in seen:
+            return
+        seen.add(real.lower())
+        if os.path.isfile(os.path.join(d, "MicrosoftGame.Config")):
+            v = match_version(d)
+            if v:
+                found.append((d, v))
+            return
+        if depth == 0:
+            return
+        try:
+            with os.scandir(d) as it:
+                subs = [e.path for e in it if e.is_dir(follow_symlinks=False)
+                        and e.name.lower() not in skip and not e.name.startswith((".", "$"))]
+        except OSError:
+            return
+        for s in subs:
+            visit(s, depth - 1)
+
+    for r in roots:
+        if os.path.isdir(r):
+            visit(r, 2)
+    return found
+
+
+def choose_game() -> str:
+    """No --game given: find the dump, or ask for it."""
+    log("looking for your game files...")
+    found = find_dumps()
+    interactive = sys.stdin is not None and sys.stdin.isatty()
+    if len(found) == 1:
+        log(f"found {found[0][1]['title']} {found[0][1]['version']} in {found[0][0]}")
+        return found[0][0]
+    if found:
+        for i, (d, v) in enumerate(found, 1):
+            print(f"  {i}. {d}  ({v['title']} {v['version']})")
+        if not interactive:
+            fail("More than one copy found: choose one with --game.")
+        while True:
+            pick = input("Which one? ").strip()
+            if pick.isdigit() and 1 <= int(pick) <= len(found):
+                return found[int(pick) - 1][0]
+    if not interactive:
+        fail("Your game files weren't found. Give the folder with --game.")
+    print("Your game files weren't found automatically. Paste the folder that holds MicrosoftGame.Config "
+          "and the .rpf archives.")
+    while True:
+        d = input("Game folder: ").strip().strip('"')
+        if d and match_version(d):
+            return d
+        print("  That folder isn't a supported version of the game. Try again.")
+
+
+def default_out() -> str:
+    return os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
+
+
+# ---------------------------------------------------------------- preflight
+MIN_FREE_GB = {"shaders": 30, "assets": 300}
+
+
+def preflight(stages: list, work: str) -> None:
+    """Find every missing prerequisite before a long build starts, and list them all at once."""
+    missing = []
+    if sys.version_info < (3, 11):
+        missing.append("Python 3.11 or newer: https://www.python.org/downloads/")
+    if "shaders" in stages:
+        llvm = os.environ.get("LLVM_MC", "llvm-mc")
+        if not (shutil.which(llvm) or os.path.isfile(llvm)):
+            missing.append("llvm-mc (LLVM 21+): https://github.com/llvm/llvm-project/releases, or set LLVM_MC")
+        for t in ("spirv-as", "spirv-val"):
+            if not shutil.which(t):
+                missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
+    if "assets" in stages:
+        if not shutil.which("dotnet"):
+            missing.append(".NET 8 SDK: https://dotnet.microsoft.com/download/dotnet/8.0")
+        ensure_submodule()
+    if "runtime" in stages and os.name == "nt":
+        vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                               "Microsoft Visual Studio", "Installer", "vswhere.exe")
+        if not os.path.isfile(vswhere):
+            missing.append("Visual Studio 2022 with 'Desktop development with C++'")
+    if missing:
+        fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
+    need_gb = sum(MIN_FREE_GB.get(s, 0) for s in stages)
+    os.makedirs(work, exist_ok=True)
+    free_gb = shutil.disk_usage(work).free / 2**30
+    if free_gb < need_gb:
+        fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
+             "Free some space or choose another drive with --work.")
+
+
+def ensure_submodule() -> None:
+    core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
+    if os.path.isdir(core) and os.listdir(core):
+        return
+    if shutil.which("git") and os.path.isdir(os.path.join(ROOT, ".git")):
+        log("fetching third_party/rpf9-explorer")
+        r = subprocess.run(["git", "-C", ROOT, "submodule", "update", "--init", "--recursive"])
+        if r.returncode == 0 and os.path.isdir(core):
+            return
+    fail("third_party/rpf9-explorer is missing. Download the project with: "
+         "git clone --recursive <this repository's URL>")
 
 
 def check(game: str, full: bool) -> dict:
@@ -194,30 +341,41 @@ def runtime(game: str, out: str, v: dict) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
-    ap.add_argument("--game", required=True, help="your package folder")
-    ap.add_argument("--out", help="folder for the finished port (and its work files unless --work is given)")
+    ap.add_argument("--game", help="your package folder (found automatically if left out)")
+    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida)")
     ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", default=",".join(STAGES), help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     a = ap.parse_args()
     below_normal()
-    game = os.path.abspath(a.game)
+    if a.find:
+        found = find_dumps()
+        for d, v in found:
+            print(f"{d}  ({v['title']} {v['version']})")
+        print(f"{len(found)} found")
+        return 0
+    game = os.path.abspath(a.game or choose_game())
     v = check(game, a.full_check)
     if a.check:
         return 0
-    if not a.out:
-        fail("--out is required to build.")
-    out = os.path.abspath(a.out)
+    out = os.path.abspath(a.out or default_out())
     work = os.path.abspath(a.work or os.path.join(out, "work"))
-    if os.path.commonpath([out, game]) == game or os.path.commonpath([work, game]) == game:
-        fail("--out and --work must be outside the game folder.")
+    for p in (out, work):
+        try:
+            inside = os.path.commonpath([p, game]) == game
+        except ValueError:          # different drives
+            inside = False
+        if inside:
+            fail("--out and --work must be outside the game folder.")
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
     for s in stages:
         if s not in STAGES:
             fail(f"unknown stage '{s}'")
-    os.makedirs(work, exist_ok=True)
+    preflight(stages, work)
+    log(f"building into {out} (work files in {work})")
     t0 = time.time()
     if "shaders" in stages:
         shaders(game, work, a.jobs)

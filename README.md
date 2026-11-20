@@ -34,7 +34,7 @@ work on booting can start as soon as one is available to a developer.
 
 | What | Status |
 |---|---|
-| Version check of your copy (Xbox Series 1.0.2.1) | ✅ Works |
+| Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
 | Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
 | Shaders: RDNA2 → SPIR-V translation | ⚠️ ~97% of vertex/pixel shaders pass `spirv-val`. Compute, mesh and geometry shaders not yet translated |
 | Shader translator checked on a real GPU | ⚠️ Vertex fetch, texture sampling, exports and ALU ops checked on one GPU |
@@ -47,37 +47,46 @@ work on booting can start as soon as one is available to a developer.
 
 ## How to build
 
-You need:
+The port isn't downloaded ready-made. It's built on your PC from your own copy.
 
-- **Your own copy** of the Xbox Series package, version 1.0.2.1, as plain files in a folder.
-- **Windows 10/11 x64**, about **400 GB** free for intermediate files.
-- [Python 3.11+](https://www.python.org/), the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
-  and the [Vulkan SDK](https://vulkan.lunarg.com/) (for `spirv-as` / `spirv-val`).
-- [LLVM 21+](https://github.com/llvm/llvm-project/releases) with `llvm-mc` on PATH (or set `LLVM_MC`).
+**The easy way:**
+
+1. Install the prerequisites below.
+2. Download this project **with its submodule**: `git clone --recursive https://github.com/<you>/Leonida`. A
+   "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
+   and otherwise tells you what to do.
+3. Double-click **`Build.bat`**.
+
+It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents, Games, your home folder and
+the top of every drive, two folders deep. It recognises the version from a few file sizes, without reading
+anything large. If you have more than one copy it asks which one, and if it finds none it asks you to paste the
+folder. Before starting it checks that everything below is installed and that there is enough free space, and it
+lists anything missing in one go. The result goes to `Documents\Leonida`. A stopped build continues where it left
+off.
+
+Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` archives, as plain files.
+
+**Prerequisites:**
+
+- **Your own copy** of the Xbox Series package, version 1.0.2.1.
+- **Windows 10/11 x64**, with about **350 GB** free for work files. They can go on another drive with `--work`.
+- [Python 3.11+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
+- [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
+- [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
+- [LLVM 21+](https://github.com/llvm/llvm-project/releases) with `llvm-mc` on PATH, or set `LLVM_MC` to its path.
 - Visual Studio 2022 with **Desktop development with C++**, for the runtime stage.
 
-Clone with the submodule:
+**From a terminal**, with the same behaviour and more control:
 
 ```powershell
-git clone --recursive https://github.com/<you>/Leonida
-cd Leonida
+python -I make_game.py --find                          # list the copies found on this PC
+python -I make_game.py --check                         # check your copy, build nothing
+python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
+python -I make_game.py --stages shaders,assets         # only some stages
 ```
 
-Check your copy (reads names and sizes only, takes a second):
-
-```powershell
-python -I make_game.py --game "D:\path\to\your\package" --check
-```
-
-Build:
-
-```powershell
-python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida"
-```
-
-Stages run in order: `check`, `shaders`, `assets`, `runtime`. Pick some with `--stages shaders,assets`. Put
-intermediate files on another drive with `--work`. A stopped build continues where it left off. The shader
-translation is the longest step: several hours on one core for now.
+Stages run in order: `check`, `shaders`, `assets`, `runtime`. The shader translation is the longest step: several
+hours on one core for now.
 
 ## How it works
 
