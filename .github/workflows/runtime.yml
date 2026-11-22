@@ -535,6 +535,10 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       ASAN_OPTIONS: detect_leaks=1
       UBSAN_OPTIONS: print_stacktrace=1
+      # The Vulkan loader unloads llvmpipe at vkDestroyInstance, and LeakSanitizer then reports the 112 bytes the
+      # driver still holds (vk_command_replay) with no stack it can name. The loader keeps drivers loaded with this
+      # set, for leak sanitizers; the tests' own leaks are still reported.
+      VK_LOADER_DISABLE_DYNAMIC_LIBRARY_UNLOADING: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
