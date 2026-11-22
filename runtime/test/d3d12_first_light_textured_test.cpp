@@ -60,10 +60,18 @@ UINT texel_bytes(DXGI_FORMAT format) {
 }  // namespace
 
 int main() {
-    const char* dir_env = std::getenv("LEONIDA_FIRST_LIGHT_TEX_DIR");
-    if (!dir_env || !*dir_env) {
-        std::printf("SKIP: LEONIDA_FIRST_LIGHT_TEX_DIR is not set (run tools/first_light.py --texture first)\n");
-        return 77;
+    // _dupenv_s, as pe_loader_test reads its environment: MSVC warns about std::getenv (C4996).
+    std::filesystem::path dir;
+    {
+        char* env = nullptr;
+        std::size_t env_size = 0;
+        if (_dupenv_s(&env, &env_size, "LEONIDA_FIRST_LIGHT_TEX_DIR") != 0 || !env || !*env) {
+            std::free(env);
+            std::printf("SKIP: LEONIDA_FIRST_LIGHT_TEX_DIR is not set (run tools/first_light.py --texture first)\n");
+            return 77;
+        }
+        dir = env;
+        std::free(env);
     }
     vktest::Device d;
     const auto device_status = d.initialize();
@@ -77,7 +85,6 @@ int main() {
         return 77;
     }
 
-    const std::filesystem::path dir = dir_env;
     const auto manifest_text = read_file(dir / "manifest.json");
     leonida::Json manifest;
     EXPECT(leonida::JsonReader(std::string_view(reinterpret_cast<const char*>(manifest_text.data()),
