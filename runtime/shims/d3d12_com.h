@@ -154,6 +154,10 @@ struct VulkanDeviceInfo {
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
+    // robustImageAccess is enabled on `device`, so typed 1D-family and 3D UAV loads are range checked.
+    bool robust_image_access = false;
+    // VK_EXT_image_sliced_view_of_3d (imageSlicedViewOf3D) is also enabled for partial 3D UAVs.
+    bool sliced_3d_uav = false;
     // BuildRaytracingAccelerationStructure writes the console's XDXR BVH4 records into the destination buffer
     // (src/xdxr_build.h), the layout the game's translated traversal shaders read, instead of building a
     // VkAccelerationStructureKHR; needs buffer_device_address and the GPU address arena. The standalone device sets it

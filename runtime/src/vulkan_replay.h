@@ -2488,16 +2488,22 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // Emulated R9G9B9E5_SHAREDEXP images (backed by R32_UINT) lack COLOR_ATTACHMENT on E5B9G9R9 and keep the
             // bit-exact R32_UINT backing path.
             const VkFormat view_format = view.format ? VkFormat(view.format) : p.binding.format;
+            const bool packed_rgb9e5 = view_format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 &&
+                                       p.binding.format == VK_FORMAT_R32_UINT;
             if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element))
                 return ReplayResult::unsupported;
             const auto* image_layout = uav_clear::layout(p.binding.format);
             if (!image_layout || image_layout->bytes != p.element.size)
                 return ReplayResult::unsupported;
-            const bool attachment = p.binding.color_attachment && !p.binding.volume;
+            // The UAV attachment path creates a 2D-array view. 1D/3D UAVs can only use a transfer clear, which
+            // must not reinterpret bytes through a different numeric format (except packed RGB9E5 in R32_UINT).
+            const bool attachment = p.binding.color_attachment && !p.binding.volume && !view.exact_clear_format;
             const bool view_attachable = vk.color_attachment_format
                                              ? vk.color_attachment_format(view_format)
                                              : view_format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
-            const bool reinterpret = view_format != p.binding.format && attachment && view_attachable;
+            const bool reinterpret = view_format != p.binding.format && attachment && view_attachable && !packed_rgb9e5;
+            if (view.exact_clear_format && view_format != p.binding.format && !packed_rgb9e5)
+                return ReplayResult::unsupported;
             const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
             if (!uav_clear::decode(clear_format, p.element, p.clear_color))
                 return ReplayResult::unsupported;
