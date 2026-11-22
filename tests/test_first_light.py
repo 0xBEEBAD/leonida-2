@@ -1041,6 +1041,19 @@ class LayerTexturedOracleTests(unittest.TestCase):
             self.assertNotIn("VKH_TEX_RGBA", env)
             self.assertTrue(os.path.isfile(os.path.join(tmp, "texture.bin")))
 
+    def test_tsharp_load_offset_reads_the_first_8_dword_load(self):
+        # The T# slot comes from the PS's own s_load_dwordx8; a missing listing or a null offset is slot 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            listing = os.path.join(tmp, "ps.s")
+            with open(listing, "w", encoding="utf-8") as f:
+                f.write("\ts_load_dwordx4 s[8:11], s[2:3], 0x40\n\ts_load_dwordx8 s[0:7], s[2:3], 0xa0 ; T#\n"
+                        "\ts_load_dwordx8 s[12:19], s[2:3], 0x20\n")
+            self.assertEqual(fl.tsharp_load_offset(listing), 0xA0)
+            with open(listing, "w", encoding="utf-8") as f:
+                f.write("\ts_load_dwordx8 s[4:11], s[8:9], null\n")
+            self.assertEqual(fl.tsharp_load_offset(listing), 0)
+            self.assertEqual(fl.tsharp_load_offset(os.path.join(tmp, "missing.s")), 0)
+
     def test_ramp_texels_hold_their_own_centre(self):
         texels, data = fl.ramp_texture(4)
         self.assertEqual(struct.unpack_from("<III", data), (4, 4, fl.DXGI_FORMAT_R16G16B16A16_FLOAT))

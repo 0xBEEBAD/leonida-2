@@ -155,18 +155,28 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
 
-        // [0] s0..s7: eight zero constants; [1] s8:s9: the SRV table whose low dword the PS reads as its pointer.
-        D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        // [0] s0..s(p-1): zero constants; [1] s(p):s(p+1): the SRV table whose low dword the PS reads as its
+        // pointer. p is the PS's pointer SGPR from the index (layer_ptr_sgpr; s8 for $PS_PassthroughCopy).
+        const UINT ptr_sgpr = UINT(number(manifest, "layer_ptr_sgpr", 8));
+        EXPECT(ptr_sgpr <= 30);
+        // The PS s_loads its T# at a byte offset in the table (layer_tsharp_offset, from its listing): the table
+        // holds that many descriptors before it, and the texture's SRV goes in that slot.
+        const UINT tsharp_offset = UINT(number(manifest, "layer_tsharp_offset", 0));
+        EXPECT(tsharp_offset % 32 == 0 && tsharp_offset <= 32 * 63);
+        const UINT srv_slot = tsharp_offset / 32;
+        D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srv_slot + 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants = {0, 0, 8};
+        params[0].Constants = {0, 0, ptr_sgpr};
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {1, &srv_range};
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        const UINT table_param = ptr_sgpr ? 1 : 0;  // with the pointer at s0 there is nothing to pad
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        root_desc.Desc_1_0 = {table_param + 1, ptr_sgpr ? params : params + 1, 0, nullptr,
+                              D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
         const auto root_blob = serialize_root_signature(root_desc);
         EXPECT(!root_blob.empty());
         Ref<ID3D12RootSignature> root;
@@ -245,7 +255,7 @@ int main() {
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv{
             SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(rtv_heap.p, 9))(rtv_heap.p))};
         device->CreateRenderTargetView(target.p, nullptr, rtv);
-        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, srv_slot + 1,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
         const std::uint64_t srv_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(srv_heap.p, 9))(srv_heap.p);
@@ -257,7 +267,10 @@ int main() {
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = 1;
-        device->CreateShaderResourceView(tex.p, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srv_cpu)});
+        const UINT srv_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        EXPECT(srv_step == 32);  // the console's T# is 32 bytes: a byte offset in the table is a slot
+        device->CreateShaderResourceView(tex.p, &srv,
+                                         D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srv_cpu + std::uint64_t(srv_slot) * srv_step)});
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
@@ -294,7 +307,7 @@ int main() {
         list->SetGraphicsRootSignature(root.p);
         ID3D12DescriptorHeap* heaps[] = {srv_heap.p};
         list->SetDescriptorHeaps(1, heaps);
-        list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu});
+        list->SetGraphicsRootDescriptorTable(table_param, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu});
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), UINT(vertex_bytes), stride};
         list->IASetVertexBuffers(0, 1, &vbv);

@@ -234,6 +234,22 @@ Point sampling would be off by up to half a texel (1/128 = 0.0078). That is what
 were registered (#2887), because the shader's lookup found the fallback sampler: worst error 0.0078, with 19,041
 channels over the tolerance. The same count was measured on an RTX 3070, a Ryzen RDNA2 iGPU and an RTX 5090.
 
+The test takes the PS's layout from the PS itself. The pointer SGPR comes from the index (`user_sgpr_reads`,
+`layer_ptr_sgpr`), and the root signature pads up to it. The T#'s byte offset in the table comes from the PS's
+`s_load_dwordx8` (`layer_tsharp_offset`), and the SRV goes in that slot. So any 2D copy PS can be checked, not only
+`$PS_PassthroughCopy`. Of the 148 single-sample PS that link with this VS (section 6's census), 24 sample once and
+export the result with no arithmetic. On an RTX 3060:
+
+| group | PS | result |
+|---|---:|---|
+| plain copies (`PS_Copy*`, `PS_TexCopy`, `PS_mipMap`, `$PS_PassthroughCopy`, `#PS_DownsampleCopy`, `PS_CopyWetMap`, `'PS_FreezeFrameCapture`, `!PS_AIFComposite`, `-PS_SecondPassRefractionBlit`) | 11 | pass, worst 0.00028 |
+| copies that remap channels: `&PS_HDRPassThroughRGB` exports (r, g, b, b) and `PS_BlitNormal` (r, g, 1, 1), checked per channel | 2 | pass, worst 0.00028 |
+| the UV transformed before the sample (overlays, zoom, live renderer, lens distortion) | 7 | not a copy, so not comparable to the ramp |
+| 2D-array or cube textures | 4 | not run |
+
+All 13 comparable game PS give the same worst error as `$PS_PassthroughCopy`. `!PS_AIFComposite` reads its T# at
+offset `0xA0` (slot 5), which a single-slot table had missed. Pass `--ps=<name>` when the name starts with `-`.
+
 The ramp folder is for this test only: its PS samples a T# that only the D3D12 layer binds, so
 `tests/test_first_light.py`'s `vk_harness` tests skip it.
 

@@ -40,6 +40,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import os
 import shutil
 import struct
@@ -667,6 +668,20 @@ def uv_map(vertices, indices, width: int, height: int):
     return found, ambiguous
 
 
+def tsharp_load_offset(listing: str) -> int:
+    """The byte offset of the PS's first 8-dword scalar load (its T#) in its table, 0 when the listing has none or
+    doesn't exist. d3d12_first_light_textured puts the texture's SRV at that slot (32-byte descriptors)."""
+    try:
+        with open(listing, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return 0
+    m = re.search(r"^\s*s_load_dwordx8\s+s\[\d+:\d+\],\s*s\[\d+:\d+\],\s*(0x[0-9a-fA-F]+|\d+|null)", text, re.M)
+    if not m or m.group(1) == "null":
+        return 0
+    return int(m.group(1), 0)
+
+
 def write_textured_inputs(out_dir: str, vertices, indices, width: int, height: int) -> dict:
     """texture.bin and expected.raw for d3d12_first_light_textured_test: the ramp, and the CPU reference of the
     draw (the texture sampled at each covered pixel's UV, -1 elsewhere, in the harness's row order)."""
@@ -1273,6 +1288,12 @@ def main(argv=None) -> int:
             manifest["rgba_probes"] = tex_probes
     if a.texture and vertices:
         manifest.update(write_textured_inputs(out_dir, vertices, indices, a.width, a.height))
+        # The SGPR the PS reads its T# table pointer from; d3d12_first_light_textured pads the root signature to it.
+        manifest["layer_ptr_sgpr"] = next(
+            (int(r["sgpr"]) for r in (meta["ps"].get("user_sgpr_reads") or [])
+             if r.get("kind") in ("ptr32_lo", "ptr64_lo")), DEFAULT_PTR_SGPR)
+        manifest["layer_tsharp_offset"] = tsharp_load_offset(
+            os.path.join(work, "shaders", "dxbc", "disasm", picked[1]["name"] + ".s"))
         manifest["files"].update(layer_texture="texture.bin", expected="expected.raw")
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
