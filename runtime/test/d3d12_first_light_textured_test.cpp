@@ -342,7 +342,8 @@ int main() {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
 
-    // The image as drawn, rows in vk_harness order, for first_light.py --check-textured to read back.
+    // The image as drawn, rows in vk_harness order, next to the inputs (d3d12_textured.raw), so a run on one GPU can
+    // be compared with another's byte for byte; nothing in the repository reads it.
     {
         std::ofstream out(dir / "d3d12_textured.raw", std::ios::binary);
         for (UINT vk_y = 0; vk_y < height; ++vk_y)
