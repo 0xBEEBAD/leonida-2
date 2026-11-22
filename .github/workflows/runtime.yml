@@ -597,6 +597,7 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
           "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
+          -DLEONIDA_REQUIRE_VULKAN=ON
       - name: Build
         run: cmake --build runtime/build --parallel
       - name: Runtime tests under ASan and UBSan
