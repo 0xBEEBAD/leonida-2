@@ -1114,5 +1114,19 @@ class LayerTexturedOracleTests(unittest.TestCase):
         # The quad's outer edges over the back triangle are lone edges with another UV behind: ambiguous.
         self.assertIn(20 * 64 + 8, seam)
 
+    def test_overlapping_edges_on_the_same_side_are_ambiguous(self):
+        # @whattheflop's third fixture (#2906): two front triangles with equal UVs whose right edges overlap and
+        # whose interiors both lie to the left, over an older triangle with another UV. They don't share an edge
+        # (different endpoints, same side), so a top-left rule can exclude both: those samples stay ambiguous.
+        def tri(pts, uv):
+            return [((x / 128) * 2 - 1, (y / 128) * 2 - 1, 0.5, uv[0], uv[1]) for x, y in pts]
+        outer = tri([(8, 8), (104, 8), (8, 103)], (0.25, 0.75))
+        f1 = tri([(16, 20), (32.5, 20), (32.5, 52)], (0.75, 0.25))
+        f2 = tri([(12, 16), (32.5, 16), (32.5, 56)], (0.75, 0.25))
+        for order in ([0, 1, 2, 3, 4, 5, 6, 7, 8], [0, 1, 2, 6, 7, 8, 3, 4, 5]):
+            _, seam = fl.uv_map(outer + f1 + f2, order, 128, 128)
+            column = {k for k in seam if k % 128 == 32}
+            self.assertGreaterEqual(len(column), 32, order)
+
 if __name__ == "__main__":
     sys.exit(unittest.main())

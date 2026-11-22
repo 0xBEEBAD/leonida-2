@@ -589,6 +589,23 @@ def sample_bilinear_clamp(texels, w: int, h: int, u: float, v: float):
                  for c in range(4))
 
 
+def edge_side(a, b, c, weights):
+    """For a sample on exactly one edge of triangle abc: (the edge's endpoints as a sorted pair of positions, the
+    side of that edge the third vertex is on). None for a sample inside, or on a vertex (two zero weights)."""
+    zero = [i for i, w in enumerate(weights) if w <= 1e-6]
+    if len(zero) != 1:
+        return None
+    verts = (a, b, c)
+    third = verts[zero[0]]
+    p, q = (verts[i] for i in range(3) if i != zero[0])
+    cross = (q[0] - p[0]) * (third[1] - p[1]) - (q[1] - p[1]) * (third[0] - p[0])
+    key = tuple(sorted(((p[0], p[1]), (q[0], q[1]))))
+    # The side is relative to the sorted direction, so two triangles agree on it exactly when on the same side.
+    if key[0] != (p[0], p[1]):
+        cross = -cross
+    return key, cross > 0
+
+
 AMBIGUOUS = -2.0  # expected.raw alpha for a covered pixel whose colour depends on the rasteriser's edge rule
 
 
@@ -616,7 +633,7 @@ def uv_map(vertices, indices, width: int, height: int):
                         weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
                         weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],
                     )
-                    hits.setdefault(k, []).append((uv, min(weights) <= 1e-6))
+                    hits.setdefault(k, []).append((uv, min(weights) <= 1e-6, edge_side(a, b, c, weights)))
                     found[k] = uv
     # The colour a pixel ends with comes from the last triangle that owns its sample. A hit strictly inside a
     # triangle owns it and hides every earlier hit. A hit on an edge may not own it: the tie-break rule decides, so
@@ -630,16 +647,21 @@ def uv_map(vertices, indices, width: int, height: int):
     ambiguous = set()
     for k, entries in hits.items():
         edges, interior = [], None
-        for uv, on_edge in reversed(entries):
+        for uv, on_edge, side in reversed(entries):
             if not on_edge:
                 interior = uv
                 break
-            edges.append(uv)
+            edges.append((uv, side))
         if not edges:
             continue
-        if len(edges) >= 2 and all(same(uv, edges[0]) for uv in edges[1:]):
+        uvs = [uv for uv, _ in edges]
+        # The rule gives one owner only to two triangles on opposite sides of a common edge with identical
+        # endpoints (@whattheflop, #2906): equal UVs alone don't make a shared edge.
+        shared = any(s1 and s2 and s1[0] == s2[0] and s1[1] != s2[1]
+                     for i, (_, s1) in enumerate(edges) for _, s2 in edges[i + 1:])
+        if shared and all(same(uv, uvs[0]) for uv in uvs[1:]):
             continue
-        candidates = edges + ([interior] if interior is not None else [])
+        candidates = uvs + ([interior] if interior is not None else [])
         if any(not same(uv, candidates[0]) for uv in candidates[1:]):
             ambiguous.add(k)
     return found, ambiguous
