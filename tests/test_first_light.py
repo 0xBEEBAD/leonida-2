@@ -1080,5 +1080,39 @@ class LayerTexturedOracleTests(unittest.TestCase):
             if k not in seam_f:
                 self.assertEqual(forward[k], backward[k], k)
 
+    def test_an_interior_hides_earlier_edges(self):
+        # @whattheflop's second fixture (#2906): an inner triangle whose left edge (x = 24.5, on pixel centres) lies
+        # inside a larger outer one, the two with different UVs. Drawn inner-then-outer, the outer interior owns
+        # every sample on the inner's edge: nothing is ambiguous and the image equals a solid outer reference.
+        # Drawn outer-then-inner, the inner is last and those samples are on its edge, so the edge rule decides
+        # whether they show the inner or the outer UV: exactly those 48 samples are ambiguous.
+        def tri(pts, uv):
+            return [((x / 128) * 2 - 1, (y / 128) * 2 - 1, 0.5, uv[0], uv[1]) for x, y in pts]
+        outer = tri([(8, 8), (104, 8), (8, 103)], (0.25, 0.75))
+        inner = tri([(24.5, 20), (56, 20), (24.5, 68)], (0.75, 0.25))
+        vertices = outer + inner
+        uvs_oi, seam_oi = fl.uv_map(vertices, [0, 1, 2, 3, 4, 5], 128, 128)
+        uvs_io, seam_io = fl.uv_map(vertices, [3, 4, 5, 0, 1, 2], 128, 128)
+        self.assertEqual(seam_io, set())
+        self.assertEqual(len(seam_oi), 48)
+        self.assertEqual({k % 128 for k in seam_oi}, {24})   # pixel column 24: centre x = 24.5
+        solid, _ = fl.uv_map(outer, [0, 1, 2], 128, 128)
+        self.assertEqual(uvs_io, solid)   # outer drawn last covers the inner one everywhere
+
+    def test_a_shared_edge_over_an_older_interior_is_not_ambiguous(self):
+        # A front quad (two triangles sharing a diagonal, continuous UVs) drawn over a back triangle with another
+        # UV: the diagonal's samples belong to one of the two front triangles, both of which give the same UV.
+        def tri(pts, uvs):
+            return [((x / 64) * 2 - 1, (y / 64) * 2 - 1, 0.5, u, v) for (x, y), (u, v) in zip(pts, uvs)]
+        back = tri([(2, 2), (62, 2), (2, 62)], [(0.9, 0.9)] * 3)
+        quad = [(8.5, 8.5), (40.5, 8.5), (40.5, 40.5), (8.5, 40.5)]
+        quv = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        front = tri([quad[0], quad[1], quad[2]], [quv[0], quv[1], quv[2]]) + \
+            tri([quad[0], quad[2], quad[3]], [quv[0], quv[2], quv[3]])
+        _, seam = fl.uv_map(back + front, list(range(9)), 64, 64)
+        self.assertEqual(seam & {32 * 64 + 32, 20 * 64 + 20}, set())   # two diagonal samples
+        # The quad's outer edges over the back triangle are lone edges with another UV behind: ambiguous.
+        self.assertIn(20 * 64 + 8, seam)
+
 if __name__ == "__main__":
     sys.exit(unittest.main())

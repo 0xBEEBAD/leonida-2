@@ -598,7 +598,7 @@ def uv_map(vertices, indices, width: int, height: int):
     UVs (a UV seam). Vulkan gives such a sample to exactly one of them by its tie-break rule, which this reference
     does not model, so those pixels are reported instead of guessed. Returns (uvs, ambiguous pixel indices)."""
     found = [None] * (width * height)
-    hits = {}  # pixel -> [(uv, on_edge)] for pixels covered more than once
+    hits = {}  # pixel -> [(uv, on_edge)] in draw order
     for i in range(0, len(indices), 3):
         a, b, c = (vertices[indices[i + k]] for k in range(3))
         xs, ys = (a[0], b[0], c[0]), (a[1], b[1], c[1])
@@ -616,16 +616,31 @@ def uv_map(vertices, indices, width: int, height: int):
                         weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
                         weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],
                     )
-                    on_edge = min(weights) <= 1e-6
-                    if found[k] is not None or on_edge:
-                        hits.setdefault(k, []).append((uv, on_edge))
+                    hits.setdefault(k, []).append((uv, min(weights) <= 1e-6))
                     found[k] = uv
+    # The colour a pixel ends with comes from the last triangle that owns its sample. A hit strictly inside a
+    # triangle owns it and hides every earlier hit. A hit on an edge may not own it: the tie-break rule decides, so
+    # the hit before it is still a candidate. Walk from the latest hit back to the first interior one (@whattheflop,
+    # #2906). Two or more edge hits there with the same UV are an edge both triangles share, drawn after anything
+    # older: the rule gives the sample to exactly one of them, so that UV is the colour's. Otherwise the pixel is
+    # ambiguous when the candidates' UVs differ (a UV seam, or a lone edge over an older interior).
+    def same(p, q):
+        return abs(p[0] - q[0]) <= 1e-6 and abs(p[1] - q[1]) <= 1e-6
+
     ambiguous = set()
     for k, entries in hits.items():
-        if len(entries) < 2 or not any(edge for _, edge in entries):
-            continue  # overlapping interiors: draw order decides, and the last one wins as uv_at says
-        uvs = [uv for uv, _ in entries]
-        if any(abs(u[0] - uvs[0][0]) > 1e-6 or abs(u[1] - uvs[0][1]) > 1e-6 for u in uvs[1:]):
+        edges, interior = [], None
+        for uv, on_edge in reversed(entries):
+            if not on_edge:
+                interior = uv
+                break
+            edges.append(uv)
+        if not edges:
+            continue
+        if len(edges) >= 2 and all(same(uv, edges[0]) for uv in edges[1:]):
+            continue
+        candidates = edges + ([interior] if interior is not None else [])
+        if any(not same(uv, candidates[0]) for uv in candidates[1:]):
             ambiguous.add(k)
     return found, ambiguous
 
