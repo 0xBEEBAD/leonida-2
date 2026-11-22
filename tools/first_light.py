@@ -589,9 +589,16 @@ def sample_bilinear_clamp(texels, w: int, h: int, u: float, v: float):
                  for c in range(4))
 
 
+AMBIGUOUS = -2.0  # expected.raw alpha for a covered pixel whose colour depends on the rasteriser's edge rule
+
+
 def uv_map(vertices, indices, width: int, height: int):
-    """uv_at for every pixel centre at once (the last covering triangle wins), by triangle bounding box."""
+    """uv_at for every pixel centre at once (the last covering triangle wins), by triangle bounding box, plus the
+    pixels whose UV the edge rule decides: a sample on a shared edge between triangles that give it different
+    UVs (a UV seam). Vulkan gives such a sample to exactly one of them by its tie-break rule, which this reference
+    does not model, so those pixels are reported instead of guessed. Returns (uvs, ambiguous pixel indices)."""
     found = [None] * (width * height)
+    hits = {}  # pixel -> [(uv, on_edge)] for pixels covered more than once
     for i in range(0, len(indices), 3):
         a, b, c = (vertices[indices[i + k]] for k in range(3))
         xs, ys = (a[0], b[0], c[0]), (a[1], b[1], c[1])
@@ -604,11 +611,23 @@ def uv_map(vertices, indices, width: int, height: int):
                 x, y = pixel_ndc(px, py, width, height)
                 weights = barycentric(x, y, a[0], a[1], b[0], b[1], c[0], c[1])
                 if weights:
-                    found[py * width + px] = (
+                    k = py * width + px
+                    uv = (
                         weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
                         weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],
                     )
-    return found
+                    on_edge = min(weights) <= 1e-6
+                    if found[k] is not None or on_edge:
+                        hits.setdefault(k, []).append((uv, on_edge))
+                    found[k] = uv
+    ambiguous = set()
+    for k, entries in hits.items():
+        if len(entries) < 2 or not any(edge for _, edge in entries):
+            continue  # overlapping interiors: draw order decides, and the last one wins as uv_at says
+        uvs = [uv for uv, _ in entries]
+        if any(abs(u[0] - uvs[0][0]) > 1e-6 or abs(u[1] - uvs[0][1]) > 1e-6 for u in uvs[1:]):
+            ambiguous.add(k)
+    return found, ambiguous
 
 
 def write_textured_inputs(out_dir: str, vertices, indices, width: int, height: int) -> dict:
@@ -619,9 +638,13 @@ def write_textured_inputs(out_dir: str, vertices, indices, width: int, height: i
         f.write(data)
     expected = bytearray()
     covered = 0
-    for uv in uv_map(vertices, indices, width, height):
+    uvs, ambiguous = uv_map(vertices, indices, width, height)
+    for k, uv in enumerate(uvs):
         if uv is None:
             expected += struct.pack("<4f", -1.0, -1.0, -1.0, -1.0)
+        elif k in ambiguous:
+            covered += 1
+            expected += struct.pack("<4f", 0.0, 0.0, 0.0, AMBIGUOUS)
         else:
             covered += 1
             expected += struct.pack("<4f", *sample_bilinear_clamp(texels, RAMP_SIZE, RAMP_SIZE, uv[0], uv[1]))
@@ -629,6 +652,7 @@ def write_textured_inputs(out_dir: str, vertices, indices, width: int, height: i
         f.write(expected)
     return {"texture": "ramp", "texture_size": [RAMP_SIZE, RAMP_SIZE], "texture_format": "R16G16B16A16_FLOAT",
             "texture_sha256": hashlib.sha256(data).hexdigest(), "expected_covered": covered,
+            "expected_ambiguous": len(ambiguous),
             # Half a texel is 1/128 = 0.0078: a point-sampled draw exceeds this everywhere; bilinear rounding stays
             # under 0.0005 (RTX 3060).
             "texture_tolerance": 0.002}

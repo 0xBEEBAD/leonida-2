@@ -8,7 +8,8 @@
 //   - texture.bin (u32 width, height, DXGI format, then tightly packed rows) is uploaded to a DEFAULT texture with
 //     CopyTextureRegion, and CreateShaderResourceView writes its T# into a shader-visible heap.
 //   - expected.raw (first_light.py's CPU reference: the texture sampled bilinearly with clamp at each covered pixel's
-//     interpolated UV, -1 where uncovered, in vk_harness row order) is compared pixel by pixel with a tolerance.
+//     interpolated UV, -1 where uncovered, alpha -2 on a UV seam where the edge rule picks the triangle, in vk_harness
+//     row order) is compared pixel by pixel with a tolerance; seam pixels count for coverage only.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -346,7 +347,7 @@ int main() {
     const auto expected = read_file(dir / "expected.raw");
     EXPECT(expected.size() == pixels.size() * sizeof(Pixel));
     const double tolerance = number(manifest, "texture_tolerance", 4.0 / 255.0);
-    unsigned covered = 0, compared = 0, coverage_mismatch = 0, over = 0;
+    unsigned covered = 0, compared = 0, coverage_mismatch = 0, over = 0, ambiguous = 0;
     double worst = 0.0, sum = 0.0;
     for (UINT vk_y = 0; vk_y < height; ++vk_y) {
         for (UINT x = 0; x < width; ++x) {
@@ -360,6 +361,10 @@ int main() {
                 continue;
             }
             if (!want_covered) continue;
+            if (want[3] == -2.0f) {  // on a UV seam: the edge rule picks the triangle, so the colour is not compared
+                ++ambiguous;
+                continue;
+            }
             ++compared;
             for (int c = 0; c < 4; ++c) {
                 const double e = std::fabs(double(got[c]) - double(want[c]));
@@ -370,9 +375,11 @@ int main() {
         }
     }
     std::printf("covered %u/%u; %u pixels compared with the CPU reference: worst %.5f, mean %.6f, %u channels over "
-                "%.5f; %u coverage mismatches\n", covered, width * height, compared, worst,
-                compared ? sum / (compared * 4.0) : 0.0, over, tolerance, coverage_mismatch);
+                "%.5f; %u coverage mismatches; %u on a UV seam (colour not compared)\n", covered, width * height,
+                compared, worst, compared ? sum / (compared * 4.0) : 0.0, over, tolerance, coverage_mismatch,
+                ambiguous);
     EXPECT(compared > 0);
+    EXPECT(ambiguous <= covered / 100);  // seams are edges: a large count means the reference is wrong
     // Coverage is the same rasterisation as d3d12_first_light; the CPU reference marks pixel centres inside a
     // triangle, so only edge pixels may disagree.
     EXPECT(coverage_mismatch <= covered / 100);

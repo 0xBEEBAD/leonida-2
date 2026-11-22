@@ -1053,11 +1053,32 @@ class LayerTexturedOracleTests(unittest.TestCase):
         vertices = [(-1.0, -1.0, 0.5, 0.0, 0.0), (1.0, -1.0, 0.5, 1.0, 0.0), (-1.0, 1.0, 0.5, 0.0, 1.0),
                     (-0.5, -0.5, 0.5, 0.9, 0.9), (0.9, -0.5, 0.5, 0.8, 0.9), (-0.5, 0.9, 0.5, 0.9, 0.8)]
         indices = [0, 1, 2, 3, 4, 5]
-        got = fl.uv_map(vertices, indices, 16, 12)
+        got, ambiguous = fl.uv_map(vertices, indices, 16, 12)
         for py in range(12):
             for px in range(16):
                 self.assertEqual(got[py * 16 + px], fl.uv_at(vertices, indices, px, py, 16, 12), (px, py))
         self.assertTrue(any(g is None for g in got) and any(g is not None for g in got))
+        self.assertEqual(ambiguous, set())   # overlapping interiors, not a seam: draw order decides
+
+    def test_uv_seam_pixels_are_not_guessed(self):
+        # @whattheflop's fixture (#2906): a quad over framebuffer (4,4)-(28,28) on 32x32, split on its diagonal, the
+        # two halves with constant but different UVs. Which triangle owns a diagonal sample is the rasteriser's edge
+        # rule, so swapping the draw order must change nothing outside the reported seam.
+        def ndc(v):
+            return v / 32 * 2 - 1
+        p = [(ndc(4), ndc(4)), (ndc(28), ndc(4)), (ndc(28), ndc(28)), (ndc(4), ndc(28))]
+        vertices = [(p[0][0], p[0][1], 0.5, 0.25, 0.75), (p[1][0], p[1][1], 0.5, 0.25, 0.75),
+                    (p[2][0], p[2][1], 0.5, 0.25, 0.75),
+                    (p[0][0], p[0][1], 0.5, 0.75, 0.25), (p[2][0], p[2][1], 0.5, 0.75, 0.25),
+                    (p[3][0], p[3][1], 0.5, 0.75, 0.25)]
+        forward, seam_f = fl.uv_map(vertices, [0, 1, 2, 3, 4, 5], 32, 32)
+        backward, seam_b = fl.uv_map(vertices, [3, 4, 5, 0, 1, 2], 32, 32)
+        self.assertEqual(seam_f, seam_b)
+        self.assertEqual(len(seam_f), 24)    # the diagonal's sample points
+        self.assertEqual(sum(uv is not None for uv in forward), 576)
+        for k in range(32 * 32):
+            if k not in seam_f:
+                self.assertEqual(forward[k], backward[k], k)
 
 if __name__ == "__main__":
     sys.exit(unittest.main())
