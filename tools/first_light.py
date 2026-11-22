@@ -562,6 +562,78 @@ def clear_pixel(vertices, indices, width: int, height: int):
     return None
 
 
+RAMP_SIZE = 64
+DXGI_FORMAT_R16G16B16A16_FLOAT = 10
+
+
+def ramp_texture(size: int = RAMP_SIZE):
+    """A size x size R16G16B16A16_FLOAT texture whose texel (x, y) holds its own centre ((x+.5)/size, (y+.5)/size,
+    0, 1). Bilinear sampling with clamp gives back the UV (clamped to the outer texel centres), so the textured draw
+    has an exact oracle, and a point-sampled draw is off by up to half a texel. Returns (texels, texture.bin bytes)."""
+    texels = [((x + 0.5) / size, (y + 0.5) / size, 0.0, 1.0) for y in range(size) for x in range(size)]
+    data = struct.pack("<III", size, size, DXGI_FORMAT_R16G16B16A16_FLOAT)
+    data += b"".join(struct.pack("<4e", *t) for t in texels)
+    return texels, data
+
+
+def sample_bilinear_clamp(texels, w: int, h: int, u: float, v: float):
+    """Bilinear sample at (u, v) with clamp to the edge texels, texel centres at (i + 0.5) / size."""
+    x = min(max(u * w - 0.5, 0.0), w - 1.0)
+    y = min(max(v * h - 0.5, 0.0), h - 1.0)
+    x0, y0 = int(x), int(y)
+    x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
+    fx, fy = x - x0, y - y0
+    t00, t10 = texels[y0 * w + x0], texels[y0 * w + x1]
+    t01, t11 = texels[y1 * w + x0], texels[y1 * w + x1]
+    return tuple((t00[c] * (1 - fx) + t10[c] * fx) * (1 - fy) + (t01[c] * (1 - fx) + t11[c] * fx) * fy
+                 for c in range(4))
+
+
+def uv_map(vertices, indices, width: int, height: int):
+    """uv_at for every pixel centre at once (the last covering triangle wins), by triangle bounding box."""
+    found = [None] * (width * height)
+    for i in range(0, len(indices), 3):
+        a, b, c = (vertices[indices[i + k]] for k in range(3))
+        xs, ys = (a[0], b[0], c[0]), (a[1], b[1], c[1])
+        px0 = max(0, int(((min(xs) + 1) * 0.5) * width - 0.5) - 1)
+        px1 = min(width - 1, int(((max(xs) + 1) * 0.5) * width - 0.5) + 1)
+        py0 = max(0, int(((min(ys) + 1) * 0.5) * height - 0.5) - 1)
+        py1 = min(height - 1, int(((max(ys) + 1) * 0.5) * height - 0.5) + 1)
+        for py in range(py0, py1 + 1):
+            for px in range(px0, px1 + 1):
+                x, y = pixel_ndc(px, py, width, height)
+                weights = barycentric(x, y, a[0], a[1], b[0], b[1], c[0], c[1])
+                if weights:
+                    found[py * width + px] = (
+                        weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
+                        weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],
+                    )
+    return found
+
+
+def write_textured_inputs(out_dir: str, vertices, indices, width: int, height: int) -> dict:
+    """texture.bin and expected.raw for d3d12_first_light_textured_test: the ramp, and the CPU reference of the
+    draw (the texture sampled at each covered pixel's UV, -1 elsewhere, in the harness's row order)."""
+    texels, data = ramp_texture()
+    with open(os.path.join(out_dir, "texture.bin"), "wb") as f:
+        f.write(data)
+    expected = bytearray()
+    covered = 0
+    for uv in uv_map(vertices, indices, width, height):
+        if uv is None:
+            expected += struct.pack("<4f", -1.0, -1.0, -1.0, -1.0)
+        else:
+            covered += 1
+            expected += struct.pack("<4f", *sample_bilinear_clamp(texels, RAMP_SIZE, RAMP_SIZE, uv[0], uv[1]))
+    with open(os.path.join(out_dir, "expected.raw"), "wb") as f:
+        f.write(expected)
+    return {"texture": "ramp", "texture_size": [RAMP_SIZE, RAMP_SIZE], "texture_format": "R16G16B16A16_FLOAT",
+            "texture_sha256": hashlib.sha256(data).hexdigest(), "expected_covered": covered,
+            # Half a texel is 1/128 = 0.0078: a point-sampled draw exceeds this everywhere; bilinear rounding stays
+            # under 0.0005 (RTX 3060).
+            "texture_tolerance": 0.002}
+
+
 def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> list[dict]:
     """Pixels whose predicted UV has U and V far apart, so a swapped-U/V image cannot pass.
 
@@ -915,6 +987,9 @@ def main(argv=None) -> int:
         "--dds",
         help="an exported DDS texture (e.g. BCPack-decoded TTPF albedo) to bind via set-0 T# and sampler S#",
     )
+    ap.add_argument("--texture", choices=["ramp"],
+                    help="also write texture.bin and expected.raw for d3d12_first_light_textured_test "
+                         "(pick a --ps that samples one texture through a table at s8)")
     ap.add_argument("--width", type=int, default=128)
     ap.add_argument("--height", type=int, default=128)
     ap.add_argument(
@@ -1133,6 +1208,9 @@ def main(argv=None) -> int:
         )
         if tex_probes:
             manifest["rgba_probes"] = tex_probes
+    if a.texture and vertices:
+        manifest.update(write_textured_inputs(out_dir, vertices, indices, a.width, a.height))
+        manifest["files"].update(texture="texture.bin", expected="expected.raw")
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")

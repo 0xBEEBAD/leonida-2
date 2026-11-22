@@ -1019,5 +1019,45 @@ class CameraTests(unittest.TestCase):
                     os.environ[k] = v
 
 
+class LayerTexturedOracleTests(unittest.TestCase):
+    """The D3D12-layer textured first light's CPU reference (#2906), without a GPU or a package."""
+
+    def test_ramp_texels_hold_their_own_centre(self):
+        texels, data = fl.ramp_texture(4)
+        self.assertEqual(struct.unpack_from("<III", data), (4, 4, fl.DXGI_FORMAT_R16G16B16A16_FLOAT))
+        self.assertEqual(len(data), 12 + 4 * 4 * 8)
+        self.assertEqual(texels[1 * 4 + 2], (2.5 / 4, 1.5 / 4, 0.0, 1.0))
+        self.assertEqual(struct.unpack_from("<4e", data, 12 + (1 * 4 + 2) * 8), (0.625, 0.375, 0.0, 1.0))
+
+    def test_bilinear_ramp_gives_back_the_uv_and_clamps(self):
+        texels, _ = fl.ramp_texture(64)
+        for u, v in ((0.3, 0.7), (0.51, 0.49), (0.123, 0.9)):
+            r, g, b, a = fl.sample_bilinear_clamp(texels, 64, 64, u, v)
+            self.assertAlmostEqual(r, u, places=6)
+            self.assertAlmostEqual(g, v, places=6)
+            self.assertEqual((b, a), (0.0, 1.0))
+        r, g, _, _ = fl.sample_bilinear_clamp(texels, 64, 64, 0.001, 0.999)
+        self.assertAlmostEqual(r, 0.5 / 64, places=7)       # clamp to the first texel centre
+        self.assertAlmostEqual(g, 63.5 / 64, places=7)      # and to the last
+
+    def test_point_sampling_fails_the_tolerance(self):
+        # What the draw gave before literal S#s were registered (#2887): the nearest texel centre, up to half a
+        # texel (1/128) from the UV, which the manifest's 0.002 tolerance rejects.
+        texels, _ = fl.ramp_texture(64)
+        u = 10.5 / 64 + 0.49 / 64
+        nearest = (round(u * 64 - 0.5) + 0.5) / 64
+        self.assertGreater(abs(nearest - fl.sample_bilinear_clamp(texels, 64, 64, u, 0.5)[0]), 0.002)
+
+    def test_uv_map_matches_uv_at(self):
+        # Two overlapping triangles: the later one wins where both cover, as uv_at says.
+        vertices = [(-1.0, -1.0, 0.5, 0.0, 0.0), (1.0, -1.0, 0.5, 1.0, 0.0), (-1.0, 1.0, 0.5, 0.0, 1.0),
+                    (-0.5, -0.5, 0.5, 0.9, 0.9), (0.9, -0.5, 0.5, 0.8, 0.9), (-0.5, 0.9, 0.5, 0.9, 0.8)]
+        indices = [0, 1, 2, 3, 4, 5]
+        got = fl.uv_map(vertices, indices, 16, 12)
+        for py in range(12):
+            for px in range(16):
+                self.assertEqual(got[py * 16 + px], fl.uv_at(vertices, indices, px, py, 16, 12), (px, py))
+        self.assertTrue(any(g is None for g in got) and any(g is not None for g in got))
+
 if __name__ == "__main__":
     sys.exit(unittest.main())
