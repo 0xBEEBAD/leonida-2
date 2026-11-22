@@ -231,11 +231,14 @@ centres, so the image has an exact oracle. `first_light.py --texture ramp` write
 On an RTX 3060 (Windows 11, driver 616.64), the draw covers the same **12,804 pixels** as section 5, with no
 coverage mismatch. The worst channel error is **0.00028** and the mean 0.000045, against a tolerance of 0.002.
 Point sampling would be off by up to half a texel (1/128 = 0.0078). That is what this draw gave before literal S#s
-were registered (#2887), because the shader's lookup found the fallback sampler: worst error 0.0078, with 18,616
-channels over the tolerance.
+were registered (#2887), because the shader's lookup found the fallback sampler: worst error 0.0078, with 19,041
+channels over the tolerance. The same count was measured on an RTX 3070, a Ryzen RDNA2 iGPU and an RTX 5090.
+
+The ramp folder is for this test only: its PS samples a T# that only the D3D12 layer binds, so
+`tests/test_first_light.py`'s `vk_harness` tests skip it.
 
 ```sh
-python -I tools/first_light.py ... --no-fit --vs VS_main_170e32e6_Wrapped --ps '$PS_PassthroughCopy_1a08fc46_Wrapped' --texture ramp
+python -I tools/first_light.py ... --no-fit --out ~/leonida-work/first_light/out_tex --vs VS_main_170e32e6_Wrapped --ps '$PS_PassthroughCopy_1a08fc46_Wrapped' --texture ramp
 LEONIDA_FIRST_LIGHT_TEX_DIR=~/leonida-work/first_light/out_tex ctest --test-dir <build> -R d3d12_first_light_textured -V
 ```
 

@@ -117,6 +117,10 @@ class FirstLightTests(unittest.TestCase):
             )
         with open(os.path.join(self.out, "manifest.json"), encoding="utf-8") as f:
             self.manifest = json.load(f)
+        if self.manifest.get("layer_texture"):
+            # A --texture ramp folder feeds d3d12_first_light_textured (LEONIDA_FIRST_LIGHT_TEX_DIR): its PS samples a
+            # T# that only the D3D12 layer binds, so vk_harness has nothing to draw it with (@zzEmmazz, #2906).
+            self.skipTest("a --texture ramp folder is for d3d12_first_light_textured, not vk_harness")
 
     def test_draw_matches_the_manifest(self):
         raw = os.path.join(self.out, "image_first_light.raw")
@@ -1021,6 +1025,21 @@ class CameraTests(unittest.TestCase):
 
 class LayerTexturedOracleTests(unittest.TestCase):
     """The D3D12-layer textured first light's CPU reference (#2906), without a GPU or a package."""
+
+    def test_ramp_inputs_leave_the_harness_texture_keys_alone(self):
+        # @zzEmmazz (#2906): the ramp's manifest keys once shared "texture" and files["texture"] with the --dds
+        # harness path, so harness_env read the string "ramp" as the --dds dict and the tool exited with a
+        # TypeError. The ramp's keys are layer_*; harness_env must neither fail nor bind a harness texture.
+        with tempfile.TemporaryDirectory() as tmp:
+            verts = [(-0.5, -0.5, 0.5, 0.0, 0.0), (0.5, -0.5, 0.5, 1.0, 0.0), (-0.5, 0.5, 0.5, 0.0, 1.0)]
+            manifest = {"files": {"mesh": "mesh.bin"}}
+            manifest.update(fl.write_textured_inputs(tmp, verts, [0, 1, 2], 8, 8))
+            manifest["files"].update(layer_texture="texture.bin", expected="expected.raw")
+            self.assertNotIn("texture", manifest)
+            self.assertNotIn("texture", manifest["files"])
+            env = fl.harness_env(manifest, tmp, base_env={})
+            self.assertNotIn("VKH_TEX_RGBA", env)
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "texture.bin")))
 
     def test_ramp_texels_hold_their_own_centre(self):
         texels, data = fl.ramp_texture(4)

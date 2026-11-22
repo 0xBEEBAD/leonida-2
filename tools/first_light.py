@@ -687,8 +687,10 @@ def write_textured_inputs(out_dir: str, vertices, indices, width: int, height: i
             expected += struct.pack("<4f", *sample_bilinear_clamp(texels, RAMP_SIZE, RAMP_SIZE, uv[0], uv[1]))
     with open(os.path.join(out_dir, "expected.raw"), "wb") as f:
         f.write(expected)
-    return {"texture": "ramp", "texture_size": [RAMP_SIZE, RAMP_SIZE], "texture_format": "R16G16B16A16_FLOAT",
-            "texture_sha256": hashlib.sha256(data).hexdigest(), "expected_covered": covered,
+    # layer_* keys: "texture" and files["texture"] belong to the --dds harness path (harness_env reads them).
+    return {"layer_texture": "ramp", "layer_texture_size": [RAMP_SIZE, RAMP_SIZE],
+            "layer_texture_format": "R16G16B16A16_FLOAT",
+            "layer_texture_sha256": hashlib.sha256(data).hexdigest(), "expected_covered": covered,
             "expected_ambiguous": len(ambiguous),
             # Half a texel is 1/128 = 0.0078: a point-sampled draw exceeds this everywhere; bilinear rounding stays
             # under 0.0005 (RTX 3060).
@@ -1271,7 +1273,7 @@ def main(argv=None) -> int:
             manifest["rgba_probes"] = tex_probes
     if a.texture and vertices:
         manifest.update(write_textured_inputs(out_dir, vertices, indices, a.width, a.height))
-        manifest["files"].update(texture="texture.bin", expected="expected.raw")
+        manifest["files"].update(layer_texture="texture.bin", expected="expected.raw")
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")
