@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; ds_add_f32 / ds_add_rtn_f32 (#3120, merged with CPU-only checks): M = M + DATA as binary32, round to nearest even;
 ; the _rtn_ form returns the old M. Lane 0 of a wave32 group stores eight dwords:
 ;   out[0] = ds_add_rtn_f32 old value (LDS 1.5, DATA 2.25)                               = 0x3FC00000
