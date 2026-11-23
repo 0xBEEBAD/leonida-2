@@ -18,7 +18,9 @@ Upscaler::~Upscaler() {
 bool Upscaler::load(std::string& error) {
     if (module_) return true;
     std::string path = loader_name;
-    if (const char* dir = std::getenv("LEONIDA_FFX_DIR"); dir && *dir) {
+    char dir[MAX_PATH] = {};
+    std::size_t length = 0;
+    if (getenv_s(&length, dir, sizeof(dir), "LEONIDA_FFX_DIR") == 0 && length > 1) {
         // The loader finds amd_fidelityfx_upscaler_vk.dll next to itself, so the folder goes on the DLL search path.
         SetDllDirectoryA(dir);
         path = std::string(dir) + "\\" + loader_name;

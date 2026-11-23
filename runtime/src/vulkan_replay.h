@@ -41,7 +41,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
@@ -97,6 +99,17 @@ struct VulkanAccess {
     VkImageLayout layout;
     VkAccessFlags access;
     VkPipelineStageFlags stages;
+};
+
+// An Upscale's images as the upscale hook gets them, in this order: color, depth, motion vectors, output, exposure,
+// reactive, transparency and composition. An absent optional image has a null `image`. `layout` is the one replay
+// put it in for the hook (and restores afterwards): the inputs' shader-resource layout, GENERAL for the output.
+inline constexpr std::size_t upscale_image_count = 7;
+struct UpscaleImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t width = 0, height = 0;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 
 inline constexpr VkPipelineStageFlags shader_stages =
@@ -863,6 +876,10 @@ struct ReplayFunctions {
     // cannot read while the list is prepared, `xdxr_record` records the build.
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
     std::function<void(VkCommandBuffer, const BuildAccelerationStructure&)> xdxr_record;
+    // Upscale (RT-344): whether the command's context still exists (a missing one skips the command), and recording
+    // the upscale; false when the upscaler refused it, which is logged. Unset: an Upscale is unsupported.
+    std::function<bool(std::uint64_t context)> upscale_ready;
+    std::function<bool(VkCommandBuffer, const Upscale&, const UpscaleImage (&)[upscale_image_count])> upscale;
     // CopyRaytracingAccelerationStructure (CLONE, COMPACT) of XDXR structures: `bytes` is the room the destination
     // resource has; and one postbuild value (COMPACTED_SIZE, CURRENT_SIZE) of the structure at `src` to `dest`.
     std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes)> xdxr_copy;
@@ -976,7 +993,8 @@ struct Prepared {
     ComputePipeline pipeline;  // dispatches
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
-    std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
+    std::uint64_t xdxr_bytes = 0;
+    std::vector<ResourceBinding> upscale_images;  // Upscale: its images in UpscaleImage order (absent: no VkImage)     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
 
@@ -2807,6 +2825,22 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
             }
+        } else if (const auto* up = std::get_if<Upscale>(&command)) {
+            if (!vk.upscale) return ReplayResult::unsupported;
+            if (vk.upscale_ready && !vk.upscale_ready(up->context)) {
+                p.skip = true;   // its context was destroyed after recording: nothing to run it with
+                continue;
+            }
+            const ResourceId ids[upscale_image_count] = {up->color,    up->depth,    up->motion_vectors,
+                                                         up->output,   up->exposure, up->reactive,
+                                                         up->transparency_and_composition};
+            p.upscale_images.assign(upscale_image_count, ResourceBinding{});
+            for (std::size_t k = 0; k < upscale_image_count; ++k) {
+                if (!ids[k]) continue;   // optional, and the required ones were checked when recorded
+                const ResourceBinding* image = resolve(ids[k]);
+                if (!image || !image->image) return ReplayResult::unresolved_resource;
+                p.upscale_images[k] = *image;
+            }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             if (vk.xdxr_check) {
                 if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
@@ -3656,6 +3690,58 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                             (ind->count_buffer ? p.counted_dispatch.offset + VkDeviceSize(k) * 12
                                                : arguments + VkDeviceSize(k) * ind->stride));
                     }
+                }
+            }
+        } else if (const auto* up = std::get_if<Upscale>(&command)) {
+            if (p.skip) continue;
+            // As detail::round_trip, for every image at once: the inputs to the shader-resource layout and the output
+            // to the UAV layout (the D3D12 states the upscaler requires of them), the upscale, then each back.
+            const ResourceId ids[upscale_image_count] = {up->color,    up->depth,    up->motion_vectors,
+                                                         up->output,   up->exposure, up->reactive,
+                                                         up->transparency_and_composition};
+            constexpr std::size_t output = 3;
+            UpscaleImage images[upscale_image_count];
+            LayoutPieces pieces[upscale_image_count];
+            VulkanAccess states[upscale_image_count]{};
+            VkImageSubresourceRange ranges[upscale_image_count]{};
+            const VkAccessFlags reads = VK_ACCESS_SHADER_READ_BIT;
+            const VkAccessFlags writes = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            for (std::size_t k = 0; k < upscale_image_count; ++k) {
+                const ResourceBinding& b = p.upscale_images[k];
+                if (!b.image) continue;
+                states[k] = vulkan_access(k == output ? d3d12_state::unordered_access
+                                                      : d3d12_state::non_pixel_shader_resource, false);
+                const VkImageLayout layout = image_layout(b, states[k].layout);
+                ranges[k] = {b.aspects, 0, b.mip_levels, 0, b.array_layers};
+                pieces[k] = detail::current(tracker, ids[k], ranges[k], layout);
+                detail::initialize(vk, command_buffer, b, ids[k], pieces[k], layout, tracker);
+                for (const auto& piece : pieces[k]) {
+                    if (piece.layout == layout)
+                        detail::memory_barrier(vk, command_buffer, states[k].access, states[k].stages,
+                                               k == output ? writes : reads, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    else
+                        detail::image_barrier(vk, command_buffer, b, piece.range, piece.layout, layout, states[k].access,
+                                              states[k].stages, k == output ? writes : reads,
+                                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                }
+                images[k] = {b.image, b.format, b.width, b.height, layout};
+            }
+            if (!vk.upscale(command_buffer, *up, images)) {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true))
+                    std::fprintf(stderr, "[rt] replay: the upscaler refused an Upscale (context %llu); output unchanged\n",
+                                 static_cast<unsigned long long>(up->context));
+            }
+            for (std::size_t k = 0; k < upscale_image_count; ++k) {
+                if (!images[k].image) continue;
+                for (const auto& piece : pieces[k]) {
+                    if (piece.layout == images[k].layout)
+                        detail::memory_barrier(vk, command_buffer, k == output ? writes : reads,
+                                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, states[k].access, states[k].stages);
+                    else
+                        detail::image_barrier(vk, command_buffer, p.upscale_images[k], piece.range, images[k].layout,
+                                              piece.layout, k == output ? writes : reads,
+                                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, states[k].access, states[k].stages);
                 }
             }
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);

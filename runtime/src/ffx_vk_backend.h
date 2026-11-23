@@ -14,6 +14,8 @@
 #endif
 #include <vulkan/vulkan.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include "../test/ffx_api_min.h"
@@ -31,6 +33,18 @@ inline constexpr const char* wanted_device_extensions[] = {
     "VK_KHR_cooperative_matrix",
     "VK_EXT_shader_float8",
 };
+
+// LEONIDA_FFX_PC=1 turns the PC upscaler on: the layer's device then enables the wanted extensions and installs the
+// replay hooks for Upscale commands (shims/ffx_upscale.cpp). Off by default; read once.
+inline bool pc_upscaler_enabled() {
+    static const bool on = [] {
+        char value[8] = {};
+        std::size_t length = 0;
+        return getenv_s(&length, value, sizeof(value), "LEONIDA_FFX_PC") == 0 && length > 1 &&
+               std::strcmp(value, "0") != 0;
+    }();
+    return on;
+}
 
 struct Device {
     VkDevice device = VK_NULL_HANDLE;

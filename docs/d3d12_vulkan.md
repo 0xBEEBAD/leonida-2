@@ -3616,8 +3616,21 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     (`rw_reprojected_color`, `rw_history_color`, `rw_mlsr_output_color`) get a 3-component `OpImageWrite` on an
     RGBA16F view. With `LEONIDA_VK_VALIDATION=1` the test fails on any other validation error.
   - Not run on RDNA4 under Windows yet. AMD's DLLs are not in the repository; their licence allows redistribution in binary
-    form and forbids reverse engineering. The shim that routes the game's calls here and maps its resources to the
-    layer's images is the next step.
+    form and forbids reverse engineering.
+- **In the layer: the Upscale command.** With `LEONIDA_FFX_PC=1` (off by default) a device of the Vulkan layer
+  enables the extensions above and the core features the shaders declare (16-bit storage, variable pointers, int8,
+  float16, the Vulkan memory model with device scope; each where the GPU has it), and installs replay hooks
+  (`shims/ffx_upscale.cpp`). `rt::ffx_upscale::create` makes an upscale context on the device;
+  `rt::d3d12::record_upscale` records a `leonida::Upscale` (the `FfxDispatchDescUpscale` fields, the images as
+  resource ids) into a direct or compute list. At `ExecuteCommandLists`, replay moves each input to the
+  NON_PIXEL_SHADER_RESOURCE layout and the output to the UAV layout through the layout tracker, records the upscale
+  into the replay's command buffer and moves every image back. An Upscale whose context was destroyed by then is
+  skipped; `destroy` waits for the device to go idle under the submit lock first. `d3d12_ffx_upscale_test` runs it
+  end to end (30 upscales of a checkerboard, 1280x720 to 1920x1080) under Wine on RADV: RX 9070 XT FSR 4.1.2,
+  0.49 ms per execute and wait; 9800X3D iGPU FSR 3.1.6, 10.1 ms; every square right. Under the validation layer
+  with synchronization validation, the layer reports nothing; what remains are FSR 4.1.2's own shader errors listed
+  above, and storage-image format warnings on FSR's internal images (`rw_recurrent_0`, `rw_accumulation`, ...).
+  Not yet done: the shim that answers the game's five FFX calls and records these commands.
 
 ### A.4 Other DLLs and the executable
 

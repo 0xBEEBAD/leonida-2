@@ -1209,6 +1209,13 @@ public:
 
     // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
     // `allocate`. Without this such a copy is refused as unsupported.
+    // RT-344: the upscaler's hooks for Upscale commands (ReplayFunctions::upscale_ready, upscale). Replay reads them
+    // without a lock, so they are set once, before the device is handed out (shims/ffx_upscale.cpp).
+    void set_upscaler(std::function<bool(std::uint64_t)> ready, decltype(ReplayFunctions::upscale) record) {
+        replay_.upscale_ready = std::move(ready);
+        replay_.upscale = std::move(record);
+    }
+
     void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
         std::unique_lock lock(resource_mutex_);
         scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
@@ -1916,7 +1923,8 @@ private:
         for (const CommandList* list : lists)
             for (const auto& command : list->commands())
                 runs_shaders |= std::holds_alternative<Dispatch>(command) || std::holds_alternative<Draw>(command) ||
-                                std::holds_alternative<ExecuteIndirect>(command);
+                                std::holds_alternative<ExecuteIndirect>(command) ||
+                                std::holds_alternative<Upscale>(command);
         std::vector<ResourceId> storage_images;
         std::vector<VulkanContext::PendingZero> zero_buffers;
         {
