@@ -1212,6 +1212,12 @@ if(NOT TARGET Vulkan::Headers)
     FetchContent_MakeAvailable(VulkanHeaders)
   endif()
 endif()
+# The Windows runtime's D3D12 layer needs newer headers than the portable Vulkan tools, so only its builds check.
+if(TARGET Vulkan::Headers AND WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_version.cmake")
+  get_target_property(leonida_vk_include_dirs Vulkan::Headers INTERFACE_INCLUDE_DIRECTORIES)
+  leonida_vulkan_headers_version("${leonida_vk_include_dirs}")
+endif()
 if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
