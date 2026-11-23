@@ -306,12 +306,13 @@ What is implemented (all of it testable without the game):
   `supportedDepthResolveModes`/`supportedStencilResolveModes` (queried at device creation; one plane per scope, so
   `independentResolve` never applies). Refused calls fail `Close` and record nothing. `d3d12_depth_resolve_test`
   compares D32, D24S8 and D32S8 resolves (typed and typeless resources, whole and rectangle) with the PC runtime and
-  WARP. Its edge cases (TEST-848) draw a triangle over the cleared 4x source first (depth 0.5, stencil 0x44): the
-  pixels on its diagonal edge hold differing samples, and MIN, MAX and AVERAGE over them match the PC runtime on an
-  RTX 5070 (driver 621.01) and WARP byte for byte. `DECOMPRESS`,
-  `ResolveSubresource` of depth (which D3D12 does not offer) and resolves between two formats of one typeless family
-  remain open. A multisampled texture copies only to one with the same sample count
-  and has no footprint.
+  WARP, and checks a refused case by its `Close` alone: the queue refuses a list whose recording failed
+  (`d3d12_queue_list_type_test` measures that nothing it recorded runs), so the destination has no defined contents
+  to compare. Its edge cases (TEST-848) draw a triangle over the cleared 4x source first (depth 0.5, stencil 0x44):
+  the pixels on its diagonal edge hold differing samples, and MIN, MAX and AVERAGE over them match the PC runtime on
+  an RTX 5070 (driver 621.01) and WARP byte for byte. `DECOMPRESS`, `ResolveSubresource` of depth (which D3D12 does
+  not offer) and resolves between two formats of one typeless family remain open. A multisampled texture copies
+  only to one with the same sample count and has no footprint.
   Discards, immediate writes and atomic copies replay as section 4.2 describes.
 - **UAV clears** (`ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`). The CPU handle's slot is read
   while recording as the GFX10 descriptor a shader would load (section 3.4), so the clear works with any
