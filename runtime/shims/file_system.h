@@ -33,4 +33,8 @@ std::filesystem::path overlay_dir();
 // path Wine 9 takes can be checked on Windows. Off by default; main.cpp never sets it.
 void force_copy_file2_fallback(bool force);
 
+// Opens a console ("GAME:...", "G:...", "T:...") or host path for synchronous read-only I/O using the same overlay
+// and deletion rules as CreateFile*. Sets `error` and returns INVALID_HANDLE_VALUE on failure.
+void* open_read_only(const wchar_t* path, unsigned long& error);
+
 }  // namespace rt::fs

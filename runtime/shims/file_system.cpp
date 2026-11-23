@@ -1393,6 +1393,23 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+void* open_read_only(const wchar_t* path, unsigned long& error) {
+    if (!path || path[0] == L'\0') {
+        error = ERROR_INVALID_PARAMETER;
+        return INVALID_HANDLE_VALUE;
+    }
+    const Target target = read_target(path);
+    if (target.error != 0) {
+        error = target.error;
+        return INVALID_HANDLE_VALUE;
+    }
+    const HANDLE h = ::CreateFileW(target.path.c_str(), GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+    error = (h == INVALID_HANDLE_VALUE) ? ::GetLastError() : ERROR_SUCCESS;
+    return h;
+}
+
 }  // namespace rt::fs
 
 namespace {
