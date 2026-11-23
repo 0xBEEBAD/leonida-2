@@ -143,7 +143,7 @@ integer result. ctest `code_hooks` and `mods` cover the thunk and the override.
 
 The game chooses its upscaler once, in a small function that returns an upscaler number: in 1.0.2.1 **7** is
 AMD's FFX upscaler (the `amd_fidelityfx_loader_xbox.dll` imports) and **6** the game's own. It returns 7 only on a
-Series S (console type 6, which the game reads from the registry, `runtime/shims/advapi32_registry.cpp`), so a
+Series S (console type 6, which the game reads from the registry `ConsoleMode` value, answered by the runtime since #6990), so a
 Series X configuration renders through the game's upscaler. Measured by a static look at the 1.0.2.1 executable;
 nothing executed.
 
