@@ -28,11 +28,11 @@ l'issue, en précisant où se trouve le problème et pourquoi il compte. La tâc
 d'autre. Si deux pull requests se recoupent malgré tout, celle qui arrive en premier est fusionnée et l'autre doit
 être rebasée ou fermée.
 
-Les résultats des tests GPU vont dans l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166). Le travail
-sur la couche D3D12 → Vulkan a sa propre page, l'[issue #313](https://github.com/ItsNotRexed/Leonida/issues/313) :
+Les résultats des tests GPU vont dans l'[issue #166](https://github.com/ProjectLeonida/Leonida/issues/166). Le travail
+sur la couche D3D12 → Vulkan a sa propre page, l'[issue #313](https://github.com/ProjectLeonida/Leonida/issues/313) :
 on y trouve le chemin critique, qui construit quoi, et les méthodes D3D12 qui restent à faire.
 
-[claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[claims]: https://github.com/ProjectLeonida/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
 ## Travailler sur le code
 
