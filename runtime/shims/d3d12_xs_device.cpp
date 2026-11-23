@@ -1579,6 +1579,9 @@ static bool readable_range(const void* ptr, std::size_t bytes) {
     return true;
 }
 
+// The Vulkan layer's maker of a heap at a console address (set_console_descriptor_heap_handler), or null.
+std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -1599,13 +1602,18 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::uint64_t size = 0;
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
-                console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
+            // Console-extended slot 14 (issue #313): address/size follow the PC desc. A PC caller passes 16 bytes, and
+            // the 16 after them are whatever its stack holds, so a non-zero address alone does not tell the two
+            // apart (d3d12_descriptor_test entered this path with stack bytes as the address and faulted on the
+            // first descriptor write). The size must also be exactly the heap's descriptors.
+            // ASSUMPTION: the console passes size = NumDescriptors * increment; not measured on a retail call here.
+            const std::uint64_t increment = self->real->GetDescriptorHandleIncrementSize(desc->Type);
+            if (address != 0 && increment != 0 && size == std::uint64_t(desc->NumDescriptors) * increment) {
+                if (const ConsoleDescriptorHeapHandler handler =
+                        g_console_descriptor_heap.load(std::memory_order_acquire)) {
+                    console_extended = true;
+                    hr = handler(self->real, desc, address, size, __uuidof(ID3D12DescriptorHeap), &created);
+                }
             }
         }
     }
@@ -2035,6 +2043,10 @@ unsigned device_proxy_slot_count(const void* device) {
 
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
+}
+
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
+    g_console_descriptor_heap.store(handler, std::memory_order_release);
 }
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {

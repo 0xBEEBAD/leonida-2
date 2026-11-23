@@ -100,6 +100,16 @@ using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_
                                       std::uint32_t layout, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
+// Device slot 14 with the console-extended description (a PC D3D12_DESCRIPTOR_HEAP_DESC followed by an address and a
+// size) makes the heap through this handler, which the Vulkan layer registers
+// (rt::d3d12::create_console_descriptor_heap). The proxy does not name that layer itself: this file is also built
+// without it (the mock and COM tests). With none registered the slot creates a plain PC heap, as it does for a
+// description with no console address.
+using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                                 std::uint64_t console_address, std::uint64_t console_size,
+                                                 REFIID riid, void** out);
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
+
 // Called by slot 133 for a buffer, before the handler, with the buffer's range [va, va + width). gta6rt registers
 // rt::xmem::commit_physical_range: xmem commits physical pages on first touch, so a range the title has mapped but
 // not written yet is still reserved, and the handler's import refuses reserved pages (it would answer with its

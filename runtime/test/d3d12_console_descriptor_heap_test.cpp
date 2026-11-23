@@ -24,6 +24,7 @@ struct Ref {
         return &p;
     }
     T* get() const { return p; }
+    T* operator->() const { return p; }
 };
 
 bool check_console_addressed_heap(ID3D12Device* device) {
@@ -65,7 +66,10 @@ bool check_console_addressed_heap(ID3D12Device* device) {
 
 bool check_xs_proxy_slot14(ID3D12Device* real_device) {
     void* proxy_raw = nullptr;
-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
+    // The proxy takes over one reference to the device on success (d3d12_xs_device.h); the caller keeps its own.
+    real_device->AddRef();
+    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, __uuidof(ID3D12Device), &proxy_raw)) || !proxy_raw) {
+        real_device->Release();
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
@@ -90,11 +94,27 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
                      static_cast<unsigned long>(hr));
         return false;
     }
-    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
-    if (cpu.ptr != static_cast<SIZE_T>(console.address)) {
+    // The heap that comes back is the Xbox-ABI heap proxy: its slot 9 returns the 8-byte handle in RAX, not through
+    // the hidden pointer a PC GetCPUDescriptorHandleForHeapStart call passes.
+    using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);
+    void** const heap_vtable = *reinterpret_cast<void***>(heap.get());
+    const std::uint64_t cpu = reinterpret_cast<XboxHeapHandleFn>(heap_vtable[9])(heap.get());
+    if (cpu != console.address) {
         std::fprintf(stderr, "proxy CPU heap start mismatch: got 0x%llx want 0x%llx\n",
-                     static_cast<unsigned long long>(cpu.ptr),
-                     static_cast<unsigned long long>(console.address));
+                     static_cast<unsigned long long>(cpu), static_cast<unsigned long long>(console.address));
+        return false;
+    }
+
+    // A PC description followed by bytes that are not a console address and size makes a plain heap.
+    console.size = 3;
+    Ref<ID3D12DescriptorHeap> plain;
+    if (FAILED(proxy->CreateDescriptorHeap(&console.desc, IID_PPV_ARGS(plain.put()))) || !plain.get()) {
+        std::fprintf(stderr, "proxy CreateDescriptorHeap(plain) failed\n");
+        return false;
+    }
+    void** const plain_vtable = *reinterpret_cast<void***>(plain.get());
+    if (reinterpret_cast<XboxHeapHandleFn>(plain_vtable[9])(plain.get()) == console.address) {
+        std::fprintf(stderr, "a description whose tail is not address/size took the console path\n");
         return false;
     }
     return true;
@@ -123,9 +143,15 @@ bool check_normal_heap_unchanged(ID3D12Device* device) {
 
 int main() {
     vktest::Device vk;
-    const auto status = vk.initialize();
-    if (status == vktest::DeviceStatus::unavailable) return 77;
-    if (status != vktest::DeviceStatus::ready) return 1;
+    vk.request_buffer_device_address = true;
+    if (!vk.create()) {
+        std::puts("SKIP: no suitable Vulkan 1.3 (or 1.2 + KHR) device");
+        return 77;
+    }
+    if (!vk.buffer_device_address) {
+        std::puts("SKIP: bufferDeviceAddress is required");
+        return 77;
+    }
 
     Ref<ID3D12Device> device;
     rt::d3d12::VulkanDeviceInfo info{};
@@ -135,6 +161,9 @@ int main() {
     info.device = vk.device;
     info.queue = vk.queue;
     info.queue_family = vk.family;
+    info.buffer_device_address = vk.buffer_device_address;
+    info.features = vk.enabled;
+    info.subgroup = vk.subgroup;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(device.put()))) || !device.get()) {
         std::fprintf(stderr, "create_vulkan_device failed\n");
         return 1;
