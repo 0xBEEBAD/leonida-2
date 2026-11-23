@@ -23,6 +23,8 @@
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/pipeline_cache_file.h"
+#include "../src/pipeline_cache_store.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
@@ -50,6 +52,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -66,6 +69,8 @@ constexpr UINT kDescriptorSize = descriptor_size;
 // for unbound vertex and index buffers to read (D3D12 reads zeros there).
 constexpr VkDeviceSize kArenaReserved = 64 * 1024;
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
+// pipeline_cache_store.h reads this layout without vulkan.h (D3D-704); remember the two.
+static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == leonida::pipeline_cache_store::header_bytes);
 
 // The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
 // game's shaders arrive as SPIR-V from the offline translator, and the only DXIL path (the BVH builder) is lowered
@@ -133,6 +138,25 @@ std::filesystem::path pipeline_cache_path() {
     return std::filesystem::path(path).parent_path() / L"pipeline_cache.bin";
 }
 
+// What the runtime itself compiled, kept next to the offline seed and never written over it (D3D-704).
+std::filesystem::path pipeline_cache_session_path() {
+    std::filesystem::path path = pipeline_cache_path();
+    if (!path.empty()) path.replace_filename(L"pipeline_cache.session.bin");
+    return path;
+}
+
+// LEONIDA_PIPELINE_CACHE_BYTES, in bytes; 0 turns the session file off. One line for a value that is not a number.
+std::size_t pipeline_cache_save_limit() {
+    char text[32] = {};
+    size_t length = 0;
+    const bool present = getenv_s(&length, text, "LEONIDA_PIPELINE_CACHE_BYTES") == 0 && length > 1;
+    const auto limit = leonida::pipeline_cache_store::parse_save_limit(present ? text : "");
+    if (!limit.valid)
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_PIPELINE_CACHE_BYTES=%s is not a byte count; using %zu\n", text,
+                     limit.bytes);
+    return limit.bytes;
+}
+
 // A corpus cache may be several GiB. Keep the read-only view alive through vkCreatePipelineCache
 // and deny writers while the view is in use.
 class PipelineCacheSeed {
@@ -165,13 +189,7 @@ public:
     std::size_t size() const { return size_; }
 
     bool compatible(const leonida::cached_pso::Identity& identity) const {
-        static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == 32);
-        VkPipelineCacheHeaderVersionOne header{};
-        // The header is little-endian, like the host. The driver interprets the opaque payload.
-        std::memcpy(&header, data_, sizeof(header));
-        return header.headerSize == sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
-               header.vendorID == identity.vendor && header.deviceID == identity.device &&
-               std::memcmp(header.pipelineCacheUUID, identity.cache_uuid, VK_UUID_SIZE) == 0;
+        return leonida::pipeline_cache_store::header_matches(data_, size_, identity);
     }
 
 private:
@@ -197,6 +215,90 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
     }
     std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from pipeline_cache.bin\n", seed.size());
     return cache;
+}
+
+// D3D-704: merges what earlier launches compiled into the cache the pipelines are created against. The offline seed
+// and the session file cannot be handed over as one VkPipelineCacheCreateInfo -- Vulkan reads a single blob -- so the
+// session cache is created on its own and merged in. A missing, foreign or corrupt session file leaves the cache as
+// it was, and so does a driver that does not expose vkMergePipelineCaches.
+void merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
+                                  const leonida::cached_pso::Identity& identity) {
+    if (!cache || !vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkMergePipelineCaches) return;
+    if (!pipeline_cache_save_limit()) return;  // LEONIDA_PIPELINE_CACHE_BYTES=0 turns the session file off
+    const PipelineCacheSeed seed(pipeline_cache_session_path());
+    if (!seed.data()) return;
+    if (!seed.compatible(identity)) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin does not match this Vulkan device\n");
+        return;
+    }
+    const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, seed.size(),
+                                           seed.data()};
+    VkPipelineCache session = VK_NULL_HANDLE;
+    if (vk.vkCreatePipelineCache(device, &create, nullptr, &session) != VK_SUCCESS) {
+        std::fprintf(stderr, "[rt] d3d12: Vulkan declined pipeline_cache.session.bin\n");
+        return;
+    }
+    const VkResult result = vk.vkMergePipelineCaches(device, cache, 1, &session);
+    vk.vkDestroyPipelineCache(device, session, nullptr);
+    if (result == VK_SUCCESS)
+        std::fprintf(stderr, "[rt] d3d12: merged %zu bytes from pipeline_cache.session.bin\n", seed.size());
+    else
+        std::fprintf(stderr, "[rt] d3d12: vkMergePipelineCaches on pipeline_cache.session.bin returned %d; ignored\n",
+                     static_cast<int>(result));
+}
+
+// Writes what this device compiled for the next launch (D3D-704). Called once the device is idle, before the cache
+// is destroyed. Past the cap nothing is written: the blob from an earlier, smaller session stays, which is better
+// than replacing it with one the next launch would keep refusing to save.
+void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache) {
+    if (!cache || !vk.vkGetPipelineCacheData) return;
+    const std::size_t limit = pipeline_cache_save_limit();
+    if (!limit) return;  // LEONIDA_PIPELINE_CACHE_BYTES=0 turns the session file off
+    const auto over_limit = [limit](std::size_t size) {
+        std::fprintf(stderr,
+                     "[rt] d3d12: pipeline cache is %zu bytes, over the %zu-byte session limit "
+                     "(LEONIDA_PIPELINE_CACHE_BYTES); pipeline_cache.session.bin left as it was\n",
+                     size, limit);
+    };
+    std::size_t size = 0;
+    if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
+        size <= sizeof(VkPipelineCacheHeaderVersionOne))
+        return;
+    if (size > limit) {
+        over_limit(size);
+        return;
+    }
+    std::vector<char> data;
+    try {
+        // Room to spare in case the driver counts the blob short between the query and the read. Nothing creates
+        // pipelines while the device is torn down, so this is a belt-and-braces margin, not a retry loop.
+        data.resize(size + (size >> 4));
+    } catch (const std::bad_alloc&) {
+        std::fprintf(stderr,
+                     "[rt] d3d12: no memory for the %zu-byte pipeline cache; pipeline_cache.session.bin not "
+                     "written\n",
+                     size);
+        return;
+    }
+    std::size_t written = data.size();
+    const VkResult result = vk.vkGetPipelineCacheData(device, cache, &written, data.data());
+    if (result != VK_SUCCESS || written < sizeof(VkPipelineCacheHeaderVersionOne) || written > data.size()) {
+        std::fprintf(stderr,
+                     "[rt] d3d12: could not read the pipeline cache (%d); pipeline_cache.session.bin not written\n",
+                     static_cast<int>(result));
+        return;
+    }
+    if (written > limit) {
+        over_limit(written);
+        return;
+    }
+    const std::filesystem::path path = pipeline_cache_session_path();
+    if (path.empty()) return;
+    if (const std::error_code error = write_pipeline_cache_file(path, data.data(), written)) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin not written: %s\n", error.message().c_str());
+        return;
+    }
+    std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
 }
 
 // A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
@@ -629,10 +731,12 @@ struct DeviceState {
             const auto& vk = context->vk;
             if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
             pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
-            if (pipeline_cache_handle) return;
-            const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-            if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
-                pipeline_cache_handle = VK_NULL_HANDLE;
+            if (!pipeline_cache_handle) {
+                const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+                if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
+                    pipeline_cache_handle = VK_NULL_HANDLE;
+            }
+            merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
         });
         // Without EXTERNALLY_SYNCHRONIZED_BIT the driver synchronizes concurrent pipeline creation using this cache.
         return pipeline_cache_handle;
@@ -5324,8 +5428,10 @@ public:
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
         }
-        if (state_.pipeline_cache_handle)
+        if (state_.pipeline_cache_handle) {
+            save_session_pipeline_cache(state_.context->vk, state_.info.device, state_.pipeline_cache_handle);
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
+        }
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);

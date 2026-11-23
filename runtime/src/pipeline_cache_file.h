@@ -1,4 +1,7 @@
 // Publish a checkpoint only after every byte has reached a closed, same-directory staging file.
+//
+// Used by vk_pipeline_check (its corpus checkpoints) and by the runtime itself, which writes the session cache on
+// device teardown (pipeline_cache_store.h). A reader of the old file keeps it open until its rename completes.
 #pragma once
 
 #include <algorithm>
