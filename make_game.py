@@ -62,6 +62,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import NoReturn
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
     sys.exit("ERROR: Python 3.12 or newer is needed: https://www.python.org/downloads/")
@@ -100,7 +101,7 @@ def log(msg: str) -> None:
     print(line, flush=True)
 
 
-def fail(msg: str) -> "None":
+def fail(msg: str) -> NoReturn:
     board = leonida_tui.current_board()
     if board is not None:
         stage = leonida_tui.current_stage()
@@ -349,7 +350,7 @@ def match_version(game: str) -> dict | None:
     return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
-def load_version(game: str) -> dict | None:
+def load_version(game: str) -> dict:
     reports = []
     for version in versions():
         mismatches = probe_mismatches(game, version)
