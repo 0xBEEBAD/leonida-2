@@ -96,8 +96,7 @@ python -I make_game.py --wave64-emulate off            # auto (domyślnie), on l
 
 Etapy wykonują się w tej kolejności: `check` → `shaders` → `assets` → `runtime` → `pipelines`. Etap `pipelines`
 tworzy każdy przetłumaczony shader na sterowniku Twojej karty graficznej i zapisuje cache potoków
-w `pipeline_cache.bin` (w `--out`); runtime nie wczytuje jeszcze tego cache'u, więc nie przyspiesza on
-pierwszego uruchomienia. Tłumaczenie shaderów trwa najdłużej i domyślnie używa połowy wątków
+w `pipeline_cache.bin` (w `--out`). Tłumaczenie shaderów trwa najdłużej i domyślnie używa połowy wątków
 procesora (można to zmienić przez `--jobs`).
 
 - **`--wave64-emulate`**: decyduje, czy shadery compute i mesh wave64 są tłumaczone tak, by były dokładne przy

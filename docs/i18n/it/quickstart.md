@@ -97,8 +97,7 @@ python -I make_game.py --wave64-emulate off            # auto (predefinito), on 
 
 Le fasi vengono eseguite in quest'ordine: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
 `pipelines` crea ogni shader tradotto sul driver della tua GPU e salva una cache delle pipeline in
-`pipeline_cache.bin` (in `--out`); il runtime non carica ancora questa cache, quindi non velocizza il primo avvio.
-La traduzione degli shader è il passaggio più lungo: usa `--jobs` processi
+`pipeline_cache.bin` (in `--out`). La traduzione degli shader è il passaggio più lungo: usa `--jobs` processi
 (per impostazione predefinita metà dei thread della CPU).
 
 - **`--wave64-emulate`**: traduce gli shader compute e mesh wave64 in modo che siano esatti con qualunque
