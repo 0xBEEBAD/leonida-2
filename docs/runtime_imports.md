@@ -90,18 +90,6 @@ bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))`
 returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
 and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
 
-## Audio hardware (`AcpHal.dll`)
-
-The game executable imports nine functions from `AcpHal.dll`, the console's audio hardware layer.
-`runtime/shims/acphal.cpp` serves them; the argument shapes come from a static read of the executable's call sites
-(one thunk per import, 16 call sites in all), and the names of the parameters and object slots are hypotheses.
-`ApuCreateHeap` reserves one block of ordinary memory for both sizes it is given, `ApuAlloc` and `ApuFree` manage it
-first fit, and an APU address is a fixed 32-bit base plus the offset in it, so `ApuMapVirtualAddress` and
-`ApuMapApuAddress` are arithmetic and `ApuIsVirtualAddressValid` checks a live block and the alignment.
-`AcpHalAllocateShapeContexts` fills zeroed 64-byte contexts per count, and `AcpHalCreate` returns an object whose
-calls succeed and do nothing: there is no audio processor, so the game gets no sound from this path. Its boot checks
-fail hard, which is why every call succeeds. `acphal_test` covers the call shapes.
-
 ## The retail executable (RT-5)
 
 `game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
@@ -155,6 +143,19 @@ that name exists), and an unimplemented import stops the run only if the title c
 functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
 host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
 which opens none.
+
+## Audio hardware (`AcpHal.dll`)
+
+The game executable imports nine functions from `AcpHal.dll`, the console's audio hardware layer.
+`runtime/shims/acphal.cpp` serves them; the argument shapes come from a static read of the executable's call sites
+(one thunk per import, 16 call sites in all), and the names of the parameters and object slots are hypotheses.
+`ApuCreateHeap` reserves one block of ordinary memory for both sizes it is given, `ApuAlloc` and `ApuFree` manage it
+first fit, and an APU address is a fixed 32-bit base plus the offset in it, so `ApuMapVirtualAddress` and
+`ApuMapApuAddress` are arithmetic and `ApuIsVirtualAddressValid` checks a live block and the alignment.
+`AcpHalAllocateShapeContexts` fills zeroed 64-byte contexts per count, and `AcpHalCreate` returns an object whose
+calls succeed and do nothing: there is no audio processor, so the game gets no sound from this path. Its boot checks
+fail hard, which is why every call succeeds. `acphal_test` covers the call shapes.
+The table under [The retail executable](#the-retail-executable-rt-5) was measured before this shim and still lists these nine as unimplemented; they are served now.
 
 ## Console paths and the write overlay
 
