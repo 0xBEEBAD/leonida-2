@@ -4087,6 +4087,18 @@ public:
                     stage.words = std::move(patched);
                 }
             }
+            {   // LOCAL EXPERIMENT: LEONIDA_RECT_GREEN=1 gives rectangle-list pipelines a solid green pixel stage, to
+                // tell "no fragments" from "the pixel shader writes nothing".
+                static const bool green = [] { const char* v = std::getenv("LEONIDA_RECT_GREEN"); return v && *v == '1'; }();
+                static const bool trivial_vs = [] { const char* v = std::getenv("LEONIDA_RECT_VS"); return v && *v == '1'; }();
+                if (trivial_vs && rect_list && stage.bit == VK_SHADER_STAGE_VERTEX_BIT)
+                    stage.words = {0x7230203,0x10500,0x70000,0x1d,0x0,0x20011,0x1,0x3000e,0x0,0x1,0x7000f,0x0,0x1,0x6e69616d,0x0,0x2,0x3,0x40047,0x2,0xb,0x2a,0x40047,0x3,0xb,0x0,0x20013,0x4,0x30021,0x5,0x4,0x30016,0x6,0x20,0x40015,0x7,0x20,0x1,0x40017,0x8,0x6,0x4,0x40020,0x9,0x1,0x7,0x40020,0xa,0x3,0x8,0x4003b,0x9,0x2,0x1,0x4003b,0xa,0x3,0x3,0x4002b,0x7,0xb,0x1,0x4002b,0x7,0xc,0x2,0x4002b,0x6,0xd,0x0,0x4002b,0x6,0xe,0x3f800000,0x4002b,0x6,0xf,0x40800000,0x4002b,0x6,0x10,0xbf800000,0x50036,0x4,0x1,0x0,0x5,0x200f8,0x11,0x4003d,0x7,0x12,0x2,0x500c7,0x7,0x13,0x12,0xb,0x500c3,0x7,0x14,0x12,0xb,0x500c7,0x7,0x15,0x14,0xb,0x4006f,0x6,0x16,0x13,0x4006f,0x6,0x17,0x15,0x50085,0x6,0x18,0x16,0xf,0x50085,0x6,0x19,0x17,0xf,0x50081,0x6,0x1a,0x18,0x10,0x50081,0x6,0x1b,0x19,0x10,0x70050,0x8,0x1c,0x1a,0x1b,0xd,0xe,0x3003e,0x3,0x1c,0x100fd,0x10038};
+                static const bool passthrough_vs = [] { const char* v = std::getenv("LEONIDA_RECT_VS"); return v && *v == '2'; }();
+                if (passthrough_vs && rect_list && stage.bit == VK_SHADER_STAGE_VERTEX_BIT)
+                    stage.words = {0x7230203,0x10500,0x70000,0x11,0x0,0x20011,0x1,0x3000e,0x0,0x1,0x7000f,0x0,0x1,0x6e69616d,0x0,0x2,0x3,0x40047,0x2,0x1e,0x0,0x40047,0x3,0xb,0x0,0x20013,0x4,0x30021,0x5,0x4,0x30016,0x6,0x20,0x40017,0x7,0x6,0x4,0x40020,0x8,0x1,0x7,0x40020,0x9,0x3,0x7,0x4003b,0x8,0x2,0x1,0x4003b,0x9,0x3,0x3,0x4002b,0x6,0xa,0x0,0x4002b,0x6,0xb,0x3f800000,0x50036,0x4,0x1,0x0,0x5,0x200f8,0xc,0x4003d,0x7,0xd,0x2,0x50051,0x6,0xe,0xd,0x0,0x50051,0x6,0xf,0xd,0x1,0x70050,0x7,0x10,0xe,0xf,0xa,0xb,0x3003e,0x3,0x10,0x100fd,0x10038};
+                if (green && rect_list && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT)
+                    stage.words = {0x7230203,0x10500,0x70000,0xc,0x0,0x20011,0x1,0x3000e,0x0,0x1,0x6000f,0x4,0x1,0x6e69616d,0x0,0x2,0x30010,0x1,0x7,0x40047,0x2,0x1e,0x0,0x20013,0x3,0x30021,0x4,0x3,0x30016,0x5,0x20,0x40017,0x6,0x5,0x4,0x40020,0x7,0x3,0x6,0x4003b,0x7,0x2,0x3,0x4002b,0x5,0x8,0x0,0x4002b,0x5,0x9,0x3f800000,0x7002c,0x6,0xa,0x8,0x9,0x8,0x9,0x50036,0x3,0x1,0x0,0x4,0x200f8,0xb,0x3003e,0x2,0xa,0x100fd,0x10038};
+            }
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module_info.codeSize = stage.words.size() * 4;
             module_info.pCode = stage.words.data();
@@ -4100,7 +4112,9 @@ public:
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
-        if (rect_list) {  // the stage that adds each rectangle's fourth corner, from the vertex shader's outputs
+        // LOCAL EXPERIMENT: LEONIDA_RECT_NOGS=1 draws the rectangle list's three corners as a plain triangle.
+        static const bool local_no_gs = [] { const char* v = std::getenv("LEONIDA_RECT_NOGS"); return v && *v == '1'; }();
+        if (rect_list && !local_no_gs) {  // the stage that adds each rectangle's fourth corner, from the vertex shader's outputs
             std::string why;
             const std::vector<std::uint32_t> words = leonida::rect_list_geometry(vs_stage.words, why);
             if (words.empty()) {
@@ -4161,6 +4175,16 @@ public:
                 if (e.system_value == 0 && e.semantic_index == element.SemanticIndex &&
                     equal_semantic(e.semantic, element.SemanticName))
                     input = &e;
+            {   // LOCAL DIAGNOSTIC: the input layout of the first graphics pipelines with one
+                static std::atomic<int> said{0};
+                const std::string& vsn = stages[0].entry->name;
+                if ((vsn.find("Blit") != std::string::npos || vsn.find("sga_dr") != std::string::npos) && said.fetch_add(1) < 24)
+                    std::fprintf(stderr, "[rt] localdbg: input element %u/%u %s%u dxgi=%d slot=%u offset=%u -> %s (vs %s)\n", i,
+                                 desc.InputLayout.NumElements, element.SemanticName ? element.SemanticName : "?",
+                                 element.SemanticIndex, int(element.Format), element.InputSlot, offset,
+                                 input ? ("location " + std::to_string(input->register_index)).c_str() : "not read",
+                                 stages[0].entry->name.c_str());
+            }
             if (!input) continue;  // the shader does not read this element
             attributes.push_back({input->register_index, element.InputSlot, format, offset});
             const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
@@ -4182,6 +4206,13 @@ public:
                 bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
                                     instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
             }
+        }
+        {   // LOCAL DIAGNOSTIC
+            static std::atomic<int> said2{0};
+            const std::string& vsn = stages[0].entry->name;
+            if (!mesh && (vsn.find("Blit") != std::string::npos || vsn.find("sga_dr") != std::string::npos) && said2.fetch_add(1) < 8)
+                std::fprintf(stderr, "[rt] localdbg: %s input layout elements=%u attributes=%zu signature=%zu\n", vsn.c_str(),
+                             desc.InputLayout.NumElements, attributes.size(), stages[0].entry->input_signature.size());
         }
         for (const auto& e : stages[0].entry->input_signature) {
             if (e.system_value) continue;
@@ -4286,6 +4317,12 @@ public:
             if (rect_list) {  // LOCAL DIAGNOSTIC / EXPERIMENT (LEONIDA_RECT_FORCE=1: opaque, no depth or stencil test)
                 static const bool force = [] { const char* v = std::getenv("LEONIDA_RECT_FORCE"); return v && *v == '1'; }();
                 static std::atomic<int> said{0};
+                if (said.load() < 6)
+                    for (const auto& st : stages)
+                        if (st.entry)
+                            std::fprintf(stderr, "[rt] localdbg: rect pipeline stage %s = %s wave64=%d emulated=%d push=%u\n",
+                                         st.entry->stage.c_str(), st.entry->name.c_str(), int(st.entry->wave64),
+                                         int(st.entry->emulated()), st.entry->push_constant_bytes);
                 if (said.fetch_add(1) < 6)
                     std::fprintf(stderr, "[rt] localdbg: rect pipeline rt%u/%u blend=%d src=%d dst=%d op=%d srcA=%d dstA=%d "
                                  "mask=0x%x depth=%d write=%d func=%d stencil=%d samplemask=0x%x fmt=%d a2c=%d force=%d\n",
@@ -6000,6 +6037,9 @@ public:
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kZeroPage);
         state_.context->set_quad_indices(arena.buffer, kZeroPage, kQuadIndexCount);
+        leonida::g_local_arena_mapped = arena.mapped;  // LOCAL DIAGNOSTIC
+        std::fprintf(stderr, "[rt] localdbg: arena mapped at %p\n", static_cast<void*>(arena.mapped));
+        leonida::g_local_arena_size = arena.size;
         // LOCAL: vertex and index views that name the title's own CPU memory are copied into a ring carved from the
         // arena at replay (not fence-tracked: the ring is large against a frame's few KiB of immediate geometry).
         state_.context->set_title_memory(
@@ -6037,6 +6077,29 @@ public:
                 if (ring_next + aligned > kRing) ring_next = 0;
                 std::memcpy(st->arena.mapped + ring_base + ring_next, reinterpret_cast<const void*>(va),
                             std::size_t(size));
+                {   // LOCAL EXPERIMENT: LEONIDA_VTX_TEST=1 overwrites the copy with a screen-covering triangle (stride 24)
+                    static const char mode = [] { const char* v = std::getenv("LEONIDA_VTX_TEST"); return v ? *v : '0'; }();
+                    const float second_y = reinterpret_cast<const float*>(st->arena.mapped + ring_base + ring_next)[7];
+                    const bool test = mode == '1' || (mode == 'A' && second_y < 100.f) || (mode == 'B' && second_y >= 100.f);
+                    if (test && size >= 72) {
+                        const float tri[3][2] = {{-1.f, -1.f}, {3.f, -1.f}, {-1.f, 3.f}};
+                        for (int v = 0; v < 3; ++v) {
+                            float* q = reinterpret_cast<float*>(st->arena.mapped + ring_base + ring_next + v * 24);
+                            q[0] = tri[v][0]; q[1] = tri[v][1]; q[2] = 0.f;
+                        }
+                    }
+                    static std::atomic<int> said{0};
+                    if (said.load() < 6) {
+                        const float* q = reinterpret_cast<const float*>(st->arena.mapped + ring_base + ring_next);
+                        std::fprintf(stderr, "[rt] localdbg: ring copy holds %g,%g | %g,%g | %g,%g (size %llu)\n", q[0], q[1],
+                                     q[6], q[7], q[12], q[13], static_cast<unsigned long long>(size));
+                    }
+                    if (said.fetch_add(1) < 3)
+                        std::fprintf(stderr, "[rt] localdbg: ring copy at arena offset 0x%llx (ring_base 0x%llx) arena size 0x%llx\n",
+                                     static_cast<unsigned long long>(ring_base + ring_next),
+                                     static_cast<unsigned long long>(ring_base),
+                                     static_cast<unsigned long long>(st->arena.size));
+                }
                 buffer = st->arena.buffer;
                 offset = ring_base + ring_next;
                 ring_next += aligned;

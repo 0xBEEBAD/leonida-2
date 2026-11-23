@@ -166,6 +166,9 @@ bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap,
         return false;
     try {
         std::lock_guard lock(descriptor_range_mutex());
+        std::fprintf(stderr, "[rt] localdbg: descriptor range custom=0x%llx..0x%llx real_cpu=0x%llx heap=%p\n",
+                     static_cast<unsigned long long>(custom_start), static_cast<unsigned long long>(custom_start + byte_size),
+                     static_cast<unsigned long long>(real_start), static_cast<const void*>(heap));
         descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap});
         g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
         return true;
@@ -199,6 +202,59 @@ D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D1
         }
     }
     return handle;
+}
+
+// LOCAL (title-backed descriptor heaps): the title copies descriptors between its heaps' backing memory itself, with
+// no API call, so (1) every descriptor the layer writes for a title-backed slot is also stored at the title's address,
+// and (2) when a table is bound, what the title wrote at that table's address is carried into the real heap.
+// LEONIDA_DESC_MIRROR=0 turns both off.
+constexpr SIZE_T kLocalDescriptorBytes = 32;
+constexpr SIZE_T kLocalMirrorSlots = 64;
+
+bool local_desc_mirror() {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_DESC_MIRROR"); return !(v && *v == '0'); }();
+    return on;
+}
+
+void local_write_through(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE custom, SIZE_T count) {
+    if (!local_desc_mirror() || !custom.ptr || !count) return;
+    const D3D12_CPU_DESCRIPTOR_HANDLE real = translate_cpu_handle(device, custom);
+    if (real.ptr == custom.ptr) return;
+    std::memcpy(reinterpret_cast<void*>(custom.ptr), reinterpret_cast<const void*>(real.ptr),
+                count * kLocalDescriptorBytes);
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        std::fprintf(stderr, "[rt] d3d12_xs: local: descriptors written for a title-backed heap are also stored at the "
+                             "title's address\n");
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE local_real_gpu_start(const HeapProxy* heap);
+
+void local_mirror_table(const DeviceProxy* device, std::uint64_t gpu_handle) {
+    if (!local_desc_mirror() || !gpu_handle || g_custom_range_count.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard lock(descriptor_range_mutex());
+    for (const DescriptorRange& range : descriptor_ranges()) {
+        if ((device && range.device != device) || !range.heap) continue;
+        const std::uint64_t gpu_start = local_real_gpu_start(range.heap).ptr;
+        const std::uint64_t bytes = range.custom_end - range.custom_start;
+        if (!gpu_start || gpu_handle < gpu_start || gpu_handle >= gpu_start + bytes) continue;
+        const std::uint64_t offset = (gpu_handle - gpu_start) / kLocalDescriptorBytes * kLocalDescriptorBytes;
+        const std::uint64_t slots = (std::min<std::uint64_t>)(kLocalMirrorSlots, (bytes - offset) / kLocalDescriptorBytes);
+        std::uint64_t copied = 0;
+        for (std::uint64_t i = 0; i < slots; ++i) {
+            const auto* from = reinterpret_cast<const std::uint64_t*>(range.custom_start + offset + i * kLocalDescriptorBytes);
+            if (!(from[0] | from[1] | from[2] | from[3])) continue;  // nothing the title wrote: keep the real slot
+            std::memcpy(reinterpret_cast<void*>(range.real_start + offset + i * kLocalDescriptorBytes), from,
+                        kLocalDescriptorBytes);
+            ++copied;
+        }
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: local: table at heap offset 0x%llx: %llu of %llu slots taken from the "
+                                 "title's backing memory\n", static_cast<unsigned long long>(offset),
+                         static_cast<unsigned long long>(copied), static_cast<unsigned long long>(slots));
+        return;
+    }
 }
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -684,12 +740,31 @@ D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
 
 D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
     note_heap_slot(10);
+    {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 8) std::fprintf(stderr, "[rt] localdbg: heap slot 10 (GPU handle) asked on heap %p\n", static_cast<void*>(self));
+    }
     constexpr UINT64 kUnset = ~static_cast<UINT64>(0);
     D3D12_GPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = kUnset;
     using Fn = D3D12_GPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_GPU_DESCRIPTOR_HANDLE*);
     const D3D12_GPU_DESCRIPTOR_HANDLE returned =
         reinterpret_cast<Fn>(self->real_vtable[10])(self->real, &handle);
+    {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 4)
+            std::fprintf(stderr, "[rt] localdbg: heap %p slot 10 answers GPU handle 0x%llx\n", static_cast<void*>(self),
+                         static_cast<unsigned long long>(handle.ptr != kUnset ? handle.ptr : returned.ptr));
+    }
+    return handle.ptr != kUnset ? handle : returned;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE local_real_gpu_start(const HeapProxy* heap) {
+    constexpr UINT64 kUnset = ~static_cast<UINT64>(0);
+    D3D12_GPU_DESCRIPTOR_HANDLE handle{};
+    handle.ptr = kUnset;
+    using Fn = D3D12_GPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_GPU_DESCRIPTOR_HANDLE*);
+    const D3D12_GPU_DESCRIPTOR_HANDLE returned = reinterpret_cast<Fn>(heap->real_vtable[10])(heap->real, &handle);
     return handle.ptr != kUnset ? handle : returned;
 }
 
@@ -2050,6 +2125,8 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t, std::uint64_t,
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
+            // LOCAL: console SetComputeRootDescriptorTable (35) and SetGraphicsRootDescriptorTable (36)
+            if constexpr (Slot == 35 || Slot == 36) local_mirror_table(self->device, a2);
             if constexpr (pc == 10) {
                 // Reset(allocator, pso) — console 10, and 139 as the retail title calls it: the title hands its
                 // allocator proxy; the real list takes the real one (and a wrapped pipeline state, if that ever
@@ -2673,19 +2750,32 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
+    {   // LOCAL DIAGNOSTIC
+        static std::atomic<int> said{0};
+        const int n = said.fetch_add(1);
+        if (n < 6 || (n > 3000 && n < 3008)) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE t = translate_cpu_handle(self, dest);
+            std::fprintf(stderr, "[rt] localdbg: CreateCBV #%d dest=0x%llx -> 0x%llx location=0x%llx size=%u\n", n,
+                         static_cast<unsigned long long>(dest.ptr), static_cast<unsigned long long>(t.ptr),
+                         desc ? static_cast<unsigned long long>(desc->BufferLocation) : 0ull, desc ? desc->SizeInBytes : 0u);
+        }
+    }
     self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
+    local_write_through(self, dest, 1);
 }
 
 void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(18);
     self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
+    local_write_through(self, dest, 1);
 }
 
 void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resource* counter,
                       const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(19);
     self->real->CreateUnorderedAccessView(resource, counter, desc, translate_cpu_handle(self, dest));
+    local_write_through(self, dest, 1);
 }
 
 void proxy_create_rtv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
@@ -2703,6 +2793,7 @@ void proxy_create_dsv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_D
 void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(22);
     self->real->CreateSampler(desc, translate_cpu_handle(self, dest));
+    local_write_through(self, dest, 1);
 }
 
 void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
@@ -2743,6 +2834,8 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
         return;
     }
     self->real->CopyDescriptors(num_dest, dest_out, dest_sizes, num_src, src_out, src_sizes, type);
+    for (UINT i = 0; dest_starts && i < num_dest; ++i)
+        local_write_through(self, dest_starts[i], dest_sizes ? dest_sizes[i] : 1);
 }
 
 void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
@@ -2750,6 +2843,7 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D1
     note_slot(24);
     self->real->CopyDescriptorsSimple(num_descriptors, translate_cpu_handle(self, dest_start),
                                       translate_cpu_handle(self, src_start), type);
+    local_write_through(self, dest_start, num_descriptors);
 }
 
 // The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured

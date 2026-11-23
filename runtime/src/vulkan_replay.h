@@ -809,6 +809,10 @@ enum class ReplayResult {
     invalid_draw,  // DispatchMesh with a pipeline that has no mesh shader, or a vertex draw with one that has
     unsupported
 };
+// LOCAL DIAGNOSTIC: the arena's host mapping and size, for dumps of what a shader would read.
+inline std::uint8_t* g_local_arena_mapped = nullptr;
+inline std::uint64_t g_local_arena_size = 0;
+
 // LOCAL DIAGNOSTIC: which check returned unresolved_resource (first 3 times per source line).
 inline ReplayResult local_unresolved_at(int line) {
     static std::atomic<int> seen[8192];
@@ -2207,7 +2211,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                 return local_unresolved_at(__LINE__);
             {   // LOCAL DIAGNOSTIC: the first draws that read title memory
                 static std::atomic<int> shown{0};
-                if (shown.fetch_add(1, std::memory_order_relaxed) < 12) {
+                const int nth = shown.fetch_add(1, std::memory_order_relaxed);
+                if (nth < 12 || (nth % 20000) < 3) {
                     const float* f = reinterpret_cast<const float*>(view.va);
                     std::fprintf(stderr, "[rt] localdbg: draw slot=%u topology=%u count=%u instances=%u first=%u stride=%u "
                                  "bytes=%llu viewport=%.0f,%.0f %.0fx%.0f depth %.2f..%.2f\n", slot, draw.topology,
@@ -2228,6 +2233,46 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                         std::uint64_t room = 1; VkBuffer bb = VK_NULL_HANDLE; VkDeviceSize bo = 0;
                         if (draw.user_data[w] && vk.buffer_at(draw.user_data[w], room, bb, bo))
                             std::fprintf(stderr, "[rt] localdbg:   user_data[%d] is a registered buffer VA\n", w);
+                    }
+                    if (g_local_arena_mapped && draw.user_data[0] && draw.user_data[0] + 256ull <= g_local_arena_size) {
+                        const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(g_local_arena_mapped + draw.user_data[0]);
+                        for (int e = 0; e < 4; ++e) {
+                            std::fprintf(stderr, "[rt] localdbg:   table[%d]:", e);
+                            for (int w = 0; w < 8; ++w) std::fprintf(stderr, " %08x", t[e * 8 + w]);
+                            std::fprintf(stderr, "\n");
+                            const std::uint64_t va = (std::uint64_t(t[e * 8 + 1] & 0xffff) << 32) | t[e * 8];
+                            if (va && va + 64 <= g_local_arena_size) {
+                                const float* f2 = reinterpret_cast<const float*>(g_local_arena_mapped + va);
+                                std::fprintf(stderr, "[rt] localdbg:     at va 0x%llx:", static_cast<unsigned long long>(va));
+                                for (int w = 0; w < 16; ++w) std::fprintf(stderr, " %g", f2[w]);
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
+                    }
+                    {   // the same table read from the title's memory, taking the high dword from the vertex view's VA
+                        const std::uint64_t guess = (view.va & 0xffffffff00000000ull) | draw.user_data[0];
+                        std::fprintf(stderr, "[rt] localdbg:   vertex va=0x%llx table guess=0x%llx delta=%lld\n",
+                                     static_cast<unsigned long long>(view.va), static_cast<unsigned long long>(guess),
+                                     static_cast<long long>(view.va - guess));
+                        std::uint64_t probe = 256; VkBuffer pb = VK_NULL_HANDLE; VkDeviceSize po = 0;
+                        if (draw.user_data[0] && vk.title_memory && vk.title_memory(guess, probe, pb, po)) {
+                            const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(guess);
+                            for (int e = 0; e < 3; ++e) {
+                                std::fprintf(stderr, "[rt] localdbg:   title table[%d]:", e);
+                                for (int w = 0; w < 8; ++w) std::fprintf(stderr, " %08x", t[e * 8 + w]);
+                                std::fprintf(stderr, "\n");
+                            }
+                        } else {
+                            std::fprintf(stderr, "[rt] localdbg:   title table guess is not readable title memory\n");
+                        }
+                    }
+                    {   // what sits just before the vertices in the title's ring
+                        const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(view.va - 0x60);
+                        for (int e = 0; e < 3; ++e) {
+                            std::fprintf(stderr, "[rt] localdbg:   before vertices[-0x%x]:", 0x60 - e * 0x20);
+                            for (int w = 0; w < 8; ++w) std::fprintf(stderr, " %08x", t[e * 8 + w]);
+                            std::fprintf(stderr, "\n");
+                        }
                     }
                     const std::uint32_t words = view.stride / 4 ? view.stride / 4 : 1;
                     for (std::uint32_t v = 0; v < 4 && (draw.first + v + 1) * view.stride <= view.size; ++v) {
