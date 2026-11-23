@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; buffer_atomic_inc / buffer_atomic_dec (#2448) under contention: all 32 lanes of a wave32 group run every op on the
 ; same dwords, so the translated OpAtomicCompareExchange loops race for real (the CPU interpreter runs lanes in
 ; lockstep). The words start as the harness's 0xEE fill, F = 0xEEEEEEEE. Every lane applies the same op, so the final
