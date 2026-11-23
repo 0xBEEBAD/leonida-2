@@ -31,7 +31,7 @@ to another register before the test. At the other, the failing side reaches `int
 
 | Import | Calls | Fatal | Stops when | Note |
 |---|---:|---:|---|---|
-| `xmem.dll!XMemVirtualAlloc` | 23 | 14 | `rax == 0` | Since #6908 the shim takes the attribute word and drops the `PAGE_GRAPHICS_*` bits. It still refuses the 2 MiB page mode (`allocation_type` `0x20003000`, `ERROR_NOT_SUPPORTED`), which 4 of these 14 sites pass; the other 10 reach `VirtualAlloc`. The 6 calls it refuses for `0x4000` or `0x40000` (`docs/xmem_exe_calls.md`) are not among the 14 |
+| `xmem.dll!XMemVirtualAlloc` | 23 | 14 | `rax == 0` | Since #6908 the shim takes the attribute word and drops the `PAGE_GRAPHICS_*` bits. Since #6919 it takes the 2 MiB page mode (`allocation_type` `0x20003000`), which 4 of these 14 sites pass, reserving it 2 MiB-aligned through `VirtualAlloc2`; the other 10 reach `VirtualAlloc`. A host without the placeholder API (`VirtualAlloc2`, `MapViewOfFile3`) still gets `ERROR_NOT_SUPPORTED` for those 4. The 6 calls with `0x4000` (`MEM_REPLACE_PLACEHOLDER`) or `0x40000` (`MEM_RESERVE_PLACEHOLDER`) that `docs/xmem_exe_calls.md` lists as refused are placeholder windows the shim now makes too; they are not among the 14 |
 | `XMemGetWorkingSetStatistics` | 3 | 2 | `eax == 0` | The shim returns `FALSE` only for a null output or a failed `GetProcessMemoryInfo`; both sites pass a stack buffer |
 | `XMemTransferMemory` | 1 | 1 | `eax == 0` | The shim returns `TRUE` |
 | `CreateFileW` | 13 | 1 | `rax == -1` | One open that has no failure path: the file must exist where `runtime/shims/file_system.cpp` maps it |
