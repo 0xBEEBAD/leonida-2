@@ -86,6 +86,10 @@ Useful switches:
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
 * `--overlay DIR` sends the guest's writes to a private folder instead of the package.
+* `LEONIDA_CONSOLE_DESCRIPTOR_HEAP=1` (Vulkan backend) makes device slot 14 read a console address and size after
+  the 16-byte heap description and report that address as the heap's start, which the retail executable asserts
+  on ([retail_boot_chain.md](retail_boot_chain.md), stop 13). Off by default: a caller that passes only the PC
+  description has unrelated bytes there, and the descriptors would be written to whatever address they spell.
 
 ## 3. Triage order
 

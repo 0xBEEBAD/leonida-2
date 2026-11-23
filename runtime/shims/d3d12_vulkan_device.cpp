@@ -5012,6 +5012,17 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        // Slot 14's console-extended description reaches create_console_descriptor_heap through a handler too: the
+        // proxy is also built into programs without this layer, so it cannot call it by name. It is registered on
+        // request (LEONIDA_CONSOLE_DESCRIPTOR_HEAP=1), not always: the proxy tells a console description from a PC
+        // one by the 16 bytes after it, and after a PC caller's 16-byte description those are whatever follows it
+        // in memory. Always on, 21 of 294 runtime tests fail (9 crash) writing descriptors to such an address.
+        {
+            char text[8] = {};
+            size_t length = 0;
+            if (getenv_s(&length, text, "LEONIDA_CONSOLE_DESCRIPTOR_HEAP") == 0 && length > 1 && text[0] != '0')
+                rt::d3d12_xs::set_console_descriptor_heap_handler(&rt::d3d12::create_console_descriptor_heap);
+        }
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -5967,6 +5978,20 @@ public:
             return d3d12_trace::result(method, E_OUTOFMEMORY);
         }
         return d3d12_trace::result(method, hand_out(heap, riid, out));
+    }
+
+    // The heap of create_console_descriptor_heap (Xbox device slot 14): it reports `console_address` as its start.
+    // A member because the heap takes the device's state and identity, as CreateDescriptorHeap's does; the caller
+    // has applied CreateDescriptorHeap's rules to `desc`.
+    HRESULT console_descriptor_heap(const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uint64_t console_address,
+                                    std::uint64_t console_size, REFIID riid, void** out) {
+        auto* heap = new DescriptorHeap(state_, desc, console_address, console_size);
+        heap->attach_device(identity());
+        if (!heap->ok()) {
+            heap->Release();
+            return E_OUTOFMEMORY;
+        }
+        return hand_out(heap, riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** out) override {
@@ -9991,14 +10016,7 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
-
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
-    if (!heap->ok()) {
-        heap->Release();
-        return E_OUTOFMEMORY;
-    }
-    return hand_out(heap, riid, out);
+    return d->console_descriptor_heap(*desc, console_address, console_size, riid, out);
 }
 
 }  // namespace rt::d3d12

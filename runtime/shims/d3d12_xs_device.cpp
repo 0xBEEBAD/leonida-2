@@ -1579,6 +1579,9 @@ static bool readable_range(const void* ptr, std::size_t bytes) {
     return true;
 }
 
+// The handler slot 14 calls for a console-extended description (set_console_descriptor_heap_handler).
+std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -1601,11 +1604,13 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
             // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
             // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
+            // The heap at a console address is made by the device behind the proxy, through the handler it
+            // registered (set_console_descriptor_heap_handler); without one the PC path below creates the heap.
+            const ConsoleDescriptorHeapHandler handler = g_console_descriptor_heap.load(std::memory_order_acquire);
+            if (address != 0 && handler) {
                 console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
+                hr = handler(self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
+                             __uuidof(ID3D12DescriptorHeap), &created);
             }
         }
     }
@@ -2039,6 +2044,10 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler) {
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
     g_placed_at_va_pages.store(hook, std::memory_order_release);
+}
+
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
+    g_console_descriptor_heap.store(handler, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {

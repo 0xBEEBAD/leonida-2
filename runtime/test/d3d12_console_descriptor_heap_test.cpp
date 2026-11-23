@@ -24,6 +24,7 @@ struct Ref {
         return &p;
     }
     T* get() const { return p; }
+    T* operator->() const { return p; }
 };
 
 bool check_console_addressed_heap(ID3D12Device* device) {
@@ -63,9 +64,13 @@ bool check_console_addressed_heap(ID3D12Device* device) {
     return true;
 }
 
-bool check_xs_proxy_slot14(ID3D12Device* real_device) {
+// `console_path`: whether the layer's handler is registered, so slot 14 takes the address after the description.
+bool check_xs_proxy_slot14(ID3D12Device* real_device, bool console_path) {
+    // create_device_proxy takes over one reference to the device on success; the caller keeps its own.
+    real_device->AddRef();
     void* proxy_raw = nullptr;
-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
+    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, __uuidof(ID3D12Device), &proxy_raw)) || !proxy_raw) {
+        real_device->Release();
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
@@ -90,7 +95,22 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
                      static_cast<unsigned long>(hr));
         return false;
     }
-    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    // Slot 14 hands out a heap proxy, whose slots 9 and 10 return the handle in RAX as the console does: a PC call
+    // of them would read a result buffer the proxy never writes. The heap behind it is read instead.
+    if (!rt::d3d12_xs::is_heap_proxy(heap.get())) {
+        std::fprintf(stderr, "proxy CreateDescriptorHeap(console) did not return a heap proxy\n");
+        return false;
+    }
+    const auto cpu = rt::d3d12_xs::heap_proxy_real_heap(heap.get())->GetCPUDescriptorHandleForHeapStart();
+    if (!console_path) {
+        // No handler: the 16 PC bytes make an ordinary heap, with storage of its own.
+        if (cpu.ptr == 0 || cpu.ptr == static_cast<SIZE_T>(console.address)) {
+            std::fprintf(stderr, "proxy heap without the handler starts at 0x%llx\n",
+                         static_cast<unsigned long long>(cpu.ptr));
+            return false;
+        }
+        return true;
+    }
     if (cpu.ptr != static_cast<SIZE_T>(console.address)) {
         std::fprintf(stderr, "proxy CPU heap start mismatch: got 0x%llx want 0x%llx\n",
                      static_cast<unsigned long long>(cpu.ptr),
@@ -142,7 +162,14 @@ int main() {
 
     if (!check_normal_heap_unchanged(device.get())) return 1;
     if (!check_console_addressed_heap(device.get())) return 1;
-    if (!check_xs_proxy_slot14(device.get())) return 1;
+    // The proxy takes the console path only through the handler the layer registers on request
+    // (LEONIDA_CONSOLE_DESCRIPTOR_HEAP=1). Both states are checked here, whatever the environment holds.
+    rt::d3d12_xs::set_console_descriptor_heap_handler(nullptr);
+    if (!check_xs_proxy_slot14(device.get(), false)) return 1;
+    rt::d3d12_xs::set_console_descriptor_heap_handler(&rt::d3d12::create_console_descriptor_heap);
+    const bool console_ok = check_xs_proxy_slot14(device.get(), true);
+    rt::d3d12_xs::set_console_descriptor_heap_handler(nullptr);
+    if (!console_ok) return 1;
     std::fprintf(stderr, "ok\n");
     return 0;
 }
