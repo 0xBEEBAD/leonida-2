@@ -338,10 +338,11 @@ int main(int argc, char** argv) {
         EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 1) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
-        // A depth outside [0, 1] makes Close report the invalid call, as D3D12 does.
+        // Unknown D3D12_CLEAR_FLAGS bits make Close report the invalid call, as D3D12 does
+        // (depth values outside [0, 1] are accepted on D3D12/WARP and tested in d3d12_clear_test).
         EXPECT(SUCCEEDED(allocator->Reset()));
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
-        list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 2.0f, 0, 0, nullptr);
+        list->ClearDepthStencilView(dsv_handle, static_cast<D3D12_CLEAR_FLAGS>(0x4), 1.0f, 0, 0, nullptr);
         EXPECT(list->Close() == E_INVALIDARG);
 
         // State-setting calls on a closed direct list or bundle are ignored and do not mutate recorded state.
