@@ -151,7 +151,8 @@ static int run(int argc, char** argv) {
     }
     // VKC_HEAP_FILE=<path>[@<offset>]: copy a file into the heap so a shader can read a buffer (a BVH, its
     // descriptor blocks and the records) without the test hard-coding it. The offset is a decimal or 0x hex byte
-    // offset (no octal, sign or spaces); addresses the shader sees are Xbox VAs, i.e. heap offsets, as for every
+    // offset (no octal, sign or spaces) below 2^32, and the whole file must fit below 2^32 too (the heap is the
+    // 32-bit GPU window); addresses the shader sees are Xbox VAs, i.e. heap offsets, as for every
     // other heap buffer here. Two overlaps to keep in mind: "bvh" mode writes its synthetic scene after this copy,
     // so a file at 0x100..0x264 is overwritten there, and the output V# starts at heap offset 0, so a file at @0
     // shares bytes with the dispatch's output.
@@ -174,7 +175,8 @@ static int run(int argc, char** argv) {
             }
             char* end = nullptr;
             const unsigned long long parsed = std::strtoull(body, &end, hex ? 16 : 10);
-            if (end == body || *end || parsed > (1ull << 32) || heap_file_path.empty()) {
+            // The heap is the 32-bit Xbox GPU window: an offset of 2^32 is one past it (RT-439).
+            if (end == body || *end || parsed >= (1ull << 32) || heap_file_path.empty()) {
                 std::fprintf(stderr, "VKC_HEAP_FILE: expected <path>[@<offset>], got \"%s\"\n", heap_file_env);
                 return 2;
             }
@@ -184,6 +186,11 @@ static int run(int argc, char** argv) {
         heap_file.assign(std::istreambuf_iterator<char>(hf), {});
         if (heap_file.empty()) {
             std::fprintf(stderr, "VKC_HEAP_FILE: cannot read %s\n", heap_file_path.c_str());
+            return 2;
+        }
+        if (heap_file.size() > (1ull << 32) - heap_file_at) {   // the file's last byte too must be inside the heap
+            std::fprintf(stderr, "VKC_HEAP_FILE: %s (%zu bytes) at 0x%llx runs past the 4 GiB heap\n",
+                         heap_file_path.c_str(), heap_file.size(), static_cast<unsigned long long>(heap_file_at));
             return 2;
         }
     }
