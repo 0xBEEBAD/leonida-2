@@ -23,6 +23,7 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#include "d3d12_com.h"
 #include "d3d12_trace.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -1435,8 +1436,13 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
-                                                     *riid, &created);
+    const IID pc_list_iid = __uuidof(ID3D12GraphicsCommandList);
+    HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, *riid, &created);
+    if (hr == E_NOINTERFACE) {
+        hr = self->real->CreateCommandList(0, type, allocator, initial_state, pc_list_iid, &created);
+        if (FAILED(hr)) return hr;
+        return wrap_list(static_cast<IUnknown*>(created), self, &pc_list_iid, out);
+    }
     if (FAILED(hr)) return hr;
     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
 }
@@ -1843,6 +1849,33 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 25 || Slot == 26 || Slot == 58) {
+        // Xbox struct-returning ABI: (return_buffer, this, ...) vs PC (this, return_buffer, ...).
+        extern void** get_vtable_for_slot26();
+        DeviceProxy* proxy = self;
+        std::uint64_t ret_buf = a1;
+        if (!proxy || proxy->vtable != get_vtable_for_slot26()) {
+            auto* candidate = reinterpret_cast<DeviceProxy*>(a1);
+            if (candidate && candidate->vtable == get_vtable_for_slot26()) {
+                ret_buf = reinterpret_cast<std::uint64_t>(self);
+                proxy = candidate;
+            }
+        }
+        note_slot(Slot);
+        using StructRetFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                   std::uint64_t, std::uint64_t);
+        auto fn = reinterpret_cast<StructRetFn>(proxy->real_vtable[Slot]);
+        return fn(proxy->real, ret_buf, a2, a3, a4, a5);
+    } else if constexpr (Slot == 70) {
+        // Xbox device slot 70 is CreateSampler2(const D3D12_SAMPLER_DESC2*, D3D12_CPU_DESCRIPTOR_HANDLE).
+        note_slot(Slot);
+        ID3D12Device11* dev11 = nullptr;
+        if (SUCCEEDED(self->real->QueryInterface(__uuidof(ID3D12Device11), reinterpret_cast<void**>(&dev11))) && dev11) {
+            dev11->CreateSampler2(reinterpret_cast<const D3D12_SAMPLER_DESC2*>(a1),
+                                  D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)});
+            dev11->Release();
+        }
+        return 0;
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
@@ -1884,7 +1917,20 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         }
         if (Slot == routes.queue_x) {
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+            const auto* raw = reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1);
+            D3D12_COMMAND_QUEUE_DESC pc_desc{};
+            if (raw) {
+                pc_desc = *raw;
+                pc_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(
+                    static_cast<std::uint32_t>(raw->Flags) & D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
+                if (pc_desc.Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
+                    pc_desc.Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
+                    pc_desc.Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+                    pc_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+                }
+                if (pc_desc.NodeMask > 1) pc_desc.NodeMask = 0;
+            }
+            return hr_to_u64(proxy_create_command_queue(self, raw ? &pc_desc : nullptr,
                                                         reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
         }
@@ -1919,6 +1965,8 @@ void** get_vtable() {
     }();
     return vtable;
 }
+
+void** get_vtable_for_slot26() { return get_vtable(); }
 
 bool supports(ID3D12Device* real, REFIID iid) {
     void* found = nullptr;

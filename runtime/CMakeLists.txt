@@ -126,6 +126,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
     shims/process.cpp
+    shims/dstorage.cpp
     shims/com_shim.cpp
     shims/bcrypt_rng.cpp
   )

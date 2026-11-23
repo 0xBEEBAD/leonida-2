@@ -8245,6 +8245,18 @@ public:
         }
     }
 
+    HRESULT create_console_descriptor_heap_impl(const D3D12_DESCRIPTOR_HEAP_DESC& desc,
+                                                D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
+                                                REFIID riid, void** out) {
+        auto* heap = new DescriptorHeap(state_, desc, console_address, console_size);
+        heap->attach_device(identity());
+        if (!heap->ok()) {
+            heap->Release();
+            return E_OUTOFMEMORY;
+        }
+        return hand_out(heap, riid, out);
+    }
+
 private:
     IUnknown* identity() { return outer_ ? outer_ : static_cast<ID3D12Device*>(this); }
 
@@ -9998,13 +10010,7 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
 
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
-    if (!heap->ok()) {
-        heap->Release();
-        return E_OUTOFMEMORY;
-    }
-    return hand_out(heap, riid, out);
+    return d->create_console_descriptor_heap_impl(*desc, console_address, console_size, riid, out);
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
