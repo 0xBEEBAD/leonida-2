@@ -1247,6 +1247,12 @@ public:
         replay_.zero_size = size;
     }
 
+    // LOCAL: the copy-in fallback for vertex and index views in title memory (ReplayFunctions::title_memory).
+    void set_title_memory(std::function<bool(std::uint64_t, std::uint64_t, VkBuffer&, VkDeviceSize&)> copy) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.title_memory = std::move(copy);
+    }
+
     // Pre-expanded 32-bit triangle indices for non-indexed quad lists (ReplayFunctions::quad_indices).
     void set_quad_indices(VkBuffer buffer, VkDeviceSize offset, std::uint32_t count) {
         std::unique_lock lock(resource_mutex_);

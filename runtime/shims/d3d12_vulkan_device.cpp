@@ -3745,6 +3745,16 @@ public:
                                                                : VK_CULL_MODE_NONE;
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+        // LOCAL EXPERIMENT: LEONIDA_RECT_NOCULL=1 draws rectangle lists without face culling (hypothesis: the
+        // console's rectangle primitive has no facing, so the PSO's cull mode does not apply to it).
+        if (rect_list) {
+            static const bool no_cull = [] { const char* v = std::getenv("LEONIDA_RECT_NOCULL"); return v && *v == '1'; }();
+            static std::atomic<int> said{0};
+            if (said.fetch_add(1) < 4)
+                std::fprintf(stderr, "[rt] localdbg: rect-list pipeline cull=%u frontCCW=%d depthClip=%d no_cull=%d\n",
+                             unsigned(r.CullMode), int(r.FrontCounterClockwise), int(r.DepthClipEnable), int(no_cull));
+            if (no_cull) raster.cullMode = VK_CULL_MODE_NONE;
+        }
         // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
         // rasterizer's bias stays off and zero, so its clamp needs no depthBiasClamp feature either.
         raster.depthBiasEnable = !depth24_fragment && (r.DepthBias || r.SlopeScaledDepthBias != 0.0f);
@@ -3785,6 +3795,25 @@ public:
             blends[i].dstAlphaBlendFactor = blend_factor(b.DestBlendAlpha);
             blends[i].alphaBlendOp = blend_op(b.BlendOpAlpha);
             blends[i].colorWriteMask = b.RenderTargetWriteMask & 0xf;  // R, G, B, A in both APIs
+            if (rect_list) {  // LOCAL DIAGNOSTIC / EXPERIMENT (LEONIDA_RECT_FORCE=1: opaque, no depth or stencil test)
+                static const bool force = [] { const char* v = std::getenv("LEONIDA_RECT_FORCE"); return v && *v == '1'; }();
+                static std::atomic<int> said{0};
+                if (said.fetch_add(1) < 6)
+                    std::fprintf(stderr, "[rt] localdbg: rect pipeline rt%u/%u blend=%d src=%d dst=%d op=%d srcA=%d dstA=%d "
+                                 "mask=0x%x depth=%d write=%d func=%d stencil=%d samplemask=0x%x fmt=%d a2c=%d force=%d\n",
+                                 i, desc.NumRenderTargets, int(b.BlendEnable), int(b.SrcBlend), int(b.DestBlend),
+                                 int(b.BlendOp), int(b.SrcBlendAlpha), int(b.DestBlendAlpha),
+                                 unsigned(b.RenderTargetWriteMask), int(ds.DepthEnable), int(ds.DepthWriteMask),
+                                 int(ds.DepthFunc), int(ds.StencilEnable), unsigned(desc.SampleMask),
+                                 int(desc.RTVFormats[i]), int(desc.BlendState.AlphaToCoverageEnable), int(force));
+                if (force) {
+                    blends[i].blendEnable = VK_FALSE;
+                    blends[i].colorWriteMask = 0xf;
+                    depth.depthTestEnable = VK_FALSE;
+                    depth.depthWriteEnable = VK_FALSE;
+                    depth.stencilTestEnable = VK_FALSE;
+                }
+            }
             // B8G8R8X8 has no alpha, so blending reads destination alpha as 1 there (WARP and AMD's D3D12 driver),
             // where its BGRA8 Vulkan image would read the X byte. For colour SRC_ALPHA_SAT is min(As, 1 - Ad), so 0;
             // for alpha it is 1 in both APIs already.
@@ -5461,6 +5490,54 @@ public:
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kZeroPage);
         state_.context->set_quad_indices(arena.buffer, kZeroPage, kQuadIndexCount);
+        // LOCAL: vertex and index views that name the title's own CPU memory are copied into a ring carved from the
+        // arena at replay (not fence-tracked: the ring is large against a frame's few KiB of immediate geometry).
+        state_.context->set_title_memory(
+            [st = &state_](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
+                static constexpr VkDeviceSize kRing = 16ull << 20;
+                static std::mutex mutex;
+                static VkDeviceSize ring_base = 0, ring_next = 0;
+                static bool tried = false, logged = false;
+                static std::atomic<int> dbg{0};
+                if (dbg.fetch_add(1) < 6) {
+                    MEMORY_BASIC_INFORMATION q{};
+                    const SIZE_T got = VirtualQuery(reinterpret_cast<const void*>(va), &q, sizeof(q));
+                    std::fprintf(stderr, "[rt] localdbg: title_memory va=0x%llx size=0x%llx query=%zu state=0x%lx "
+                                         "protect=0x%lx type=0x%lx region=0x%llx mapped=%d\n",
+                                 static_cast<unsigned long long>(va), static_cast<unsigned long long>(size),
+                                 static_cast<std::size_t>(got), q.State, q.Protect, q.Type,
+                                 static_cast<unsigned long long>(q.RegionSize), st->arena.mapped != nullptr);
+                }
+                if (!va || !size || size > kRing / 4 || !st->arena.mapped) return false;
+                // The whole range must be committed, readable host memory.
+                for (std::uint64_t at = va; at < va + size;) {
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) return false;
+                    if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !info.Protect)
+                        return false;
+                    at = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+                }
+                std::lock_guard lock(mutex);
+                if (!tried) {
+                    tried = true;
+                    if (!st->arena_allocate(kRing, 256, ring_base, DeviceState::arena_shader)) ring_base = 0;
+                }
+                if (!ring_base) return false;
+                const VkDeviceSize aligned = (size + 255) & ~VkDeviceSize(255);
+                if (ring_next + aligned > kRing) ring_next = 0;
+                std::memcpy(st->arena.mapped + ring_base + ring_next, reinterpret_cast<const void*>(va),
+                            std::size_t(size));
+                buffer = st->arena.buffer;
+                offset = ring_base + ring_next;
+                ring_next += aligned;
+                if (!logged) {
+                    logged = true;
+                    std::fprintf(stderr, "[rt] d3d12: local: vertex/index views in title memory are copied into a "
+                                         "%llu MiB ring (first: %llu bytes)\n",
+                                 static_cast<unsigned long long>(kRing >> 20), static_cast<unsigned long long>(size));
+                }
+                return true;
+            });
         return true;
     }
 

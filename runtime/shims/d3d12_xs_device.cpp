@@ -1342,6 +1342,13 @@ PresentState* present_state_for(DeviceProxy* device) {
     HWND target = rt::d3d12::find_title_window(GetCurrentProcessId(), state->window);
     if (target) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX uses the title's own window %p\n", static_cast<void*>(target));
+        // LOCAL: LEONIDA_WINDOW=WxH resizes the title's window without waiting on its thread (SWP_ASYNCWINDOWPOS).
+        if (const char* size = std::getenv("LEONIDA_WINDOW")) {
+            int w = 0, h = 0;
+            if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w > 0 && h > 0)
+                SetWindowPos(target, nullptr, 0, 0, w, h,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_ASYNCWINDOWPOS);
+        }
     } else {
         target = state->window;
         ShowWindow(target, SW_SHOWNOACTIVATE);

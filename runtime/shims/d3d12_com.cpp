@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "d3d12_com.h"
 
 #include "d3d12_stubs.h"  // generated
@@ -698,6 +699,17 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
+        // LOCAL DIAGNOSTIC: LEONIDA_DEBUG_CLEAR=1 clears to magenta; the first clears are logged.
+        static const bool magenta = [] { const char* v = std::getenv("LEONIDA_DEBUG_CLEAR"); return v && *v == '1'; }();
+        const auto* target = reinterpret_cast<const leonida::TargetView*>(view.ptr);
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 6)
+            std::fprintf(stderr, "[rt] localdbg: clear resource=0x%llx colour=%g %g %g %g rects=%u\n",
+                         static_cast<unsigned long long>(target->resource), color[0], color[1], color[2], color[3], count);
+        if (magenta) {
+            check(list_.clear_render_target(*target, {1.0f, 0.0f, 1.0f, 1.0f}, to_rects(count, rects)));
+            return;
+        }
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
     }

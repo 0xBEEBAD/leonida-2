@@ -1,3 +1,4 @@
+#include <atomic>
 #include "xbox_present.h"
 
 #include "../src/vulkan_present.h"
@@ -128,6 +129,15 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         return result;
     }
 
+    {   // LOCAL DIAGNOSTIC: what the first presents show
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 8)
+            for (UINT i = 0; i < plane_count; ++i)
+                std::fprintf(stderr, "[rt] localdbg: PresentX plane %u/%u resource=%p count=%u src=%p dest=%p cs=%d flags=0x%x\n",
+                             i, plane_count, planes[i].ppResources ? static_cast<void*>(planes[i].ppResources[0]) : nullptr,
+                             planes[i].ResourceCount, static_cast<const void*>(planes[i].pSrcViewRects),
+                             static_cast<const void*>(planes[i].pDestPlacementBase), planes[i].ColorSpace, planes[i].Flags);
+    }
     // All planes carry the token of one frame.
     const std::uint64_t token = planes[0].Token;
     for (UINT i = 0; i < plane_count; ++i) {
