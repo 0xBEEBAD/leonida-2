@@ -1119,6 +1119,8 @@ private:
         if (g::is_image(words)) {
             g::Image image{};
             if (!g::decode(words, image)) return false;
+            out.resource = uav_image_resource(resource, image.address);
+            if (!out.resource) return false;
             const bool volume = image.type == g::ImageType::image_3d;
             out.buffer = false;
             out.format = std::uint32_t(descriptor_format(image.format, image.swizzle));

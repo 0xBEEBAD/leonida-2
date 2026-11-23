@@ -2468,6 +2468,13 @@ The trace will enumerate them.
   `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` → `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` → concurrent
   sharing, `DENY_*` → omit the corresponding usage. Buffers get the union of usages their states and flags imply;
   images copy dimension, format, mip levels, array layers and sample count.
+- Xbox slot 76 supports UAVs on committed 2D `R32G8X24_TYPELESS` depth/stencil textures with one mip, layer and
+  sample. Use a `TEXTURE2D` UAV with `R32_FLOAT` on plane 0 or `R8_UINT` on plane 1. Each plane has its own
+  storage image and descriptor address. On explicit transitions into or out of UAV access, the graphics queue
+  family transfers the affected planes through a scratch buffer. Depth attachment and shader-resource views
+  keep their original image. For these textures, replay rejects the queue-specific enhanced `DIRECT_QUEUE_COMMON`
+  and `COMPUTE_QUEUE_COMMON` layouts, which allow switching between the images without a texture barrier.
+  `d3d12_depth_stencil_uav_test` exercises both planes with a synthetic compute shader.
 - Copies: `CopyBufferRegion` → `vkCmdCopyBuffer` with arena offsets; `CopyTextureRegion` →
   `vkCmdCopyBufferToImage`/`vkCmdCopyImageToBuffer`/`vkCmdCopyImage`, using the `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`
   row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`;

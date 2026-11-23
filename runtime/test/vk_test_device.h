@@ -104,6 +104,7 @@ public:
     bool sampler_filter_minmax = false;
     bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
+    bool storage_image_extended_formats = false; // typed r8ui storage images
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
@@ -425,6 +426,8 @@ public:
             sharing_.push_back(f);
         }
         VkPhysicalDeviceFeatures enable{};
+        storage_image_extended_formats = features.features.shaderStorageImageExtendedFormats == VK_TRUE;
+        enable.shaderStorageImageExtendedFormats = storage_image_extended_formats;
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
         bc = features.features.textureCompressionBC == VK_TRUE;

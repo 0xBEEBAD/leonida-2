@@ -212,6 +212,8 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
+// Resolves the resource that a UAV clear writes. Xbox depth/stencil UAVs name one of two color images by T#.
+leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t address);
 // The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.

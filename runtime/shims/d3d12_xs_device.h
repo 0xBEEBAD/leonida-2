@@ -74,6 +74,9 @@ bool is_device_proxy(const void* device);
 using DxgiAdapterProvider = HRESULT (*)(ID3D12Device* real, REFIID riid, void** out);
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither: nothing is set then.
 bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
+// Called before publishing a slot-76 resource when the backend can implement the Xbox depth/stencil UAV views.
+using DepthStencilUavProvider = HRESULT (*)(ID3D12Resource* resource);
+bool set_depth_stencil_uav_provider(void* device, DepthStencilUavProvider provider);
 // The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.
 void* device_proxy_from_dxgi_device(void* dxgi_device);
 // The device proxy itself, given the proxy or its DXGI pointer; null for anything else.

@@ -38,6 +38,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cctype>
@@ -50,6 +51,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -1762,6 +1764,9 @@ public:
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
+    const Resource* depth_stencil_uav(UINT plane) const {
+        return plane < storage_planes_.size() ? storage_planes_[plane].get() : nullptr;
+    }
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
     const DeviceState& device_state() const { return device_; }
 
@@ -2091,10 +2096,44 @@ public:
         return S_OK;
     }
 
+    // The Xbox proxy calls this before publishing an allocated depth texture. Each storage plane owns a
+    // regular color image with its own GFX10 address, so a UAV cannot replace the original SRV in set 0.
+    HRESULT enable_depth_stencil_uav() {
+        if (!image_ || desc_.Format != DXGI_FORMAT_R32G8X24_TYPELESS ||
+            !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+            desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc_.MipLevels != 1 ||
+            desc_.DepthOrArraySize != 1 || desc_.SampleDesc.Count != 1)
+            return E_INVALIDARG;
+        if (storage_planes_[0]) return S_OK;
+        try {
+            decltype(storage_planes_) planes;
+            D3D12_RESOURCE_DESC plane_desc = desc_;
+            plane_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            constexpr DXGI_FORMAT formats[] = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8_UINT};
+            for (UINT plane = 0; plane < planes.size(); ++plane) {
+                plane_desc.Format = formats[plane];
+                planes[plane] = std::make_unique<Resource>(device_, plane_desc, heap_, D3D12_HEAP_FLAG_NONE);
+                const HRESULT hr = planes[plane]->create_texture(device_.texture_format(plane_desc));
+                if (FAILED(hr)) return hr;
+            }
+            // Replacing the binding preserves the tracked layout of the original depth/stencil image.
+            auto binding = binding_;
+            binding.depth_uav = planes[0]->id();
+            binding.stencil_uav = planes[1]->id();
+            device_.context->add_resource(id(), binding);
+            binding_ = binding;
+            storage_planes_ = std::move(planes);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        return S_OK;
+    }
+
     // D3D12 reports the placement alignment of a description that left it 0: 64 KiB, or 4 MiB for a multisampled
     // texture. One the description asked for is kept. Measured on the PC runtime and WARP (d3d12_resource_desc_test).
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override {
         D3D12_RESOURCE_DESC desc = desc_;
+        if (storage_planes_[0]) desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (!desc.Alignment) {
             desc.Alignment = (desc.SampleDesc.Count > 1 && !is_tiled_layout(desc.Layout))
                                  ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
@@ -2426,6 +2465,7 @@ private:
     bool sparse_image_ = false;
     bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
+    std::array<std::unique_ptr<Resource>, 2> storage_planes_;  // Xbox depth/stencil UAV, by plane
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
@@ -4896,6 +4936,7 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.context->set_graphics_family(info.queue_family);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -6326,7 +6367,7 @@ public:
                 return;
             }
         }
-        write_image_descriptor(*r, view, destination, false);
+        write_image_descriptor(*r, view, destination, ImageViewUse::sampled);
     }
 
     // An unordered-access view of a buffer is a V# in the slot (docs section 3.4): the shader loads those four dwords
@@ -6435,6 +6476,28 @@ public:
             log_once("unordered-access view of a texture with a counter resource; dimension", int(r->desc().Dimension));
             return;
         }
+        if (r->depth_stencil_uav(0)) {
+            if (!desc || desc->ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc->Texture2D.MipSlice) {
+                log_once("Xbox depth-stencil UAV requires an explicit 2D mip-zero view; dimension",
+                         desc ? int(desc->ViewDimension) : 0);
+                return;
+            }
+            const Resource* plane = r->depth_stencil_uav(desc->Texture2D.PlaneSlice);
+            if (!plane) {
+                log_once("unsupported Xbox depth-stencil UAV plane", int(desc->Texture2D.PlaneSlice));
+                return;
+            }
+            if (desc->Format != plane->desc().Format) {
+                log_once(desc->Texture2D.PlaneSlice ? "unsupported Xbox stencil UAV format"
+                                                   : "unsupported Xbox depth UAV format", int(desc->Format));
+                return;
+            }
+            TextureView view{};
+            view.format = desc->Format;
+            view.mip_count = view.layer_count = 1;
+            write_image_descriptor(*plane, view, destination, ImageViewUse::depth_stencil_uav);
+            return;
+        }
         if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));
@@ -6479,7 +6542,7 @@ public:
             log_once("unordered-access view of a B8G8R8X8 format; format", int(view.format));
             return;
         }
-        write_image_descriptor(*r, view, destination, true);
+        write_image_descriptor(*r, view, destination, ImageViewUse::storage);
         state_.context->note_shader_image(r->id());
     }
 
@@ -7986,18 +8049,21 @@ private:
         return std::min(fallback, align_up(total, alignment));
     }
 
+    enum class ImageViewUse { sampled, storage, depth_stencil_uav };
+
     // Writes the view's T# into the slot and makes sure set 0 and the hash table know it. A view that cannot be
     // shown leaves the slot a null descriptor.
     void write_image_descriptor(const Resource& resource, const TextureView& view,
-                                D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
+                                D3D12_CPU_DESCRIPTOR_HANDLE destination, ImageViewUse use) {
         leonida::gfx10::Image image{};
         if (!image_descriptor(resource, view, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
-        const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
-                                                  resource.aspects(), storage, resource.has_view_format_list(),
+        const bool registered = state_.bind_image(words, image, resource.image(), resource.format(), resource.aspects(),
+                                                  use != ImageViewUse::sampled, resource.has_view_format_list(),
                                                   resource.r9g9b9e5_as_r32_uint());
-        if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
-        if (leonida::gfx10::multisampled(image.type) && !registered) return;
+        const bool storage_plane = use == ImageViewUse::depth_stencil_uav;
+        if (registered && (resource.sparse_image() || storage_plane)) state_.context->note_shader_image(resource.id());
+        if (!registered && (leonida::gfx10::multisampled(image.type) || storage_plane)) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 
@@ -8349,6 +8415,21 @@ bool is_sparse_image(ID3D12Resource* resource) {
     return object && object->sparse_image();
 }
 
+static HRESULT enable_depth_stencil_uav(ID3D12Resource* resource) {
+    Resource* r = Resource::from<Resource>(resource);
+    return r ? r->enable_depth_stencil_uav() : E_INVALIDARG;
+}
+
+leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t address) {
+    const Resource* r = Resource::from<Resource>(resource);
+    if (!r || !r->depth_stencil_uav(0)) return resource_id(resource);
+    for (UINT plane = 0; plane < 2; ++plane) {
+        const Resource* storage = r->depth_stencil_uav(plane);
+        if (storage->image_address() == address) return storage->id();
+    }
+    return 0;
+}
+
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     Device* d = Device::from<Device>(device);
     if (!d) return;
@@ -8360,6 +8441,7 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
     // a host DXGI object from it.
     if (!rt::d3d12_xs::is_device_proxy(outer)) return;
+    rt::d3d12_xs::set_depth_stencil_uav_provider(outer, &enable_depth_stencil_uav);
     rt::d3d12_xs::set_device_adapter_provider(outer, [](ID3D12Device* real, REFIID riid, void** out) {
         IDXGIFactory1* factory = nullptr;
         HRESULT hr = create_dxgi_factory(real, __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
@@ -9325,6 +9407,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.shaderClipDistance = chosen_features.shaderClipDistance;
     enable.shaderCullDistance = chosen_features.shaderCullDistance;
     enable.shaderStorageImageWriteWithoutFormat = chosen_features.shaderStorageImageWriteWithoutFormat;
+    enable.shaderStorageImageExtendedFormats = chosen_features.shaderStorageImageExtendedFormats;
     enable.shaderStorageImageReadWithoutFormat = chosen_features.shaderStorageImageReadWithoutFormat;
     enable.shaderImageGatherExtended = chosen_features.shaderImageGatherExtended;
     enable.shaderResourceMinLod = chosen_features.shaderResourceMinLod;

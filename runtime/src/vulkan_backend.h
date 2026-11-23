@@ -1175,6 +1175,7 @@ public:
         }
         {
             std::lock_guard lock(storage_mutex_);  // a buffer destroyed before any submission is not filled
+            storage_pending_.erase(id);
             std::erase_if(zero_pending_, [id](const PendingZero& zero) { return zero.id == id; });
         }
         if (img) {
@@ -1361,6 +1362,7 @@ public:
     // written: the device brings the bindless set 0 of the translated shaders up to date there (vulkan_bindless.h)
     // and records what the set needs first. When it fails, nothing of that call is executed.
     void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
+    void set_graphics_family(std::uint32_t family) { graphics_family_ = family; }
 
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
         std::unique_lock lock(resource_mutex_);
@@ -1687,6 +1689,7 @@ private:
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
+    std::uint32_t graphics_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
 };
 #ifdef _MSC_VER
@@ -2201,6 +2204,7 @@ private:
         // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
         if (prepared.size() < lists.size()) prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
+        replay.graphics_family = family_ == context_.graphics_family_;
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                             : 0;

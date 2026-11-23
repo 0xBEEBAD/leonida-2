@@ -60,6 +60,7 @@ struct DeviceProxy {
     // The device's IDXGIDevice1 (see "IDXGIDevice1 on the device" below): a title's IDXGIDevice1* points here.
     void** dxgi_vtable;
     DxgiAdapterProvider adapter_provider;
+    DepthStencilUavProvider depth_stencil_uav_provider = nullptr;
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
     // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
@@ -1476,6 +1477,23 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                      "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
+    constexpr auto depth_uav_flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (self->depth_stencil_uav_provider && (xbox_desc->Flags & depth_uav_flags) == depth_uav_flags &&
+        pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && pc_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS &&
+        pc_desc.DepthOrArraySize == 1 && pc_desc.MipLevels == 1 && pc_desc.SampleDesc.Count == 1) {
+        pc_desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        // Only the color storage images need UAV access. The native depth image must be created in a legal PC state.
+        const auto depth_state = initial_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                     ? D3D12_RESOURCE_STATE_COMMON : initial_state;
+        ID3D12Resource* resource = nullptr;
+        HRESULT hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, depth_state,
+                                                         clear_value, IID_PPV_ARGS(&resource));
+        if (FAILED(hr)) return hr;
+        hr = self->depth_stencil_uav_provider(resource);
+        if (SUCCEEDED(hr)) hr = resource->QueryInterface(*riid, out);
+        resource->Release();
+        return hr;
+    }
     return self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state, clear_value,
                                                *riid, out);
 }
@@ -1681,6 +1699,13 @@ bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {
         return false;
     }
     proxy->adapter_provider = provider;
+    return true;
+}
+
+bool set_depth_stencil_uav_provider(void* device, DepthStencilUavProvider provider) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) return false;
+    proxy->depth_stencil_uav_provider = provider;
     return true;
 }
 

@@ -94,6 +94,8 @@ struct ResourceBinding {
     bool sampled = false;              // has SAMPLED usage (no DENY_SHADER_RESOURCE): the present compose pass reads it
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
     bool sparse_buffer = false;
+    // The two independently addressable storage images of an Xbox depth/stencil UAV.
+    ResourceId depth_uav = 0, stencil_uav = 0;
 };
 
 struct VulkanAccess {
@@ -810,6 +812,7 @@ struct ReplayFunctions {
     // Optional; a list that needs a missing one is rejected with ReplayResult::unsupported.
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2 = nullptr;  // enhanced barriers
     VkPipelineStageFlags2 queue_stages = 0;
+    bool graphics_family = true;  // depth/stencil image-buffer transfers require a graphics-capable queue
     PFN_vkCmdBeginRendering begin_rendering = nullptr;      // rectangle clears
     PFN_vkCmdEndRendering end_rendering = nullptr;
     PFN_vkCmdClearAttachments clear_attachments = nullptr;
@@ -1021,11 +1024,29 @@ struct Prepared {
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
+    std::uint32_t depth_uav_copy = UINT32_MAX;
+    bool order_depth_uav = false;
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
+
+struct DepthUavCopy {
+    std::array<ResourceBinding, 2> storage;
+    VkBuffer scratch;
+    VkDeviceSize offset;
+    bool to_storage;
+};
+
+inline bool texture_uav_layout(std::uint32_t layout) {
+    return layout == d3d12_layout::unordered_access || layout == d3d12_layout::direct_queue_unordered_access ||
+           layout == d3d12_layout::compute_queue_unordered_access;
+}
+
+inline bool queue_common_layout(std::uint32_t layout) {
+    return layout == d3d12_layout::direct_queue_common || layout == d3d12_layout::compute_queue_common;
+}
 
 inline constexpr std::size_t max_render_targets = 8;  // D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
 
@@ -1490,7 +1511,8 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
         const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
-        const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
+        const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color) ||
+                               (resource.depth_uav && vk.graphics_family);
         const bool compressed = fmt.block > 1 || (!can_clear && color);
         if (resource.not_zeroed || (!can_clear && !color)) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
@@ -2068,6 +2090,51 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
     }
 }
 
+// Vulkan cannot copy a depth or stencil image aspect directly to or from a color image. The transfer
+// buffer preserves the native D32 or S8 bits. Only the requested planes are copied, even when the device
+// requires both parent aspects to transition layouts together. A storage descriptor always names GENERAL.
+inline void copy_depth_uav(const ReplayFunctions& vk, VkCommandBuffer cb, const Prepared& p, const DepthUavCopy& copy,
+                           VkImageLayout parent_layout, LayoutTracker* tracker) {
+    constexpr auto all = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    const auto parent_access = copy.to_storage ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+    const auto child_access = copy.to_storage ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+    const auto parent_range = planes_for_layout(p.binding, p.range, vk.separate_depth_stencil_layouts);
+    image_barrier(vk, cb, p.binding, parent_range, parent_layout, VK_IMAGE_LAYOUT_GENERAL,
+                  any, all, parent_access, transfer);
+    constexpr VkImageSubresourceRange color{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    for (unsigned plane = 0; plane < copy.storage.size(); ++plane) {
+        const ResourceBinding& child = copy.storage[plane];
+        if (!child.image) continue;
+        const ResourceId child_id = plane ? p.binding.stencil_uav : p.binding.depth_uav;
+        auto pieces = current(tracker, child_id, color, VK_IMAGE_LAYOUT_GENERAL);
+        if (!copy.to_storage) initialize(vk, cb, child, child_id, pieces, VK_IMAGE_LAYOUT_GENERAL, tracker);
+        for (const auto& piece : pieces)
+            image_barrier(vk, cb, child, color, piece.layout, VK_IMAGE_LAYOUT_GENERAL,
+                          piece.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : any, all, child_access, transfer);
+        if (tracker) tracker->set(child_id, color, VK_IMAGE_LAYOUT_GENERAL);
+        VkBufferImageCopy parent_region{};
+        parent_region.bufferOffset = copy.offset;
+        const VkImageAspectFlags aspect = plane ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+        parent_region.imageSubresource = {aspect, 0, 0, 1};
+        parent_region.imageExtent = {p.binding.width, p.binding.height, 1};
+        VkBufferImageCopy child_region = parent_region;
+        child_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        // Last use of this staging range was a read by CopyBufferToImage, possibly on the previous barrier.
+        memory_barrier(vk, cb, VK_ACCESS_TRANSFER_READ_BIT, transfer, VK_ACCESS_TRANSFER_WRITE_BIT, transfer);
+        vk.copy_image_to_buffer(cb, copy.to_storage ? p.binding.image : child.image, VK_IMAGE_LAYOUT_GENERAL,
+                                copy.scratch, 1, copy.to_storage ? &parent_region : &child_region);
+        memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, transfer, VK_ACCESS_TRANSFER_READ_BIT, transfer);
+        vk.copy_buffer_to_image(cb, copy.scratch, copy.to_storage ? child.image : p.binding.image, VK_IMAGE_LAYOUT_GENERAL,
+                                1, copy.to_storage ? &child_region : &parent_region);
+        image_barrier(vk, cb, child, color, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                      child_access, transfer, any, all);
+    }
+    image_barrier(vk, cb, p.binding, parent_range, VK_IMAGE_LAYOUT_GENERAL, parent_layout,
+                  parent_access, transfer, any, all);
+}
+
 } // namespace detail
 
 namespace detail {
@@ -2267,6 +2334,7 @@ public:
     // The draws' own data, by Prepared::draw. Kept from one execution to the next like the PreparedList itself: the
     // first draw_count entries are this list's, and the rest keep their vectors' storage for later draws.
     std::vector<detail::PreparedDraw> draws;
+    std::vector<detail::DepthUavCopy> depth_uav_copies;
     std::size_t draw_count = 0;
     std::vector<detail::PreparedQuery> queries;
     VkQueryPool segment_pool = VK_NULL_HANDLE;
@@ -2526,6 +2594,12 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
             },
             command);
         if (missing(id, p.binding, p.range)) return true;
+        if (p.depth_uav_copy != UINT32_MAX) {
+            const auto& copy = prepared.depth_uav_copies[p.depth_uav_copy];
+            constexpr VkImageSubresourceRange color{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            if (!copy.to_storage && (missing(p.binding.depth_uav, copy.storage[0], color) ||
+                                     missing(p.binding.stencil_uav, copy.storage[1], color))) return true;
+        }
     }
     return false;
 }
@@ -2543,6 +2617,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.list = &list;
     out.commands.assign(commands.size(), {});
     out.draw_count = 0;
+    out.depth_uav_copies.clear();
     out.queries.clear();
     out.segment_pool = VK_NULL_HANDLE;
     out.segment_base = out.segment_count = 0;
@@ -2571,6 +2646,43 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     bool overlaps = false, statistics_overlaps = false, statistics_active = false;
     out.wrote_readback = false;
     out.readback_src_stages = 0;
+
+    // Successive plane transfers use the same transient range and order their buffer accesses in emit().
+    VkBuffer plane_scratch = VK_NULL_HANDLE;
+    VkDeviceSize plane_capacity = 0, plane_offset = 0;
+    const auto prepare_depth_uav = [&](detail::Prepared& p, bool before, bool after) {
+        if (!p.binding.depth_uav && !p.binding.stencil_uav) return ReplayResult::success;
+        if (before == after) {
+            p.order_depth_uav = after;
+            return ReplayResult::success;
+        }
+        if (!vk.graphics_family || !vk.copy_image_to_buffer || !vk.copy_buffer_to_image || !vk.copy_scratch)
+            return ReplayResult::unsupported;
+        detail::DepthUavCopy copy{};
+        const ResourceId ids[] = {p.binding.depth_uav, p.binding.stencil_uav};
+        for (unsigned plane = 0; plane < 2; ++plane) {
+            const auto aspect = plane ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (!(p.range.aspectMask & aspect)) continue;
+            const auto* child = resolve(ids[plane]);
+            if (!child || !child->image) return ReplayResult::unresolved_resource;
+            copy.storage[plane] = *child;
+        }
+        const VkDeviceSize texels = VkDeviceSize(p.binding.width) * p.binding.height;
+        const VkDeviceSize bytes_per_texel = p.range.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT ? 4 : 1;
+        if (!texels || texels > UINT64_MAX / bytes_per_texel) return ReplayResult::unsupported;
+        const VkDeviceSize bytes = texels * bytes_per_texel;
+        if (bytes > plane_capacity) {
+            if (!vk.copy_scratch(bytes, plane_scratch, plane_offset) || !plane_scratch || plane_offset % 4)
+                return ReplayResult::unsupported;
+            plane_capacity = bytes;
+        }
+        copy.scratch = plane_scratch;
+        copy.offset = plane_offset;
+        copy.to_storage = after;
+        p.depth_uav_copy = static_cast<std::uint32_t>(out.depth_uav_copies.size());
+        out.depth_uav_copies.push_back(copy);
+        return ReplayResult::success;
+    };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -2609,6 +2721,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             } else if (!image_range(p.binding, transition->subresource, p.range)) {
                 return ReplayResult::invalid_subresource;
             }
+            const auto result = prepare_depth_uav(p, transition->before & d3d12_state::unordered_access,
+                                                  transition->after & d3d12_state::unordered_access);
+            if (result != ReplayResult::success) return result;
         } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
             if (const auto* buffer_barrier = std::get_if<BufferBarrier>(&command))
@@ -2618,6 +2733,17 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!bind(texture->resource)) return ReplayResult::unresolved_resource;
             if (!p.binding.image || !barrier_range(p.binding, texture->range, p.range))
                 return ReplayResult::invalid_subresource;
+            // In a queue-specific COMMON layout shaders can write a UAV then read the SRV or copy the
+            // parent after only a global barrier. Bindless shaders need no per-resource bind command, so
+            // there is no observable ownership transition at which to synchronize the two images.
+            if (p.binding.depth_uav && (detail::queue_common_layout(texture->layout_before) ||
+                                        detail::queue_common_layout(texture->layout_after)))
+                return ReplayResult::unsupported;
+            if (!(texture->flags & texture_barrier_discard) && texture->layout_before != d3d12_layout::undefined) {
+                const auto result = prepare_depth_uav(p, detail::texture_uav_layout(texture->layout_before),
+                                                      detail::texture_uav_layout(texture->layout_after));
+                if (result != ReplayResult::success) return result;
+            }
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (!bind(color_clear->target.resource)) return ReplayResult::unresolved_resource;
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
@@ -3363,6 +3489,15 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         vk.depth24_run(command_buffer, job);
         if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
     };
+    const auto finish_depth_uav_barrier = [&](const detail::Prepared& p, VkImageLayout layout) {
+        if (p.depth_uav_copy != UINT32_MAX) {
+            detail::copy_depth_uav(vk, command_buffer, p, prepared.depth_uav_copies[p.depth_uav_copy], layout, tracker);
+        } else if (p.order_depth_uav) {
+            // A UAV-to-UAV texture barrier names the parent, but the actual shader accesses target its children.
+            detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        }
+    };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -3430,6 +3565,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 detail::image_barrier(vk, command_buffer, p.binding, piece.range, piece.layout, new_layout,
                                       from.access, from.stages, to.access, to.stages);
             if (tracker) tracker->set(id, range, new_layout);
+            finish_depth_uav_barrier(p, new_layout);
         } else if (std::holds_alternative<UavBarrier>(command)) {
             const VulkanAccess uav = vulkan_access(d3d12_state::unordered_access, false);
             VkAccessFlags src_access = VK_ACCESS_SHADER_WRITE_BIT;
@@ -3446,7 +3582,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
+        } else if (const auto* texture_memory = std::get_if<TextureBarrier>(&command);
+                   std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command) ||
+                   (texture_memory && p.binding.depth_uav && texture_memory->layout_before == d3d12_layout::undefined &&
+                    texture_memory->layout_after == d3d12_layout::undefined)) {
             const auto [sync_before, sync_after, access_before, access_after] = std::visit(
                 [](const auto& c) -> std::array<std::uint32_t, 4> {
                     if constexpr (requires { c.sync_before; })
@@ -3475,10 +3614,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VkImageLayout new_layout =
                 image_layout(p.binding, vulkan_layout(texture->layout_after, p.binding.presentable));
             LayoutPieces pieces;
-            if (discard)
+            // With coupled layouts, discarding a single plane must preserve the other plane's data.
+            const bool keep_sibling = p.binding.depth_uav && range.aspectMask != p.range.aspectMask;
+            if (discard && !keep_sibling)
                 pieces.push_back({range, VK_IMAGE_LAYOUT_UNDEFINED});
             else {
                 const VkImageLayout before =
+                    texture->layout_before == d3d12_layout::undefined ? VK_IMAGE_LAYOUT_GENERAL :
                     image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable));
                 pieces = detail::current(tracker, id, range, before);
                 detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
@@ -3512,6 +3654,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             dependency.pImageMemoryBarriers = barriers;
             vk.pipeline_barrier2(command_buffer, &dependency);
             if (tracker) tracker->set(id, range, new_layout);
+            finish_depth_uav_barrier(p, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
