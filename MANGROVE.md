@@ -31,7 +31,7 @@ Left out: #2231 (conflicts with #8448 in the lane-mask analysis, adds 46 library
 The prerequisites are the ones in [README.md](README.md#how-to-build): package version 1.0.2.1, Python 3.12+,
 .NET 8 SDK, Vulkan SDK, LLVM with the AMDGPU target (`LLVM_MC`), VS 2022 C++ with Windows SDK 10.0.26100+.
 
-1. `git clone --recurse-submodules truenas_admin@192.168.0.250:repos/mangrove.git`. The submodule
+1. `git clone --recurse-submodules https://github.com/TreXito/mangrove.git`. The submodule
    `third_party/rpf9-explorer` comes from its GitHub URL in `.gitmodules`.
 2. `python -I tools/pc_checker.py --cli` checks whether the PC is strong enough.
 3. `python -I make_game.py --check --game "D:\path\to\package"` checks the copy and builds nothing.
@@ -40,34 +40,24 @@ The prerequisites are the ones in [README.md](README.md#how-to-build): package v
    Add `assets` (about 370 GB) only for the asset tools.
 5. Or double-click `Build.bat`, which finds the package by itself and builds everything (about 400 GB).
 
-What is tested and what is not: the C++ runtime is built with clang-cl and its tests run under Wine on the NAS;
+What is tested and what is not: the C++ runtime is built with clang-cl and its tests run under Wine;
 the Python tests run on Linux. An MSVC build (`build_runtime.ps1` with `cl.exe`) and a real `make_game.py` run
 with the game files have not been done on this copy yet.
 
 ## Keeping up with upstream
 
 GitHub disabled the upstream repository (moved to `ProjectLeonida/Leonida`, git returns 403 "disabled") on
-2026-11-23. Its last `main` is `upstream-main` here (`5d74c2723`, 2026-11-23 21:01 UTC, full history).
-
-The open upstream PRs still exist in their authors' forks. A snapshot of every open PR head (4,731 PRs) is in
-`truenas_admin@192.168.0.250:repos/leonida-own.git` under `refs/pr/<number>`:
-
-```bash
-git remote add claude truenas_admin@192.168.0.250:repos/leonida-own.git
-git fetch claude 'refs/pr/7320:refs/remotes/pr/7320'     # one PR
-git fetch claude 'refs/pr/*:refs/remotes/pr/*'           # all of them
-```
-
-`claude/main` is Claude's working copy (mangrove's base plus fixes); `claude/for-mangrove` is this `main` with those
-fixes merged, a fast-forward from here: `git fetch claude && git merge --ff-only claude/for-mangrove`.
+2026-11-23. Its last `main` is the `upstream-main` branch here (`5d74c2723`, 2026-11-23 21:01 UTC, full history).
+Open upstream PRs still live in their authors' forks: `gh api repos/ProjectLeonida/Leonida/pulls/<number>` names
+the fork and branch to fetch.
 
 ## Testing
 
 - Python: `python3 -I tests/<file>.py` (spirv-as / spirv-val on PATH un-skip the translator tests that need them).
-- C++ under Wine on the NAS: `git bundle create own.bundle <base>..main`, copy it to `~/leonida/w/own.bundle`,
-  put `/w/own.bundle refs/heads/main` in `~/leonida/w/xref.txt`, leave `xtests.txt` empty for a full run, then
-  `midclt call cronjob.run 1370 true`. Results: `~/leonida/w/out/xjob.log` (`XJOB_DONE`) and `out/ctest.log`.
-  The known Wine baseline is 10 failures: file_system, dstorage, run_startup_cmdline, d3d12_clear,
+  Some files need pytest. Against upstream `main` the same 59 files fail on Linux (tools missing on the test box,
+  Windows-only paths, docs checks that already failed upstream); none fails here that passes upstream.
+- C++: the runtime is cross-built with clang-cl and its ctest suite run under Wine: 243 of 253 pass. The 10 that
+  fail under Wine also fail on upstream `main`: file_system, dstorage, run_startup_cmdline, d3d12_clear,
   d3d12_view_slices, d3d12_depth_resolve, d3d12_residency, d3d12_heap_properties, dxgi_swapchain,
   d3d12_clear_formats.
 
