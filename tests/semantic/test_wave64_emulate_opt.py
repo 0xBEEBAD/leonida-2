@@ -1584,6 +1584,17 @@ class StructuredEmulationTests(unittest.TestCase):
         self.assertEqual(mw, (1 << 4) | (1 << 5))
         self.assertEqual(mk, (1 << 4) | (1 << 5))
 
+    def test_ds_append_and_consume_always_barrier(self):
+        # ds_append/ds_consume hand the LDS counter's old value to every lane through an exchange round, which
+        # emits OpControlBarrier under --wave64-emulate. They must be classified as barriers so a block holding
+        # one is never treated as sync-free in a multi-wave group (that aborted make_game.py --stages shaders
+        # with "unexpected OpControlBarrier in sync-free multi-wave block").
+        for op in ("ds_append", "ds_consume"):
+            ins = {"op": op, "args": [{"k": "vgpr", "r": 3, "n": 1}], "mods": ()}
+            self.assertTrue(wave64_emulate_opt._insn_may_barrier(ins, {}, set()), op)
+            clean, _, _, _, _ = wave64_emulate_opt._classify_block_body([ins], {}, set(), frozenset())
+            self.assertFalse(clean, op)
+
     def test_slist_lane_mask_and_barrier_classification(self):
         sgpr = lambda r, n=1: {"k": "sgpr", "r": r, "n": n}
         slist = lambda *regs: {"k": "slist", "r": list(regs), "n": len(regs)}
