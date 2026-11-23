@@ -9,6 +9,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | AMD Radeon RX 9070 GRE (RDNA4, GFX1201), subgroup 32..64 | RADV, Mesa 26.3.1-arch3.5, Vulkan 1.4.363, CachyOS | `05961f0` | 264/264 translated and valid | 203/206 pass, 3 skipped | 218/235 passed, 16 skipped (native and emulated) | `ms_wave_info_s3`, flaky (see below) | [local note](../gpu-test-results/RX9070GRE.txt) |
 | AMD Radeon RX 9070 XT (RDNA4, GFX1201), subgroup 32..64 | AMD 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 26300.9550 | `5d74c27` | not run | not run | 224/241 passed, 16 skipped, 1 failed (native); 225/241 passed, 0 failed (`LEONIDA_W64_EMULATE=1`) | `ms_wave_info_s3`, every native run, flaky emulated (see below) | [local note](../gpu-test-results/RX9070XT.txt) |
 | AMD Radeon RX 7900 GRE (RDNA3, gfx1100), subgroup 32..64 | AMD proprietary 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 x64 | `5d74c27` | 247/247 translated and valid | run via run_gpu_tests.py | 225/241 passed, 16 skipped | none | [#166](https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7115041436) |
+| NVIDIA GeForce GTX 1650 SUPER (Turing, TU116), subgroup 32..32 | NVIDIA 610.88, Vulkan 1.4.341, Windows 11 26300 (26H2) | `db6115940` (PR #4426 on `dde82f2`) | 247/247 translated and valid | run via run_gpu_tests.py | 192/241 passed, 48 skipped (native); 223/241 passed, 17 skipped (`LEONIDA_W64_EMULATE=1`) | `ms_wave_info_s3` (native and emulated) | [#166](https://github.com/ProjectLeonida/Leonida/issues/166#issuecomment-7115144655) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -96,3 +97,36 @@ until it reports nothing to do before installing it. Loader warnings from instal
 affect the run. This is the first RDNA3 entry: wave64 and mesh shader tests ran natively (all `ms_*` pass).
 
 AI-assisted (Claude): helped set up the tools and write this entry; the build and test run were done on this GPU.
+
+## NVIDIA GeForce GTX 1650 SUPER — 2026-11-23
+
+```
+GPU:        NVIDIA GeForce GTX 1650 SUPER (Turing / TU116, PCI 10DE:2187), subgroup 32..32
+Driver:     NVIDIA 610.88, Vulkan 1.4.341
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32; default 32, subgroupSizeControl, computeFullSubgroups)
+OS:         Windows 11 x64, build 10.0.26300 (26H2)
+Commit:     db6115940 (PR #4426 on top of dde82f2, 2026-11-23); ctest and fuzzers on main a2c2ba878
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools), Vulkan SDK 1.4.363 / SPIRV-Tools,
+            CMake + Ninja, llvm-mingw 23.1.6 (UCRT), Python 3.15.0
+build.py:   247 shaders: 247 translated, 247 pass spirv-val
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1
+check.py:   not run separately (run_gpu_tests.py below)
+run_gpu_tests.py:
+            native:                 192/241 passed, 48 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  223/241 passed, 17 skipped, 1 failed
+Failed:     ms_wave_info_s3: at (0,0) got (-1,-1,-1,-1), want (0.0078,0.0078,0.5,1.0),
+            both native and emulated. Same signature as the RTX 5070 Laptop noted in docs/design.md.
+Skipped:    48 native skips (16 runner-delegated + 32 wave64 tests requiring 64-wide subgroups);
+            17 emulated skips (16 runner-delegated + ps_w64x_readlane requiring a 64-wide fragment subgroup).
+Runtime ctest (standalone Vulkan subset, -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF):
+            67/67 passed (including vk_xdxr_build_test in 1.94 s and xdxr_build_check in 134.46 s,
+            0/1000 rays differing across all 30 BLAS/TLAS cases).
+Fuzzers (wave64 emulated, --seed 1 --programs 30):
+            valu_fuzz.py --family f16: 30/30 matched, 0 mismatched
+            valu_fuzz.py --family mem: 30/30 matched, 0 mismatched
+            lds_fuzz.py:               30/30 matched, 0 mismatched
+```
+
+Setup: standalone Vulkan tools built with `cmake -S runtime -B runtime/build/vulkan -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF` using llvm-mingw 23.1.6 (UCRT) and Vulkan SDK 1.4.363 headers. Under Python 3.15 (UTF-8 mode by default) with a non-ASCII Windows user profile folder, `main` at `dde82f2` crashed in `run_cmd` with `UnicodeDecodeError` → `TypeError`; running on PR #4426 (`db6115940`) resolved the crash cleanly. This is the first NVIDIA / Turing entry on this page.
+
+AI-assisted: helped set up the toolchain, run the tests and format this entry; all builds, shader suites, runtime `ctest` checks and fuzzers were executed locally on this GPU.
