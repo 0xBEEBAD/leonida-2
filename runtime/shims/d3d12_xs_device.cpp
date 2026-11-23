@@ -977,11 +977,6 @@ inline void note_list_slot(unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2
                      static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
 }
 
-// The retail executable asks CreateCommandListX for its own command-list interface rather than a PC one: measured
-// at slot 73 as {c3827890-4024-474c-98cf-645b51dc4874}. It is the proxy's to answer, and its calls are mapped to
-// the PC slots like the console's other list interfaces.
-constexpr GUID kConsoleListIID{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
-
 inline bool is_list_iid(const IID& iid) {
     if (IsEqualIID(iid, kConsoleListIID)) return true;
     return IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
