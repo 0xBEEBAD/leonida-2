@@ -22,6 +22,7 @@
 // Any other description type is FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE, reported once per type.
 #include "ffx_upscale.h"
 
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 #include <set>
@@ -72,7 +73,15 @@ ffx::ReturnCode ffxCreateContext(ffx::Context* context, ffx::Header* desc, const
         unsupported("ffxCreateContext", desc->type);
         return ffx::RETURN_ERROR_UNKNOWN_DESCTYPE;
     }
-    if (!backend || !backend->device) return ffx::RETURN_ERROR_PARAMETER;   // as the console DLL: no device, no context
+    if (!backend || !backend->device) {   // as the console DLL: no device, no context
+        // Said once: a title whose backend description doesn't match would otherwise fail without a trace.
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] ffx: ffxCreateContext refused: %s\n",
+                         backend ? "the Xbox backend description has no device"
+                                 : "no Xbox backend description (type 0x01000002) in the chain");
+        return ffx::RETURN_ERROR_PARAMETER;
+    }
     std::string error;
     const std::uint64_t id = rt::ffx_upscale::create(static_cast<ID3D12Device*>(backend->device), *upscale, error);
     if (!id) {
