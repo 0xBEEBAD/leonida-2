@@ -1409,8 +1409,9 @@ mask or VCC) and `v_cmp_class_f32` e64, each read back with `v_cndmask_b32_e64`.
 `mul:2`/`mul:4`/`div:2` and `clamp`, with VGPR, SGPR, inline-constant and literal sources within the constant-bus
 limits. It runs one lane through `tests/semantic/spirv_mini_interp.py` against its own exact-rational ISA model, with
 the shrinking, skips and exit codes of `salu_diff.py`. Any NaN matches any NaN. It does not judge denormal operands
-or results, a computed NaN read as an integer, the clamp of a NaN or an output modifier that gives a zero: those
-programs are counted as skips with the reason.
+or results, a computed NaN read as an integer, the clamp of a NaN, an output modifier that gives a zero or an output
+modifier on a signalling-NaN result (the translator's multiply quiets it; the hardware is not measured): those programs
+are counted as skips with the reason.
 
 `--oracle hw` runs the kernels under the MODE inferred for the game's shaders (IEEE off, f32 denormals flushed). With
 the assembler's compute default (IEEE on) the hardware ignores `omod`: `v_fract_f32_e64 v4, -v16 mul:2` with v16 = 0.5
