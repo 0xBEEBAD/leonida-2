@@ -90,15 +90,6 @@ bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))`
 returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
 and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
 
-The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
-`XGSuggestSwizzleMode` (2 call sites, in the helper that fills a texture description) and `XGCreateTextureComputer`
-(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). The runtime has no model of the console
-resource layout, so `runtime/shims/xg_xs.cpp` computes none: both return `E_NOTIMPL` and write no layout. Two of the
-four `XGCreateTextureComputer` callers ignore the HRESULT and call through the object at once, so the shim still stores
-a static object in the out pointer; its slot 1 (read as `Release`) does nothing, and every other slot up to 31 logs its
-index and caller once and returns `E_NOTIMPL` without writing its arguments. The call shapes and the reasoning are at
-the top of the file; `xg_xs_test` covers them. Textures whose layout the game asks for are therefore not laid out yet.
-
 ## The retail executable (RT-5)
 
 `game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
@@ -135,6 +126,16 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 | `chad.dll` | 5: `XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand` | the audio DSP |
 | `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
 | `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
+
+The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
+`XGSuggestSwizzleMode` (2 call sites, in the helper that fills a texture description) and `XGCreateTextureComputer`
+(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). The runtime has no model of the console
+resource layout, so `runtime/shims/xg_xs.cpp` computes none: both return `E_NOTIMPL` and write no layout. Two of the
+four `XGCreateTextureComputer` callers ignore the HRESULT and call through the object at once, so the shim still stores
+a static object in the out pointer; its slot 1 (read as `Release`) does nothing, and every other slot up to 31 logs its
+index and caller once and returns `E_NOTIMPL` without writing its arguments. The call shapes and the reasoning are at
+the top of the file; `xg_xs_test` covers them. Textures whose layout the game asks for are therefore not laid out yet.
+The table above was measured before this shim and still lists these two as unimplemented; they are served now.
 
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
