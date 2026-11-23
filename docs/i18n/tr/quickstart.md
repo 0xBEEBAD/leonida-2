@@ -85,7 +85,7 @@ python -I make_game.py --game "D:\paket\yolu" --wav    # Opus akışlarını ayr
 python -I make_game.py --wave64-emulate off            # auto (varsayılan), on veya off
 ```
 
-Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
+Önce `check` aşaması çalışır. Ardından `shaders`, `assets` ve `runtime` aşamalarından seçilenler paralel çalışır. `pipelines`, çevrilmiş gölgelendiriciler hazır olduğunda ve `runtime` seçildiyse `vk_pipeline_check` yeniden derlendikten sonra başlar.
 
 - **`--wave64-emulate`**: Wave64 compute ve mesh shader'larını her subgroup genişliğinde birebir çalışacak şekilde
   çevirir. NVIDIA ve Intel GPU'lar 32 şeritli subgroup kullandığı için buna ihtiyaç duyar. Varsayılan `auto` modu
