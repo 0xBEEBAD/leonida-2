@@ -2061,6 +2061,9 @@ Pipeline creation:
   (`LEONIDA_PIPELINE_CACHE_BYTES=<bytes>`, `0` turns it off): a cache seeded with the corpus file returns the whole
   union, which is not worth rewriting at every exit. A session file from another device, driver or pipeline-cache
   UUID is ignored with one line, and a write that fails (a read-only install directory) leaves the previous file.
+  Set `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` to write the session file after a successful compute pipeline
+  compile that took at least 500 ms. A later launch can reuse the completed work if the process exits before device
+  teardown. The session file keeps the same size cap and atomic replacement.
   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description
   without `Flags`, sealed by a checksum (`runtime/src/cached_pso.h`). The answers are the host's, measured on an
   RTX 3060 and WARP: the same description is accepted; another
