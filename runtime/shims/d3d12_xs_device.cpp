@@ -2533,6 +2533,18 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
     note_slot(70);
     log_xbox_route_once(70, "CreateShaderResourceView from raw words", texture_words, view_desc, destination, 0, 0);
     if (!destination) return;
+    // LOCAL: whatever this call writes to the real slot is stored at the title's address too when it returns.
+    struct LocalWriteThrough {
+        DeviceProxy* self;
+        std::uint64_t custom;
+        ~LocalWriteThrough() { local_write_through(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(custom)}, 1); }
+    } local_write_back{self, destination};
+    {
+        static std::atomic<int> calls{0};
+        const int n = calls.fetch_add(1);
+        if (n < 4 || n % 5000 == 0)
+            std::fprintf(stderr, "[rt] localdbg: slot 70 call #%d dest=0x%llx\n", n, static_cast<unsigned long long>(destination));
+    }
     // The console hands a CPU descriptor handle in the title's heap memory; #7021 translates it to the real heap's.
     destination = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)}).ptr;
 
@@ -2547,7 +2559,28 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
     ID3D12Resource* resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
     if (!resource || shape.va < start || shape.va - start >= size) {
         if (resource) resource->Release();
+        // LOCAL: a small raw view over the title's own memory becomes a raw buffer V# through the constant-view path,
+        // which resolves a title address to its GPU copy (#9137). LEONIDA_SLOT70_TITLE=0 keeps the null view.
+        static const bool title_views = [] { const char* v = std::getenv("LEONIDA_SLOT70_TITLE"); return !(v && *v == '0'); }();
+        if (title_views && shape.va && shape.va < 0x100000000ull && shape.resource.Width && shape.resource.Width <= 65536) {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC constants{};
+            constants.BufferLocation = shape.va;
+            constants.SizeInBytes = static_cast<UINT>(shape.resource.Width);
+            self->real->CreateConstantBufferView(&constants, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12_xs: local: slot 70 view over title memory (%llu bytes) written as a raw "
+                                     "buffer V# on its GPU copy\n", static_cast<unsigned long long>(shape.resource.Width));
+            return;
+        }
         log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
+        {
+            static std::atomic<int> nulls{0};
+            const int n = nulls.fetch_add(1);
+            if (n < 3 || n % 5000 == 0)
+                std::fprintf(stderr, "[rt] localdbg: slot 70 null #%d: no buffer holds va=0x%llx width=%llu\n", n,
+                             static_cast<unsigned long long>(shape.va), static_cast<unsigned long long>(shape.resource.Width));
+        }
         write_null_srv(self, destination);
         return;
     }

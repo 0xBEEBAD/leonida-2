@@ -2235,17 +2235,18 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                         if (draw.user_data[w] && vk.buffer_at(draw.user_data[w], room, bb, bo))
                             std::fprintf(stderr, "[rt] localdbg:   user_data[%d] is a registered buffer VA\n", w);
                     }
-                    if (g_local_arena_mapped && draw.user_data[0] && draw.user_data[0] + 256ull <= g_local_arena_size) {
-                        const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(g_local_arena_mapped + draw.user_data[0]);
+                    const std::uint32_t local_table = draw.user_data[0] ? draw.user_data[0] : draw.user_data[8];
+                    if (g_local_arena_mapped && local_table && local_table + 256ull <= g_local_arena_size) {
+                        const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(g_local_arena_mapped + local_table);
                         for (int e = 0; e < 4; ++e) {
                             std::fprintf(stderr, "[rt] localdbg:   table[%d]:", e);
                             for (int w = 0; w < 8; ++w) std::fprintf(stderr, " %08x", t[e * 8 + w]);
                             std::fprintf(stderr, "\n");
                             const std::uint64_t va = (std::uint64_t(t[e * 8 + 1] & 0xffff) << 32) | t[e * 8];
-                            if (va && va + 64 <= g_local_arena_size) {
+                            if (va && va + 128 <= g_local_arena_size) {
                                 const float* f2 = reinterpret_cast<const float*>(g_local_arena_mapped + va);
                                 std::fprintf(stderr, "[rt] localdbg:     at va 0x%llx:", static_cast<unsigned long long>(va));
-                                for (int w = 0; w < 16; ++w) std::fprintf(stderr, " %g", f2[w]);
+                                for (int w = 0; w < 32; ++w) std::fprintf(stderr, " %g", f2[w]);
                                 std::fprintf(stderr, "\n");
                             }
                         }
