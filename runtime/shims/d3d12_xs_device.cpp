@@ -842,6 +842,7 @@ static_assert(kQueueSlots * sizeof(void*) <= 4096 && kFenceSlots * sizeof(void*)
                   kAllocatorSlots * sizeof(void*) <= 4096,
               "a table must fit in the first page of its reservation");
 
+constexpr unsigned kQueueExecuteCommandLists = 10;   // (UINT, ID3D12CommandList* const*)
 constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64)
 constexpr unsigned kFenceSignal = 10;                    // ID3D12Fence::Signal(UINT64), from the CPU
 constexpr unsigned kFenceCompletedValueSlot = 12;        // one past ID3D12Fence1: the completed value's address
@@ -849,6 +850,9 @@ static_assert(kFenceCompletedValueSlot >= kFence1PublicSlots && kFenceCompletedV
               "fence slot 12 is past the public chain and inside the table");
 
 struct FenceMirror;
+constexpr unsigned kQueueExecuteCommandListsX = 35;  // console ExecuteCommandLists(count, lists) variant
+static_assert(kQueueExecuteCommandLists < kQueuePublicSlots && kQueueExecuteCommandListsX < kQueueSlots,
+              "queue execution slots must stay within their respective tables");
 
 struct ChildProxy {
     void** vtable;          // offset 0: the caller's ID3D12CommandQueue* / ID3D12Fence* points here
@@ -901,6 +905,7 @@ const char* child_public_name(unsigned slot) {
     if (slot < 8) return object[slot];
     if constexpr (K == ChildKind::queue) {
         if (slot < kQueuePublicSlots) return queue[slot - 8];
+        if (slot == kQueueExecuteCommandListsX) return "ExecuteCommandListsX";
     } else if constexpr (K == ChildKind::fence) {
         if (slot < kFence1PublicSlots) return fence[slot - 8];
     } else {
@@ -1363,6 +1368,22 @@ std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::ui
 
 #endif
 
+// LOCAL (merge of #7286 + list-array unwrap): console ExecuteCommandLists(count, lists) at queue slot 35. Each list
+// proxy in the array is replaced by its real list before the PC call.
+std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
+    const UINT count = static_cast<UINT>(count_word);
+    auto* const lists = reinterpret_cast<ID3D12CommandList* const*>(lists_word);
+    std::vector<ID3D12CommandList*> real(count);
+    for (UINT i = 0; lists && i < count; ++i) {
+        IUnknown* r = proxy_real_object(lists[i]);
+        real[i] = r ? static_cast<ID3D12CommandList*>(r) : lists[i];
+    }
+    using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, ID3D12CommandList* const*);
+    reinterpret_cast<ExecuteFn>(self->real_vtable[kQueueExecuteCommandLists])(
+        self->real, static_cast<std::uint64_t>(count), lists ? real.data() : lists);
+    return 0;
+}
+
 template <ChildKind K, unsigned Slot>
 std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1387,6 +1408,10 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         return fence_completed_value_address(self, a1, a2, a3);
     } else {
         note_child_slot<K>(Slot);
+        if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            return queue_execute_command_lists(self, a1, a2);
+        }
         if constexpr (K == ChildKind::queue) {
             // Layout detection (the comment at the PresentX section): a fence reaching slot 16 or 17 is the newer
             // layout's Signal/Wait; anything else there is the older layout's frequency/calibration getter. A
@@ -1514,6 +1539,9 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
+        if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandLists) {
+            return queue_execute_command_lists(self, a1, a2);
+        }
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
 
         // Queue slot 10: ExecuteCommandLists(count, lists). The array is copied with each list proxy replaced by
@@ -3830,6 +3858,11 @@ unsigned fence_proxy_slot_count(const void* fence) {
 
 unsigned queue_proxy_table_size() { return kQueueSlots; }
 unsigned fence_proxy_table_size() { return kFenceSlots; }
+
+bool queue_slot_overridden(unsigned slot) {
+    return slot <= 2 || slot == 7 || slot == kQueueSignal || slot == kQueueWait ||
+           slot == kQueueExecuteCommandListsX;
+}
 unsigned allocator_proxy_table_size() { return kAllocatorSlots; }
 unsigned allocator_proxy_slot_count(const void* allocator) {
     return is_allocator_proxy(allocator) ? static_cast<const ChildProxy*>(allocator)->slot_count : 0;
