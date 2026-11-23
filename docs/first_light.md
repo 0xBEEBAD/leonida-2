@@ -280,7 +280,7 @@ The package's 357,115 TTPF descriptors use 20 DXGI formats (counted with `ttpf_m
 - R8, BC4 and R16F sample as (r, 0, 0, 1). BC5 samples as (r, g, 0, 1).
 - An alpha the decoder doesn't give is not compared.
 
-One game texture per format, each with at least 64 distinct values, on an RTX 3060:
+One game texture per format (at least 64 distinct values where the package has one), on an RTX 3060:
 
 | formats | worst error | tolerance |
 |---|---:|---:|
@@ -290,13 +290,18 @@ One game texture per format, each with at least 64 distinct values, on an RTX 30
 | BC1, BC3 | 0.020 | 6/255 |
 | BC1 sRGB, BC3 sRGB | 0.026 | 7/255 |
 | BC6H UF16, SF16 | 0.033 | 0.04 |
+| RGBA16F (256×2), RGBA16 UNORM (128×4) | ≤ 0.0045 | 2/255 |
+| RGBA8 sRGB (4×4) | 0 | 2/255 |
+
+All 20 formats pass. RGBA8 sRGB is a weak case: its only 2D texture is a uniform 4×4. Its sRGB decode is the same
+one that BGRA8 sRGB and the BC1/BC3/BC7 sRGB rows exercise with real content. The small RGBA16 textures are the
+package's only 2D ones in those formats.
 
 The wider tolerances are decoder arithmetic, not the layer. The BC1/BC3 colour palette on the RTX 3060 follows
 integer weights: regenerating the reference with `(43a + 21b + 32) >> 6` instead of `(2a + b) / 3` cuts the channels
 off by more than 2/255 five- to sevenfold. BC4/BC5 interpolate their 8-entry palette above 8 bits. A wrong mapping is
 far outside every tolerance: declaring the BC1 sRGB texture as BC1 UNORM (a missed sRGB decode) gives a worst error
-of 0.31 with 28,829 channels over, and fails. The three formats not run here are RGBA16 UNORM, RGBA16F and RGBA8
-sRGB, 10 textures in all; no 2D one of them exported in the size this sweep uses.
+of 0.31 with 28,829 channels over, and fails.
 
 ## 10. Limits and next
 
