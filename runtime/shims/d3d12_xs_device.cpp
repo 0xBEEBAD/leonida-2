@@ -1509,7 +1509,12 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 }
                 return hr_to_u64(S_OK);
             }
-            if (Slot == (newer ? 32u : 30u)) return queue_present_x(self, a1, a2, a3);  // PresentX
+            if (Slot == (newer ? 32u : 30u)) {  // PresentX
+                const std::uint64_t hr = queue_present_x(self, a1, a2, a3);
+                // LOCAL: one trace line per present, so a run's presents can be counted.
+                d3d12_trace::record("XboxID3D12CommandQueue::PresentX", static_cast<HRESULT>(hr) < 0 ? "failed" : "ok");
+                return hr;
+            }
             if (Slot >= self->slot_count || (newer && (Slot == 14 || Slot == 15))) {
                 d3d12_trace::record(child_trace_name<K>(Slot), "console-only");
                 return hr_to_u64(S_OK);  // unmodelled console queue methods: frame pacing flows through them
