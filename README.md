@@ -183,11 +183,12 @@ Stages: `check` always runs first; then `shaders`, `assets` and `runtime` run to
 depend on each other). `pipelines` starts once the translated shaders are ready and, when this run includes runtime,
 that stage has finished rebuilding `vk_pipeline_check`, so it can overlap the rest of assets; it creates every
 translated shader on your GPU driver, reports any it has to skip, and saves a pipeline cache to `pipeline_cache.bin`
-in `--out` (the runtime doesn't load that cache yet, so it doesn't speed up the first boot). The shader translation
-is the longest CPU step: it runs on `--jobs` processes (half the CPU threads by default). When shaders and assets
-share the machine, that budget is split between them and passed to `rpf9dump` as `--jobs`; a solo assets run still
-lets `rpf9dump` use every core. Progress lines include percent and a rough ETA for translation shards, asset steps,
-and overall stage completion.
+in `--out`. To seed the runtime's Vulkan pipeline cache, the file must sit beside the executable and its header
+must match the device and pipeline cache UUID. The runtime falls back to an empty cache if the file is missing,
+incompatible, or rejected by the driver. Shader translation is the longest CPU step. It runs on `--jobs` processes
+(half the CPU threads by default). When shaders and assets share the machine, that budget is split between them and
+passed to `rpf9dump` as `--jobs`. A solo assets run still lets `rpf9dump` use every core. Progress lines include
+percent and a rough ETA for translation shards, asset steps, and overall stage completion.
 
 On an interactive terminal, a LEONIDA setup screen lets you set jobs and whether stages overlap, then a key-switchable
 per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage logs go under `work/logs/`. Use
