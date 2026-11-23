@@ -3598,7 +3598,7 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   no D3D12 device. `runtime/src/ffx_vk_backend.{h,cpp}` loads it (from `LEONIDA_FFX_DIR`, else next to the program),
   creates the upscale context with the Vulkan backend descriptor in place of the console one, reports the provider
   the loader chose, and passes dispatches through with `VkImage` resources and a `VkCommandBuffer`. The loader picks
-  the newest upscaler the GPU supports. Measured with `ffx_vk_dispatch_test` (procedural inputs, the game's context
+  the newest upscaler the GPU and driver support, which is not a split by architecture alone. Measured with `ffx_vk_dispatch_test` (procedural inputs, the game's context
   flags, 30 frames; 1280x720 to 1920x1080, the console DLL's one configuration, and 1920x1080 to 3840x2160) under
   Wine 11.22 on RADV (Mesa 26.3.1), every square of the checkerboard right and no non-finite value:
   - RX 9070 XT (RDNA4): providers 4.1.2, 3.1.6 and 2.3.4; the context gets **FSR 4.1.2**; 0.41 ms per upscale to
@@ -3606,6 +3606,9 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   - Ryzen 7 9800X3D iGPU (RDNA2, 2 CUs): providers 3.1.6 and 2.3.4; the context gets FSR 3.1.6; 10.1 ms to 1080p and
     35.3 ms to 4K. FSR 3.1.6 also on AMD's Windows driver 32.0.21030.2001 (`whattheflop`) and on an RTX 3080 Ti
     under Wine (`Kev-Ball`), both at 1280x720 to 2560x1440 (#4999).
+  - On native Windows (#4999): an **RX 7600** (RDNA3, gfx1102) with AMD's driver 26.11.2 gets **FSR 4.1.2**, 4.56 ms
+    to 1080p and 16.98 ms to 4K, every square right, no validation error of the test's own (`RSK2707X`). An RTX 4080
+    (driver 621.01, `CryingLaughing`) and an RTX 5070 Ti (`Kam471`) get FSR 3.1.6, every square right.
   - **Device extensions.** The shaders run without any, but they use some: FSR 3.1 compute-shader derivatives, FSR 4
     also cooperative matrices and 8-bit floats. Without the extensions the validation layer reports
     `VUID-VkShaderModuleCreateInfo-pCode-08740`/`-08742` (on Windows and on RADV). The device must enable those of
