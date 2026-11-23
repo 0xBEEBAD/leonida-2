@@ -440,6 +440,10 @@ if(BUILD_TESTING)
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
 
+  # D3D-704's session-cache limit and header check: pure stdlib, no Vulkan headers.
+  add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
+  add_test(NAME pipeline_cache_store COMMAND pipeline_cache_store_test)
+
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
 

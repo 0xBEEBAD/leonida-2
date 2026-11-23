@@ -2023,6 +2023,14 @@ Pipeline creation:
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
+  The runtime also keeps what it compiled itself: `pipeline_cache.session.bin`, written from
+  `vkGetPipelineCacheData` on device teardown and merged into the cache at the next launch with
+  `vkMergePipelineCaches` (the offline seed and the session file cannot be passed together as one
+  `VkPipelineCacheCreateInfo`). The two files are separate so a run never replaces the multi-GB corpus cache with
+  the handful of pipelines it happened to compile. The session write is capped at 256 MiB
+  (`LEONIDA_PIPELINE_CACHE_BYTES=<bytes>`, `0` turns it off): a cache seeded with the corpus file returns the whole
+  union, which is not worth rewriting at every exit. A session file from another device, driver or pipeline-cache
+  UUID is ignored with one line, and a write that fails (a read-only install directory) leaves the previous file.
   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description
   without `Flags`, sealed by a checksum (`runtime/src/cached_pso.h`). The answers are the host's, measured on an
   RTX 3060 and WARP: the same description is accepted; another
