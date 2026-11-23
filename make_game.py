@@ -1734,10 +1734,33 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
 
 
 # ---------------------------------------------------------------- runtime
-WINE_LAUNCHER = """#!/bin/sh
+def wine_launcher(out: str, work: str, image: str) -> str:
+    shaders = os.path.abspath(os.path.join(work, "shaders", "spirv"))
+    # The runtime reads shader_path.txt. Its absolute path needs updating only if the whole port moved.
+    moved_catalog = ""
+    if os.path.commonpath([os.path.abspath(out), shaders]) == os.path.abspath(out):
+        relative = shlex.quote(os.path.relpath(shaders, out))
+        moved_catalog = f"""    if [ "$here" != {shlex.quote(os.path.realpath(out))} ]; then
+        shaders="$here"/{relative}
+        export LEONIDA_SHADERS="${{LEONIDA_SHADERS:-Z:$shaders}}"
+    fi
+"""
+    return f"""#!/bin/sh
 # Starts the Windows build of the loader with Wine. WINE picks another one, e.g. a Proton build's bin/wine.
 here=$(dirname "$(readlink -f "$0")")
-exec "${WINE:-wine}" "$here/gta6rt.exe" "$@"
+if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
+    game=$(cat "$here/game_path.txt" && printf .) || exit 1
+    cd "${{game%.}}" || exit 1
+    image={shlex.quote(image)}
+    if [ ! -f "./$image" ]; then
+        printf 'Missing game executable: %s/%s\\n' "$PWD" "$image" >&2
+        exit 1
+    fi
+    # Wine maps the Unix filesystem root to Z:. The game reads from its package and writes to the port's overlay.
+{moved_catalog}    export LEONIDA_D3D12="${{LEONIDA_D3D12:-vulkan}}"
+    set -- "$1" "./$image" --overlay "Z:$here/overlay"
+fi
+exec "${{WINE:-wine}}" "$here/gta6rt.exe" "$@"
 """
 
 
@@ -1785,9 +1808,10 @@ def build_pipeline_check(jobs: int) -> None:
                 "or VULKAN_SDK); the CMake output above says which is missing.")
 
 
-def install_runtime(game: str, out: str, artifacts: list, work: str | None = None) -> None:
+def install_runtime(game: str, out: str, artifacts: list, work: str | None = None,
+                    launcher: str | None = None) -> None:
     """Puts the runtime files, game_path.txt, shader_path.txt (with `work`) and (off Windows) gta6rt.sh in `out`,
-    staged first (RT-249).
+    staged first (RT-249). `launcher` is gta6rt.sh's text (wine_launcher()); None writes no launcher.
 
     Everything is written to a staging folder inside `out` (same filesystem), and only once all of it is there is
     it published (publish(): all files or none). A failure while copying (disk full, an interrupt) or while
@@ -1817,11 +1841,11 @@ def install_runtime(game: str, out: str, artifacts: list, work: str | None = Non
             with open(os.path.join(stage, "shader_path.txt"), "wb") as f:
                 f.write(encoded)
             staged.append("shader_path.txt")
-        if os.name != "nt":
-            launcher = os.path.join(stage, "gta6rt.sh")
-            with open(launcher, "w", encoding="utf-8", newline="\n") as f:
-                f.write(WINE_LAUNCHER)
-            os.chmod(launcher, os.stat(launcher).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        if launcher is not None:
+            script = os.path.join(stage, "gta6rt.sh")
+            with open(script, "w", encoding="utf-8", newline="\n") as f:
+                f.write(launcher)
+            os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             staged.append("gta6rt.sh")
         publish(stage, out, staged)
     except IncompleteRollback:
@@ -1897,7 +1921,8 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         if not os.path.isfile(built):
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
     try:
-        install_runtime(game, out, artifacts, work)
+        launcher = wine_launcher(out, work or os.path.join(out, "work"), v["expected_exe"]) if os.name != "nt" else None
+        install_runtime(game, out, artifacts, work, launcher)
     except IncompleteRollback as e:
         fail(f"runtime: could not install into {out}, and the previous files could not all be put back: {e}. "
              "Close the programs holding them, then move each <name>.old from there back into place (or run the stage "
@@ -1917,9 +1942,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         log("runtime: built. Inspect the game's imports in PowerShell:\n"
             f"  & {ps_literal(start)} --dry-run {ps_literal(image)}")
     else:
-        # Wine inherits the package directory; the image argument needs no host-to-Windows path conversion.
-        command = shlex.join([start, "--dry-run", "./" + v["expected_exe"]])
-        log(f"runtime: built. Inspect the game's imports with Wine:\n  (cd {shlex.quote(game)} && {command})")
+        log(f"runtime: built. Inspect the game's imports with Wine:\n  {shlex.join([start, '--dry-run'])}")
 
 
 def positive_int(text: str) -> int:

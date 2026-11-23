@@ -20,6 +20,14 @@ if ROOT not in sys.path:
 import make_game
 
 
+# gta6rt.sh's text, as runtime() passes it from wine_launcher(); Windows writes no launcher
+LAUNCHER = "#!/bin/sh\n# test launcher\n" if os.name != "nt" else None
+
+
+def install(game, out, artifacts, work=None):
+    return make_game.install_runtime(game, out, artifacts, work, LAUNCHER)
+
+
 def read(path):
     with open(path, "rb") as f:
         return f.read()
@@ -52,13 +60,13 @@ class RuntimeStagingTests(unittest.TestCase):
         return sorted(os.listdir(self.out))
 
     def test_success_replaces_everything_and_leaves_no_staging(self):
-        make_game.install_runtime(self.game, self.out, self.artifacts)
+        install(self.game, self.out, self.artifacts)
         for name in make_game.RUNTIME_FILES:
             self.assertEqual(read(os.path.join(self.out, name)), b"new " + name.encode())
         self.assertEqual(read(os.path.join(self.out, "game_path.txt")).decode(), os.path.abspath(self.game))
         self.assertEqual(self.entries(), sorted(self.old))
         if os.name != "nt":
-            self.assertEqual(read(os.path.join(self.out, "gta6rt.sh")).decode(), make_game.WINE_LAUNCHER)
+            self.assertEqual(read(os.path.join(self.out, "gta6rt.sh")).decode(), LAUNCHER)
             self.assertTrue(os.access(os.path.join(self.out, "gta6rt.sh"), os.X_OK))
 
     def test_failed_copy_leaves_the_old_install(self):
@@ -73,7 +81,7 @@ class RuntimeStagingTests(unittest.TestCase):
 
         with patch.object(make_game.shutil, "copy2", copy2):
             with self.assertRaises(OSError):
-                make_game.install_runtime(self.game, self.out, self.artifacts)
+                install(self.game, self.out, self.artifacts)
         self.assertEqual(len(calls), 2)
         for name, data in self.old.items():
             self.assertEqual(read(os.path.join(self.out, name)), data, name)
@@ -89,7 +97,7 @@ class RuntimeStagingTests(unittest.TestCase):
 
         with patch("builtins.open", failing_open):
             with self.assertRaises(OSError):
-                make_game.install_runtime(self.game, self.out, self.artifacts)
+                install(self.game, self.out, self.artifacts)
         for name, data in self.old.items():
             self.assertEqual(read(os.path.join(self.out, name)), data, name)
         self.assertEqual(self.entries(), sorted(self.old))
@@ -115,7 +123,7 @@ class RuntimeStagingTests(unittest.TestCase):
                 replace, calls = self.failing_replace(fail_on)
                 with patch.object(make_game.os, "replace", replace):
                     with self.assertRaises(PermissionError):
-                        make_game.install_runtime(self.game, self.out, self.artifacts)
+                        install(self.game, self.out, self.artifacts)
                 for name, data in self.old.items():
                     self.assertEqual(read(os.path.join(self.out, name)), data, name)
                 self.assertEqual(self.entries(), sorted(self.old))
@@ -127,7 +135,7 @@ class RuntimeStagingTests(unittest.TestCase):
         replace, _ = self.failing_replace(2)          # moving the old DLL aside fails, after the exe is published
         with patch.object(make_game.os, "replace", replace):
             with self.assertRaises(PermissionError):
-                make_game.install_runtime(self.game, self.out, self.artifacts)
+                install(self.game, self.out, self.artifacts)
         self.assertEqual(self.entries(), before)      # the new exe is taken back out
         for name in (second, "game_path.txt"):
             self.assertEqual(read(os.path.join(self.out, name)), self.old[name])
@@ -149,7 +157,7 @@ class RuntimeStagingTests(unittest.TestCase):
         exe, dll = make_game.RUNTIME_FILES[:2]
         with patch.object(make_game.os, "replace", replace):
             with self.assertRaises(make_game.IncompleteRollback) as raised:
-                make_game.install_runtime(self.game, self.out, self.artifacts)
+                install(self.game, self.out, self.artifacts)
         e = raised.exception
         self.assertEqual([name for name, _ in e.failures], [exe])
         self.assertIn(e.stage, str(e))
@@ -161,7 +169,7 @@ class RuntimeStagingTests(unittest.TestCase):
         # --runtime-build pointing at --out: the runtime files are already there and are not copied onto themselves
         artifacts = [os.path.join(self.out, name) for name in make_game.RUNTIME_FILES]
         with patch.object(make_game.shutil, "copy2", side_effect=AssertionError("copied onto itself")):
-            make_game.install_runtime(self.game, self.out, artifacts)
+            install(self.game, self.out, artifacts)
         for name in make_game.RUNTIME_FILES:
             self.assertEqual(read(os.path.join(self.out, name)), self.old[name])
         self.assertEqual(read(os.path.join(self.out, "game_path.txt")).decode(), os.path.abspath(self.game))
@@ -170,19 +178,19 @@ class RuntimeStagingTests(unittest.TestCase):
     def test_shader_path_is_staged_with_the_rest(self):
         # main's shader_path.txt (from --work) goes through the same staging: a failed copy leaves no new one
         work = os.path.join(self.tmp, "work")
-        make_game.install_runtime(self.game, self.out, self.artifacts, work)
+        install(self.game, self.out, self.artifacts, work)
         self.assertEqual(read(os.path.join(self.out, "shader_path.txt")),
                          os.fsencode(os.path.join(os.path.abspath(work), "shaders", "spirv"))
                          if os.name != "nt" else os.path.join(os.path.abspath(work), "shaders", "spirv").encode())
         os.remove(os.path.join(self.out, "shader_path.txt"))
         with patch.object(make_game.shutil, "copy2", side_effect=OSError(28, "No space left on device")):
             with self.assertRaises(OSError):
-                make_game.install_runtime(self.game, self.out, self.artifacts, work)
+                install(self.game, self.out, self.artifacts, work)
         self.assertNotIn("shader_path.txt", os.listdir(self.out))
 
     def test_missing_output_folder_is_created(self):
         out = os.path.join(self.tmp, "fresh", "out")
-        make_game.install_runtime(self.game, out, self.artifacts)
+        install(self.game, out, self.artifacts)
         names = sorted(os.listdir(out))
         want = sorted([*make_game.RUNTIME_FILES, "game_path.txt"] + (["gta6rt.sh"] if os.name != "nt" else []))
         self.assertEqual(names, want)
