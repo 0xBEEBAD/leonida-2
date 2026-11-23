@@ -2,8 +2,8 @@
 // the five FFX functions of the package's amd_fidelityfx_upscaler_xbox.dll (fsr_dispatch_test, docs/d3d12_vulkan.md
 // A.3); this backend answers the same calls with AMD's signed amd_fidelityfx_loader_vk.dll from the public
 // FidelityFX SDK (v2.4.0 and later), on the layer's own VkDevice, so no D3D12 device is involved. The loader picks
-// the newest upscaler the GPU supports: FSR 4.1 where AMD ships it (RDNA4; RDNA2 discrete since SDK 2.4.0), FSR 3.1
-// elsewhere. The DLLs are the user's: they are looked up in LEONIDA_FFX_DIR, else next to the program, and nothing of
+// the newest upscaler the GPU and driver support (measured: FSR 4.1.2 on RDNA4 under RADV and on RDNA3 under AMD's
+// Windows driver 26.11.2, FSR 3.1.6 on an RDNA2 iGPU and on NVIDIA; docs/d3d12_vulkan.md A.3). The DLLs are the user's: they are looked up in LEONIDA_FFX_DIR, else next to the program, and nothing of
 // AMD's is in the repository (its licence allows redistribution in binary form and forbids reverse engineering).
 //
 // The shim that routes the game's calls here, and maps its resources to the layer's VkImages, is a later step.
