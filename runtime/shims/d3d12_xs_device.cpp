@@ -24,6 +24,7 @@
 // 78 SetFrameIntervalX, 79 ScheduleFrameEventX and 80 WaitFrameEventX. The slots can be moved with LEONIDA_XS_*_SLOT
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
+#include "title_window.h"
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
@@ -1337,7 +1338,15 @@ PresentState* present_state_for(DeviceProxy* device) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
         return state;
     }
-    auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
+    // LOCAL (wiring of #8591): present into the title's own window when it has one; else show the fallback window.
+    HWND target = rt::d3d12::find_title_window(GetCurrentProcessId(), state->window);
+    if (target) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX uses the title's own window %p\n", static_cast<void*>(target));
+    } else {
+        target = state->window;
+        ShowWindow(target, SW_SHOWNOACTIVATE);
+    }
+    auto presenter = rt::d3d12::create_window_presenter(device->real, target);
     if (!presenter) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
         return state;
