@@ -46,11 +46,20 @@ with the game files have not been done on this copy yet.
 
 ## Keeping up with upstream
 
+GitHub disabled the upstream repository (moved to `ProjectLeonida/Leonida`, git returns 403 "disabled") on
+2026-11-23. Its last `main` is `upstream-main` here (`5d74c2723`, 2026-11-23 21:01 UTC, full history).
+
+The open upstream PRs still exist in their authors' forks. A snapshot of every open PR head (4,731 PRs) is in
+`truenas_admin@192.168.0.250:repos/leonida-own.git` under `refs/pr/<number>`:
+
 ```bash
-git remote add upstream https://github.com/ItsNotRexed/Leonida.git
-git fetch upstream main
-git merge upstream/main
+git remote add claude truenas_admin@192.168.0.250:repos/leonida-own.git
+git fetch claude 'refs/pr/7320:refs/remotes/pr/7320'     # one PR
+git fetch claude 'refs/pr/*:refs/remotes/pr/*'           # all of them
 ```
+
+`claude/main` is Claude's working copy (mangrove's base plus fixes); `claude/for-mangrove` is this `main` with those
+fixes merged, a fast-forward from here: `git fetch claude && git merge --ff-only claude/for-mangrove`.
 
 ## Testing
 
