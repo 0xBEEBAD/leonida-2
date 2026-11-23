@@ -8561,8 +8561,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
 #endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
-    device_extensions.insert(device_extensions.end(), ffx_extensions.begin(), ffx_extensions.end());
 #endif
+    device_extensions.insert(device_extensions.end(), ffx_extensions.begin(), ffx_extensions.end());
     if (info.shader_subgroup_clock || info.shader_device_clock)
         device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (calibrated) device_extensions.push_back(calibrated);
