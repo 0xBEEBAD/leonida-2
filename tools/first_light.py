@@ -779,7 +779,7 @@ def tsharp_load_offset(listing: str) -> int:
 
 # DDS formats d3d12_first_light_textured can upload, by DXGI code: (block edge, bytes per texel or block, channel rule,
 # scale to [0, 1] or None for float data, sRGB). Channel rules: "rgb" (alpha not predicted), "r" (r, 0, 0, 1),
-# "rg" (r, g, 0, 1), "a" (0, 0, 0, a). These are the formats the game's TTPF pools use (docs/first_light.md section 8).
+# "rg" (r, g, 0, 1), "a" (0, 0, 0, a). These are the formats the game's TTPF pools use (docs/first_light.md section 9).
 DDS_FORMATS = {
     28: (1, 4, "rgb", 255.0, False), 29: (1, 4, "rgb", 255.0, True),
     87: (1, 4, "rgb", 255.0, False), 91: (1, 4, "rgb", 255.0, True),

@@ -49,7 +49,7 @@ std::string stage_hash(const leonida::Json& manifest, std::string_view stage) {
 }
 
 // A texture.bin format: its block edge (1 for plain texels, 4 for BC) and the bytes of one texel or block. These are
-// the formats the game's TTPF pools use (docs/first_light.md section 8).
+// the formats the game's TTPF pools use (docs/first_light.md section 9).
 struct TexelLayout {
     UINT block = 0;
     UINT bytes = 0;
