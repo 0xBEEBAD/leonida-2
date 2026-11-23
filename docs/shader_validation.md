@@ -663,6 +663,34 @@ pair replaced by a wrapped subtraction, and the `v_sad_hi_u8` shift dropped — 
 programs fail (`--programs 60 --seed 2 --max-ops 5 --no-sweep`), so the runner does catch arithmetic
 errors.
 
+### Relative VGPR moves across the whole wave (`tools/vrel_diff.py`)
+
+No other fuzzer generates `v_movrels_b32`, `v_movreld_b32`, `v_movrelsd_b32`, `v_movrelsd_2_b32`, `v_swaprel_b32`
+or `v_swap_b32`. `tools/vrel_diff.py` runs seeded programs of them through the translator and
+`tests/semantic/spirv_wave_interp.py` (one subgroup, every lane at once) and compares all 32 VGPRs of the window
+v0..v31 in every lane bit for bit, against a per-lane model of the RDNA2 ISA descriptions that shares no code with
+the translator:
+
+- `v_movrels_b32` D = VGPR[S0 + M0], `v_movreld_b32` VGPR[D + M0] = S0, `v_movrelsd_b32` VGPR[D + M0] = VGPR[S0 + M0].
+- `v_movrelsd_2_b32` VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]; `v_swaprel_b32` swaps those two registers, both read
+  before either is written. The other M0 bits are ignored.
+- `v_movreld_b32`'s source is any VOP1 source: a VGPR, an SGPR, M0, an inline constant or a literal. The other four
+  relative forms take a VGPR.
+- An inactive lane keeps every VGPR.
+
+Generated: M0 from `s_mov_b32` (a constant or an SGPR) and `s_add_u32 m0, m0, K`, with random bits in M0[15:10] and
+M0[31:26] under the two-field forms and both fields sometimes naming one register; EXEC from edge masks and random
+words (`exec_hi` in wave64); the e32 forms and e64 for `v_movrels_b32`/`v_movreld_b32`; plain VGPR moves, adds and
+xors between them. Every effective index stays inside the window: the hardware's check against the VGPR allocation
+is not modelled. Not generated: `exec_lo` or `vcc_lo` as `v_movreld_b32`'s source (a lane mask read as data, #293)
+and the DPP and SDWA forms. `--wave 32`, `64` or `both`; a translator or interpreter skip exits 1, as a mismatch does.
+
+```
+python -I tools/vrel_diff.py --programs 300 --seed 1 --wave both
+python -I tools/vrel_diff.py --ops v_swaprel_b32,v_movrelsd_2_b32
+python -I tests/test_vrel_diff.py
+```
+
 ### Images on the GPU (`tools/image_fuzz.py`)
 
 `tools/image_fuzz.py` starts on the image path, where the T# format, the view type and the binding layout
