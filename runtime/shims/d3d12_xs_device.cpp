@@ -24,6 +24,7 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "shims.h"  // rt::shims::module_offset names the caller of a slot's first call
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -36,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <intrin.h>
 #include <iterator>
 #include <new>
 #include <memory>
@@ -86,6 +88,8 @@ struct HeapProxy {
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
 std::atomic<bool> g_first[kMaxSlots];
+// The return address of the first call of each slot that reached the generic forwarding branch (0: none yet).
+std::atomic<std::uint64_t> g_first_caller[kMaxSlots];
 std::atomic<bool> g_beyond_warned[kMaxSlots];
 std::atomic<std::uint64_t> g_heap_hits[kHeapSlots];
 std::atomic<bool> g_heap_first[kHeapSlots];
@@ -155,11 +159,18 @@ const char* slot_name(unsigned slot) {
     }
 }
 
-void note_slot(unsigned slot) {
+// caller: the title code that called the slot, for the slots the proxy forwards by number (RT-526). The first call
+// then also names it as module+offset, so a new Xbox-only slot can be found in the executable without a debugger.
+void note_slot(unsigned slot, const void* caller = nullptr) {
     if (slot >= kMaxSlots) return;
     count_hit(g_hits[slot]);
     const bool first = first_call(g_first[slot]);
-    if (first) {
+    if (first && caller) {
+        const auto address = reinterpret_cast<std::uint64_t>(caller);
+        g_first_caller[slot].store(address, std::memory_order_relaxed);
+        std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call from %s\n", slot, slot_name(slot),
+                     rt::shims::module_offset(address).c_str());
+    } else if (first) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call\n", slot, slot_name(slot));
     } else if (slot >= 3 && trace_enabled()) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) call\n", slot, slot_name(slot));
@@ -1865,7 +1876,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
     } else {
-        note_slot(Slot);
+        note_slot(Slot, _ReturnAddress());
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
@@ -2160,6 +2171,11 @@ std::uint64_t device_slot_hits(unsigned slot) {
 
 bool device_slot_first_call_seen(unsigned slot) {
     return slot < kMaxSlots && g_first[slot].load(std::memory_order_relaxed);
+}
+
+std::string device_slot_first_caller(unsigned slot) {
+    const std::uint64_t address = slot < kMaxSlots ? g_first_caller[slot].load(std::memory_order_relaxed) : 0;
+    return address ? rt::shims::module_offset(address) : std::string();
 }
 
 unsigned long device_proxy_ref_count(const void* device) {
