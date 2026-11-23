@@ -1655,6 +1655,46 @@ python -I tests/test_f16misc_diff.py
 ```
 
 
+### f16 rounding under MODE writes (`tools/mode_diff.py`)
+
+The corpus switches MODE.FP_ROUND[3:2] (f16/f64 rounding) at run time: `s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3`
+selects toward zero and `..., 0` goes back to nearest even; `s_round_mode` writes the same field. No other fuzzer
+writes MODE, so the f16 fuzzers only ever run in nearest-even mode. `tools/mode_diff.py` generates straight-line
+programs that mix those writes (setreg 0 / 3, `s_round_mode 0x0` / `0xc`) with 19 mode-aware f16 ops in their e32,
+e64, VOP3P and literal forms: `v_add/sub/subrev/mul_f16`, `v_fma/fmac/fmamk/fmaak_f16`, `v_pk_add/mul/fma/fmac_f16`,
+`v_fma_mixlo/mixhi_f16`, `v_cvt_f16_f32` (with `mul:2`/`mul:4`/`div:2`), `v_cvt_f16_u16/i16`, `v_ldexp_f16` and
+`v_fract_f16`, with neg/abs/op_sel/clamp. Operands are built for the cases where the two modes differ: an addend
+a few binades below the other operand or under half an f32 ulp of it, an f32 word near an f16 tie, the overflow edge,
+f16 denormals, small negatives for fract, integers past 2048. Two oracles:
+
+- an exact reference (`fractions.Fraction`, written from the rules docs/design.md records and sharing no code with the
+  translator) that tracks the mode and rounds each result once, compared bit for bit with the translation run in
+  `spirv_mini_interp`. A NaN the reference computed matches any NaN. The clamp of a NaN or of -0 and values SPIR-V
+  leaves undefined are counted as not judged, with the reason;
+- mode invariance: programs of ops whose result must not depend on the field (the seven f16 transcendentals,
+  floor/ceil/trunc/rndne, frexp, the f16 min/max/med3 and conversions to integer, `v_cvt_pkrtz_f16_f32`, f32
+  arithmetic and `v_fma_mix_f32`) give the same four words with their MODE writes and with every write removed.
+
+A run is a sweep of every form of every op under each of the four writes (116 programs), then random programs
+(a write before about one op in three), then the invariance programs. The seven refused forms (directed rounding,
+register values, other MODE bits, `s_denorm_mode`) are pinned as rejections in `--self-test`, next to the RX 6800 and
+`tools/mode_round_probe.py` words. Not covered: `v_add_f64` (the mini interpreter has no binary64 arithmetic;
+`tests/test_mode_round.py` checks it), `v_interp_p2_f16`, the SDWA/DPP forms, omod on f16 arithmetic (SHADER-297)
+and op_sel on an f32 operand of `v_fma_mix*`.
+
+```
+python -I tools/mode_diff.py --programs 300 --invariance 100 --seed 1
+python -I tools/mode_diff.py --self-test
+python -I tests/test_mode_diff.py
+```
+
+Seeds 1 to 5 (sweep, 300 random programs and 100 invariance programs each): 2,532 of 2,532 judged programs match
+with #5310's `v_ldexp_f16` change; without it, seed 1 reports `v_ldexp_f16` overflowing to inf under toward zero
+(`want 0x7bff, got 0x7c00`). Each of eight planted translator bugs is caught by `--programs 150 --invariance 60`:
+`f16_res` ignoring the mode, `sum_toward_zero` removed, `f16_omod` overflowing to inf under toward zero,
+`s_round_mode` ignored, the transcendentals following the mode, `v_fract_f16` ignoring it, and plain f32 `Fma` in
+place of `fma_mix_odd` or `fma_f16_odd`.
+
 ### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
 
 The `16-bit results` row of `docs/design.md` listed `v_exp_f16`/`v_log_f16` and the NaN and denormal operands as
