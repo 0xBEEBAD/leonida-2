@@ -1777,8 +1777,9 @@ python -I tests/test_cvt_diff.py
 **Results.** Seeds 776521 to 776524 (`--programs 25000 --max-ops 8`) and 776525 to 776528 (`--programs 100000
 --max-ops 8`) match bit for bit, with zero mismatches and zero skips: 4 x 27,239 and 4 x 102,239 programs.
 `--exhaustive-f16` matches 49,152 of 49,152 programs. Those runs predate the generation of the f16 destination
-`op_sel` and of `clamp` on `pknorm_f16`; with both, seed 776539 (`--programs 2000 --max-ops 8`) matches 5,055 of
-5,055 programs.
+`op_sel` and of `clamp` on `pknorm_f16`. With both, seeds 776531 to 776534 (`--programs 25000 --max-ops 8`) and
+776535 to 776538 (`--programs 100000 --max-ops 8`) match, 4 x 28,055 and 4 x 103,055 programs with zero mismatches
+and zero skips, and `--exhaustive-f16` matches 49,152 of 49,152 again.
 
 Nine mutations of the translator's lowerings, run with `--programs 300 --seed 2` (failing programs per stage):
 
