@@ -116,7 +116,7 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # more ops with CPU-only checks until now (derivations in cs_w32_misc_ext.asm)
             # ops merged on 2026-11-22 with CPU-only checks (derivations in cs_w32_new_ops.asm)
             # s_movrels_b64 pairs, run-time M0, overlap, SCC kept (cs_w32_movrels64.asm)
-            ("cs_w32_movrels64", [0x5EED0111, 0x5EED0222, 0x5EED0444, 0x5EED0555, 0x5EED0555, 0x5EED0222, 0x5EED0333, 1]),
+            ("cs_w32_movrels64", [0x5EED0111, 0x5EED0222, 0x5EED0444, 0x5EED0555, 0x5EED0555, 0x5EED0111, 0x5EED0222, 1]),
             ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
             ("cs_w32_misc_ext", [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D]),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),

@@ -36,8 +36,8 @@ def model():
     s[14], s[15] = rels(20, 4, 2)
     s[12], = rels(22, 3, 1)
     scc = 1                                                  # s_cmp_eq_u32 s5, 3 with s5 = 3; s_movrels keeps it
-    s[21], s[22] = rels(21, 1, 2)                            # read before the write
-    return [s[10], s[11], s[14], s[15], s[12], s[21], s[22], scc]
+    s[22], s[23] = rels(20, 1, 2)                            # reads s21, s22 before writing s22
+    return [s[10], s[11], s[14], s[15], s[12], s[22], s[23], scc]
 
 
 EXPECTED = model()
@@ -45,8 +45,8 @@ EXPECTED = model()
 
 class Movrels64Fixture(unittest.TestCase):
     def test_reference(self):
-        self.assertEqual(EXPECTED, [0x5EED0111, 0x5EED0222, 0x5EED0444, 0x5EED0555, 0x5EED0555, 0x5EED0222,
-                                    0x5EED0333, 1])
+        self.assertEqual(EXPECTED, [0x5EED0111, 0x5EED0222, 0x5EED0444, 0x5EED0555, 0x5EED0555, 0x5EED0111,
+                                    0x5EED0222, 1])
 
     def test_translated_shader(self):
         spv = support.translate_fixture("cs_w32_movrels64", fssm=FSSM)
@@ -66,6 +66,15 @@ class Movrels64Fixture(unittest.TestCase):
             with self.subTest(file="/".join(rel)):
                 self.assertIsNotNone(m)
                 self.assertEqual([int(v, 0) for v in m.group(1).split(",")], EXPECTED)
+
+    def test_sgpr_pairs_are_even_aligned(self):
+        # LLVM 22+ rejects a 64-bit SGPR pair with an odd base ("invalid register alignment"), and one fixture
+        # llvm-mc can't assemble stops the whole GPU run (TEST-961), so no SGPR range here may start at an odd SGPR
+        with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_w32_movrels64.asm"), encoding="utf-8") as f:
+            body = "".join(ln for ln in f if not ln.startswith(";"))
+        pairs = [(int(a), int(b)) for a, b in re.findall(r"s\[(\d+):(\d+)\]", body)]
+        self.assertTrue(pairs)
+        self.assertEqual([p for p in pairs if p[0] % 2], [])        # any SGPR range: an even base
 
     def test_m0_reaches_the_dynamic_path(self):
         # two of the reads take M0 from v_readfirstlane, which the translator can't fold to a constant

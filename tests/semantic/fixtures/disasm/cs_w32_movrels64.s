@@ -20,7 +20,7 @@
 	s_movrels_b32 s12, s22
 	s_cselect_b32 s13, 1, 0
 	s_mov_b32 m0, 1
-	s_movrels_b64 s[21:22], s[21:22]
+	s_movrels_b64 s[22:23], s[20:21]
 	v_cmpx_eq_u32_e32 0, v0
 	v_mov_b32_e32 v20, 0
 	v_mov_b32_e32 v21, s10
@@ -38,10 +38,10 @@
 	v_mov_b32_e32 v21, s12
 	buffer_store_dword v21, v20, s[0:3], 0 offen
 	v_mov_b32_e32 v20, 20
-	v_mov_b32_e32 v21, s21
+	v_mov_b32_e32 v21, s22
 	buffer_store_dword v21, v20, s[0:3], 0 offen
 	v_mov_b32_e32 v20, 24
-	v_mov_b32_e32 v21, s22
+	v_mov_b32_e32 v21, s23
 	buffer_store_dword v21, v20, s[0:3], 0 offen
 	v_mov_b32_e32 v20, 28
 	v_mov_b32_e32 v21, s13
