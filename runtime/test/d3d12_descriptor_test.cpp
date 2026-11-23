@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Descriptors through the Xbox-ABI proxy over the Vulkan device.
 //   - CopyDescriptors and CopyDescriptorsSimple, checked on the bytes of the heap slots.
 //   - Texture views and samplers (milestone M2, the device's part): CreateShaderResourceView,
@@ -665,6 +666,122 @@ int main() {
 
                 std::puts("[v29 TEST] allocation and descriptor calls completed");
             }
+        }
+
+
+        {
+            char enabled[2]{};
+
+            if (GetEnvironmentVariableA(
+                    "LEONIDA_V32_TEST",enabled,sizeof(enabled))==1 &&
+                enabled[0]=='1') {
+
+                Ref<ID3D12Fence> fence;
+
+                EXPECT(SUCCEEDED(device->CreateFence(
+                    3,D3D12_FENCE_FLAG_NONE,
+                    IID_PPV_ARGS(&fence.p))));
+
+                auto** table=*reinterpret_cast<void***>(fence.p);
+
+                using CounterFn=UINT64(WINAPI*)(ID3D12Fence*);
+                auto counter_fn=reinterpret_cast<CounterFn>(table[12]);
+
+                auto* counter=reinterpret_cast<volatile LONG64*>(
+                    counter_fn(fence.p));
+
+                EXPECT(counter!=nullptr);
+                EXPECT(reinterpret_cast<UINT64>(counter)%8==0);
+
+                auto load=[&]() -> UINT64 {
+                    return static_cast<UINT64>(
+                        InterlockedCompareExchange64(counter,0,0));
+                };
+
+                auto await=[&](UINT64 value) {
+                    const auto deadline=GetTickCount64()+3000;
+
+                    while (GetTickCount64()<deadline) {
+                        if (load()==value) return true;
+                        Sleep(1);
+                    }
+                    return load()==value;
+                };
+
+                EXPECT(load()==3);
+                Sleep(20);
+                EXPECT(load()==3);
+
+                EXPECT(counter_fn(fence.p)==
+                       reinterpret_cast<UINT64>(counter));
+
+                EXPECT(SUCCEEDED(fence->Signal(11)));
+                EXPECT(await(11));
+
+                std::fprintf(stderr,
+                    "[v32 TEST] CPU completion=11 verified\n");
+
+                D3D12_COMMAND_QUEUE_DESC qd{};
+                qd.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+
+                Ref<ID3D12CommandQueue> fence_queue;
+
+                EXPECT(SUCCEEDED(device->CreateCommandQueue(
+                    &qd,IID_PPV_ARGS(&fence_queue.p))));
+
+                EXPECT(SUCCEEDED(fence_queue->Signal(fence.p,19)));
+                EXPECT(await(19));
+                EXPECT(fence->GetCompletedValue()==19);
+
+                std::fprintf(stderr,
+                    "[v32 TEST] queue completion=19 verified\n");
+
+                std::fprintf(stderr,
+                    "[v32 TEST] LIVE FENCE COUNTER PASS\n");
+            }
+        }
+
+
+        if (std::getenv("LEONIDA_V34_A8_1D")) {
+            D3D12_RESOURCE_DESC line{};
+            line.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+            line.Width=128;
+            line.Height=1;
+            line.DepthOrArraySize=1;
+            line.MipLevels=1;
+            line.Format=DXGI_FORMAT_A8_UNORM;
+            line.SampleDesc.Count=1;
+            line.Layout=D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            line.Flags=D3D12_RESOURCE_FLAG_NONE;
+
+            const auto info=
+                device->GetResourceAllocationInfo(0,1,&line);
+
+            EXPECT(info.SizeInBytes!=UINT64_MAX);
+            EXPECT(info.SizeInBytes>=128);
+            EXPECT(info.Alignment!=0);
+
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+            heap.CreationNodeMask=1;
+            heap.VisibleNodeMask=1;
+
+            Ref<ID3D12Resource> texture;
+
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(
+                &heap,D3D12_HEAP_FLAG_NONE,&line,
+                D3D12_RESOURCE_STATE_COMMON,nullptr,
+                IID_PPV_ARGS(&texture.p))));
+
+            EXPECT(texture.p!=nullptr);
+
+            std::fprintf(stderr,
+                "[v34 TEST] A8 1D allocation=%llu alignment=%llu "
+                "resource creation PASS\n",
+                static_cast<unsigned long long>(
+                    info.SizeInBytes),
+                static_cast<unsigned long long>(
+                    info.Alignment));
         }
 
         Ref<ID3D12Resource> byte_textures[2];

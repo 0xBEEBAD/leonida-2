@@ -856,7 +856,13 @@ struct ChildProxy {
     static constexpr unsigned char kQueueLayoutUnknown = 0;
     static constexpr unsigned char kQueueLayoutOlder = 1;   // PC order; PresentX 30, SignalX 23
     static constexpr unsigned char kQueueLayoutNewer = 2;   // +2 shift; PresentX 32, SignalX 25
+
     std::atomic<unsigned char> queue_layout{kQueueLayoutUnknown};
+
+    std::mutex v32_fence_mutex;
+    alignas(8) volatile LONG64 v32_completed=0;
+    HANDLE v32_stop=nullptr;
+    HANDLE v32_worker=nullptr;
 };
 
 template <ChildKind K>
@@ -949,7 +955,187 @@ void reset_child_stats() {
 }
 
 // Frees a proxy whose last reference is gone, with the real object and the device reference it held.
+
+bool v32_enabled(const char* name) {
+    char value[2]{};
+    return GetEnvironmentVariableA(name,value,sizeof(value))==1 &&
+           value[0]=='1';
+}
+
+DWORD WINAPI v32_fence_worker(void* opaque) {
+    auto* self=static_cast<ChildProxy*>(opaque);
+    auto* fence=reinterpret_cast<ID3D12Fence*>(self->real);
+
+    while (WaitForSingleObject(self->v32_stop,1)==WAIT_TIMEOUT) {
+        const UINT64 completed=fence->GetCompletedValue();
+
+        InterlockedExchange64(
+            &self->v32_completed,
+            static_cast<LONG64>(completed));
+    }
+
+    return 0;
+}
+
+std::atomic<std::uintptr_t> v32_monitor_pc{0};
+std::atomic<std::uintptr_t> v32_mwait_pc{0};
+std::atomic<unsigned> v32_monitor_hits{0};
+std::atomic<unsigned> v32_mwait_hits{0};
+
+bool v32_match(const void* address,const unsigned char* bytes,
+               size_t count) {
+    MEMORY_BASIC_INFORMATION mbi{};
+
+    if (!VirtualQuery(address,&mbi,sizeof(mbi)) ||
+        mbi.State!=MEM_COMMIT ||
+        (mbi.Protect & (PAGE_GUARD|PAGE_NOACCESS)))
+        return false;
+
+    const auto at=reinterpret_cast<std::uintptr_t>(address);
+    const auto start=reinterpret_cast<std::uintptr_t>(
+        mbi.BaseAddress);
+
+    if (at<start || at-start>mbi.RegionSize ||
+        count>mbi.RegionSize-(at-start))
+        return false;
+
+    return std::memcmp(address,bytes,count)==0;
+}
+
+// Restricted compatibility handling for the exact
+// observed game fence wait loop.
+//
+// MONITORX is advisory. MWAITX yields, allowing the
+// unchanged game loop to recheck the real counter.
+// No artificial GPU completion is generated.
+
+LONG CALLBACK v32_wait_handler(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    const DWORD code=ep->ExceptionRecord->ExceptionCode;
+
+    if (code!=EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code!=EXCEPTION_PRIV_INSTRUCTION)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    auto* ctx=ep->ContextRecord;
+    const auto rip=static_cast<std::uintptr_t>(ctx->Rip);
+
+    if (rip==v32_monitor_pc.load(std::memory_order_acquire)) {
+        v32_monitor_hits.fetch_add(1,std::memory_order_relaxed);
+        ctx->Rip+=3;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (rip==v32_mwait_pc.load(std::memory_order_acquire)) {
+        v32_mwait_hits.fetch_add(1,std::memory_order_relaxed);
+
+        if (!SwitchToThread()) Sleep(0);
+
+        ctx->Rip+=3;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool v32_install_wait_handler(const void* caller) {
+    const auto address=reinterpret_cast<std::uintptr_t>(caller);
+
+    // v31:
+    // call [rax+0x60] at +0x4fb0aec
+    // return address +0x4fb0aef
+    // MONITORX at +0x4fb0bd7
+    // MWAITX   at +0x4fb0c00
+
+    if (address<3) return false;
+
+    const unsigned char call[]={0xff,0x50,0x60};
+    const unsigned char monitor[]={0x0f,0x01,0xfa};
+    const unsigned char mwait[]={0x0f,0x01,0xfb};
+
+    const auto monitor_pc=address+0xe8;
+    const auto mwait_pc=address+0x111;
+
+    if (!v32_match(
+            reinterpret_cast<const void*>(address-3),
+            call,sizeof(call)) ||
+        !v32_match(
+            reinterpret_cast<const void*>(monitor_pc),
+            monitor,sizeof(monitor)) ||
+        !v32_match(
+            reinterpret_cast<const void*>(mwait_pc),
+            mwait,sizeof(mwait)))
+        return false;
+
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+
+    if (v32_monitor_pc.load()) {
+        return v32_monitor_pc.load()==monitor_pc &&
+               v32_mwait_pc.load()==mwait_pc;
+    }
+
+    static const auto handler=
+        AddVectoredExceptionHandler(1,v32_wait_handler);
+
+    if (!handler) return false;
+
+    v32_monitor_pc.store(monitor_pc,std::memory_order_release);
+    v32_mwait_pc.store(mwait_pc,std::memory_order_release);
+
+    std::fprintf(stderr,
+        "[v32 AMD WAIT] verified MONITORX=%p MWAITX=%p\n",
+        reinterpret_cast<void*>(monitor_pc),
+        reinterpret_cast<void*>(mwait_pc));
+
+    return true;
+}
+
+std::uint64_t v32_fence_counter(ChildProxy* self) {
+    std::lock_guard lock(self->v32_fence_mutex);
+
+    auto* fence=reinterpret_cast<ID3D12Fence*>(self->real);
+
+    if (!self->v32_worker) {
+        const UINT64 completed=fence->GetCompletedValue();
+
+        InterlockedExchange64(
+            &self->v32_completed,
+            static_cast<LONG64>(completed));
+
+        self->v32_stop=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+
+        if (!self->v32_stop) return 0;
+
+        self->v32_worker=CreateThread(
+            nullptr,0,v32_fence_worker,self,0,nullptr);
+
+        if (!self->v32_worker) {
+            CloseHandle(self->v32_stop);
+            self->v32_stop=nullptr;
+            return 0;
+        }
+
+        std::fprintf(stderr,
+            "[v32 FENCE] counter=%p completed=%llu\n",
+            const_cast<LONG64*>(&self->v32_completed),
+            static_cast<unsigned long long>(completed));
+    }
+
+    return reinterpret_cast<std::uint64_t>(
+        &self->v32_completed);
+}
+
 void destroy_child(ChildProxy* self) {
+    // Stop the mirror before releasing its underlying fence.
+    if (self->v32_worker) {
+        SetEvent(self->v32_stop);
+        WaitForSingleObject(self->v32_worker,INFINITE);
+        CloseHandle(self->v32_worker);
+        CloseHandle(self->v32_stop);
+    }
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
     delete self;
@@ -1253,6 +1439,41 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                              reinterpret_cast<void**>(a2)));
     } else {
         note_child_slot<K>(Slot);
+
+        if constexpr (K == ChildKind::fence && Slot == 12) {
+            const bool test=v32_enabled("LEONIDA_V32_TEST");
+
+            if ((self->device->console_lists || test) &&
+                v32_enabled("LEONIDA_V32_FENCE")) {
+
+                if (!test &&
+                    !v32_install_wait_handler(_ReturnAddress())) {
+
+                    std::fprintf(stderr,
+                        "[v32 FENCE] unrecognised slot12 caller=%p\n",
+                        _ReturnAddress());
+
+                    RaiseException(0xe032000cu,
+                                   EXCEPTION_NONCONTINUABLE,
+                                   0,nullptr);
+                    return 0;
+                }
+
+                const auto counter=v32_fence_counter(self);
+
+                if (!counter) {
+                    RaiseException(0xe032000du,
+                                   EXCEPTION_NONCONTINUABLE,
+                                   0,nullptr);
+                    return 0;
+                }
+
+                d3d12_trace::record(
+                    "XboxID3D12Fence::GetCompletionAddress");
+
+                return counter;
+            }
+        }
         if constexpr (
             (K == ChildKind::allocator && Slot == 9) ||
             (K == ChildKind::queue &&
@@ -4225,6 +4446,43 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         v16_log_forward(
             Slot, self, _ReturnAddress(),
             a1, a2, a3, a4, a5);
+
+
+        if constexpr (Slot == 81) {
+            if (self->console_lists &&
+                v32_enabled("LEONIDA_V34_STATS") &&
+                a2 == 0x11100u &&
+                a3 && a4) {
+
+                const auto caller =
+                    reinterpret_cast<std::uintptr_t>(
+                        _ReturnAddress());
+
+                const unsigned char call_bytes[] = {
+                    0xff,0x90,0x88,0x02,0x00,0x00
+                };
+
+                const unsigned char return_bytes[] = {
+                    0x85,0xc0
+                };
+
+                if (caller >= sizeof(call_bytes) &&
+                    v32_match(
+                        reinterpret_cast<const void*>(
+                            caller-sizeof(call_bytes)),
+                        call_bytes,sizeof(call_bytes)) &&
+                    v32_match(
+                        reinterpret_cast<const void*>(caller),
+                        return_bytes,sizeof(return_bytes))) {
+
+                    std::fprintf(stderr,
+                        "[v35 SLOT81] optional record query "
+                        "unsupported; caller failure path used\n");
+
+                    return hr_to_u64(E_NOTIMPL);
+                }
+            }
+        }
 
         if (self->console_lists && Slot >= 44) {
             char strict[2]{};

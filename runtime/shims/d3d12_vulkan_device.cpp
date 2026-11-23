@@ -1,3 +1,4 @@
+#include <fstream>
 #include "../src/v29_packed16.h"
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
@@ -986,7 +987,13 @@ struct DeviceState {
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
         if (desc.Format == DXGI_FORMAT_A8_UNORM) {
-            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+            if ((desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+ !(desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+   desc.Height == 1 &&
+   desc.DepthOrArraySize == 1 &&
+   desc.Flags == D3D12_RESOURCE_FLAG_NONE &&
+   std::getenv("LEONIDA_V34_A8_1D"))) ||
+ desc.SampleDesc.Count != 1 ||
                 (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
                 return {};
             if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
@@ -3821,6 +3828,74 @@ public:
         const leonida::ShaderEntry* entry = pick_entry(library->program_candidates("cs", program, &ambiguous),
                                                        [](const leonida::ShaderEntry&) { return true; });
         if (!entry) {
+            // Save the actual missing shader's bytes and state
+            // for local translation, not for publication.
+            try {
+                const char* directory =
+                    std::getenv("LEONIDA_V35_CAPTURE");
+
+                if (directory &&
+                    desc.CS.BytecodeLength <= 16u*1024u*1024u) {
+
+                    const auto code_hash =
+                        leonida::sha256_hex(program.bytes);
+
+                    const auto state_hash =
+                        leonida::sha256_hex(program.state);
+
+                    const auto prefix =
+                        std::filesystem::path(directory) /
+                        (code_hash+"_"+state_hash);
+
+                    static std::mutex capture_mutex;
+                    std::lock_guard lock(capture_mutex);
+
+                    auto save=[&](
+                        const char* suffix,
+                        const void* data,
+                        size_t size) {
+
+                        auto path=prefix;
+                        path+=suffix;
+
+                        if (std::filesystem::exists(path))
+                            return;
+
+                        std::ofstream file(
+                            path,std::ios::binary);
+
+                        if (file && size)
+                            file.write(
+                                static_cast<const char*>(data),
+                                static_cast<std::streamsize>(size));
+                    };
+
+                    save(".original",
+                         desc.CS.pShaderBytecode,
+                         desc.CS.BytecodeLength);
+
+                    save(".code",
+                         program.bytes.data(),
+                         program.bytes.size());
+
+                    save(".state",
+                         program.state.data(),
+                         program.state.size());
+
+                    std::fprintf(stderr,
+                        "[v35 CAPTURE] code=%s state=%s "
+                        "code_bytes=%llu state_bytes=%llu\n",
+                        code_hash.c_str(),state_hash.c_str(),
+                        static_cast<unsigned long long>(
+                            program.bytes.size()),
+                        static_cast<unsigned long long>(
+                            program.state.size()));
+                }
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[v35 CAPTURE] unable to save shader\n");
+            }
+
             const bool fspx = program.kind == leonida::ComputeProgram::Kind::fspx;
             if (ambiguous)
                 std::fprintf(stderr, "[rt] d3d12: FSPX kind-6 program sha256 %s is ambiguous without its kind-0 "
