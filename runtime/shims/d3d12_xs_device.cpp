@@ -23,6 +23,7 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#include "d3d12_xs_placed_depth.h"
 #include "d3d12_trace.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -44,7 +45,7 @@
 namespace rt::d3d12_xs {
 namespace {
 
-constexpr unsigned kMaxSlots = 128;
+constexpr unsigned kMaxSlots = 134;  // includes the measured CreatePlacedResourceX slot
 static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
@@ -61,6 +62,8 @@ struct DeviceProxy {
     void** dxgi_vtable;
     DxgiAdapterProvider adapter_provider;
     DepthStencilUavProvider depth_stencil_uav_provider = nullptr;
+    ValidateDepthPlacement validate_depth_placement = nullptr;
+    PlacedDepthTextures placed_depth_textures;
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
     // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
@@ -148,6 +151,7 @@ const char* slot_name(unsigned slot) {
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 133: return "Xbox CreatePlacedResourceX";
         default: return "forwarded";
     }
 }
@@ -1453,6 +1457,64 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     return hr;
 }
 
+bool supports_depth_uav(const DeviceProxy* self, const D3D12_RESOURCE_DESC& desc) {
+    constexpr auto flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return self->depth_stencil_uav_provider && (desc.Flags & flags) == flags &&
+           desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_R16_TYPELESS) &&
+           desc.DepthOrArraySize && desc.MipLevels == 1 && desc.SampleDesc.Count == 1;
+}
+
+D3D12_RESOURCE_DESC depth_image_desc(D3D12_RESOURCE_DESC desc) {
+    // Keep desktop resource flags up to RTAS and USE_TIGHT_ALIGNMENT. Xbox stores additional flags above them.
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>((UINT(desc.Flags) & 0x5ffu) &
+                                                  ~UINT(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    return desc;
+}
+
+D3D12_RESOURCE_STATES depth_image_state(D3D12_RESOURCE_STATES requested) {
+    return requested == D3D12_RESOURCE_STATE_UNORDERED_ACCESS ? D3D12_RESOURCE_STATE_COMMON : requested;
+}
+
+HRESULT create_depth_uav_backing(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* props, D3D12_HEAP_FLAGS flags,
+                                 const D3D12_RESOURCE_DESC& native, D3D12_RESOURCE_STATES initial,
+                                 const D3D12_CLEAR_VALUE* clear, ID3D12Resource** out) {
+    // The logical Xbox texture has a UAV. Its writable planes take ALLOW_SHADER_ATOMICS, which the PC
+    // rejects on the depth-only attachment. Upload/readback heaps cannot hold a UAV on either API.
+    if (props && (props->Type == D3D12_HEAP_TYPE_UPLOAD || props->Type == D3D12_HEAP_TYPE_READBACK))
+        return E_INVALIDARG;
+    const auto storage_flags = flags & D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
+    HRESULT hr = self->real->CreateCommittedResource(props, flags & ~storage_flags, &native, initial, clear,
+                                                     IID_PPV_ARGS(out));
+    if (FAILED(hr)) return hr;
+    hr = self->depth_stencil_uav_provider(*out, storage_flags);
+    if (FAILED(hr)) {
+        (*out)->Release();
+        *out = nullptr;
+    }
+    return hr;
+}
+
+HRESULT proxy_create_placed_depth(DeviceProxy* self, UINT64 address, const D3D12_RESOURCE_DESC* desc,
+                                  UINT state, const D3D12_CLEAR_VALUE* clear, const IID* riid, void** out) {
+    note_slot(133);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!self->validate_depth_placement) return E_NOTIMPL;
+    if (!desc || !riid) return E_POINTER;
+    if (!supports_depth_uav(self, *desc)) return E_NOTIMPL;
+    const auto native = depth_image_desc(*desc);
+    const auto initial = state == UINT_MAX ? D3D12_RESOURCE_STATE_COMMON
+                                           : depth_image_state(static_cast<D3D12_RESOURCE_STATES>(state));
+    if (!self->validate_depth_placement(native, initial, clear)) return E_INVALIDARG;
+    const auto alloc = self->real->GetResourceAllocationInfo(0, 1, &native);
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    return self->placed_depth_textures.create(address, native, alloc, clear, *riid, out, [&](ID3D12Resource** backing) {
+        return create_depth_uav_backing(self, &heap, D3D12_HEAP_FLAG_NONE, native, initial, clear, backing);
+    });
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -1477,20 +1539,12 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                      "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
-    constexpr auto depth_uav_flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if (self->depth_stencil_uav_provider && (xbox_desc->Flags & depth_uav_flags) == depth_uav_flags &&
-        pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && pc_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS &&
-        pc_desc.DepthOrArraySize == 1 && pc_desc.MipLevels == 1 && pc_desc.SampleDesc.Count == 1) {
-        pc_desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        // Only the color storage images need UAV access. The native depth image must be created in a legal PC state.
-        const auto depth_state = initial_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                     ? D3D12_RESOURCE_STATE_COMMON : initial_state;
+    if (supports_depth_uav(self, *xbox_desc)) {
         ID3D12Resource* resource = nullptr;
-        HRESULT hr = self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, depth_state,
-                                                         clear_value, IID_PPV_ARGS(&resource));
+        HRESULT hr = create_depth_uav_backing(self, heap_properties, heap_flags, depth_image_desc(pc_desc),
+                                              depth_image_state(initial_state), clear_value, &resource);
         if (FAILED(hr)) return hr;
-        hr = self->depth_stencil_uav_provider(resource);
-        if (SUCCEEDED(hr)) hr = resource->QueryInterface(*riid, out);
+        hr = resource->QueryInterface(*riid, out);
         resource->Release();
         return hr;
     }
@@ -1539,6 +1593,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 133) {
+        return hr_to_u64(proxy_create_placed_depth(self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
+                                                   static_cast<UINT>(a3), reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4),
+                                                   reinterpret_cast<const IID*>(a5), reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -1702,10 +1760,11 @@ bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {
     return true;
 }
 
-bool set_depth_stencil_uav_provider(void* device, DepthStencilUavProvider provider) {
+bool set_depth_stencil_uav_provider(void* device, DepthStencilUavProvider provider, ValidateDepthPlacement validate) {
     auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
     if (!proxy) return false;
     proxy->depth_stencil_uav_provider = provider;
+    proxy->validate_depth_placement = validate;
     return true;
 }
 
@@ -1731,7 +1790,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
         slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76)
+        slot == 75 || slot == 76 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

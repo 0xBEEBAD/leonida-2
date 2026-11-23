@@ -572,10 +572,7 @@ struct DeviceState {
 
     template<typename CreateInfo>
     void share(CreateInfo& create) const {
-        if (families.size() < 2) return;
-        create.sharingMode = VK_SHARING_MODE_CONCURRENT;
-        create.queueFamilyIndexCount = std::uint32_t(families.size());
-        create.pQueueFamilyIndices = families.data();
+        leonida::share_across_queue_families(create, families);
     }
     std::unique_ptr<leonida::VulkanContext> context;
     VkPhysicalDeviceMemoryProperties memory{};
@@ -1712,8 +1709,7 @@ private:
 class Resource final
     : public Child<Resource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource> {
 public:
-    // {9b3e5f12-7c48-4d0e-a6b1-2f8d4c7e9a35}
-    static constexpr GUID kTag{0x9b3e5f12, 0x7c48, 0x4d0e, {0xa6, 0xb1, 0x2f, 0x8d, 0x4c, 0x7e, 0x9a, 0x35}};
+    static constexpr GUID kTag = rt::d3d12_xs::kVulkanResourceTag;
 
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags)
@@ -2098,31 +2094,35 @@ public:
 
     // The Xbox proxy calls this before publishing an allocated depth texture. Each storage plane owns a
     // regular color image with its own GFX10 address, so a UAV cannot replace the original SRV in set 0.
-    HRESULT enable_depth_stencil_uav() {
-        if (!image_ || desc_.Format != DXGI_FORMAT_R32G8X24_TYPELESS ||
+    HRESULT enable_depth_stencil_uav(D3D12_HEAP_FLAGS storage_heap_flags) {
+        const bool depth16 = desc_.Format == DXGI_FORMAT_R16_TYPELESS;
+        if (!image_ || (!depth16 && desc_.Format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
             !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
             desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc_.MipLevels != 1 ||
-            desc_.DepthOrArraySize != 1 || desc_.SampleDesc.Count != 1)
+            !desc_.DepthOrArraySize || desc_.SampleDesc.Count != 1)
             return E_INVALIDARG;
         if (storage_planes_[0]) return S_OK;
         try {
             decltype(storage_planes_) planes;
             D3D12_RESOURCE_DESC plane_desc = desc_;
             plane_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-            constexpr DXGI_FORMAT formats[] = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8_UINT};
-            for (UINT plane = 0; plane < planes.size(); ++plane) {
+            // D16 copies through a buffer as raw UNORM bits. R16_UINT lets an Xbox UAV read/write those bits.
+            const DXGI_FORMAT formats[] = {depth16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8_UINT};
+            const UINT plane_count = depth16 ? 1 : 2;
+            for (UINT plane = 0; plane < plane_count; ++plane) {
                 plane_desc.Format = formats[plane];
-                planes[plane] = std::make_unique<Resource>(device_, plane_desc, heap_, D3D12_HEAP_FLAG_NONE);
+                planes[plane] = std::make_unique<Resource>(device_, plane_desc, heap_, storage_heap_flags);
                 const HRESULT hr = planes[plane]->create_texture(device_.texture_format(plane_desc));
                 if (FAILED(hr)) return hr;
             }
             // Replacing the binding preserves the tracked layout of the original depth/stencil image.
             auto binding = binding_;
             binding.depth_uav = planes[0]->id();
-            binding.stencil_uav = planes[1]->id();
+            binding.stencil_uav = planes[1] ? planes[1]->id() : 0;
             device_.context->add_resource(id(), binding);
             binding_ = binding;
             storage_planes_ = std::move(planes);
+            heap_flags_ |= storage_heap_flags;  // GetHeapProperties describes the caller's entire logical texture.
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
         }
@@ -4937,6 +4937,31 @@ public:
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
         state_.context->set_graphics_family(info.queue_family);
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+        if (info.maintenance10 && info.physical) {
+            const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFormatProperties2"));
+            if (get_props) {
+                const auto aspects = [&](VkFormat format) {
+                    VkFormatProperties3 props{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+                    VkFormatProperties2 query{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &props};
+                    get_props(info.physical, format, &query);
+                    VkImageAspectFlags mask = 0;
+                    if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR)
+                        mask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+                    if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR)
+                        mask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                    return mask;
+                };
+                state_.context->set_compute_copy_aspects(
+                    [d16 = aspects(VK_FORMAT_D16_UNORM), ds = aspects(VK_FORMAT_D32_SFLOAT_S8_UINT)](VkFormat format) {
+                        if (format == VK_FORMAT_D16_UNORM) return d16;
+                        if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) return ds;
+                        return VkImageAspectFlags{};
+                    });
+            }
+        }
+#endif
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -4971,7 +4996,7 @@ public:
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        });
+        }, state_.families);
         if (info.buffer_device_address && info.physical && info.get_instance_proc) {
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
@@ -5123,7 +5148,8 @@ public:
                                  "sampler heap (%u of %u besides the fallback): its limits or "
                                  "vkGetDescriptorSetLayoutSupport allow no more\n",
                          features.counts[b::sampler_binding] - 1, unsigned(D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE));
-        state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features);
+        state_.bindless = std::make_unique<leonida::BindlessSet>(get_device, state_.info.device, state_.memory, features,
+                                                                 state_.families);
         if (!state_.bindless->ok() || !state_.context->vk.vkCreateSampler) {
             state_.bindless.reset();
             return false;
@@ -6476,29 +6502,8 @@ public:
             log_once("unordered-access view of a texture with a counter resource; dimension", int(r->desc().Dimension));
             return;
         }
-        if (r->depth_stencil_uav(0)) {
-            if (!desc || desc->ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc->Texture2D.MipSlice) {
-                log_once("Xbox depth-stencil UAV requires an explicit 2D mip-zero view; dimension",
-                         desc ? int(desc->ViewDimension) : 0);
-                return;
-            }
-            const Resource* plane = r->depth_stencil_uav(desc->Texture2D.PlaneSlice);
-            if (!plane) {
-                log_once("unsupported Xbox depth-stencil UAV plane", int(desc->Texture2D.PlaneSlice));
-                return;
-            }
-            if (desc->Format != plane->desc().Format) {
-                log_once(desc->Texture2D.PlaneSlice ? "unsupported Xbox stencil UAV format"
-                                                   : "unsupported Xbox depth UAV format", int(desc->Format));
-                return;
-            }
-            TextureView view{};
-            view.format = desc->Format;
-            view.mip_count = view.layer_count = 1;
-            write_image_descriptor(*plane, view, destination, ImageViewUse::depth_stencil_uav);
-            return;
-        }
-        if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+        const bool depth_uav = r->depth_stencil_uav(0) != nullptr;
+        if (!depth_uav && !(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));
             return;
@@ -6536,6 +6541,25 @@ public:
                 log_once("unordered-access view dimension not supported:", desc->ViewDimension);
                 return;
             }
+        }
+        if (depth_uav) {
+            const UINT layers = r->desc().DepthOrArraySize;
+            if (!desc || !(desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY ||
+                           (desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D && layers == 1)) ||
+                view.first_mip || !view.layer_count || view.first_layer >= layers ||
+                (view.layer_count != UINT_MAX && view.layer_count > layers - view.first_layer)) {
+                log_once("Xbox depth-stencil UAV requires a valid mip-zero 2D or array view; dimension",
+                         desc ? int(desc->ViewDimension) : 0);
+                return;
+            }
+            const Resource* storage = r->depth_stencil_uav(view.plane);
+            if (!storage || view.format != storage->desc().Format) {
+                log_once("unsupported Xbox depth-stencil UAV plane or format; format", int(view.format));
+                return;
+            }
+            view.plane = 0;  // The chosen shadow is a single-plane colour image with the same array layers.
+            write_image_descriptor(*storage, view, destination, ImageViewUse::depth_stencil_uav);
+            return;
         }
         // B8G8R8X8 has no typed UAV, so no format of its family gives an unordered-access view.
         if (alpha_unused(r->desc().Format) || alpha_unused(view.format)) {
@@ -8415,9 +8439,9 @@ bool is_sparse_image(ID3D12Resource* resource) {
     return object && object->sparse_image();
 }
 
-static HRESULT enable_depth_stencil_uav(ID3D12Resource* resource) {
+static HRESULT enable_depth_stencil_uav(ID3D12Resource* resource, D3D12_HEAP_FLAGS storage_heap_flags) {
     Resource* r = Resource::from<Resource>(resource);
-    return r ? r->enable_depth_stencil_uav() : E_INVALIDARG;
+    return r ? r->enable_depth_stencil_uav(storage_heap_flags) : E_INVALIDARG;
 }
 
 leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t address) {
@@ -8425,7 +8449,7 @@ leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t a
     if (!r || !r->depth_stencil_uav(0)) return resource_id(resource);
     for (UINT plane = 0; plane < 2; ++plane) {
         const Resource* storage = r->depth_stencil_uav(plane);
-        if (storage->image_address() == address) return storage->id();
+        if (storage && storage->image_address() == address) return storage->id();
     }
     return 0;
 }
@@ -8441,7 +8465,12 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
     // a host DXGI object from it.
     if (!rt::d3d12_xs::is_device_proxy(outer)) return;
-    rt::d3d12_xs::set_depth_stencil_uav_provider(outer, &enable_depth_stencil_uav);
+    rt::d3d12_xs::set_depth_stencil_uav_provider(outer, &enable_depth_stencil_uav,
+        [](const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear) {
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            return !committed_resource_refusal(heap, D3D12_HEAP_FLAG_NONE, desc, state, clear, false, false);
+        });
     rt::d3d12_xs::set_device_adapter_provider(outer, [](ID3D12Device* real, REFIID riid, void** out) {
         IDXGIFactory1* factory = nullptr;
         HRESULT hr = create_dxgi_factory(real, __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
@@ -9359,6 +9388,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     }
 #endif
 
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+    VkPhysicalDeviceMaintenance10FeaturesKHR maintenance10{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_FEATURES_KHR};
+    // Vulkan 1.3 makes the 64-bit optimal tiling format features used by this path core.
+    if (v13.core && has_device_extension(VK_KHR_MAINTENANCE_10_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance10};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.maintenance10 = maintenance10.maintenance10 == VK_TRUE;
+        if (info.maintenance10) {
+            maintenance10.pNext = *v13.next();
+            *v13.next() = &maintenance10;
+        }
+    }
+#endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     // VK_KHR_shader_fma: OpFmaKHR is a single-rounding multiply-add in SPIR-V (GLSL.std.450 Fma may round twice).
     // Translated shaders built with `rdna2spirv.py --fma khr` need it (index capability FMAKHR, feature
@@ -9497,6 +9539,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+#endif
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+    if (info.maintenance10) device_extensions.push_back(VK_KHR_MAINTENANCE_10_EXTENSION_NAME);
 #endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);

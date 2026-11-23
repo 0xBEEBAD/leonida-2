@@ -5,7 +5,7 @@
 // interfaces as far as is known; docs/d3d12_vulkan.md section 3.1 lists what is still unverified.
 //
 // Contracts with the rest of the layer (the device proxy that will hand these objects out):
-// - an ID3D12Resource's leonida::ResourceId is its pointer value; the device registers it with the VulkanContext;
+// - a resource's ID is its backing pointer value (identical Xbox depth placements share storage and layouts);
 // - so is an ID3D12QueryHeap's leonida::QueryHeapId, registered with its VkQueryPool;
 // - the CPU handle of an RTV or DSV points at a leonida::TargetView in the device's descriptor heap.
 #pragma once
@@ -15,6 +15,7 @@
 #include <memory>
 #include <vector>
 
+#include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
 
@@ -154,6 +155,7 @@ struct VulkanDeviceInfo {
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
     bool maintenance8 = false;
+    bool maintenance10 = false;  // VK_KHR_maintenance10 enabled: query depth/stencil copy support per format
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
@@ -412,7 +414,7 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands);
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
-    return reinterpret_cast<leonida::ResourceId>(resource);
+    return reinterpret_cast<leonida::ResourceId>(rt::d3d12_xs::texture_backing(resource));
 }
 
 // A query heap's ID in the command-list IR and the VulkanContext: its pointer value, as for resources.

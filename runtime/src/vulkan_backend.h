@@ -1363,6 +1363,9 @@ public:
     // and records what the set needs first. When it fails, nothing of that call is executed.
     void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
     void set_graphics_family(std::uint32_t family) { graphics_family_ = family; }
+    void set_compute_copy_aspects(std::function<VkImageAspectFlags(VkFormat)> check) {
+        replay_.compute_copy_aspects = std::move(check);
+    }
 
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
         std::unique_lock lock(resource_mutex_);
@@ -1387,9 +1390,10 @@ public:
 
     // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
     // `allocate`. Without this such a copy is refused as unsupported.
-    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
+    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate,
+                             std::vector<std::uint32_t> families = {}) {
         std::unique_lock lock(resource_mutex_);
-        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
+        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), std::move(families));
         if (!scratch_->loaded()) scratch_.reset();
     }
 
@@ -2450,8 +2454,7 @@ private:
                 storage_init_seen_ = context_.storage_init_version_;
             }
             // The set this submission binds may be a new generation whose table another queue's submission uploads:
-            // wait for that one, as for the storage images (the table's buffers are used by one queue family only:
-            // every D3D12 queue of the device is made in info.queue_family).
+            // wait for that one, as for the storage images. The table and fallback images share the device's families.
             if (context_.bindless_upload_semaphore_ && context_.bindless_upload_semaphore_ != progress_ &&
                 context_.bindless_upload_version_ != bindless_upload_seen_) {
                 waits_.push_back(context_.bindless_upload_semaphore_);

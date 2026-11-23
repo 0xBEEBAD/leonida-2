@@ -330,7 +330,7 @@ int main(int argc, char** argv) {
         auto ds_uav = xbox_texture;
         ds_uav.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
         ds_uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        check(rt::d3d12_xs::set_depth_stencil_uav_provider(device.Get(), [](ID3D12Resource*) -> HRESULT {
+        check(rt::d3d12_xs::set_depth_stencil_uav_provider(device.Get(), [](ID3D12Resource*, D3D12_HEAP_FLAGS) -> HRESULT {
             return E_OUTOFMEMORY;
         }), "install a failing Xbox storage-image provider");
         void* result = reinterpret_cast<void*>(1);

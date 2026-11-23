@@ -43,6 +43,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "descriptor_table.h"
+#include "queue_families.h"
 
 #include <vulkan/vulkan.h>
 
@@ -52,6 +53,7 @@
 #include <cstring>
 #include <functional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -314,8 +316,8 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
 class BindlessSet {
 public:
     BindlessSet(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
-                BindlessFeatures features = {})
-        : device_(device), memory_(memory), features_(features) {
+                BindlessFeatures features = {}, std::vector<std::uint32_t> families = {})
+        : device_(device), memory_(memory), features_(features), families_(std::move(families)) {
         ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
     }
 
@@ -713,6 +715,7 @@ private:
                 if (t != ms_type) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
                 if (t == ms_type || c == 0) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
                 FallbackImage& image = fallback_images_[t * classes + c];
+                share_across_queue_families(info, families_);
                 if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
                 VkMemoryRequirements requirements{};
                 vk_.vkGetImageMemoryRequirements(device_, image.image, &requirements);
@@ -760,6 +763,7 @@ private:
                      (device_local ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         TableBuffer made;
         made.size = bytes;
+        share_across_queue_families(info, families_);
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &made.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, made.buffer, &requirements);
@@ -1014,6 +1018,7 @@ private:
     VkDevice device_;
     VkPhysicalDeviceMemoryProperties memory_;
     BindlessFeatures features_;
+    std::vector<std::uint32_t> families_;
     Functions vk_;
     bool ok_ = false;
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;

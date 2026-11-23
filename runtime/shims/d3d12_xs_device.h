@@ -49,6 +49,7 @@
 
 #include <d3d12.h>
 
+#include <atomic>
 #include <cstdint>
 
 namespace rt::d3d12_xs {
@@ -74,9 +75,27 @@ bool is_device_proxy(const void* device);
 using DxgiAdapterProvider = HRESULT (*)(ID3D12Device* real, REFIID riid, void** out);
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither: nothing is set then.
 bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
-// Called before publishing a slot-76 resource when the backend can implement the Xbox depth/stencil UAV views.
-using DepthStencilUavProvider = HRESULT (*)(ID3D12Resource* resource);
-bool set_depth_stencil_uav_provider(void* device, DepthStencilUavProvider provider);
+// Called before publishing an Xbox resource when the backend can implement its depth/stencil UAV views.
+using DepthStencilUavProvider = HRESULT (*)(ID3D12Resource* resource, D3D12_HEAP_FLAGS storage_heap_flags);
+using ValidateDepthPlacement = bool (*)(const D3D12_RESOURCE_DESC&, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*);
+bool set_depth_stencil_uav_provider(void* device, DepthStencilUavProvider provider,
+                                    ValidateDepthPlacement validate_placement = nullptr);
+
+// The Vulkan implementation uses this private interface to look up an image for view creation.
+inline constexpr GUID kVulkanResourceTag{0x9b3e5f12, 0x7c48, 0x4d0e, {0xa6, 0xb1, 0x2f, 0x8d, 0x4c, 0x7e, 0x9a, 0x35}};
+
+// Identically placed Xbox depth textures have distinct COM identities but refer to one GPU image and layout.
+// Only these wrappers carry a backing pointer. Every other resource retains its ordinary pointer-valued IR ID.
+struct PlacedDepthInterface : ID3D12Resource {
+    ID3D12Resource* backing = nullptr;
+};
+inline std::atomic<const void*> placed_depth_vtable{nullptr};
+inline const ID3D12Resource* texture_backing(const ID3D12Resource* resource) {
+    const void* vtable = placed_depth_vtable.load(std::memory_order_acquire);
+    if (resource && vtable && *reinterpret_cast<const void* const*>(resource) == vtable)
+        return static_cast<const PlacedDepthInterface*>(resource)->backing;
+    return resource;
+}
 // The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.
 void* device_proxy_from_dxgi_device(void* dxgi_device);
 // The device proxy itself, given the proxy or its DXGI pointer; null for anything else.

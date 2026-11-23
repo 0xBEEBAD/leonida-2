@@ -105,6 +105,7 @@ public:
     bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool storage_image_extended_formats = false; // typed r8ui storage images
+    bool maintenance10 = false;  // depth/stencil transfers on non-graphics families, per format
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
@@ -566,6 +567,21 @@ public:
         if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+#ifdef VK_KHR_maintenance10
+        VkPhysicalDeviceMaintenance10FeaturesKHR maint10{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_FEATURES_KHR};
+        if (v13_.core && all_queue_types && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_10_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maint10};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            maintenance10 = maint10.maintenance10 == VK_TRUE;
+            if (maintenance10) {
+                maint10.pNext = *v13_.next();
+                *v13_.next() = &maint10;
+                device_extensions.push_back(VK_KHR_MAINTENANCE_10_EXTENSION_NAME);
+            }
+        }
+#endif
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
 #if defined(VK_KHR_swapchain_maintenance1)

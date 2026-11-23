@@ -37,6 +37,8 @@ struct FakeVulkan {
     int free_memory_calls = 0;
     int wait_idle_calls = 0;
     int get_counter_calls = 0;
+    VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+    std::vector<std::uint32_t> families;
 
     VkResult create_buffer_result = VK_SUCCESS;
     VkResult bind_result = VK_SUCCESS;
@@ -52,6 +54,9 @@ const VkDevice k_device = make_handle<VkDevice>(0x100);
 VKAPI_ATTR VkResult VKAPI_CALL fake_create_buffer(
     VkDevice, const VkBufferCreateInfo* info, const VkAllocationCallbacks*, VkBuffer* out) {
     ++g_vk->create_buffer_calls;
+    g_vk->sharing_mode = info->sharingMode;
+    if (info->queueFamilyIndexCount)
+        g_vk->families.assign(info->pQueueFamilyIndices, info->pQueueFamilyIndices + info->queueFamilyIndexCount);
     if (g_vk->create_buffer_result != VK_SUCCESS) return g_vk->create_buffer_result;
     const std::uintptr_t id = g_vk->next_buffer++;
     g_vk->live_buffers[id] = info->size;
@@ -148,7 +153,7 @@ int main() {
         g_vk = &vk;
         constexpr VkDeviceSize k_4mib = 4u << 20;
         {
-            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate);
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate, {2, 5});
             EXPECT(scratch.loaded());
 
             VkBuffer buf = VK_NULL_HANDLE;
@@ -157,6 +162,7 @@ int main() {
             EXPECT(vk.create_buffer_calls == 0);
 
             EXPECT(scratch.get(100, buf, off));
+            EXPECT(vk.sharing_mode == VK_SHARING_MODE_CONCURRENT && vk.families == std::vector<std::uint32_t>({2, 5}));
             const VkBuffer chunk1 = buf;
             EXPECT(chunk1 != VK_NULL_HANDLE && off == 0);
             EXPECT(vk.live_buffers[reinterpret_cast<std::uintptr_t>(chunk1)] == k_4mib);
