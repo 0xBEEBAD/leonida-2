@@ -21,11 +21,11 @@ Every one of the 22 has at least one site, so none is dead code the linker kept.
 
 | Import | Sites | What the sites show |
 |---|---:|---|
-| `AcpHalCreate` | 1 | first argument is the address of a global that is read right after the call (an out parameter); second is 0. The result is tested for a negative value and a negative one jumps to a cleanup path |
-| `AcpHalAllocateShapeContexts` | 1 | first argument is the address of another global, read afterwards; the result is tested for a negative value like the one above |
+| `AcpHalCreate` | 1 | one argument, the address of a global that is read right after the call (an out parameter); no second argument is set up. A negative result makes the audio init fail. On success the title calls the returned object's slot 0 with two dwords, and later slot 2 with five arguments, and either one failing does the same ([below](#what-the-executable-does-when-a-call-fails)) |
+| `AcpHalAllocateShapeContexts` | 1 | first argument is the address of another global, a struct whose fifth count the title sets to 350 and whose other counts it zeroes. A negative result makes the audio init fail. On success the title clears count x 64 bytes through the struct's fifth context pointer, so the callee has to fill that pointer |
 | `AcpHalReleaseShapeContexts` | 1 | called with a handle read from the first global; result not used |
 | `ApuCreateHeap` | 1 | second argument `0x226e00`; the result is tested for a negative value |
-| `ApuAlloc` | 1 | second argument `0`, third a computed value, fourth `0x800`; the result is not used at the site |
+| `ApuAlloc` | 1 | second argument `0`, third a computed value, fourth `0x800`. The result is not used at the site, but the title writes through the returned virtual address right after the call, so it must be real memory |
 | `ApuFree` | 1 tail jump | no call, only a tail jump from a wrapper |
 | `ApuIsVirtualAddressValid` | 4 | second argument `0x40`, `0x80`, `0x800`, `0x800`; the result byte is tested |
 | `ApuMapVirtualAddress` | 4 | the same pointer and the same four constants as `ApuIsVirtualAddressValid`, one after the other; the 32-bit result is stored in a per-entry record |
@@ -39,7 +39,7 @@ turns such an address back into a pointer. That is an inference from the shapes;
 
 | Import | Sites | What the sites show |
 |---|---:|---|
-| `XApuConnect` | 1 | no argument loaded in the lines before the call was read |
+| `XApuConnect` | 1 | three arguments, each the address of a global. A negative result makes the audio init fail |
 | `XApuDisconnect` | 1 | first argument a handle read from a global, second `0x20`; the global is set to 0 right after |
 | `XApuEnqueueCommand` | 4 | the same global handle, a pointer to a stack-built command, and 0 |
 | `XApuDequeueResult` | 1 | the same global handle and a second argument; the result is tested for a negative value |
@@ -63,15 +63,33 @@ with a result queue, connected once and torn down once. How `chad.dll`'s handle 
 `DStorageGetFactory` has the shape of the public DirectStorage function `DStorageGetFactory(REFIID, void**)`. #4348 is an
 open pull request for it.
 
-## What the executable already does about a failure
+## What the executable does when a call fails
 
-Four of the calls above have a branch for a negative result: `AcpHalCreate`, `AcpHalAllocateShapeContexts`,
-`ApuCreateHeap` and `XApuDequeueResult`. An unimplemented import under `LEONIDA_UNIMPLEMENTED=log` returns 0, so a caller
-that tests for a negative result sees success with its outputs unset; under `fail` only imports `classify_import`
-knows to return an `HRESULT` get `E_NOTIMPL`, and none of these four is on that list (it names only functions the public
-documentation describes). So today neither mode makes the executable take its own failure path for the audio hardware.
-Whether the title survives that path, or needs the coprocessor, is **unmeasured**: it takes a run to find out, and the
-first run reported in #6603 stops earlier, in `D3D12ConfigureVirtualMemoryX`.
+One function runs the audio init, and it makes three checks in order. Any failure goes to one `int3` in that
+function, so there is no path without audio:
+
+1. `ApuCreateHeap` gives a non-negative HRESULT.
+2. A HAL init routine returns true. It:
+   - calls `AcpHalAllocateShapeContexts` (negative: false);
+   - calls `ApuAlloc` and writes through the returned address;
+   - calls `AcpHalCreate` (negative: false);
+   - calls the returned object's slot 0 (negative: false);
+   - calls `CreateEventA`;
+   - waits in a `Sleep(10)` loop while a status dword is negative;
+   - returns `SUCCEEDED` of the object's slot 2.
+
+   The status dword is zeroed by this routine, and no other instruction in the image writes it. So unless something
+   writes it through a pointer, the wait ends at once.
+3. `XApuConnect` returns `SUCCEEDED`.
+
+So a shim must succeed in all of them and fill the outputs that are read: the fifth shape context pointer, `ApuAlloc`'s
+virtual address, and an object whose slots 0 and 2 return a non-negative HRESULT. An unimplemented import does not get
+through this function:
+- under `LEONIDA_UNIMPLEMENTED=log` it returns 0, so the call "succeeds" with its outputs unset, and the title then
+  writes through a null pointer or calls through a null object;
+- under `fail`, none of these imports is on `classify_import`'s HRESULT list.
+
+This was read from the file (2026-11-23, #7154 answer A20) and has not been run.
 
 ## What this does not show
 
