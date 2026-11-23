@@ -5,11 +5,13 @@ no GPU, LLVM or game files; SPIRV-Tools only for the optional validation test).
 
 The image's numeric type lives in the T# (word 1 FORMAT [28:20]), so the translator branches on it at run time.
 UINT and SINT formats are fetched through uint and sint aliases of the dimension's sampled array (same set and
-binding), everything else and a lookup miss (index 0, the RGBA8_UNORM fallback) through the float array. Nothing
-reads a storage image, so a shader that only loads declares no StorageImageReadWithoutFormat (which Intel Xe-LP
-lacks, #619) and no StorageImageWriteWithoutFormat. These tests translate small pixel shaders and check the SPIR-V:
+binding), everything else and a lookup miss (index 0, the RGBA8_UNORM fallback) through the float array. Ordinary
+sampled-image loads need neither StorageImageReadWithoutFormat (which Intel Xe-LP lacks, #619) nor
+StorageImageWriteWithoutFormat. These tests translate small pixel shaders and check the SPIR-V:
 the capabilities, which binding and component type each fetch reads, and, with a small evaluator of the code that
-picks the branch, the branch taken for all 512 FORMAT values with a hit and with a miss.
+picks the branch, the branch taken for all 512 FORMAT values with a hit and with a miss. Coherent `glc`
+loads and storage-only 1D-array loads take the explicit storage-image path (D3D-78); the normal typed
+sampled path needs neither formatless storage-image capability.
 runtime/test/shaders/cs_imgload.asm checks the result on a GPU (vk_store_test load).
 """
 import itertools
@@ -126,7 +128,9 @@ class Module:
             assert var_op == "OpVariable" and v[1] == "Private", (var_op, v)
             words = self.defs[v[2]][1][1:]            # OpConstantComposite %fmt_mask_arr <words>
             return get(words[get(p[2])])
-        if op == "OpGroupNonUniformBroadcastFirst":   # One invocation: return the value (a[1] is the Subgroup scope).
+        if op == "OpGroupNonUniformBroadcastFirst":   # One invocation: return the value (a[1] is the scope).
+            return get(a[2])
+        if op == "OpGroupNonUniformShuffle":          # One invocation; subgroup shuffle returns its input.
             return get(a[2])
         if op == "OpCompositeExtract":
             return get(a[1])[int(a[2])]
@@ -527,12 +531,14 @@ class TypedGatherShaders(unittest.TestCase):
 
 
 class StoreAndLoad(unittest.TestCase):
-    def test_a_shader_that_also_stores_needs_only_the_write_feature(self):
+    def test_a_shader_that_also_stores_needs_write_without_format_and_both_indexing_capabilities(self):
         m = Module(translate(["v_mov_b32 v4, 1", "v_mov_b32 v5, 2",
                               "image_store v[0:3], v[4:5], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
                               "image_load v[0:3], v[4:5], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
                               "s_waitcnt vmcnt(0)"]))
         self.assertIn("StorageImageWriteWithoutFormat", m.caps)
+        self.assertIn("StorageImageArrayDynamicIndexing", m.caps)
+        self.assertIn("SampledImageArrayDynamicIndexing", m.caps)
         self.assertNotIn("StorageImageReadWithoutFormat", m.caps)
         self.assertNotIn("OpImageRead", m.text)
         self.assertEqual(set(m.binding.values()), {0, 1, 2, 8, 9, 10})
@@ -699,13 +705,13 @@ class VolumeGradientSamples(unittest.TestCase):
                 self.assertEqual(len(clamp), int("_cl " in line))
 
                 def source(value: str) -> tuple[int, int | None]:
-                    op, (_, word) = module.defs[value]
-                    self.assertEqual(op, "OpBitcast")
-                    op, args = module.defs[word]
+                    # Through the bitcasts between a VGPR word and a float (a round trip is the original id).
+                    op, args = module.defs[value]
+                    while op == "OpBitcast":
+                        op, args = module.defs[args[1]]
                     half = None
-                    if op == "OpBitcast":  # f16 coord converted to f32, then kept in a VGPR word
-                        extract, (_, unpacked, selector) = module.defs[args[1]]
-                        self.assertEqual(extract, "OpCompositeExtract")
+                    if op == "OpCompositeExtract":  # f16 coord converted to f32
+                        _, unpacked, selector = args
                         unpack, (_, _, name, packed) = module.defs[unpacked]
                         self.assertEqual((unpack, name), ("OpExtInst", "UnpackHalf2x16"))
                         half = int(selector)
