@@ -344,12 +344,12 @@ def probe_mismatches(game: str, version: dict) -> list[str]:
     return mismatches
 
 
-def match_version(game: str):
+def match_version(game: str) -> dict | None:
     """The supported version this folder is, or None. Only names and sizes are read."""
     return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
-def load_version(game: str) -> dict:
+def load_version(game: str) -> dict | None:
     reports = []
     for version in versions():
         mismatches = probe_mismatches(game, version)
@@ -392,7 +392,7 @@ def volume_roots() -> list:
     return roots
 
 
-def xvd_header(path: str):
+def xvd_header(path: str) -> dict | None:
     """The few XVD header fields the build reports, or None when the file isn't an XVD. Reads 4 KiB, nothing else."""
     try:
         with open(path, "rb") as f:
@@ -545,7 +545,7 @@ PICK_UNSUPPORTED = ("That folder isn't a supported version of the game. Choose t
                     "MicrosoftGame.Config and the .rpf archives.")
 
 
-def native_picker():
+def native_picker() -> tuple[str, str] | None:
     """The desktop's own folder dialog on Linux and the BSDs, where Tk's is a bare one of its own: kdialog on
     KDE, zenity elsewhere (GNOME and the rest), either one when only that one is installed. Returns
     (tool, path) or None: on Windows and macOS Tk already opens the system dialog, and with no display there
@@ -1560,7 +1560,7 @@ def keep_recorded_fallback(flag: str, work: str) -> bool:
     return True
 
 
-def smallest_max_subgroup(vulkaninfo_text: str):
+def smallest_max_subgroup(vulkaninfo_text: str) -> int | None:
     """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
     # A device's own name is the least indented one; deeper ones (VK_KHR_maintenance7's layered APIs, e.g.
@@ -1645,7 +1645,7 @@ def runtime_gpu_info() -> dict:
         return {}
 
 
-def runtime_gpu_per_vertex():
+def runtime_gpu_per_vertex() -> bool | None:
     """per_vertex_inputs as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where the
     driver can't compile PerVertexKHR (MoltenVK) or lacks fragmentShaderBarycentric, None when it can't tell."""
     try:
@@ -1657,7 +1657,7 @@ def runtime_gpu_per_vertex():
         return None
 
 
-def runtime_gpu_barycentric_fallback():
+def runtime_gpu_barycentric_fallback() -> bool | None:
     """Whether the selected Vulkan GPU's driver has a known BaryCoordKHR bug (Mesa ANV, AMD Windows on gfx90c), or None
     when it can't be told."""
     try:
@@ -1667,7 +1667,7 @@ def runtime_gpu_barycentric_fallback():
         return None
 
 
-def barycentric_fallback_override():
+def barycentric_fallback_override() -> bool | None:
     """LEONIDA_BARY_FALLBACK=1/0 forces the same barycentric path as the GPU test runner; None leaves it automatic."""
     v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
     if v in ("1", "true", "yes", "on"):
@@ -1681,7 +1681,7 @@ def barycentric_fallback_override():
 VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS = 5
 
 
-def runtime_gpu_mesh_draws_crash():
+def runtime_gpu_mesh_draws_crash() -> bool | None:
     """True where the GPU the runtime would use is on Intel's Windows Vulkan driver with VK_EXT_mesh_shader: there
     vkCmdDrawMeshTasksEXT crashes (0xC0000409 in igvk64.dll) for a mesh shader with a live push-constant load at
     byte offset 32 or more, which every corpus mesh shader has (BUILD-2202, measured on an Arc A770 with driver
@@ -1694,7 +1694,7 @@ def runtime_gpu_mesh_draws_crash():
         info.get("mesh_in_supported_stages") is True
 
 
-def runtime_gpu_max_push_constants():
+def runtime_gpu_max_push_constants() -> int | None:
     """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
     v = runtime_gpu_info().get("max_push_constants_size")
     return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
@@ -2572,16 +2572,16 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
     shader_jobs = split if (overlap and len(cpu_heavy) > 1 and "shaders" in stages) else jobs
     progress = StageBoard([s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages])
 
-    def fn_shaders():
+    def fn_shaders() -> None:
         shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
 
-    def fn_assets():
+    def fn_assets() -> None:
         assets(game, work, wav, jobs, dump_jobs=dump_jobs)
 
-    def fn_runtime():
+    def fn_runtime() -> None:
         runtime(game, out, v, runtime_build, jobs, work=work)
 
-    def fn_pipelines():
+    def fn_pipelines() -> None:
         pipelines(work, out, jobs, runtime_build=runtime_build)
 
     builders = {
