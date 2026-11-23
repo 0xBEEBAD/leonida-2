@@ -447,11 +447,12 @@ class Analysis:
                 # SHADER-820: a vote's SCC names the mask register it tested (its first SGPR for a pair). A new
                 # value in that register (v_cmp into the pair or VCC, s_mov_b64, s_cselect_b64: none of them
                 # writes SCC) leaves SCC a vote on the old mask, while a run side narrows EXEC to the new one, so
-                # the tag goes. Ops that vote on their own destination set the new tag after this put().
+                # the vote is stale: a branch on it is an unsafe vote branch, and no other reader sees a vote. Ops
+                # that vote on their own destination set the new tag after this put().
                 vote = st["g"].get("scc")
                 if vote and vote[0] == "vote" and r != "scc" and (
                         r == vote[1] or (isinstance(vote[1], tuple) and r == (vote[1][0], vote[1][1] + 1))):
-                    del st["g"]["scc"]
+                    st["g"]["scc"] = ("stale_vote",) + vote[1:]
                 if tag is not None:
                     st["g"][r] = tag
                 if isinstance(r, tuple) and r[0] == "v":
@@ -1102,6 +1103,12 @@ class Analysis:
             return
         if op in ("s_cbranch_scc0", "s_cbranch_scc1"):
             t, g = T.get("scc", 0) | (CTRL if (id(ins), "scc") in self.stale else 0), st["g"].get("scc")
+            if g and g[0] == "stale_vote":
+                # a vote whose mask was rewritten before the branch (SHADER-820): the halves decide on the old
+                # mask, the run side narrows to the new one
+                if ev is not None:
+                    ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
+                return
             if g and g[0] == "vote":
                 t &= ~X           # SCC of a vote carries X for every other reader; this branch is the vote's consumer
             if t & ~ELECT:
