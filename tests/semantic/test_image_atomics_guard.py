@@ -75,16 +75,19 @@ def parse_blocks(spv):
 
 def find_guarded_texel_block(spv):
     """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
+    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions.
+    A shader that never writes EXEC has every lane active and branches on constant true instead."""
     blocks = parse_blocks(spv)
-    active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
+    guards = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
+    if not re.search(r"^\s*OpStore %active\b", spv, re.M):
+        guards |= set(re.findall(r"^\s*(%\w+) = OpConstantTrue %bool\b", spv, re.M))
     guarded_targets = set()
     for insns in blocks.values():
         for i, ln in enumerate(insns):
             if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
                 br = insns[i + 1]
                 m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", br)
-                if m and m.group(1) in active_loads:
+                if m and m.group(1) in guards:
                     guarded_targets.add(m.group(2))
     found = []
     for lbl, insns in blocks.items():
@@ -175,6 +178,22 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                     self.assertIn("OpAtomicLoad %uint ", spv)
                     self.assertIn("OpAtomicCompareExchange %uint ", spv)
                     self.assertIn("OpLoopMerge ", spv)
+
+    def test_guard_reads_the_active_bit_when_exec_is_written(self):
+        # Once the shader writes EXEC, the guard is a real %active load rather than constant true.
+        spv = translate([
+            "s_mov_b64 exec, s[0:1]",
+            "v_mov_b32_e32 v0, 5",
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 2",
+            "image_atomic_add v0, v[1:2], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+        ])
+        validate_spirv(spv)
+        self.assertRegex(spv, r"(?m)^\s*OpStore %active\b")
+        guarded = find_guarded_texel_block(spv)
+        self.assertEqual(len(guarded), 1)
+        block = guarded[0][0]
+        self.assertNotRegex(spv, rf"OpBranchConditional %true {re.escape(block)}\b")
 
     def test_cmpswap_and_bad_data_width_rejected(self):
         # Valid 2-VGPR cmpswap (2D and 3D) stays guarded and valid.
