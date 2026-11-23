@@ -16,6 +16,7 @@ template <class T>
 struct Ref {
     T* p = nullptr;
     ~Ref() { if (p) p->Release(); }
+    T* operator->() const { return p; }
     T** put() {
         if (p) {
             p->Release();
@@ -65,7 +66,7 @@ bool check_console_addressed_heap(ID3D12Device* device) {
 
 bool check_xs_proxy_slot14(ID3D12Device* real_device) {
     void* proxy_raw = nullptr;
-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
+    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, __uuidof(ID3D12Device), &proxy_raw)) || !proxy_raw) {
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
@@ -142,6 +143,8 @@ int main() {
 
     if (!check_normal_heap_unchanged(device.get())) return 1;
     if (!check_console_addressed_heap(device.get())) return 1;
+    // The layer does not register slot 14's console handler by default (d3d12_xs_device.h); this check does.
+    rt::d3d12_xs::set_console_descriptor_heap_handler(&rt::d3d12::create_console_descriptor_heap);
     if (!check_xs_proxy_slot14(device.get())) return 1;
     std::fprintf(stderr, "ok\n");
     return 0;

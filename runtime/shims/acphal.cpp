@@ -141,7 +141,10 @@ struct SHAPE_XMA_CONTEXT {
     uint32_t reserved1 : 6;
     uint32_t loopStartOffset : 26;
     uint32_t loopEndOffset : 6;
-    uint32_t reserved[10];
+    // The bit-fields above take 5 dwords, not 6: the third holds 24 bits, and a 26-bit field cannot straddle a
+    // dword with MSVC, GCC or Clang. 11 dwords of padding keep the GDK size (only sizeof is used, as the array
+    // stride in AcpHalAllocateShapeContexts); the bit positions inside the first dwords are not verified.
+    uint32_t reserved[11];
 };
 static_assert(sizeof(SHAPE_XMA_CONTEXT) == 64, "SHAPE_XMA_CONTEXT is 64 bytes per GDK");
 
@@ -162,7 +165,9 @@ struct SHAPE_PCM_CONTEXT {
     uint32_t reserved6 : 15;
     uint32_t format : 2;
     uint32_t reserved7 : 14;
-    uint32_t reserved[1];
+    // The bit-fields above take 6 dwords; 2 of padding keep the GDK size of 32 (only sizeof is used, as the array
+    // stride in AcpHalAllocateShapeContexts).
+    uint32_t reserved[2];
 };
 static_assert(sizeof(SHAPE_PCM_CONTEXT) == 32, "SHAPE_PCM_CONTEXT is 32 bytes per GDK");
 

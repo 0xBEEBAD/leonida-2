@@ -44,6 +44,9 @@
 namespace rt::d3d12_xs {
 namespace {
 
+// Slot 14's console-address heap handler (set_console_descriptor_heap_handler); null without the Vulkan layer.
+std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
+
 // The retail title calls device slots well past ID3D12Device14 (slot 133 at least); every slot past the PC device's
 // vtable goes through the generic thunk and is refused with E_NOTIMPL, so the table must outlast the highest one.
 constexpr unsigned kMaxSlots = 192;
@@ -1601,11 +1604,10 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
             // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
             // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
+            const ConsoleDescriptorHeapHandler handler = g_console_descriptor_heap.load(std::memory_order_acquire);
+            if (address != 0 && handler) {
                 console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
+                hr = handler(self->real, desc, address, size, __uuidof(ID3D12DescriptorHeap), &created);
             }
         }
     }
@@ -2035,6 +2037,10 @@ unsigned device_proxy_slot_count(const void* device) {
 
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
+}
+
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
+    g_console_descriptor_heap.store(handler, std::memory_order_release);
 }
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
