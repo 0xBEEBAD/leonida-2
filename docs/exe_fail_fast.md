@@ -18,7 +18,7 @@ python -I tools/import_fail_fast.py game_scarlett_master.exe
 python -I tools/import_fail_fast.py game_scarlett_master.exe --dll xmem.dll --all --json
 ```
 
-Result: 515 imports called, 27 with a fatal result check, 78 fatal sites. An independent pass with Capstone found the
+Result: 515 of 587 imports called directly, 27 with a fatal result check, 78 fatal sites. An independent pass with Capstone found the
 same sites, apart from two `XMemVirtualAlloc` sites that the tool finds and that pass missed. At one, the result is copied
 to another register before the test. At the other, the failing side reaches `int3` through a `jmp`.
 
