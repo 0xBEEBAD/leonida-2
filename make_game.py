@@ -1709,10 +1709,10 @@ def build_pipeline_check(jobs: int) -> None:
 def install_runtime(game: str, out: str, artifacts: list) -> None:
     """Puts the runtime files, game_path.txt and (off Windows) gta6rt.sh in `out`, staged first (RT-249).
 
-    Everything is written to a staging folder inside `out` (same filesystem), and only once all of it is there does
-    each file replace its old copy with os.replace, which is atomic per file. A copy that fails (disk full, a file
-    locked by a running gta6rt.exe, an interrupt) leaves the previous install untouched and no staging folder
-    behind, instead of a new gta6rt.exe next to an old gta6rt_tls_host.dll."""
+    Everything is written to a staging folder inside `out` (same filesystem), and only once all of it is there is
+    it published (publish(): all files or none). A failure while copying (disk full, an interrupt) or while
+    publishing (a destination file held open) leaves the previous install untouched and no staging folder behind,
+    instead of a new gta6rt.exe next to an old gta6rt_tls_host.dll."""
     os.makedirs(out, exist_ok=True)
     stage = tempfile.mkdtemp(prefix=".runtime-staging-", dir=out)
     try:
@@ -1735,10 +1735,40 @@ def install_runtime(game: str, out: str, artifacts: list) -> None:
                 f.write(WINE_LAUNCHER)
             os.chmod(launcher, os.stat(launcher).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             staged.append("gta6rt.sh")
-        for name in staged:
-            os.replace(os.path.join(stage, name), os.path.join(out, name))
+        publish(stage, out, staged)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
+
+
+def publish(stage: str, out: str, names: list) -> None:
+    """Moves each staged file over its copy in `out`, all or none (RT-249, #5278).
+
+    Each old file is first moved aside into the staging folder, then the new one takes its place. If any step fails
+    (on Windows, a destination another process holds open without delete sharing cannot be renamed: error 5), the files
+    already published are taken back out and the old ones restored, and the error is raised, so `out` never mixes a
+    new gta6rt.exe with an old gta6rt_tls_host.dll."""
+    done = []  # (name, whether an old copy was moved aside), in publish order
+    try:
+        for name in names:
+            target, backup = os.path.join(out, name), os.path.join(stage, name + ".old")
+            had_old = os.path.lexists(target)
+            if had_old:
+                os.replace(target, backup)
+            try:
+                os.replace(os.path.join(stage, name), target)
+            except BaseException:
+                if had_old:
+                    os.replace(backup, target)
+                raise
+            done.append((name, had_old))
+    except BaseException:
+        for name, had_old in reversed(done):
+            target, backup = os.path.join(out, name), os.path.join(stage, name + ".old")
+            if had_old:
+                os.replace(backup, target)
+            else:
+                os.remove(target)
+        raise
 
 
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1) -> None:
@@ -1756,7 +1786,11 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     for built in artifacts:
         if not os.path.isfile(built):
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
-    install_runtime(game, out, artifacts)
+    try:
+        install_runtime(game, out, artifacts)
+    except OSError as e:
+        fail(f"runtime: could not install into {out} ({e}); the previous files there are unchanged. If a program has "
+             "one of them open (a running gta6rt.exe, an antivirus scan), close it and run the stage again.")
     start = os.path.join(out, "gta6rt.exe" if os.name == "nt" else "gta6rt.sh")
     image = os.path.join(game, v["expected_exe"])
     if not os.path.isfile(image):

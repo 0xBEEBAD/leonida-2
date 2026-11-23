@@ -94,6 +94,44 @@ class RuntimeStagingTests(unittest.TestCase):
             self.assertEqual(read(os.path.join(self.out, name)), data, name)
         self.assertEqual(self.entries(), sorted(self.old))
 
+    def failing_replace(self, fail_on):
+        real = os.replace
+        calls = []
+
+        def replace(src, dst):
+            calls.append((os.path.basename(src), os.path.basename(dst)))
+            if len(calls) == fail_on:
+                raise PermissionError(13, "Access is denied", dst)
+            return real(src, dst)
+        return replace, calls
+
+    def test_failed_publish_restores_the_old_install(self):
+        # @shdann and @Flyander on #5278: a replace that fails after the first file was published (on Windows, the
+        # destination DLL held open by a reader) left the new exe next to the old DLL. Fail at every step in turn.
+        names = [*make_game.RUNTIME_FILES, "game_path.txt"] + (["gta6rt.sh"] if os.name != "nt" else [])
+        for fail_on in range(1, 2 * len(names) + 1):
+            with self.subTest(fail_on=fail_on):
+                self.tearDown(); self.setUp()
+                replace, calls = self.failing_replace(fail_on)
+                with patch.object(make_game.os, "replace", replace):
+                    with self.assertRaises(PermissionError):
+                        make_game.install_runtime(self.game, self.out, self.artifacts)
+                for name, data in self.old.items():
+                    self.assertEqual(read(os.path.join(self.out, name)), data, name)
+                self.assertEqual(self.entries(), sorted(self.old))
+
+    def test_failed_publish_removes_files_that_had_no_old_copy(self):
+        first, second = make_game.RUNTIME_FILES[:2]
+        os.remove(os.path.join(self.out, first))   # a fresh exe: published with one replace, nothing moved aside
+        before = self.entries()
+        replace, _ = self.failing_replace(2)          # moving the old DLL aside fails, after the exe is published
+        with patch.object(make_game.os, "replace", replace):
+            with self.assertRaises(PermissionError):
+                make_game.install_runtime(self.game, self.out, self.artifacts)
+        self.assertEqual(self.entries(), before)      # the new exe is taken back out
+        for name in (second, "game_path.txt"):
+            self.assertEqual(read(os.path.join(self.out, name)), self.old[name])
+
     def test_runtime_build_in_the_output_folder_is_left_in_place(self):
         # --runtime-build pointing at --out: the runtime files are already there and are not copied onto themselves
         artifacts = [os.path.join(self.out, name) for name in make_game.RUNTIME_FILES]
