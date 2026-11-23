@@ -40,8 +40,8 @@
 #include "d3d12_test_shaders.h"
 #ifndef LEONIDA_M15_GUEST
 #include "../shims/d3d12_com.h"
-#include "../shims/d3d12_xs_device.h"
 #endif
+#include "../shims/d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 #ifndef LEONIDA_M15_GUEST
 #include "../src/shader_library.h"
@@ -252,10 +252,10 @@ int main() {
         std::memcpy(up, vertices, sizeof(vertices));
 
         // A shader-visible heap in the arena; each slot gets the 16 bytes of a V#, written as raw bytes.
-        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
-                                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        const rt::d3d12_xs::ConsoleDescriptorHeapDesc srv_heap_desc{
+            {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0}};
         Ref<ID3D12DescriptorHeap> srv_heap;
-        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc.desc, IID_PPV_ARGS(&srv_heap.p))));
         const std::uint64_t cpu = reinterpret_cast<XboxHeapHandleFn>(slot(srv_heap.p, 9))(srv_heap.p);
         const std::uint64_t gpu = reinterpret_cast<XboxHeapHandleFn>(slot(srv_heap.p, 10))(srv_heap.p);
         const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -267,9 +267,10 @@ int main() {
         for (unsigned i = 0; i < 2; ++i)
             std::memcpy(reinterpret_cast<void*>(cpu + std::uint64_t(i) * step), vsharps[i].data(), 16);
 
-        const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        const rt::d3d12_xs::ConsoleDescriptorHeapDesc heap_desc{
+            {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0}};
         Ref<ID3D12DescriptorHeap> rtv_heap;
-        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc.desc, IID_PPV_ARGS(&rtv_heap.p))));
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv{
             SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(rtv_heap.p, 9))(rtv_heap.p))};
         device->CreateRenderTargetView(target.p, nullptr, rtv);

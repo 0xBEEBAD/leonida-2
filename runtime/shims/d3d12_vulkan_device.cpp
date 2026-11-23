@@ -5943,6 +5943,11 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,
                                                    void** out) override {
+        return create_descriptor_heap(desc, 0, 0, riid, out);
+    }
+
+    HRESULT create_descriptor_heap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, D3D12_GPU_VIRTUAL_ADDRESS address,
+                                   std::uint64_t size, REFIID riid, void** out) {
         constexpr auto method = "ID3D12Device::CreateDescriptorHeap";
         if (out) *out = nullptr;
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
@@ -5956,7 +5961,7 @@ public:
             log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
-        auto* heap = new DescriptorHeap(state_, *desc);
+        auto* heap = new DescriptorHeap(state_, *desc, address, size);
         heap->attach_device(identity());
         if (!heap->ok()) {
             heap->Release();
@@ -9989,22 +9994,10 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     if (!device || !desc) return E_INVALIDARG;
     // No output: a capability check, as CreateDescriptorHeap does.
     if (!out) return S_FALSE;
-    if ((desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || desc->NodeMask > 1 ||
-        ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
-         (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV))) {
-        return E_INVALIDARG;
-    }
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
-
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
-    if (!heap->ok()) {
-        heap->Release();
-        return E_OUTOFMEMORY;
-    }
-    return hand_out(heap, riid, out);
+    return d->create_descriptor_heap(desc, console_address, console_size, riid, out);
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {

@@ -63,6 +63,7 @@ struct DeviceProxy {
     // The device's IDXGIDevice1 (see "IDXGIDevice1 on the device" below): a title's IDXGIDevice1* points here.
     void** dxgi_vtable;
     DxgiAdapterProvider adapter_provider;
+    ConsoleDescriptorHeapProvider console_heap_provider;
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
     // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
@@ -1590,23 +1591,15 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     void* created = nullptr;
     HRESULT hr = E_INVALIDARG;
     bool console_extended = false;
-    if (desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
-        (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) {
-        const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
-        const void* tail = bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC);
-        if (readable_range(tail, sizeof(std::uint64_t) * 2)) {
-            std::uint64_t address = 0;
-            std::uint64_t size = 0;
-            std::memcpy(&address, tail, sizeof(address));
-            std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
-                console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
-            }
+    if (self->console_heap_provider && desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
+        (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0 &&
+        readable_range(desc, sizeof(ConsoleDescriptorHeapDesc))) {
+        ConsoleDescriptorHeapDesc console;
+        std::memcpy(&console, desc, sizeof(console));
+        if (console.address != 0) {
+            console_extended = true;
+            hr = self->console_heap_provider(self->real, desc, console.address, console.size,
+                                             __uuidof(ID3D12DescriptorHeap), &created);
         }
     }
     if (!console_extended)
@@ -1962,7 +1955,8 @@ unsigned detect_slot_count(ID3D12Device* real) {
 
 }  // namespace
 
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out,
+                            ConsoleDescriptorHeapProvider console_heap_provider) {
     if (!real) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -1976,6 +1970,7 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->dxgi_vtable = get_dxgi_vtable();
     proxy->adapter_provider = nullptr;
+    proxy->console_heap_provider = console_heap_provider;
     proxy->gpu_thread_priority.store(0, std::memory_order_relaxed);
     proxy->max_frame_latency.store(3, std::memory_order_relaxed);
 

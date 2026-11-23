@@ -54,10 +54,23 @@
 
 namespace rt::d3d12_xs {
 
+// Xbox device slot 14 takes this layout. A zero address requests an ordinary heap.
+struct ConsoleDescriptorHeapDesc {
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+    std::uint64_t size = 0;
+};
+static_assert(offsetof(ConsoleDescriptorHeapDesc, address) == 0x10 && offsetof(ConsoleDescriptorHeapDesc, size) == 0x18);
+
+// Supply this provider when slot 14 callers pass ConsoleDescriptorHeapDesc. The default accepts the PC prefix.
+using ConsoleDescriptorHeapProvider = HRESULT (*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*,
+                                                 D3D12_GPU_VIRTUAL_ADDRESS, std::uint64_t, REFIID, void**);
+
 // Wraps `real` and returns the requested device interface through `out`. Takes ownership of one reference to
 // `real` on success; on failure the caller keeps its reference. Returns E_NOINTERFACE if `riid` is not a D3D12
 // device interface the PC device implements.
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out);
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out,
+                            ConsoleDescriptorHeapProvider console_heap_provider = nullptr);
 
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);

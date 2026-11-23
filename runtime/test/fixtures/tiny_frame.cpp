@@ -9,6 +9,7 @@
 // D3D12 API only; no game data and no shader.
 #include <windows.h>
 #include <d3d12.h>
+#include "../../shims/d3d12_xs_device.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -69,10 +70,10 @@ int main() {
     check(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) && fence, "a fence");
 
     ID3D12DescriptorHeap* rtv_heap = nullptr;
-    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
-    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    heap_desc.NumDescriptors = 1;
-    check(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap))) && rtv_heap, "an RTV heap");
+    rt::d3d12_xs::ConsoleDescriptorHeapDesc heap_desc{};
+    heap_desc.desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap_desc.desc.NumDescriptors = 1;
+    check(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc.desc, IID_PPV_ARGS(&rtv_heap))) && rtv_heap, "an RTV heap");
     if (!queue || !list || !fence || !rtv_heap) return finish();
     const std::uint64_t start = reinterpret_cast<HeapStartFn>((*reinterpret_cast<void***>(rtv_heap))[9])(rtv_heap);
     check(start != 0, "the heap's start handle comes back in RAX (heap slot 9)");
