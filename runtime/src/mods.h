@@ -271,4 +271,15 @@ inline uint32_t override_view_mode(uint32_t result, uint32_t context) {
     return v.first_person_value;
 }
 
+// The upscaler the hooked upscaler picker returns (gta6rt --upscaler-picker RVA[,KIND], docs/modding.md): 0 keeps the
+// game's choice. In 1.0.2.1 the picker returns 7 (AMD's FFX upscaler) on Series S and 6 (the game's own) otherwise.
+inline uint32_t& upscaler_kind_slot() {
+    static uint32_t kind = 0;
+    return kind;
+}
+inline uint32_t override_upscaler(uint32_t result, uint32_t /*arg0*/) {
+    const uint32_t kind = upscaler_kind_slot();
+    return kind ? kind : result;
+}
+
 }  // namespace leonida::mods

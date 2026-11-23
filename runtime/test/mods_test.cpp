@@ -84,6 +84,11 @@ int main() {
     set_active_camera(camera_of({}));
     check(override_view_mode(3, 0) == 3, "with no camera mod the game's view mode passes through");
 
+    check(override_upscaler(6, 0) == 6, "with no --upscaler-picker kind the game's upscaler passes through");
+    upscaler_kind_slot() = 7;
+    check(override_upscaler(6, 0) == 7 && override_upscaler(7, 1) == 7, "--upscaler-picker RVA,7 makes every pick 7");
+    upscaler_kind_slot() = 0;
+
     const auto dir = std::filesystem::temp_directory_path() / "leonida_mods_test";
     std::filesystem::remove_all(dir);
     write(dir / "a_mandy" / "mod.json",

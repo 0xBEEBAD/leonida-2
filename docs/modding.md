@@ -138,3 +138,33 @@ metadata per mode, and the callers of the `UseFirstPersonCameraMatrix` check in 
 whether the active view is first person). The hook (`hook_image_results` in `runtime/src/code_hooks.h`) runs
 the original and overrides its result; it is for getters with at most four register arguments and an
 integer result. ctest `code_hooks` and `mods` cover the thunk and the override.
+
+## Upscaler (`--upscaler-picker`)
+
+The game chooses its upscaler once, in a small function that returns an upscaler number: in 1.0.2.1 **7** is
+AMD's FFX upscaler (the `amd_fidelityfx_loader_xbox.dll` imports) and **6** the game's own. It returns 7 only on a
+Series S (console type 6, which the game reads from the registry, `runtime/shims/advapi32_registry.cpp`), so a
+Series X configuration renders through the game's upscaler. Measured by a static look at the 1.0.2.1 executable;
+nothing executed.
+
+`--upscaler-picker RVA[,KIND]` (hex RVA, decimal `KIND`, default 7) replaces every result of that function with
+`KIND`, through the same result-override hook as the view-mode getter (`leonida::mods::override_upscaler`). With the
+default console type (Series X) and the PC upscaler shim (`LEONIDA_FFX_PC=1`, `LEONIDA_FFX_DIR`), the game keeps its
+Series X configuration and upscales through FSR:
+
+```powershell
+$env:LEONIDA_FFX_PC = '1'
+gta6rt.exe --run game_scarlett_master.exe --game-dir <package> --upscaler-picker 7E93F0
+```
+
+| Version | RVA | Direct calls redirected |
+|---|---|---|
+| 1.0.2.1 | `0x7E93F0` | 4 (three calls and a tail jump) |
+
+To find it in another version: the FFX wrapper's `ffxCreateContext` call is in a class whose one instance is a
+static; a short function returns that instance for upscaler 7 (another static for 6, null for anything else). The
+picker is the function whose result is passed to it, and it tests the console type the registry gave. `--dry-run`
+with the RVA prints how many direct calls were redirected, which should match the table.
+
+**Not yet seen running:** the game doesn't reach its first frame under `gta6rt` yet, so the effect is unmeasured.
+The FSR render size per quality mode is the FFX wrapper's own choice. ctest `mods` checks the override.
