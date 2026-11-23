@@ -701,6 +701,78 @@ pair replaced by a wrapped subtraction, and the `v_sad_hi_u8` shift dropped — 
 programs fail (`--programs 60 --seed 2 --max-ops 5 --no-sweep`), so the runner does catch arithmetic
 errors.
 
+### Packed integer dot products (`tools/dot_diff.py`)
+
+No other runner generates a dot product: none of the `--list-ops` lists of `vint_diff`, `pk16_diff`,
+`fmisc_diff` or `f32_fuzz` has one. Yet the FidelityFX programs use `v_dot4c_i32_i8` 25,813 times and
+`v_dot4_i32_i8` 1,458 times ([fspx.md](fspx.md)). `tools/dot_diff.py` covers twelve opcodes:
+
+- the VOP3P `v_dot2_i32_i16`, `v_dot2_u32_u16`, `v_dot4_i32_i8`, `v_dot4_u32_u8`, `v_dot8_i32_i4`
+  and `v_dot8_u32_u4` (accumulator `S2`);
+- the VOP2 `v_dot4c_i32_i8` (accumulator: the old destination);
+- the five gfx908-syntax accumulating forms the translator also accepts: `v_dot2c_i32_i16`,
+  `v_dot2c_u32_u16`, `v_dot4c_u32_u8`, `v_dot8c_i32_i4` and `v_dot8c_u32_u4`.
+
+The first seven are the gfx103x encodings; `--ops gfx103x` keeps only those.
+
+The reference uses Python integers and shares no code with the translator. It takes the exact sum
+`sum(S0.elem[k] * S1.elem[k]) + acc` modulo 2^32, or under `clamp` saturates it to
+`[-2^31, 2^31-1]` (signed) or `[0, 2^32-1]` (unsigned). `tests/test_dot_diff.py` checks it against
+the rows measured on gfx1036 in `tests/semantic/test_alu_dot4_i8.py`: 10 operand sets (`MEASURED`),
+each of which gave one word as `v_dot4_i32_i8`, as `v_dot4c_i32_i8` and with the two sources swapped,
+and 5 more under `op_sel` 2 / `op_sel_hi` 5 (`MEASURED_OP_SEL`). Saturation under `clamp` is measured on
+hardware only for `v_dot4_i32_i8` (its two overflowing cases give 0x7fffffff and 0x80000000); for the other ops
+the reference takes it from the ISA documentation, so a misreading the translator shares would not show
+here. It is compared with the translation run in `spirv_mini_interp`, on the four exported mrt0 words,
+bit for bit.
+
+**Programs and sources.**
+- Programs follow the `sad_diff.py` shape: seeds in v8..v15 and s4..s7, then family ops writing
+  v8..v11, so accumulating forms chain on earlier results.
+- Sources are VGPR, SGPR, a hex literal and an integer inline constant. Constants read as 32-bit
+  dwords (positive zero-extends, negative sign-extends), the rule measured for VOP3P integer
+  constants in [design.md](design.md).
+- Every VOP3P program is encodable on GFX10: at most one literal and two constant-bus reads.
+  `S1` of the accumulating forms is a VGPR.
+- Modifiers: `clamp` wherever the translator takes it, all 16 `op_sel`/`op_sel_hi` settings of
+  `S0`/`S1` on `v_dot4_i32_i8`, and the explicit default `op_sel:[0,0,0] op_sel_hi:[1,1,1]` on the
+  other VOP3P ops.
+- `--self-test` pins the refused forms as expected rejections: `neg_lo`/`neg_hi`, source
+  `neg`/`abs`, other `op_sel` settings, and `clamp` on `v_dot4c_i32_i8`.
+
+**Three stages.**
+1. A sweep of every encodable source-kind combination with and without `clamp` (671 programs).
+2. An edge grid (2,944 cases, four per program). `S0`/`S1` come from words built of one lane width's
+   extremes; the accumulators sit on and next to the saturation bounds.
+3. Random seeded programs.
+
+The grid is the only stage that reliably reaches the single point where `v_dot2_i32_i16`'s two
+products alone overflow: `(-32768)^2 + (-32768)^2 = 2^31`. The report counts, per op, the results
+that saturated under `clamp` and the ones that wrapped without it.
+
+```powershell
+python -I tools/dot_diff.py --programs 2000 --seed 7
+python -I tools/dot_diff.py --self-test
+python -I tests/test_dot_diff.py
+```
+
+**Results.** Seeds 776511 to 776514 (`--programs 25000 --max-ops 8`) match bit for bit, zero
+mismatches and zero skips: 4 x 26,407 programs.
+
+Four mutations of the translator's dot lowering are all caught by a default run
+(`--programs 0 --seed 2`, sweep and grid):
+
+| Mutation | Failing programs |
+|---|---|
+| unsigned `clamp` that never saturates | 32 + 192 |
+| `u4` lanes sign-extended | 91 + 116 |
+| `op_sel_hi[0]` ignored on `v_dot4_i32_i8` (S0's byte pairs 2..3 always from the high half) | 8 sweep |
+| `v_dot2_i32_i16` product carry dropped | 4 grid, missed by the sweep and by 200 random programs |
+
+The counts belong to these exact one-line changes and move with the mutation. On the same run, ignoring
+`op_sel_hi[1]` instead fails 10 sweep programs, ignoring both 13, and reading S1's byte pairs 2..3 from the
+low half (an `op_sel_hi[1]` taken as 0) fails 64.
+
 ### Images on the GPU (`tools/image_fuzz.py`)
 
 `tools/image_fuzz.py` starts on the image path, where the T# format, the view type and the binding layout
