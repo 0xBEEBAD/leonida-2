@@ -3599,11 +3599,13 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   creates the upscale context with the Vulkan backend descriptor in place of the console one, reports the provider
   the loader chose, and passes dispatches through with `VkImage` resources and a `VkCommandBuffer`. The loader picks
   the newest upscaler the GPU supports. Measured with `ffx_vk_dispatch_test` (procedural inputs, the game's context
-  flags, 1280x720 to 2560x1440, 30 frames) under Wine 11.22 on RADV (Mesa 26.3.1):
-  - RX 9070 XT (RDNA4): providers 4.1.2, 3.1.6 and 2.3.4; the context gets **FSR 4.1.2**; 0.66 ms per upscale
-    (submit and wait); every square of the checkerboard right and no non-finite value.
-  - Ryzen 7 9800X3D iGPU (RDNA2, 2 CUs): providers 3.1.6 and 2.3.4; the context gets FSR 3.1.6; 15.8 ms. The same
-    on AMD's Windows driver 32.0.21030.2001 (16.8 ms; `whattheflop`, #4999).
+  flags, 30 frames; 1280x720 to 1920x1080, the console DLL's one configuration, and 1920x1080 to 3840x2160) under
+  Wine 11.22 on RADV (Mesa 26.3.1), every square of the checkerboard right and no non-finite value:
+  - RX 9070 XT (RDNA4): providers 4.1.2, 3.1.6 and 2.3.4; the context gets **FSR 4.1.2**; 0.41 ms per upscale to
+    1080p and 1.22 ms to 4K (submit and wait).
+  - Ryzen 7 9800X3D iGPU (RDNA2, 2 CUs): providers 3.1.6 and 2.3.4; the context gets FSR 3.1.6; 10.1 ms to 1080p and
+    35.3 ms to 4K. FSR 3.1.6 also on AMD's Windows driver 32.0.21030.2001 (`whattheflop`) and on an RTX 3080 Ti
+    under Wine (`Kev-Ball`), both at 1280x720 to 2560x1440 (#4999).
   - **Device extensions.** The shaders run without any, but they use some: FSR 3.1 compute-shader derivatives, FSR 4
     also cooperative matrices and 8-bit floats. Without the extensions the validation layer reports
     `VUID-VkShaderModuleCreateInfo-pCode-08740`/`-08742` (on Windows and on RADV). The device must enable those of

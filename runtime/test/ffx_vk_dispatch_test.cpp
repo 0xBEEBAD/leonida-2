@@ -3,10 +3,11 @@
 //
 //   LEONIDA_FFX_DIR=<FidelityFX SDK>\Kits\FidelityFX\signedbin  ffx_vk_dispatch_test
 //
-// A 1280x720 RGBA16F checkerboard of 32-pixel squares (1.0 / 0.0), depth 0 (far, inverted) and zero motion go
-// through 30 upscales to 2560x1440 with a Halton(2,3) jitter, using the game's measured context flags (HDR, inverted
-// depth, auto exposure; docs/d3d12_vulkan.md A.3). Then every output pixel must be finite and the centre of every
-// 64-pixel output square near its input value. Prints the provider the loader chose (FSR 4.1 on GPUs AMD ships it
+// Two cases, each on its own context: 1280x720 -> 1920x1080, the one configuration the console's DLL builds
+// (docs/d3d12_vulkan.md A.3), and 1920x1080 -> 3840x2160 (4K, Performance). An RGBA16F checkerboard of 32-pixel squares
+// (1.0 / 0.0), depth 0 (far, inverted) and zero motion go through 30 upscales with a Halton(2,3) jitter, using the
+// game's measured context flags (HDR, inverted depth, auto exposure). Then every output value must be finite and the
+// centre of every output square near its input value. Prints the provider the loader chose (FSR 4.1 on GPUs AMD ships it
 // for, else 3.1) and the time per upscale. Exits 77 without a Vulkan device or the loader DLL.
 //
 // LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation, and any validation error fails it, except the
@@ -27,7 +28,11 @@
 
 namespace {
 
-constexpr uint32_t RW = 1280, RH = 720, OW = 2560, OH = 1440, SQUARE = 32, FRAMES = 30, WARMUP = 5;
+constexpr uint32_t SQUARE = 32, FRAMES = 30, WARMUP = 5;
+struct Case {
+    uint32_t rw, rh, ow, oh;   // render and upscale sizes; integer ratios of SQUARE pixels
+};
+constexpr Case cases[] = {{1280, 720, 1920, 1080}, {1920, 1080, 3840, 2160}};
 
 void on_message(uint32_t type, const wchar_t* message) { std::printf("  ffx message (%u): %ls\n", type, message); }
 
@@ -93,9 +98,8 @@ VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBits
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    leonida::ffx_vk::Upscaler upscaler;
     std::string error;
-    if (!upscaler.load(error)) {
+    if (leonida::ffx_vk::Upscaler probe; !probe.load(error)) {
         std::printf("SKIP %s\n", error.c_str());
         return 77;
     }
@@ -273,166 +277,187 @@ int main() {
                vkMapMemory(dev, memory, 0, size, 0, mapped) == VK_SUCCESS;
     };
 
-    const VkImageUsageFlags input = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    VkImage color, depth, motion, output;
-    VkBuffer upload, readback;
-    void* upload_map;
-    void* readback_map;
-    if (!make_image(RW, RH, VK_FORMAT_R16G16B16A16_SFLOAT, input, color) ||
-        !make_image(RW, RH, VK_FORMAT_R32_SFLOAT, input, depth) ||
-        !make_image(RW, RH, VK_FORMAT_R16G16_SFLOAT, input, motion) ||
-        !make_image(OW, OH, VK_FORMAT_R16G16B16A16_SFLOAT,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, output) ||
-        !make_buffer(VkDeviceSize(RW) * RH * 8, upload, &upload_map) ||
-        !make_buffer(VkDeviceSize(OW) * OH * 8, readback, &readback_map)) {
-        std::printf("FAIL image or buffer creation\n");
-        return 1;
-    }
-    auto* texel = static_cast<uint16_t*>(upload_map);
-    for (uint32_t y = 0; y < RH; ++y)
-        for (uint32_t x = 0; x < RW; ++x) {
-            uint16_t* p = texel + (std::size_t(y) * RW + x) * 4;
-            p[0] = p[1] = p[2] = ((x / SQUARE + y / SQUARE) & 1) ? 0x3C00 : 0;   // 1.0 or 0.0
-            p[3] = 0x3C00;
+#define CHECK_CASE(x)                                                           \
+    do {                                                                        \
+        VkResult r_ = (x);                                                      \
+        if (r_ != VK_SUCCESS) {                                                 \
+            std::printf("FAIL %s -> %d (line %d)\n", #x, int(r_), __LINE__);    \
+            return false;                                                       \
+        }                                                                       \
+    } while (0)
+    // One case on a fresh context and fresh images; true when its output is right.
+    auto run_case = [&](const Case& c) -> bool {
+        const uint32_t RW = c.rw, RH = c.rh, OW = c.ow, OH = c.oh;
+        std::printf("case %ux%u -> %ux%u\n", RW, RH, OW, OH);
+        const VkImageUsageFlags input = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImage color, depth, motion, output;
+        VkBuffer upload, readback;
+        void* upload_map;
+        void* readback_map;
+        if (!make_image(RW, RH, VK_FORMAT_R16G16B16A16_SFLOAT, input, color) ||
+            !make_image(RW, RH, VK_FORMAT_R32_SFLOAT, input, depth) ||
+            !make_image(RW, RH, VK_FORMAT_R16G16_SFLOAT, input, motion) ||
+            !make_image(OW, OH, VK_FORMAT_R16G16B16A16_SFLOAT,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, output) ||
+            !make_buffer(VkDeviceSize(RW) * RH * 8, upload, &upload_map) ||
+            !make_buffer(VkDeviceSize(OW) * OH * 8, readback, &readback_map)) {
+            std::printf("FAIL image or buffer creation\n");
+            return false;
         }
+        auto* texel = static_cast<uint16_t*>(upload_map);
+        for (uint32_t y = 0; y < RH; ++y)
+            for (uint32_t x = 0; x < RW; ++x) {
+                uint16_t* p = texel + (std::size_t(y) * RW + x) * 4;
+                p[0] = p[1] = p[2] = ((x / SQUARE + y / SQUARE) & 1) ? 0x3C00 : 0;   // 1.0 or 0.0
+                p[3] = 0x3C00;
+            }
 
-    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cpi.queueFamilyIndex = family;
-    VkCommandPool pool;
-    CHECK(vkCreateCommandPool(dev, &cpi, nullptr, &pool));
-    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cai.commandPool = pool;
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    VkCommandBuffer cb;
-    CHECK(vkAllocateCommandBuffers(dev, &cai, &cb));
-    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    auto barrier = [&](VkImage image, VkImageLayout from, VkImageLayout to) {
-        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        b.oldLayout = from;
-        b.newLayout = to;
-        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = image;
-        b.subresourceRange = range;
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
-                             0, nullptr, 1, &b);
-    };
-    const VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    auto submit = [&]() {
-        vkEndCommandBuffer(cb);
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cb;
-        VkResult r = vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-        if (r == VK_SUCCESS) r = vkQueueWaitIdle(queue);
-        vkResetCommandBuffer(cb, 0);
-        return r;
-    };
+        VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpi.queueFamilyIndex = family;
+        VkCommandPool pool;
+        CHECK_CASE(vkCreateCommandPool(dev, &cpi, nullptr, &pool));
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        VkCommandBuffer cb;
+        CHECK_CASE(vkAllocateCommandBuffers(dev, &cai, &cb));
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        auto barrier = [&](VkImage image, VkImageLayout from, VkImageLayout to) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            b.oldLayout = from;
+            b.newLayout = to;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = image;
+            b.subresourceRange = range;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                                 0, nullptr, 1, &b);
+        };
+        const VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        auto submit = [&]() {
+            vkEndCommandBuffer(cb);
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cb;
+            VkResult r = vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+            if (r == VK_SUCCESS) r = vkQueueWaitIdle(queue);
+            vkResetCommandBuffer(cb, 0);
+            return r;
+        };
 
-    // Inputs in SHADER_READ_ONLY_OPTIMAL (the COMPUTE_READ state), the output in GENERAL (UNORDERED_ACCESS).
-    vkBeginCommandBuffer(cb, &begin);
-    for (VkImage image : {color, depth, motion})
-        barrier(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy up{};
-    up.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    up.imageExtent = {RW, RH, 1};
-    vkCmdCopyBufferToImage(cb, upload, color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &up);
-    const VkClearColorValue zero{};
-    vkCmdClearColorImage(cb, depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
-    vkCmdClearColorImage(cb, motion, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
-    for (VkImage image : {color, depth, motion})
-        barrier(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    barrier(output, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    CHECK(submit());
-
-    ffx::CreateContextDescUpscale create{{ffx::CREATE_CONTEXT_DESC_TYPE_UPSCALE, nullptr},
-                                         ffx::UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | ffx::UPSCALE_ENABLE_DEPTH_INVERTED |
-                                             ffx::UPSCALE_ENABLE_AUTO_EXPOSURE | ffx::UPSCALE_ENABLE_DEBUG_CHECKING,
-                                         {RW, RH}, {OW, OH}, on_message};
-    const ffx::ReturnCode made = upscaler.create({dev, pd, vkGetDeviceProcAddr}, create);
-    if (made != ffx::RETURN_OK) {
-        std::printf("FAIL ffxCreateContext on the Vulkan backend: %s\n", ffx::return_code_name(made));
-        return 1;
-    }
-    std::printf("provider: %s\n", upscaler.provider().c_str());
-
-    auto resource = [](VkImage image, uint32_t w, uint32_t h, uint32_t format, uint32_t usage, uint32_t state) {
-        ffx::Resource r{};
-        r.resource = reinterpret_cast<void*>(image);
-        r.description = {ffx::RESOURCE_TYPE_TEXTURE2D, format, w, h, 1, 1, 0, usage};
-        r.state = state;
-        return r;
-    };
-    ffx::DispatchDescUpscale d{};
-    d.header.type = ffx::DISPATCH_DESC_TYPE_UPSCALE;
-    d.color = resource(color, RW, RH, ffx::SURFACE_FORMAT_R16G16B16A16_FLOAT, ffx::RESOURCE_USAGE_READ_ONLY,
-                       ffx::RESOURCE_STATE_COMPUTE_READ);
-    d.depth = resource(depth, RW, RH, ffx::SURFACE_FORMAT_R32_FLOAT, ffx::RESOURCE_USAGE_READ_ONLY,
-                       ffx::RESOURCE_STATE_COMPUTE_READ);
-    d.motionVectors = resource(motion, RW, RH, ffx::SURFACE_FORMAT_R16G16_FLOAT, ffx::RESOURCE_USAGE_READ_ONLY,
-                               ffx::RESOURCE_STATE_COMPUTE_READ);
-    d.output = resource(output, OW, OH, ffx::SURFACE_FORMAT_R16G16B16A16_FLOAT, ffx::RESOURCE_USAGE_UAV,
-                        ffx::RESOURCE_STATE_UNORDERED_ACCESS);
-    d.motionVectorScale = {float(RW), float(RH)};
-    d.renderSize = {RW, RH};
-    d.upscaleSize = {OW, OH};
-    d.frameTimeDelta = 16.6f;
-    d.preExposure = 1.0f;
-    d.cameraNear = 1e30f;   // inverted depth: near and far swap
-    d.cameraFar = 0.1f;
-    d.cameraFovAngleVertical = 1.0f;
-    d.viewSpaceToMetersFactor = 1.0f;
-    LARGE_INTEGER frequency, t0, t1;
-    QueryPerformanceFrequency(&frequency);
-    double timed_ms = 0;
-    for (uint32_t frame = 0; frame < FRAMES; ++frame) {
-        d.jitterOffset = {halton(int(frame % 8) + 1, 2) - 0.5f, halton(int(frame % 8) + 1, 3) - 0.5f};
-        d.reset = frame == 0;
+        // Inputs in SHADER_READ_ONLY_OPTIMAL (the COMPUTE_READ state), the output in GENERAL (UNORDERED_ACCESS).
         vkBeginCommandBuffer(cb, &begin);
-        d.commandList = cb;
-        const ffx::ReturnCode rc = upscaler.dispatch(d);
-        if (rc != ffx::RETURN_OK) {
-            std::printf("FAIL ffxDispatch, frame %u: %s\n", frame, ffx::return_code_name(rc));
-            return 1;
-        }
-        QueryPerformanceCounter(&t0);
-        CHECK(submit());
-        QueryPerformanceCounter(&t1);
-        if (frame >= WARMUP) timed_ms += double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(frequency.QuadPart);
-    }
-    std::printf("%u upscales %ux%u -> %ux%u, submit and wait %.2f ms each after %u warm-up frames\n", FRAMES, RW, RH,
-                OW, OH, timed_ms / (FRAMES - WARMUP), WARMUP);
+        for (VkImage image : {color, depth, motion})
+            barrier(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy up{};
+        up.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        up.imageExtent = {RW, RH, 1};
+        vkCmdCopyBufferToImage(cb, upload, color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &up);
+        const VkClearColorValue zero{};
+        vkCmdClearColorImage(cb, depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+        vkCmdClearColorImage(cb, motion, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+        for (VkImage image : {color, depth, motion})
+            barrier(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        barrier(output, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        CHECK_CASE(submit());
 
-    vkBeginCommandBuffer(cb, &begin);
-    barrier(output, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    VkBufferImageCopy down{};
-    down.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    down.imageExtent = {OW, OH, 1};
-    vkCmdCopyImageToBuffer(cb, output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &down);
-    CHECK(submit());
-
-    const auto* out = static_cast<const uint16_t*>(readback_map);
-    std::size_t non_finite = 0;
-    for (std::size_t i = 0; i < std::size_t(OW) * OH * 4; ++i) non_finite += !std::isfinite(half_to_float(out[i]));
-    const uint32_t square = SQUARE * OW / RW;
-    uint32_t right = 0, squares = 0;
-    for (uint32_t sy = 0; (sy + 1) * square <= OH; ++sy)
-        for (uint32_t sx = 0; (sx + 1) * square <= OW; ++sx, ++squares) {
-            const float want = ((sx + sy) & 1) ? 1.0f : 0.0f;
-            const std::size_t centre = (std::size_t(sy) * square + square / 2) * OW + sx * square + square / 2;
-            bool close = true;
-            for (int c = 0; c < 3; ++c) close = close && std::fabs(half_to_float(out[centre * 4 + c]) - want) < 0.1f;
-            right += close;
+        ffx::CreateContextDescUpscale create{{ffx::CREATE_CONTEXT_DESC_TYPE_UPSCALE, nullptr},
+                                             ffx::UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | ffx::UPSCALE_ENABLE_DEPTH_INVERTED |
+                                                 ffx::UPSCALE_ENABLE_AUTO_EXPOSURE | ffx::UPSCALE_ENABLE_DEBUG_CHECKING,
+                                             {RW, RH}, {OW, OH}, on_message};
+        leonida::ffx_vk::Upscaler upscaler;
+        if (!upscaler.load(error)) {
+            std::printf("FAIL %s\n", error.c_str());
+            return false;
         }
-    std::printf("non-finite output values: %zu; square centres within 0.1 of the input: %u of %u\n", non_finite,
-                right, squares);
+        const ffx::ReturnCode made = upscaler.create({dev, pd, vkGetDeviceProcAddr}, create);
+        if (made != ffx::RETURN_OK) {
+            std::printf("FAIL ffxCreateContext on the Vulkan backend: %s\n", ffx::return_code_name(made));
+            return false;
+        }
+        std::printf("provider: %s\n", upscaler.provider().c_str());
+
+        auto resource = [](VkImage image, uint32_t w, uint32_t h, uint32_t format, uint32_t usage, uint32_t state) {
+            ffx::Resource r{};
+            r.resource = reinterpret_cast<void*>(image);
+            r.description = {ffx::RESOURCE_TYPE_TEXTURE2D, format, w, h, 1, 1, 0, usage};
+            r.state = state;
+            return r;
+        };
+        ffx::DispatchDescUpscale d{};
+        d.header.type = ffx::DISPATCH_DESC_TYPE_UPSCALE;
+        d.color = resource(color, RW, RH, ffx::SURFACE_FORMAT_R16G16B16A16_FLOAT, ffx::RESOURCE_USAGE_READ_ONLY,
+                           ffx::RESOURCE_STATE_COMPUTE_READ);
+        d.depth = resource(depth, RW, RH, ffx::SURFACE_FORMAT_R32_FLOAT, ffx::RESOURCE_USAGE_READ_ONLY,
+                           ffx::RESOURCE_STATE_COMPUTE_READ);
+        d.motionVectors = resource(motion, RW, RH, ffx::SURFACE_FORMAT_R16G16_FLOAT, ffx::RESOURCE_USAGE_READ_ONLY,
+                                   ffx::RESOURCE_STATE_COMPUTE_READ);
+        d.output = resource(output, OW, OH, ffx::SURFACE_FORMAT_R16G16B16A16_FLOAT, ffx::RESOURCE_USAGE_UAV,
+                            ffx::RESOURCE_STATE_UNORDERED_ACCESS);
+        d.motionVectorScale = {float(RW), float(RH)};
+        d.renderSize = {RW, RH};
+        d.upscaleSize = {OW, OH};
+        d.frameTimeDelta = 16.6f;
+        d.preExposure = 1.0f;
+        d.cameraNear = 1e30f;   // inverted depth: near and far swap
+        d.cameraFar = 0.1f;
+        d.cameraFovAngleVertical = 1.0f;
+        d.viewSpaceToMetersFactor = 1.0f;
+        LARGE_INTEGER frequency, t0, t1;
+        QueryPerformanceFrequency(&frequency);
+        double timed_ms = 0;
+        for (uint32_t frame = 0; frame < FRAMES; ++frame) {
+            d.jitterOffset = {halton(int(frame % 8) + 1, 2) - 0.5f, halton(int(frame % 8) + 1, 3) - 0.5f};
+            d.reset = frame == 0;
+            vkBeginCommandBuffer(cb, &begin);
+            d.commandList = cb;
+            const ffx::ReturnCode rc = upscaler.dispatch(d);
+            if (rc != ffx::RETURN_OK) {
+                std::printf("FAIL ffxDispatch, frame %u: %s\n", frame, ffx::return_code_name(rc));
+                return false;
+            }
+            QueryPerformanceCounter(&t0);
+            CHECK_CASE(submit());
+            QueryPerformanceCounter(&t1);
+            if (frame >= WARMUP) timed_ms += double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(frequency.QuadPart);
+        }
+        std::printf("%u upscales %ux%u -> %ux%u, submit and wait %.2f ms each after %u warm-up frames\n", FRAMES, RW, RH,
+                    OW, OH, timed_ms / (FRAMES - WARMUP), WARMUP);
+
+        vkBeginCommandBuffer(cb, &begin);
+        barrier(output, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy down{};
+        down.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        down.imageExtent = {OW, OH, 1};
+        vkCmdCopyImageToBuffer(cb, output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &down);
+        CHECK_CASE(submit());
+
+        const auto* out = static_cast<const uint16_t*>(readback_map);
+        std::size_t non_finite = 0;
+        for (std::size_t i = 0; i < std::size_t(OW) * OH * 4; ++i) non_finite += !std::isfinite(half_to_float(out[i]));
+        const uint32_t square = SQUARE * OW / RW;
+        uint32_t right = 0, squares = 0;
+        for (uint32_t sy = 0; (sy + 1) * square <= OH; ++sy)
+            for (uint32_t sx = 0; (sx + 1) * square <= OW; ++sx, ++squares) {
+                const float want = ((sx + sy) & 1) ? 1.0f : 0.0f;
+                const std::size_t centre = (std::size_t(sy) * square + square / 2) * OW + sx * square + square / 2;
+                bool close = true;
+                for (int c = 0; c < 3; ++c) close = close && std::fabs(half_to_float(out[centre * 4 + c]) - want) < 0.1f;
+                right += close;
+            }
+        std::printf("non-finite output values: %zu; square centres within 0.1 of the input: %u of %u\n", non_finite,
+                    right, squares);
+        return non_finite == 0 && right == squares;
+    };
+    bool ok = true;
+    for (const Case& c : cases) ok = run_case(c) && ok;
     if (validation)
         std::printf("validation errors: %u (and %u in AMD's FSR 4 shaders, not counted)\n", validation_errors,
                     provider_errors);
-    const bool ok = non_finite == 0 && right == squares && validation_errors == 0;
+    ok = ok && validation_errors == 0;
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
