@@ -295,12 +295,12 @@ void check_run_time_load() {
           "the same module for a bare name, a full path in any case, LoadLibraryExA and GetModuleHandleW");
 
     const char* entry_points[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2",
-                                  "UninitializeApiImpl", "QueryApiImpl"};
+                                  "UninitializeApiImpl", "QueryApiImpl", "XErrorReport"};
     bool all = true;
     for (const char* n : entry_points)
         all = all && get_proc(rt_mod, n) &&
               reinterpret_cast<void*>(get_proc(rt_mod, n)) == rt::shims::find("xgameruntime.dll", n);
-    check(all, "GetProcAddress serves the five entry points xgameruntime.lib looks up");
+    check(all, "GetProcAddress serves all six xgameruntime.lib lookup names");
     SetLastError(0);
     check(get_proc(rt_mod, "NoSuchRuntimeFunction") == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
           "an unserved name is NULL with ERROR_PROC_NOT_FOUND, as from a real module");
@@ -434,6 +434,20 @@ void check_run_time_load() {
         const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        // GDK static-library thunks call the *flat* dynamic export, not this COM
+        // method. Verify that it resolves and has no hidden COM this-pointer.
+        using FlatReport = HRESULT(WINAPI*)(HRESULT, const char*);
+        auto flat_report = reinterpret_cast<FlatReport>(get_proc(rt_mod, "XErrorReport"));
+        check(flat_report != nullptr &&
+                  reinterpret_cast<void*>(flat_report) == rt::shims::find("xgameruntime.dll", "XErrorReport"),
+              "GetProcAddress resolves the direct XErrorReport export");
+        if (flat_report) {
+            seen.hr = S_OK;
+            seen.msg[0] = '\0';
+            const HRESULT flat_hr = flat_report(E_FAIL, "flat XErrorReport");
+            check(flat_hr == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "flat XErrorReport") == 0,
+                  "direct XErrorReport has the two-argument ABI and invokes the registered callback");
+        }
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None

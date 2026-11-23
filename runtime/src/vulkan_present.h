@@ -1,3 +1,4 @@
+#include "v29_packed16.h"
 #pragma once
 
 // Puts a D3D12 back buffer on screen through a Vulkan swapchain, for whichever front end the game turns out to use
@@ -780,7 +781,7 @@ private:
             view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
             view_info.format = current[i].format;
             view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            if (vk.vkCreateImageView(context_.device(), &view_info, nullptr, &frame.views[i]) != VK_SUCCESS) {
+            if (v29_packed16::create_view(vk.vkCreateImageView,context_.device(), &view_info, nullptr, &frame.views[i]) != VK_SUCCESS) {
                 drop_views(frame);
                 return false;
             }

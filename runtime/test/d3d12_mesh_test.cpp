@@ -145,7 +145,7 @@ int main() {
         ID3D12Device* inner = nullptr;
         if (FAILED(rt::d3d12::create_vulkan_device(device_info(mesh), IID_PPV_ARGS(&inner)))) return false;
         if (FAILED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                     reinterpret_cast<void**>(&device.p))))
+                                                     reinterpret_cast<void**>(&device.p), false)))
             return false;
         rt::d3d12::set_device_outer(inner, device.p);
         return true;
@@ -297,6 +297,14 @@ int main() {
         std::uint8_t* up = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         for (int i = 0; i < 3; ++i) std::memcpy(up + 256 * i, tints[i], sizeof(tints[i]));
+        const D3D12_DISPATCH_MESH_ARGUMENTS groups{1, 1, 2};
+        std::memcpy(up + 1024, &groups, sizeof(groups));
+        D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{};
+        mesh_arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+        D3D12_COMMAND_SIGNATURE_DESC mesh_signature_desc{sizeof(groups), 1, &mesh_arg, 0};
+        Ref<ID3D12CommandSignature> mesh_signature;
+        EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_signature_desc, nullptr,
+                                                        IID_PPV_ARGS(&mesh_signature.p))));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -342,7 +350,7 @@ int main() {
         // of the bottom-right quadrant.
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
-        list6->DispatchMesh(1, 1, 2);
+        list->ExecuteIndirect(mesh_signature.p, 1, upload.p, 1024, nullptr, 0);
         // The stream's VS PSO: a full-screen triangle through a viewport on the bottom-left quadrant, yellow.
         const D3D12_VIEWPORT bottom_left{0, float(size / 2), float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &bottom_left);
@@ -490,6 +498,7 @@ int main() {
         allocator.reset();
         queue.reset();
         fence.reset();
+        mesh_signature.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
     std::filesystem::remove_all(library);

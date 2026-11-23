@@ -780,12 +780,25 @@ public:
                 kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
                 : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
                 : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+                : kind == leonida::IndirectKind::dispatch_mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
                 : 0;
             if (!record_size || stride < record_size || stride % 4 != 0)
                 return check(false);
             const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
             if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
                 return check(false);
+        }
+        if (kind == leonida::IndirectKind::dispatch_mesh) {
+            if (!max_command_count) return;
+            if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+            leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+                              scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, 1, 1, 1, 0, 0};
+            draw.mesh = true;
+            draw.indirect_mesh = {resource_id(argument_buffer), argument_buffer_offset, stride, max_command_count,
+                                  count_buffer ? resource_id(count_buffer) : 0, count_buffer_offset};
+            check(list_.draw(std::move(draw)));
+            return;
         }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
@@ -799,6 +812,7 @@ public:
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
+            cmd.spill_data = compute_.spill;
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1043,6 +1057,7 @@ private:
     struct RootState {
         const RootArgumentLayout* layout = nullptr;
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+        std::vector<std::uint32_t> spill;
     };
 
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
@@ -1058,6 +1073,7 @@ private:
         hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
+        state.spill.assign((is_compute(state) && layout && layout->compute_ok) ? layout->compute_spill_dwords : 0, 0);
         if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
@@ -1092,6 +1108,11 @@ private:
             stub("root arguments beyond 32 user-data dwords (spill not modelled)");
     }
 
+    void write_spill(RootState& state, std::uint32_t dword, std::uint32_t value) {
+        if (dword < state.spill.size()) state.spill[dword] = value;
+        else check(false);
+    }
+
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
             // The layout is the executing list's, so the range is checked when it runs; no signature takes more
@@ -1113,7 +1134,13 @@ private:
         if (!p) return;
         if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
+        if (is_compute(state) && p->compute_offset == rt::rootsig::kNoSgpr) {
+            if (p->compute_spill_offset == rt::rootsig::kNoSpill) return check(false);
+            for (UINT i = 0; i < count; ++i) write_spill(state, p->compute_spill_offset + offset + i, values[i]);
+            return;
+        }
         const std::uint32_t first = first_dword(state, *p);
+        if (first == UINT32_MAX) return check(false);
         for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
     }
 
@@ -1124,7 +1151,15 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
+        if (is_compute(state) && p->compute_offset == rt::rootsig::kNoSgpr) {
+            if (p->compute_spill_offset == rt::rootsig::kNoSpill) return check(false);
+            write_spill(state, p->compute_spill_offset, std::uint32_t(va));
+            if (type != rt::rootsig::ParamType::Table)
+                write_spill(state, p->compute_spill_offset + 1, std::uint32_t(va >> 32));
+            return;
+        }
         const std::uint32_t first = first_dword(state, *p);
+        if (first == UINT32_MAX) return check(false);
         write(state, first, std::uint32_t(va));
         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
         // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
@@ -1237,7 +1272,7 @@ private:
 
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z, compute_.spill}));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.

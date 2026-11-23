@@ -1,3 +1,4 @@
+#include "v29_packed16.h"
 #pragma once
 
 // The execution side of the D3D12 layer, without COM: the per-device Vulkan context (resources, layout tracker,
@@ -96,7 +97,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
-    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
@@ -487,7 +488,7 @@ public:
                 vk.vkDestroyImageView(device, reinterpret_cast<VkImageView>(item.handle), nullptr);
                 break;
             case Kind::image:
-                vk.vkDestroyImage(device, reinterpret_cast<VkImage>(item.handle), nullptr);
+                v29_packed16::destroy_image(vk.vkDestroyImage,device, reinterpret_cast<VkImage>(item.handle), nullptr);
                 break;
             case Kind::sparse_resource:
                 // Releases the resource and its page backing together after outstanding submissions.
@@ -880,7 +881,7 @@ struct SparseResource {
     SparseResource(const SparseResource&) = delete;
     SparseResource& operator=(const SparseResource&) = delete;
     ~SparseResource() {
-        if (image) vk.vkDestroyImage(device, image, nullptr);
+        if (image) v29_packed16::destroy_image(vk.vkDestroyImage,device, image, nullptr);
         if (buffer) vk.vkDestroyBuffer(device, buffer, nullptr);
     }
 
@@ -1247,6 +1248,21 @@ public:
         replay_.zero_size = size;
     }
 
+    // Staged compute arguments live until the owning submission retires.
+    using RootSpillStager =
+        std::function<bool(const void*, std::size_t, std::uint64_t&, std::shared_ptr<void>&)>;
+    void set_root_spill_stager(RootSpillStager stager) {
+        std::unique_lock lock(resource_mutex_);
+        root_spill_stager_ = std::move(stager);
+    }
+
+    void set_mesh_indirect_caps(bool mesh, bool counted, std::uint32_t max_count) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.draw_mesh_tasks_indirect = mesh ? vk.vkCmdDrawMeshTasksIndirectEXT : nullptr;
+        replay_.draw_mesh_tasks_indirect_count = mesh && counted ? vk.vkCmdDrawMeshTasksIndirectCountEXT : nullptr;
+        replay_.max_mesh_indirect_count = max_count;
+    }
+
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
     void set_color_attachment_format(std::function<bool(VkFormat)> check) {
         std::unique_lock lock(resource_mutex_);
@@ -1560,7 +1576,7 @@ private:
         if (r.typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
             info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
-        if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        if (v29_packed16::create_view(vk.vkCreateImageView,device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
         views_[key] = view;
         return view;
     }
@@ -1682,6 +1698,7 @@ private:
     bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     ReplayFunctions replay_;
+    RootSpillStager root_spill_stager_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
@@ -2166,6 +2183,7 @@ private:
             std::vector<KhrInstanceStage> stages;
             ~KhrGuard() { queue->recycle_khr_stages(stages); }
         } khr_guard{this};
+        std::vector<std::shared_ptr<void>> spill_holds;
         std::function<void(bool)> bindless_commit;
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
         // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
@@ -2208,6 +2226,17 @@ private:
                                                                    VkDeviceAddress& address) {
             return stage_khr_instances(replay, build, khr_guard.stages, address);
         };
+        if (context_.root_spill_stager_) {
+            replay.stage_root_spill = [this, &spill_holds](const std::uint32_t* dwords, std::size_t count,
+                                                           std::uint64_t& console_va) {
+                if (!dwords || !count || count > 64) return false;
+                std::shared_ptr<void> hold;
+                if (!context_.root_spill_stager_(dwords, count * sizeof(std::uint32_t), console_va, hold))
+                    return false;
+                if (hold) spill_holds.push_back(std::move(hold));
+                return true;
+            };
+        }
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -2379,6 +2408,7 @@ private:
         if (!slot) return ReplayResult::unsupported;
         slot->khr_instances = std::move(khr_guard.stages);  // freed when this slot is reused
         khr_guard.stages.clear();
+        slot->root_spills = std::move(spill_holds);
         command_buffer = slot->buffer;
         // MoltenVK writes a timestamp at the end of a Metal encoder and resolves it with a blit that nothing orders
         // after that write, so a copy in the same or the next command buffer reads the old value (docs section 4.6).
@@ -2399,6 +2429,7 @@ private:
                 ordered_timestamps = true;
             };
         const auto discard = [&] {
+            slot->root_spills.clear();
             if (context_.vk.vkResetCommandBuffer(command_buffer, 0) == VK_SUCCESS) slot->ticket = 0;
         };
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -2787,6 +2818,7 @@ private:
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_dispatch;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
+        std::vector<std::shared_ptr<void>> root_spills;
     };
 
     struct PendingBindings {
@@ -2948,6 +2980,7 @@ private:
             if (slot.ticket > done) continue;
             slot.segments.clear();
             recycle_khr_stages(slot.khr_instances);
+            slot.root_spills.clear();
             for (VkEvent event : slot.events)
                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
                 else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);

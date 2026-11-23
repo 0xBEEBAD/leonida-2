@@ -21,6 +21,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "d3d12_xs_rootsig.h"
+#include "d3d12_xs_vmem.h"
 #include "shims.h"
 
 namespace {
@@ -117,11 +118,22 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
+void* xmem_descriptor_heap_alloc(std::size_t byte_size, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    return (hooks && hooks->alloc) ? hooks->alloc(byte_size, attributes) : nullptr;
+}
+
+void xmem_descriptor_heap_free(void* ptr, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    if (hooks && hooks->free) hooks->free(ptr, attributes);
+}
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
 // least restrictive floor; higher feature levels are still exposed by the created device.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
+    rt::d3d12_xs::set_default_descriptor_heap_allocator(&xmem_descriptor_heap_alloc, &xmem_descriptor_heap_free);
     constexpr auto method = "D3D12XboxCreateDevice";
     using rt::d3d12_trace::result;
     if (!out) return result(method, E_POINTER);
@@ -157,6 +169,13 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
     }
 
+// Native PC test clients use a normal PC command-list table; the Xbox title
+    // instead requires the console list ABI, including the extra list slots.
+    char list_mode[8] = {};
+    size_t list_mode_length = 0;
+    const bool pc_lists = getenv_s(&list_mode_length, list_mode, "LEONIDA_D3D12_LISTS") == 0 &&
+                          std::strcmp(list_mode, "pc") == 0;
+
 #ifdef LEONIDA_VULKAN_DEVICE
     // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
     // behind the same proxy instead of the host's D3D12 device.
@@ -171,7 +190,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<unsigned long>(vhr));
             return result(method, vhr);
         }
-        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
+        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out, /*console_lists=*/!pc_lists);
         if (FAILED(vhr)) {
             vulkan->Release();
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
@@ -199,7 +218,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         return result(method, FAILED(hr) ? hr : E_FAIL);
     }
 
-    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
+    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out, /*console_lists=*/!pc_lists);
     if (FAILED(hr)) {
         // create_device_proxy keeps the caller's reference on failure.
         real->Release();
@@ -217,6 +236,37 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
+// Console graphics memory configuration is an ABI call, not PC GPU page-table allocation.
+// Validate the measured 32-byte block, initialize outputs, and retain the policy;
+// the Vulkan backend and XMem shims own actual memory mappings. Never return
+// success for unrecognized flags or an impossible table size.
+HRESULT WINAPI configure_virtual_memory(rt::d3d12_xs::VirtualMemoryConfigurationX* desc) {
+    rt::d3d12_xs::VirtualMemoryPolicyX policy{};
+    const std::int32_t hr = rt::d3d12_xs::apply_virtual_memory_configuration(desc, policy);
+    if (hr < 0) {
+        if (desc) {
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX rejected "
+                                 "flags=0x%08x pages=%u preserve=%u\n",
+                         static_cast<unsigned>(desc->flags),
+                         static_cast<unsigned>(desc->page_table_pages),
+                         static_cast<unsigned>(desc->frame_buffer_preserve_bytes));
+        } else {
+            std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX rejected null descriptor\n");
+        }
+        return static_cast<HRESULT>(hr);
+    }
+    static std::atomic<std::uint32_t> configured_table_bytes{0};
+    static std::atomic<std::uint32_t> framebuffer_preserve_bytes{0};
+    configured_table_bytes.store(policy.page_table_bytes, std::memory_order_release);
+    framebuffer_preserve_bytes.store(policy.frame_buffer_preserve_bytes, std::memory_order_release);
+    std::fprintf(stderr,
+        "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX flags=0x%08x "
+        "page_table_bytes=%u framebuffer_preserve_bytes=%u -> 0x%08x\n",
+        static_cast<unsigned>(policy.flags), static_cast<unsigned>(policy.page_table_bytes),
+        static_cast<unsigned>(policy.frame_buffer_preserve_bytes), static_cast<unsigned>(hr));
+    return static_cast<HRESULT>(hr);
+}
+
 }  // namespace
 
 SHIM_TABLE(d3d12_xs,
@@ -225,4 +275,5 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
 );

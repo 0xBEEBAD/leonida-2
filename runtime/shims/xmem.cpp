@@ -1,6 +1,6 @@
 // xmem.dll: the GDK's tracked allocator. Mapped onto the CRT's aligned heap and VirtualQueryEx.
 //
-// The measured ABI (docs from the clean-room spec) shows four imports:
+// The original measured ABI (docs from the clean-room spec) covers:
 //   XMemAlloc(size, attributes)
 //   XMemFree(ptr, attributes)
 //   XMemVirtualQuery(process, address, out64)
@@ -26,15 +26,16 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "xmem_physical.h"
 
 namespace {
 
 constexpr size_t kAlign = 64;
 constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
 
-// gta6rt --trace FILE: the first XMemAlloc, XMemFree and XMemVirtualAlloc call for each distinct raw attribute word go to the
-// startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
-// bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
+// gta6rt --trace FILE: the first XMemAlloc/Free (including Default) and XMemVirtualAlloc calls for each distinct
+// raw attribute word go to the startup trace as an "xmem_attributes" event (api, word, allocation size, caller as
+// module+RVA). The attribute bits are not known yet; this records them from a real run without logging every allocation,
 // which would fill the file. Off: one relaxed load per call.
 void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
@@ -52,14 +53,40 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
+void* allocate_block(size_t size) {
+    return _aligned_malloc(size ? size : 1, kAlign);
+}
+
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
-    return _aligned_malloc(size ? size : 1, kAlign);
+    return allocate_block(size);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
     note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
     _aligned_free(p);
+}
+
+// The default wrappers use the same two-argument ABI and aligned heap as XMemAlloc/Free (upstream #6919,
+// 36936f3bf43e33a60e36cff942fa0862e7474645). Sharing the allocator is necessary for cross-family frees; do not
+// substitute HeapAlloc/HeapFree or infer unmeasured attribute fields here.
+void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
+    note_attributes("XMemAllocDefault", attributes, size, _ReturnAddress());
+    return allocate_block(size);
+}
+
+void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
+    note_attributes("XMemFreeDefault", attributes, kNoSize, _ReturnAddress());
+    _aligned_free(p);
+}
+
+BOOL WINAPI XMemIsToolsMemAvailable() {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] xmem: XMemIsToolsMemAvailable -> FALSE (no devkit tools memory; logged once)\n");
+    }
+    return FALSE;
 }
 
 // Measured call sites pass a zeroed 64-byte structure. Only the MEMORY_BASIC_INFORMATION-compatible prefix is
@@ -132,8 +159,23 @@ constexpr DWORD kXmemLargePages = 0x20000000;
 constexpr DWORD kXmem64kPages = 0x20400000;
 constexpr DWORD kXmemPageModeMask = kXmem64kPages;
 constexpr SIZE_T kXmemPageSize64k = 0x10000;
+constexpr SIZE_T kXmemPageSize2m = 0x200000;
 constexpr DWORD kXmemHostAllocationTypeMask =
     MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
+
+std::atomic<rt::xmem::PhysicalReserveFn> g_physical_reserve{nullptr};
+std::atomic<rt::xmem::PlaceholderReplaceFn> g_placeholder_replace{nullptr};
+
+using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+
+VirtualAlloc2Fn aligned_virtual_alloc() {
+    static const auto fn = []() -> VirtualAlloc2Fn {
+        HMODULE module = GetModuleHandleW(L"kernelbase.dll");
+        if (!module) module = GetModuleHandleW(L"kernel32.dll");
+        return module ? reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(module, "VirtualAlloc2")) : nullptr;
+    }();
+    return fn;
+}
 
 bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     const SIZE_T max = (std::numeric_limits<SIZE_T>::max)();
@@ -153,9 +195,10 @@ DWORD host_protect(DWORD p) {
 }
 
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
-    // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
-    // region.
+    // The guest's page size controls alignment and rounding. The 2 MiB path uses VirtualAlloc2 address
+    // requirements and ordinary host pages, not privileged Windows large pages (upstream #6919). Reserve-only
+    // 64 KiB physical windows continue to go through our shared-page store below. The new 2 MiB reservations
+    // are ordinary private regions for subsequent commits, not physical-page mapping windows.
     //
     // The attribute word is recorded, not applied, as for XMemAlloc: the host has no allocator ids or memory types.
     // The retail executable passes 0x21, 0x3, 0x183, 0x283 and 0x181 and stops at an int3 when a reservation
@@ -166,12 +209,43 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    const DWORD page_mode = allocation_type & kXmemPageModeMask;
-    if (page_mode == kXmemLargePages) {
+    // The title maps XMemAllocatePhysicalPages pages into these reserve-only 64 KiB windows.
+    // Preserve current attribute tracing and CPU protection handling; the physical store supplies
+    // placeholders instead of ordinary reservations. Targets that do not link it keep the old path.
+    if (address == nullptr && (allocation_type & ~MEM_TOP_DOWN) == (MEM_RESERVE | kXmem64kPages)) {
+        if (const rt::xmem::PhysicalReserveFn reserve = rt::xmem::physical_reserve()) {
+            return reserve(size, host_protect(protect), allocation_type & MEM_TOP_DOWN);
+        }
+    }
+
+    // The 185 MiB descriptor pool uses a Win32 placeholder (0x42000).
+    // Use the existing CPU physical page store, not plain VirtualAlloc:
+    // subsequent XMemMapPhysicalPages calls require an actual placeholder
+    // registered with the store. Attributes 0x7 carry guest policy only.
+    if (address == nullptr &&
+        (allocation_type & ~MEM_TOP_DOWN) == (MEM_RESERVE | MEM_RESERVE_PLACEHOLDER)) {
+        if (const auto reserve = rt::xmem::physical_reserve())
+            return reserve(size, host_protect(protect), allocation_type & MEM_TOP_DOWN);
         SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
-    if (page_mode != 0 && page_mode != kXmem64kPages) {
+
+    // The guest splits the placeholder with VirtualFree(PRESERVE_PLACEHOLDER)
+    // then reserves its windows with MEM_REPLACE_PLACEHOLDER + 64 KiB mode.
+    // Retain the same placeholder so physical pages can later be mapped to it.
+    if ((allocation_type & (MEM_RESERVE | MEM_REPLACE_PLACEHOLDER)) ==
+        (MEM_RESERVE | MEM_REPLACE_PLACEHOLDER) &&
+        (allocation_type & MEM_COMMIT) == 0 && address != nullptr &&
+        (allocation_type & ~(MEM_RESERVE | MEM_REPLACE_PLACEHOLDER |
+                              kXmemPageModeMask | MEM_TOP_DOWN)) == 0) {
+        if (const auto replace = rt::xmem::placeholder_replace())
+            return replace(address, size, host_protect(protect));
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+
+    const DWORD page_mode = allocation_type & kXmemPageModeMask;
+    if (page_mode != 0 && page_mode != kXmem64kPages && page_mode != kXmemLargePages) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
@@ -187,11 +261,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 
     SYSTEM_INFO system_info{};
     GetSystemInfo(&system_info);
-    const SIZE_T page_granularity = page_mode == kXmem64kPages ? kXmemPageSize64k : system_info.dwPageSize;
-    const SIZE_T base_granularity =
-        page_mode == kXmem64kPages
-            ? kXmemPageSize64k
-            : ((host_type & MEM_RESERVE) ? system_info.dwAllocationGranularity : system_info.dwPageSize);
+    SIZE_T page_granularity = system_info.dwPageSize;
+    SIZE_T base_granularity = (host_type & MEM_RESERVE) ? system_info.dwAllocationGranularity : system_info.dwPageSize;
+    if (page_mode == kXmem64kPages) page_granularity = base_granularity = kXmemPageSize64k;
+    if (page_mode == kXmemLargePages) page_granularity = base_granularity = kXmemPageSize2m;
     if (page_granularity == 0 || (page_granularity & (page_granularity - 1)) != 0 || base_granularity == 0 ||
         (base_granularity & (base_granularity - 1)) != 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -207,6 +280,11 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         }
         const uintptr_t requested_end = requested + size;
         const uintptr_t base = requested & ~(static_cast<uintptr_t>(base_granularity) - 1);
+        // A non-null request below the guest granularity must not become a host-selected allocation at nullptr.
+        if (base == 0) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return nullptr;
+        }
         if (requested_end > max - (static_cast<uintptr_t>(page_granularity) - 1)) {
             SetLastError(ERROR_INVALID_PARAMETER);
             return nullptr;
@@ -215,11 +293,27 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                               ~(static_cast<uintptr_t>(page_granularity) - 1);
         address = reinterpret_cast<void*>(base);
         size = static_cast<SIZE_T>(end - base);
-    } else if (page_mode == kXmem64kPages && !round_up_size(size, page_granularity, size)) {
+    } else if (page_mode != 0 && !round_up_size(size, page_granularity, size)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
 
+    // Only new reserve/commit requests need an alignment constraint. MEM_RESET and MEM_RESET_UNDO operate on
+    // existing memory; never add MEM_RESERVE to them or turn a reset into a successful fresh allocation.
+    if (page_mode == kXmemLargePages && address == nullptr && (host_type & (MEM_RESERVE | MEM_COMMIT)) &&
+        !(host_type & (MEM_RESET | 0x01000000))) {
+        const auto alloc2 = aligned_virtual_alloc();
+        if (!alloc2) {
+            SetLastError(ERROR_NOT_SUPPORTED);
+            return nullptr;
+        }
+        MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.Alignment = kXmemPageSize2m;
+        MEM_EXTENDED_PARAMETER parameter{};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &requirements;
+        return alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_protect(protect), &parameter, 1);
+    }
     return VirtualAlloc(address, size, host_type, host_protect(protect));
 }
 
@@ -294,6 +388,17 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
 
 }  // namespace
 
+namespace rt::xmem {
+void set_physical_reserve(PhysicalReserveFn fn) { g_physical_reserve.store(fn, std::memory_order_release); }
+PhysicalReserveFn physical_reserve() { return g_physical_reserve.load(std::memory_order_acquire); }
+void set_placeholder_replace(PlaceholderReplaceFn fn) {
+    g_placeholder_replace.store(fn, std::memory_order_release);
+}
+PlaceholderReplaceFn placeholder_replace() {
+    return g_placeholder_replace.load(std::memory_order_acquire);
+}
+}  // namespace rt::xmem
+
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
 
 // The classic libraries and the memory api sets a title's imports name.
@@ -312,6 +417,9 @@ SHIM_TABLE(title_memory,
 SHIM_TABLE(xmem,
     {"xmem.dll", "XMemAlloc", reinterpret_cast<void*>(&XMemAlloc)},
     {"xmem.dll", "XMemFree", reinterpret_cast<void*>(&XMemFree)},
+    {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
+    {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
+    {"xmem.dll", "XMemIsToolsMemAvailable", reinterpret_cast<void*>(&XMemIsToolsMemAvailable)},
     {"xmem.dll", "XMemVirtualQuery", reinterpret_cast<void*>(&XMemVirtualQuery)},
     {"xmem.dll", "XMemGetWorkingSetStatistics", reinterpret_cast<void*>(&XMemGetWorkingSetStatistics)},
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},

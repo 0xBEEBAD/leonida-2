@@ -463,7 +463,11 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R8_UNORM:
     case VK_FORMAT_R8_SNORM:
     case VK_FORMAT_R8_UINT:
-    case VK_FORMAT_R8_SINT: return {1, 1};
+    case VK_FORMAT_R8_SINT:
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    case VK_FORMAT_A8_UNORM_KHR:  // an A8_UNORM render target (VulkanDeviceInfo::a8_render_target)
+#endif
+        return {1, 1};
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
     case VK_FORMAT_BC4_UNORM_BLOCK:
@@ -853,6 +857,9 @@ struct ReplayFunctions {
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
+    std::uint32_t max_mesh_indirect_count = 1;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -901,6 +908,7 @@ struct ReplayFunctions {
     // device addresses, not console VAs. This stages one that stays alive until the submission completes and returns
     // its device address. A GPU-written list is refused as unsupported; a bad entry is invalid_copy.
     std::function<ReplayResult(const BuildAccelerationStructure&, VkDeviceAddress&)> prepare_khr_instances;
+    std::function<bool(const std::uint32_t*, std::size_t, std::uint64_t&)> stage_root_spill;
     // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
     // cannot read while the list is prepared, `xdxr_record` records the build.
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
@@ -1020,6 +1028,7 @@ struct Prepared {
     VkDeviceSize fill_scratch_offset = 0;
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
+    std::uint64_t spill_va = 0;
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
@@ -1140,6 +1149,9 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     case VK_FORMAT_R8G8_UNORM:
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_UNORM: is_integer = false; unorm = {255, 255, 255, 255}; break;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    case VK_FORMAT_A8_UNORM_KHR: is_integer = false; unorm = {0, 0, 0, 255}; break;  // alpha only
+#endif
     case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_SRGB:  // the colour channels go through the sRGB curve on the GPU
         is_integer = false;
@@ -1542,6 +1554,7 @@ inline VkDeviceSize indirect_record_size(IndirectKind kind) {
     case IndirectKind::draw: return sizeof(VkDrawIndirectCommand);
     case IndirectKind::draw_indexed: return sizeof(VkDrawIndexedIndirectCommand);
     case IndirectKind::dispatch: return sizeof(VkDispatchIndirectCommand);
+    case IndirectKind::dispatch_mesh: return 0; // mesh commands must carry captured Draw state
     }
     return 0;
 }
@@ -3028,6 +3041,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
+                if (!ind->spill_data.empty() && (!vk.stage_root_spill ||
+                    !vk.stage_root_spill(ind->spill_data.data(), ind->spill_data.size(), p.spill_va)))
+                    return ReplayResult::unsupported;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -3077,6 +3093,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
+            if (!dispatch->spill_data.empty() && (!vk.stage_root_spill ||
+                !vk.stage_root_spill(dispatch->spill_data.data(), dispatch->spill_data.size(), p.spill_va)))
+                return ReplayResult::unsupported;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
@@ -3084,6 +3103,26 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.draw = std::uint32_t(out.draw_count++);
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
                 return r;
+            if (const auto& m = draw->indirect_mesh; m.arguments) {
+                if (!draw->mesh || !vk.draw_mesh_tasks_indirect || !m.max_count ||
+                    m.stride < sizeof(VkDrawMeshTasksIndirectCommandEXT) || m.stride % 4)
+                    return ReplayResult::invalid_indirect_arguments;
+                if (!bind(m.arguments) || !p.binding.buffer || p.binding.image)
+                    return ReplayResult::unresolved_resource;
+                const VkDeviceSize bytes = VkDeviceSize(m.max_count - 1) * m.stride +
+                                            sizeof(VkDrawMeshTasksIndirectCommandEXT);
+                if (!detail::indirect_range(p.binding, m.argument_offset, bytes))
+                    return ReplayResult::invalid_indirect_arguments;
+                if (m.count_buffer) {
+                    if (!vk.draw_mesh_tasks_indirect_count || m.max_count > vk.max_mesh_indirect_count)
+                        return ReplayResult::unsupported;
+                    const ResourceBinding* count = resolve(m.count_buffer);
+                    if (!count || !count->buffer || count->image) return ReplayResult::unresolved_resource;
+                    if (!detail::indirect_range(*count, m.count_offset, sizeof(std::uint32_t)))
+                        return ReplayResult::invalid_indirect_arguments;
+                    p.source = *count;
+                } else if (m.count_offset) return ReplayResult::invalid_indirect_arguments;
+            }
         }
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
@@ -3929,6 +3968,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     if (ind->pipeline) {
                         ShaderUserData data{};
                         std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
+                        if (!ind->spill_data.empty()) {
+                            data.s[0] = static_cast<std::uint32_t>(p.spill_va);
+                            data.s[1] = static_cast<std::uint32_t>(p.spill_va >> 32);
+                        }
                         data.heap_base = vk.heap_base;
                         data.code_base = p.pipeline.code_base;
                         vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
@@ -4014,6 +4057,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             ShaderUserData data{};
             std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
+            if (!dispatch->spill_data.empty()) {
+                data.s[0] = static_cast<std::uint32_t>(p.spill_va);
+                data.s[1] = static_cast<std::uint32_t>(p.spill_va >> 32);
+            }
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
@@ -4105,7 +4152,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
             if (draw->mesh) {
-                vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+                const auto& m = draw->indirect_mesh;
+                if (m.arguments) {
+                    const VkDeviceSize args = p.binding.buffer_offset + m.argument_offset;
+                    if (m.count_buffer) {
+                        vk.draw_mesh_tasks_indirect_count(command_buffer, p.binding.buffer, args,
+                            p.source.buffer, p.source.buffer_offset + m.count_offset, m.max_count, m.stride);
+                    } else {
+                        // One record per call works even without the multiDrawIndirect feature.
+                        for (std::uint32_t k = 0; k < m.max_count; ++k)
+                            vk.draw_mesh_tasks_indirect(command_buffer, p.binding.buffer,
+                                                        args + VkDeviceSize(k) * m.stride, 1, m.stride);
+                    }
+                } else vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,

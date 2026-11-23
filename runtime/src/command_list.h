@@ -380,6 +380,7 @@ struct Dispatch {
     std::uint32_t x;
     std::uint32_t y;
     std::uint32_t z;
+    std::vector<std::uint32_t> spill_data;
 };
 
 // D3D12_VIEWPORT.
@@ -440,6 +441,15 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     bool mesh = false;
+    // A native mesh-indirect draw captures the same pipeline, targets and root arguments as DispatchMesh.
+    struct MeshIndirect {
+        ResourceId arguments = 0;
+        std::uint64_t argument_offset = 0;
+        std::uint32_t stride = 0;
+        std::uint32_t max_count = 0;
+        ResourceId count_buffer = 0;
+        std::uint64_t count_offset = 0;
+    } indirect_mesh;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -586,6 +596,7 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
+    dispatch_mesh = 3,
 };
 
 struct ExecuteIndirect {
@@ -601,6 +612,7 @@ struct ExecuteIndirect {
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
+    std::vector<std::uint32_t> spill_data;
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).

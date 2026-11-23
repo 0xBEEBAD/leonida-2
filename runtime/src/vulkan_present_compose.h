@@ -1,3 +1,4 @@
+#include "v29_packed16.h"
 #pragma once
 
 // The compute pass behind PresentX's plane composition (docs/d3d12_vulkan.md section 4.5), used by VulkanPresenter::
@@ -155,7 +156,7 @@ public:
         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view_info.format = target_format;
         view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        if (vk.vkCreateImageView(device, &view_info, nullptr, &view_) != VK_SUCCESS) {
+        if (v29_packed16::create_view(vk.vkCreateImageView,device, &view_info, nullptr, &view_) != VK_SUCCESS) {
             release_target();
             return false;
         }
@@ -234,7 +235,7 @@ private:
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         if (view_) vk.vkDestroyImageView(device, view_, nullptr);
-        if (image_) vk.vkDestroyImage(device, image_, nullptr);
+        if (image_) v29_packed16::destroy_image(vk.vkDestroyImage,device, image_, nullptr);
         if (memory_object_) vk.vkFreeMemory(device, memory_object_, nullptr);
         view_ = VK_NULL_HANDLE;
         image_ = VK_NULL_HANDLE;

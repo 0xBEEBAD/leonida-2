@@ -424,29 +424,34 @@ int main() {
         check(empty.ok && empty.first_sgpr.empty() && empty.end_sgpr == 4, "pack_stage: empty signature");
     }
 
-    // pack_stage refuses a spill instead of truncating: compute has 28 SGPRs above s4, mesh 16 above s16.
+    // Compute spills trailing whole arguments; graphics overflow remains a refusal.
     {
         RootSignature exact;
         exact.params = {consts(28)};
-        check(pack_stage(exact, Stage::Compute).ok, "pack_stage: 28 constants fill compute exactly");
+        const StagePackResult e = pack_stage(exact, Stage::Compute);
+        check(e.ok && e.end_sgpr == 32 && e.spill_dwords == 0 &&
+                  e.spill_dword == std::vector<uint32_t>({kNoSpill}), "compute exact inline fit");
         RootSignature over;
-        over.params = {consts(27), view()};  // the view would need s31..s32
+        over.params = {consts(27), view(), table(), consts(3)};
         const StagePackResult r = pack_stage(over, Stage::Compute);
-        check(!r.ok && r.first_sgpr.empty() && r.error.find("root parameter 1") != std::string::npos &&
-                  r.error.find("spill") != std::string::npos,
-              "pack_stage: a parameter that does not fit whole is refused and named");
-        RootSignature fits_old;
-        fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, not 28 from s4
-        check(pack(fits_old).ok && !pack_stage(fits_old, Stage::Compute).ok,
-              "pack_stage: compute budget is 28, not 32");
+        check(r.ok && r.first_sgpr == std::vector<uint32_t>({4, kNoSgpr, kNoSgpr, kNoSgpr}) &&
+                  r.spill_dword == std::vector<uint32_t>({kNoSpill, 0, 2, 3}) &&
+                  r.end_sgpr == 31 && r.spill_dwords == 6, "compute spill remains monotonic and packed");
+        RootSignature all;
+        all.params = {consts(64)};
+        const StagePackResult m = pack_stage(all, Stage::Compute);
+        check(m.ok && m.spill_dwords == 64 && m.end_sgpr == 4 && m.d3d12_cost == 64,
+              "compute full 64-dword spill");
+        check(!pack_stage(over, Stage::Vertex).ok && !pack_stage(over, Stage::Pixel).ok,
+              "graphics root spill still unsupported");
         RootSignature tables;
-        tables.params.assign(20, table());  // one dword each: compute s4..s23; pack() needs 40
+        tables.params.assign(20, table());
         check(pack_stage(tables, Stage::Compute).ok && !pack(tables).ok,
-              "pack_stage: 20 one-dword tables fit compute, which pack() refuses (40 dwords of tables)");
-        tables.params.assign(16, table());  // fills mesh s16..s31 exactly
-        check(pack_stage(tables, Stage::Mesh).ok, "pack_stage: 16 tables fill the mesh stage exactly");
+              "compute tables have one inline dword");
+        tables.params.assign(16, table());
+        check(pack_stage(tables, Stage::Mesh).ok, "mesh inline fit");
         tables.params.push_back(table());
-        check(!pack_stage(tables, Stage::Mesh).ok, "pack_stage: a 17th table spills on mesh");
+        check(!pack_stage(tables, Stage::Mesh).ok, "mesh overflow refused");
     }
 
     // pack_stage keeps pack()'s validation.

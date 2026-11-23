@@ -1,3 +1,4 @@
+#include "v29_packed16.h"
 #pragma once
 
 // The bindless descriptor set of translated shaders: set 0 of the contract in docs/design.md and
@@ -325,7 +326,7 @@ public:
         if (fallback_sampler_) vk_.vkDestroySampler(device_, fallback_sampler_, nullptr);
         for (const VkImageView view : fallback_views_) vk_.vkDestroyImageView(device_, view, nullptr);
         for (const auto& image : fallback_images_) {
-            if (image.image) vk_.vkDestroyImage(device_, image.image, nullptr);
+            if (image.image) v29_packed16::destroy_image(vk_.vkDestroyImage,device_, image.image, nullptr);
             if (image.memory) vk_.vkFreeMemory(device_, image.memory, nullptr);
         }
         if (pool_) vk_.vkDestroyDescriptorPool(device_, pool_, nullptr);  // frees the set
@@ -735,7 +736,7 @@ private:
                 info.format = formats[c];
                 info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                 VkImageView view = VK_NULL_HANDLE;
-                if (vk_.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return false;
+                if (v29_packed16::create_view(vk_.vkCreateImageView,device_, &info, nullptr, &view) != VK_SUCCESS) return false;
                 fallback_views_.push_back(view);
                 if (c == 0 || bindless::multisampled(dimension))
                     fallback_by_binding_[bindless::sampled_binding(dimension, c)] = view;

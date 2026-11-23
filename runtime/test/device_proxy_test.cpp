@@ -12,9 +12,13 @@
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
+#include <vector>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 
+#include <cstddef>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -108,7 +112,130 @@ bool load_compute_shader(ComPtr<ID3DBlob>& bytecode) {
 
 }  // namespace
 
+
+static bool v16_check_slot108(ID3D12Device* real) {
+    if (!real) return false;
+
+    ID3D12Device8* native = nullptr;
+
+    if (FAILED(real->QueryInterface(
+            __uuidof(ID3D12Device8),
+            reinterpret_cast<void**>(&native))) ||
+        !native) return false;
+
+    void* proxy = nullptr;
+
+    real->AddRef();
+
+    const HRESULT hr =
+        rt::d3d12_xs::create_device_proxy(
+            real, __uuidof(ID3D12Device), &proxy, true);
+
+    if (FAILED(hr) || !proxy) {
+        native->Release();
+        return false;
+    }
+
+    using XboxAllocation =
+        D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
+            D3D12_RESOURCE_ALLOCATION_INFO*,
+            void*, UINT, UINT,
+            const D3D12_RESOURCE_DESC*,
+            D3D12_RESOURCE_ALLOCATION_INFO1*);
+
+    auto* table = *reinterpret_cast<void***>(proxy);
+
+    const auto call =
+        reinterpret_cast<XboxAllocation>(table[108]);
+
+    bool ok = true;
+
+    for (unsigned kind = 0; kind < 2; ++kind) {
+        D3D12_RESOURCE_DESC desc{};
+
+        desc.Dimension = kind == 0
+            ? D3D12_RESOURCE_DIMENSION_BUFFER
+            : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
+        desc.Width = kind == 0 ? 65536 : 32;
+        desc.Height = kind == 0 ? 1 : 32;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+
+        desc.Format = kind == 0
+            ? DXGI_FORMAT_UNKNOWN
+            : DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        desc.Layout = kind == 0
+            ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+            : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        D3D12_RESOURCE_ALLOCATION_INFO1 expected_each{};
+        D3D12_RESOURCE_ALLOCATION_INFO1 actual_each{};
+
+        D3D12_RESOURCE_DESC1 native_desc{};
+
+        std::memcpy(&native_desc, &desc, sizeof(desc));
+        native_desc.SamplerFeedbackMipRegion = {};
+
+        if (kind == 1) {
+            // Confirm console-only descriptor words are
+            // normalized on a copy.
+            desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+            desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20000);
+        }
+
+        const auto expected =
+            native->GetResourceAllocationInfo2(
+                1, 1, &native_desc, &expected_each);
+
+        D3D12_RESOURCE_ALLOCATION_INFO actual{};
+
+        const auto returned = call(
+            &actual, proxy, 1, 1, &desc, &actual_each);
+
+        ok = ok &&
+            returned == &actual &&
+            expected.SizeInBytes != UINT64_MAX &&
+            actual.SizeInBytes == expected.SizeInBytes &&
+            actual.Alignment == expected.Alignment &&
+            actual_each.Offset == expected_each.Offset &&
+            actual_each.Alignment == expected_each.Alignment &&
+            actual_each.SizeInBytes == expected_each.SizeInBytes;
+    }
+
+    reinterpret_cast<IUnknown*>(proxy)->Release();
+    native->Release();
+
+    return ok;
+}
+
 int main(int argc, char** argv) {
+    const bool v14_debug_enabled =
+        GetEnvironmentVariableW(
+            L"LEONIDA_DIAG_DEBUG", nullptr, 0) != 0;
+
+    if (v14_debug_enabled) {
+        HMODULE dll = LoadLibraryW(L"d3d12.dll");
+        using DebugFn = HRESULT(WINAPI*)(REFIID, void**);
+
+        auto fn = dll ? reinterpret_cast<DebugFn>(
+            GetProcAddress(dll, "D3D12GetDebugInterface"))
+            : nullptr;
+
+        ID3D12Debug* debug = nullptr;
+
+        if (!fn || FAILED(fn(IID_PPV_ARGS(&debug))) || !debug) {
+            std::printf("FAIL v14 debug layer unavailable\n");
+            return 1;
+        }
+
+        debug->EnableDebugLayer();
+        debug->Release();
+        std::printf("v14 D3D12 debug layer enabled\n");
+    }
+
     // --trace-d3d12, as gta6rt takes it: device_proxy_trace checks that the parameter words still print then.
     if (argc == 2 && std::strcmp(argv[1], "--trace-d3d12") == 0) rt::d3d12_trace::set_enabled(true);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -151,6 +278,8 @@ int main(int argc, char** argv) {
 
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device.Get());
     check(real != nullptr, "proxy exposes its PC device");
+    check(v16_check_slot108(real),
+          "v16 slot108 Xbox allocation ABI matches native D3D12");
     unsigned slots = rt::d3d12_xs::device_proxy_slot_count(device.Get());
     std::printf("proxy forwards %u PC vtable slots (ID3D12Device..Device14 max is 83)\n", slots);
     check(slots >= 44, "proxy forwards at least the base ID3D12Device vtable");
@@ -168,6 +297,66 @@ int main(int argc, char** argv) {
     if (slots > 62) check(proxy_vtbl[62] != real_vtbl[62], "slot 62 thunk differs from PC CreateStateObject");
     if (slots > 67) check(proxy_vtbl[67] != real_vtbl[67], "slot 67 thunk differs from PC CreateProtectedResourceSession1");
     if (slots > 76) check(proxy_vtbl[76] != real_vtbl[76], "slot 76 thunk differs from PC CreateCommittedResource3");
+
+    // Xbox struct-return ABI: RCX is the hidden result buffer, RDX is the
+    // device, R8/R9 carry the ordinary arguments (PC reverses RCX/RDX).
+    // The real WARP device is the oracle for the *values* of both methods.
+    check(rt::d3d12_xs::device_slot_overridden(25) && rt::d3d12_xs::device_slot_overridden(26),
+          "device slots 25 and 26 have struct-return adapters");
+    using XboxHeapPropsFn = std::uintptr_t(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
+    auto xbox_heap_props = reinterpret_cast<XboxHeapPropsFn>(proxy_vtbl[26]);
+    D3D12_HEAP_PROPERTIES xbox_heap{};
+    const auto xbox_heap_pointer = xbox_heap_props(&xbox_heap, device.Get(), 0, D3D12_HEAP_TYPE_DEFAULT);
+    const D3D12_HEAP_PROPERTIES real_heap_props = real->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_DEFAULT);
+    check(xbox_heap_pointer == reinterpret_cast<std::uintptr_t>(&xbox_heap) &&
+              xbox_heap.Type == real_heap_props.Type &&
+              xbox_heap.CPUPageProperty == real_heap_props.CPUPageProperty &&
+              xbox_heap.MemoryPoolPreference == real_heap_props.MemoryPoolPreference &&
+              xbox_heap.CreationNodeMask == real_heap_props.CreationNodeMask &&
+              xbox_heap.VisibleNodeMask == real_heap_props.VisibleNodeMask,
+          "slot 26 Xbox sret order returns the actual host heap properties");
+    const D3D12_HEAP_PROPERTIES pc_heap_props = device->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_DEFAULT);
+    check(std::memcmp(&pc_heap_props, &real_heap_props, sizeof pc_heap_props) == 0,
+          "slot 26 also retains native PC C++ sret order");
+
+    D3D12_RESOURCE_DESC info_desc = buffer_desc();
+    info_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    using XboxAllocationInfoFn = std::uintptr_t(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                         const D3D12_RESOURCE_DESC*);
+    auto xbox_allocation_info = reinterpret_cast<XboxAllocationInfoFn>(proxy_vtbl[25]);
+    D3D12_RESOURCE_ALLOCATION_INFO xbox_info{};
+    const auto xbox_info_pointer = xbox_allocation_info(&xbox_info, device.Get(), 0, 1, &info_desc);
+    const D3D12_RESOURCE_ALLOCATION_INFO real_info = real->GetResourceAllocationInfo(0, 1, &info_desc);
+    check(xbox_info_pointer == reinterpret_cast<std::uintptr_t>(&xbox_info) &&
+              xbox_info.SizeInBytes == real_info.SizeInBytes && xbox_info.Alignment == real_info.Alignment,
+          "slot 25 Xbox sret order returns the actual host allocation info");
+    const D3D12_RESOURCE_ALLOCATION_INFO pc_info = device->GetResourceAllocationInfo(0, 1, &info_desc);
+    check(pc_info.SizeInBytes == real_info.SizeInBytes && pc_info.Alignment == real_info.Alignment,
+          "slot 25 also retains native PC C++ sret order");
+
+    // Avoid an out-of-bounds vtable read if startup reaches Xbox slot 133.
+    check(rt::d3d12_xs::device_slot_overridden(133) && proxy_vtbl[133] != nullptr,
+          "slot 133 has a guarded entry instead of a null vtable pointer");
+    using Slot133Fn = HRESULT(WINAPI*)(void*, UINT64, const D3D12_RESOURCE_DESC*,
+                                         D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+                                         const IID*, void**);
+    const IID iid_placed = __uuidof(ID3D12Resource);
+    void* missing_resource = reinterpret_cast<void*>(0x1234);
+    auto make_placed = reinterpret_cast<Slot133Fn>(proxy_vtbl[133]);
+    const HRESULT invalid_placed = make_placed(device.Get(), 0, nullptr,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, &iid_placed, &missing_resource);
+    check(invalid_placed == E_POINTER && missing_resource == nullptr,
+          "slot 133 refuses missing desc and initializes the output pointer");
+    D3D12_RESOURCE_DESC placed_desc = buffer_desc();
+    placed_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x100000u);
+    ComPtr<ID3D12Resource> placed_buffer;
+    const HRESULT placed_hr = make_placed(device.Get(), 0x10000000ull, &placed_desc,
+        static_cast<D3D12_RESOURCE_STATES>(0xffffffffu), nullptr, &iid_placed,
+        reinterpret_cast<void**>(placed_buffer.GetAddressOf()));
+    check(SUCCEEDED(placed_hr) && placed_buffer &&
+          placed_buffer->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR &&
+          placed_buffer->GetDesc().Flags == D3D12_RESOURCE_FLAG_NONE,
+          "slot 133 creates a separate PC buffer with normalised Xbox flags and layout");
 
     // The hit counters are for tests and count from the first read or reset, so that a title's calls write no
     // shared counter. The QueryInterface of the creation above was before that: its flag is set, its hit is not.
@@ -354,12 +543,20 @@ int main(int argc, char** argv) {
 
         D3D12_COMMAND_QUEUE_DESC xbox_queue{};
         xbox_queue.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        // The guest can supply console-only bits. The Xbox slot 48 adapter
+        // strips those bits before the host D3D12/Vulkan queue sees them.
+        xbox_queue.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(0x40000000u);
         const IID iid_queue = __uuidof(ID3D12CommandQueue);
         ComPtr<ID3D12CommandQueue> xbox_queue_proxy;
         hr = reinterpret_cast<CreateQueueXFn>(proxy_vtbl[48])(device.Get(), &xbox_queue, &iid_queue,
                                                                reinterpret_cast<void**>(xbox_queue_proxy.GetAddressOf()));
         check(hr == S_OK && rt::d3d12_xs::is_queue_proxy(xbox_queue_proxy.Get()),
               "slot 48 CreateCommandQueueX returns a queue proxy");
+        if (xbox_queue_proxy) {
+            const D3D12_COMMAND_QUEUE_DESC got = rt::d3d12_xs::queue_proxy_real_queue(xbox_queue_proxy.Get())->GetDesc();
+            check(got.Flags == D3D12_COMMAND_QUEUE_FLAG_NONE,
+                  "slot 48 removes console-only flags from the actual queue description");
+        }
         check(rt::d3d12_xs::device_slot_hits(48) == 1, "slot 48 hit counter is 1");
 
         ComPtr<ID3D12CommandAllocator> xbox_allocator;
@@ -497,10 +694,329 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Title-exported __XMemAllocationHooks__ backing for CreateDescriptorHeap (slot 14) + CPU handle translation
+    // against the real WARP D3D12 runtime.
+    {
+        struct HookState {
+            alignas(64) std::uint8_t backing[4096]{};
+            std::size_t alloc_size = 0;
+            std::uint64_t alloc_attr = 0;
+            void* freed_ptr = nullptr;
+            std::uint64_t freed_attr = 0;
+            int alloc_count = 0;
+            int free_count = 0;
+        };
+        static HookState hook_state;
+        hook_state = {};
+        struct HookCallbacks {
+            static void* __stdcall alloc(std::size_t size, std::uint64_t attr) {
+                ++hook_state.alloc_count;
+                hook_state.alloc_size = size;
+                hook_state.alloc_attr = attr;
+                if ((attr & 0x3FFFull) == 4 && size <= sizeof(hook_state.backing)) return hook_state.backing;
+                return nullptr;
+            }
+            static void __stdcall free(void* ptr, std::uint64_t attr) {
+                ++hook_state.free_count;
+                hook_state.freed_ptr = ptr;
+                hook_state.freed_attr = attr;
+            }
+        };
+        const rt::shims::XMemAllocationHooks title_hooks{&HookCallbacks::alloc, &HookCallbacks::free};
+        rt::shims::add_xmem_allocation_hooks(&title_hooks, &title_hooks);
+
+        D3D12_DESCRIPTOR_HEAP_DESC hooked_desc{};
+        hooked_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hooked_desc.NumDescriptors = 4;
+        hooked_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        const UINT inc = device->GetDescriptorHandleIncrementSize(hooked_desc.Type);
+        ComPtr<ID3D12DescriptorHeap> hooked_heap;
+        hr = device->CreateDescriptorHeap(&hooked_desc, IID_PPV_ARGS(hooked_heap.GetAddressOf()));
+        check(SUCCEEDED(hr) && hooked_heap != nullptr, "hooked slot 14 creates a descriptor heap");
+        check(hook_state.alloc_count == 1 && hook_state.alloc_size == hooked_desc.NumDescriptors * inc &&
+                  hook_state.alloc_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
+              "slot 14 invokes __XMemAllocationHooks__ with heap byte size and D3D descriptor-heap attributes");
+        if (hooked_heap) {
+            void** hooked_vtbl = *reinterpret_cast<void***>(hooked_heap.Get());
+            const auto hooked_cpu = reinterpret_cast<GetCpuHandleFn>(hooked_vtbl[9])(hooked_heap.Get());
+            const auto hooked_gpu = reinterpret_cast<GetGpuHandleFn>(hooked_vtbl[10])(hooked_heap.Get());
+            const auto expected_base = reinterpret_cast<SIZE_T>(hook_state.backing);
+            check(hooked_cpu.ptr == expected_base,
+                  "hooked heap slot 9 returns the title-supplied CPU descriptor base");
+            check(hooked_gpu.ptr != 0, "hooked heap slot 10 returns a valid GPU descriptor start");
+
+            // Create a CBV at slot 1 of the title-backed heap; WARP validates the translated real handle.
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+            cbv.BufferLocation = 0;
+            cbv.SizeInBytes = 256;
+            device->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{expected_base + inc});
+            const auto real_cpu = rt::d3d12_xs::heap_proxy_real_heap(hooked_heap.Get())->GetCPUDescriptorHandleForHeapStart();
+            const auto translated = rt::d3d12_xs::translate_cpu_descriptor_handle(
+                device.Get(), D3D12_CPU_DESCRIPTOR_HANDLE{expected_base + inc});
+            check(translated.ptr == real_cpu.ptr + inc,
+                  "title-backed CPU descriptor handle translates to the actual host heap slot");
+        }
+        hooked_heap.Reset();
+        check(hook_state.free_count == 1 && hook_state.freed_ptr == hook_state.backing &&
+                  hook_state.freed_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
+              "releasing the hooked heap frees its backing through __XMemAllocationHooks__");
+        rt::shims::remove_xmem_allocation_hooks(&title_hooks);
+    }
+
+    // Xbox device slot 127: invalid descriptor/arguments must fail without touching GPU memory.
+    {
+        using XboxCreateResource3Fn = HRESULT(WINAPI*)(void*, std::uint64_t, std::uint64_t,
+            std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+            std::uint64_t, std::uint64_t, std::uint64_t);
+        auto call127 = reinterpret_cast<XboxCreateResource3Fn>(proxy_vtbl[127]);
+        check(rt::d3d12_xs::device_slot_overridden(127), "slot 127 routes Xbox CreateCommittedResource3");
+        const HRESULT missing = call127(device.Get(), 0,0,0,0,0,0,0,0,0,0);
+        check(missing == E_POINTER, "slot 127 rejects missing output and descriptor");
+    }
+
+    // Exercise slot 70 in console mode, while the original PC-shaped tests
+    // continue to use the native slots. No game executable is required.
+    {
+        ComPtr<ID3D12Device> console_device;
+        real->AddRef(); // create_device_proxy consumes this reference on success.
+        const HRESULT setup = rt::d3d12_xs::create_device_proxy(real, __uuidof(ID3D12Device),
+            reinterpret_cast<void**>(console_device.GetAddressOf()), true);
+        if (FAILED(setup)) real->Release();
+        check(SUCCEEDED(setup) && console_device, "v10 console device creation");
+        if (console_device) {
+            void** cv = *reinterpret_cast<void***>(console_device.Get());
+            D3D12_INDIRECT_ARGUMENT_DESC indirect{};
+            indirect.Type = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105u);
+            D3D12_COMMAND_SIGNATURE_DESC signature_desc{12, 1, &indirect, 0};
+            ComPtr<ID3D12CommandSignature> signature;
+            const auto signature_hr = console_device->CreateCommandSignature(&signature_desc, nullptr,
+                                                         IID_PPV_ARGS(signature.GetAddressOf()));
+            check(SUCCEEDED(signature_hr) && signature, "v12 console indirect signature maps to actual DISPATCH");
+            check(static_cast<UINT>(indirect.Type) == 105u, "v12 leaves caller signature unchanged");
+            signature.Reset();
+            signature_desc.ByteStride = 8;
+            check(FAILED(console_device->CreateCommandSignature(&signature_desc, nullptr,
+                      IID_PPV_ARGS(signature.GetAddressOf()))) && !signature, "v12 refuses invalid console stride");
+            const IID resource_iid = __uuidof(ID3D12Resource);
+            using Place = HRESULT(WINAPI*)(void*, UINT64, const D3D12_RESOURCE_DESC*,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, const IID*, void**);
+            using RawSrv = HRESULT(WINAPI*)(void*, const D3D12_RESOURCE_DESC*, const void*, SIZE_T);
+            constexpr UINT64 guest_base = 0x30000000ull;
+            auto desc = buffer_desc();
+            ComPtr<ID3D12Resource> placed;
+            const HRESULT placed_result = reinterpret_cast<Place>(cv[133])(console_device.Get(), guest_base,
+                &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, &resource_iid,
+                reinterpret_cast<void**>(placed.GetAddressOf()));
+            check(SUCCEEDED(placed_result) && placed, "v10 tracks console slot-133 buffer");
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            hd.NumDescriptors = 4;
+            ComPtr<ID3D12DescriptorHeap> test_heap;
+            const HRESULT heap_result = console_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(test_heap.GetAddressOf()));
+            check(SUCCEEDED(heap_result) && test_heap, "v10 creates tracked descriptor heap");
+            if (placed && test_heap) {
+                void** hv = *reinterpret_cast<void***>(test_heap.Get());
+                const auto handle = reinterpret_cast<GetCpuHandleFn>(hv[9])(test_heap.Get()).ptr;
+                const UINT stride = console_device->GetDescriptorHandleIncrementSize(hd.Type);
+                struct View { D3D12_SHADER_RESOURCE_VIEW_DESC srv; UINT64 va; } view{};
+                static_assert(offsetof(View, va) == 0x28);
+                view.srv.Format = DXGI_FORMAT_R32_TYPELESS;
+                view.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                view.srv.Buffer.FirstElement = 4;
+                view.srv.Buffer.NumElements = 16;
+                view.srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+                view.va = guest_base + 64;
+                auto create_srv = reinterpret_cast<RawSrv>(cv[70]);
+                check(create_srv(console_device.Get(), &desc, &view, handle) == S_OK,
+                      "v10 Xbox slot 70 resolves a buffer address and writes a real SRV");
+                check(view.srv.Buffer.FirstElement == 4 &&
+                      view.va == guest_base + 64,
+                      "v10 preserves the caller's SRV description");
+
+                // Translated FirstElement=20: valid 80-byte RAW offset.
+                check(real->GetDeviceRemovedReason() == S_OK,
+                      "v14 aligned RAW view preserves device health");
+
+                // Translated FirstElement=18: invalid 72-byte RAW offset.
+                view.srv.Buffer.FirstElement = 2;
+                check(create_srv(console_device.Get(), &desc, &view,
+                                 handle + stride) == S_FALSE,
+                      "v14 rejects unaligned translated RAW view with null fallback");
+                check(view.srv.Buffer.FirstElement == 2 &&
+                      view.va == guest_base + 64,
+                      "v14 preserves rejected caller description");
+                check(real->GetDeviceRemovedReason() == S_OK,
+                      "v14 unaligned RAW view preserves device health");
+
+                view.srv.Buffer.FirstElement = 4;
+
+                view.srv.Buffer.NumElements = 0;
+                check(create_srv(console_device.Get(), &desc, &view,
+                                 handle + 2 * stride) == S_FALSE,
+                      "v14 rejects zero-element RAW view");
+                view.srv.Buffer.NumElements = 16;
+
+                view.srv.Format = DXGI_FORMAT_R32_FLOAT;
+                check(create_srv(console_device.Get(), &desc, &view,
+                                 handle + 2 * stride) == S_FALSE,
+                      "v14 rejects invalid RAW format");
+                view.srv.Format = DXGI_FORMAT_R32_TYPELESS;
+
+                view.srv.Shader4ComponentMapping = 0;
+                check(create_srv(console_device.Get(), &desc, &view,
+                                 handle + 2 * stride) == S_FALSE,
+                      "v14 rejects invalid RAW component mapping");
+                view.srv.Shader4ComponentMapping =
+                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+                check(real->GetDeviceRemovedReason() == S_OK,
+                      "v14 malformed RAW views preserve device health");
+                view.va = guest_base + desc.Width - 4;
+                check(create_srv(console_device.Get(), &desc, &view, handle + stride) == S_FALSE,
+                      "v10 bounds-checks an SRV that extends outside its placed buffer");
+                check(create_srv(console_device.Get(), &desc, &view, handle + 1) == E_INVALIDARG,
+                      "v10 rejects misaligned descriptor destination");
+                check(create_srv(console_device.Get(), &desc, &view, 1) == E_INVALIDARG,
+                      "v10 rejects untracked descriptor destination");
+                check(create_srv(console_device.Get(), nullptr, &view, handle + 2 * stride) == E_INVALIDARG,
+                      "v10 rejects missing description");
+                check(real->GetDeviceRemovedReason() == S_OK,
+                      "v14 device remains healthy after all slot 70 tests");
+            }
+        }
+    }
+
+    // Synthetic console sampler ABI test, with no guest executable or shader assets.
+    {
+        ComPtr<ID3D12Device> console_device;
+        real->AddRef();
+        const HRESULT setup = rt::d3d12_xs::create_device_proxy(real, __uuidof(ID3D12Device),
+            reinterpret_cast<void**>(console_device.GetAddressOf()), true);
+        if (FAILED(setup)) real->Release();
+        check(SUCCEEDED(setup) && console_device, "v13 creates console device for sampler test");
+        if (console_device) {
+            auto** cv = *reinterpret_cast<void***>(console_device.Get());
+            using SamplerX = HRESULT(WINAPI*)(void*, const void*, SIZE_T);
+            const auto create = reinterpret_cast<SamplerX>(cv[61]);
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            hd.NumDescriptors = 2;
+
+            ComPtr<ID3D12DescriptorHeap> native_probe;
+            const HRESULT native_cpu = real->CreateDescriptorHeap(
+                &hd, IID_PPV_ARGS(native_probe.GetAddressOf()));
+            std::printf("Native CPU sampler heap: 0x%08lX\n",
+                static_cast<unsigned long>(native_cpu));
+            check(SUCCEEDED(native_cpu) && native_probe,
+                  "v14 native CPU sampler heap succeeds");
+            native_probe.Reset();
+
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+            const HRESULT native_visible = real->CreateDescriptorHeap(
+                &hd, IID_PPV_ARGS(native_probe.GetAddressOf()));
+            std::printf("Native visible sampler heap: 0x%08lX\n",
+                static_cast<unsigned long>(native_visible));
+            check(SUCCEEDED(native_visible) && native_probe,
+                  "v14 native visible sampler heap succeeds");
+            native_probe.Reset();
+
+            ComPtr<ID3D12DescriptorHeap> sampler_heap;
+            using HeapFn = HRESULT(WINAPI*)(void*,
+                const D3D12_DESCRIPTOR_HEAP_DESC*, const IID*, void**);
+            const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+            const HRESULT made = reinterpret_cast<HeapFn>(cv[14])(
+                console_device.Get(), &hd, &heap_iid,
+                reinterpret_cast<void**>(sampler_heap.GetAddressOf()));
+            std::printf("Proxy visible sampler heap: 0x%08lX\n",
+                static_cast<unsigned long>(made));
+            check(SUCCEEDED(made) && sampler_heap, "v13 creates tracked sampler heap");
+            if (sampler_heap) {
+                auto** hv = *reinterpret_cast<void***>(sampler_heap.Get());
+                const auto base = reinterpret_cast<GetCpuHandleFn>(hv[9])(sampler_heap.Get()).ptr;
+                const UINT inc = console_device->GetDescriptorHandleIncrementSize(hd.Type);
+                std::array<std::uint32_t, 21> synthetic{};
+                synthetic[1] = synthetic[2] = synthetic[3] = 2;
+                synthetic[6] = synthetic[7] = synthetic[8] = 1;
+                synthetic[10] = 0x447a0000u;  // finite MaxLOD = 1000.0f
+                synthetic[13] = 1;
+                synthetic[16] = 1;
+                check(create(console_device.Get(), synthetic.data(), base) == S_OK,
+                      "v13 translates slot 61 to native CreateSampler");
+                check(create(console_device.Get(), synthetic.data(), base + inc) == S_OK,
+                      "v13 accepts second sampler slot");
+                check(create(console_device.Get(), synthetic.data(), base + 1) == E_INVALIDARG,
+                      "v13 refuses misaligned handle");
+                check(create(console_device.Get(), synthetic.data(), 0) == E_INVALIDARG,
+                      "v13 refuses null handle");
+                check(create(console_device.Get(), nullptr, base) == E_INVALIDARG,
+                      "v13 refuses null description");
+                D3D12_DESCRIPTOR_HEAP_DESC other = hd;
+                other.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                ComPtr<ID3D12DescriptorHeap> other_heap;
+                check(SUCCEEDED(console_device->CreateDescriptorHeap(&other, IID_PPV_ARGS(other_heap.GetAddressOf()))) && other_heap,
+                      "v13 creates non-sampler heap for negative control");
+                if (other_heap) {
+                    auto** ov = *reinterpret_cast<void***>(other_heap.Get());
+                    const auto wrong = reinterpret_cast<GetCpuHandleFn>(ov[9])(other_heap.Get()).ptr;
+                    check(create(console_device.Get(), synthetic.data(), wrong) == E_INVALIDARG,
+                          "v13 refuses non-sampler heap destination");
+                }
+            }
+        }
+    }
+
+    check(real->GetDeviceRemovedReason() == S_OK,
+          "v14 device remains healthy after all sampler tests");
+
+    if (v14_debug_enabled) {
+        ComPtr<ID3D12InfoQueue> info;
+        const HRESULT info_hr = real->QueryInterface(
+            IID_PPV_ARGS(info.GetAddressOf()));
+
+        check(SUCCEEDED(info_hr) && info,
+              "v14 D3D12 debug info queue available");
+
+        unsigned errors = 0;
+
+        if (info) {
+            const UINT64 count =
+                info->GetNumStoredMessagesAllowedByRetrievalFilter();
+
+            for (UINT64 i = 0; i < count; ++i) {
+                SIZE_T size = 0;
+
+                if (FAILED(info->GetMessage(i, nullptr, &size))) {
+                    ++errors;
+                    continue;
+                }
+
+                std::vector<unsigned char> bytes(size);
+                auto* msg = reinterpret_cast<D3D12_MESSAGE*>(bytes.data());
+
+                if (FAILED(info->GetMessage(i, msg, &size))) {
+                    ++errors;
+                    continue;
+                }
+
+                if (msg->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+                    ++errors;
+                    std::printf("[D3D12 ERROR %u] %s\n",
+                        static_cast<unsigned>(msg->ID),
+                        msg->pDescription);
+                }
+            }
+        }
+
+        check(errors == 0, "v14 no D3D12 validation errors");
+    }
+
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
     if (real) real->AddRef();
     // Drop every device child before the proxy so the PC device is not released first.
     root_signature.Reset();
+    placed_buffer.Reset();
     reserved.Reset();
     texture.Reset();
     buffer.Reset();

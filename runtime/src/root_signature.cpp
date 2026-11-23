@@ -58,11 +58,17 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
         return out;
     }
     uint64_t cost = 0;  // 64-bit, as in pack()
-    uint64_t next = out.base;
-    std::vector<uint32_t> first;
+    uint64_t next = out.base, spill_next = 0;
+    bool spilling = false;
+    std::vector<uint32_t> first, spill;
     first.reserve(sig.params.size());
+    spill.reserve(sig.params.size());
     for (size_t i = 0; i < sig.params.size(); ++i) {
         const RootParameter& p = sig.params[i];
+        if (p.type != ParamType::Constants && p.type != ParamType::Descriptor && p.type != ParamType::Table) {
+            out.error = "unknown root parameter type";
+            return out;
+        }
         if (p.type == ParamType::Constants && p.num_values == 0) {
             out.error = "root constant parameter needs at least 1 dword";
             return out;
@@ -73,17 +79,25 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
             return out;
         }
         const uint64_t dwords = stage_dwords(p.type, p.num_values);
-        if (next + dwords > kMaxUserSgprs) {
-            // The console moves this parameter and every later one to the spill array behind s[0:1]; that array's
-            // layout is not modelled here, so refuse rather than drop arguments.
+        if (!spilling && next + dwords <= kMaxUserSgprs) {
+            first.push_back(static_cast<uint32_t>(next));
+            spill.push_back(kNoSpill);
+            next += dwords;
+        } else if (stage == Stage::Compute) {
+            // Once spilling starts, later arguments also spill, even if a small one would fit inline.
+            spilling = true;
+            first.push_back(kNoSgpr);
+            spill.push_back(static_cast<uint32_t>(spill_next));
+            spill_next += dwords;
+        } else {
             out.error = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
                         std::to_string(out.base) + " (spill array not modelled)";
             return out;
         }
-        first.push_back(static_cast<uint32_t>(next));
-        next += dwords;
     }
     out.first_sgpr = std::move(first);
+    out.spill_dword = std::move(spill);
+    out.spill_dwords = static_cast<uint32_t>(spill_next);
     out.end_sgpr = static_cast<uint32_t>(next);
     out.d3d12_cost = static_cast<uint32_t>(cost);
     out.ok = true;

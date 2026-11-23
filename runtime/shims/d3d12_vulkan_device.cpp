@@ -1,3 +1,4 @@
+#include "../src/v29_packed16.h"
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
 // committed buffers and textures (1D, 1D arrays, 2D, multisampled 2D, 3D) and their 1/2/3 variants, allocation
@@ -230,6 +231,14 @@ void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonid
                              "subgroup size)\n", entry.stage.c_str());
 }
 
+// VK_FORMAT_A8_UNORM_KHR where the Vulkan headers have VK_KHR_maintenance5. Older headers have no A8 render targets:
+// VulkanDeviceInfo::a8_render_target is then never set, so this is never used as UNDEFINED.
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+constexpr VkFormat kA8UnormFormat = VK_FORMAT_A8_UNORM_KHR;
+#else
+constexpr VkFormat kA8UnormFormat = VK_FORMAT_UNDEFINED;
+#endif
+
 struct Format {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspects = 0;
@@ -237,6 +246,11 @@ struct Format {
     bool d24_as_float = false;  // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU)
     bool d24 = false;           // a D24_UNORM_S8_UINT family format, native or stored as D32
     bool r9g9b9e5_as_r32_uint = false;  // R9G9B9E5_SHAREDEXP UAV stored as mutable R32_UINT (no E5B9G9R9 storage)
+    // An A8_UNORM render target stored as VK_FORMAT_A8_UNORM_KHR (VulkanDeviceInfo::a8_render_target): its RTVs render
+    // to the alpha channel and its SRVs view it in that format, whose one channel the T# names as X (gfx10's
+    // channels_a). Other A8_UNORM textures are R8_UNORM images. Vulkan puts A8 in a compatibility class of its own,
+    // so one image cannot be viewed both ways.
+    bool a8_as_alpha = false;
     // A 96-bit R32G32B32 format, held in the R32G32B32A32 image `format` names (ResourceBinding::rgb96).
     bool rgb96 = false;
 };
@@ -514,6 +528,31 @@ struct TextureCreateInfo {
                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         }
         if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+
+        if (v29_packed16::enabled() &&
+            desc.Format == DXGI_FORMAT_B5G5R5A1_UNORM &&
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            desc.SampleDesc.Count == 1 &&
+            desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+            (static_cast<UINT>(desc.Flags) & ~0x300000u) == 5u) {
+
+            info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                          VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+
+            view_formats = {
+                VK_FORMAT_A1R5G5B5_UNORM_PACK16,
+                VK_FORMAT_R16_UINT
+            };
+
+            format_list.viewFormatCount=2;
+            format_list.pViewFormats=view_formats.data();
+            info.pNext=&format_list;
+
+            std::fprintf(stderr,
+                "[v29 CONFIG] packed16 width=%llu height=%u\n",
+                static_cast<unsigned long long>(desc.Width),
+                desc.Height);
+        }
         if (format.r9g9b9e5_as_r32_uint) {
             // R32_UINT owns storage and attachment usages; E5B9G9R9 views restrict usage to SAMPLED_BIT.
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
@@ -946,11 +985,21 @@ struct DeviceState {
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
-        if (desc.Format == DXGI_FORMAT_A8_UNORM &&
-            (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
-             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
-            return {};
+        if (desc.Format == DXGI_FORMAT_A8_UNORM) {
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+                (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+                return {};
+            if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                if (!info.a8_render_target) {
+                    log_once("A8_UNORM render targets need VK_FORMAT_A8_UNORM_KHR (VK_KHR_maintenance5); format",
+                             desc.Format);
+                    return {};
+                }
+                Format alpha{kA8UnormFormat, VK_IMAGE_ASPECT_COLOR_BIT};
+                alpha.a8_as_alpha = true;
+                return alpha;
+            }
+        }
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                                                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
@@ -1007,7 +1056,7 @@ struct DeviceState {
         share(shared);
         if (vk.vkCreateImage(info.device, &shared, nullptr, &image) != VK_SUCCESS) return false;
         vk.vkGetImageMemoryRequirements(info.device, image, &out);
-        vk.vkDestroyImage(info.device, image, nullptr);
+        v29_packed16::destroy_image(vk.vkDestroyImage,info.device, image, nullptr);
         return true;
     }
 
@@ -1131,9 +1180,22 @@ struct DeviceState {
         // views it in the image's own format with the stencil aspect, and returns the value in R, as a T# whose
         // format is 8_UINT reads it from X.
         const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
+
+        const bool packed16 =
+            v29_packed16::usage(info.device,vk_image)!=0;
+
+        if (packed16 && storage && image.format!=11) {
+            std::fprintf(stderr,
+                "[v29 UNSUPPORTED] packed colour storage format=%u\n",
+                image.format);
+            return false;
+        }
+
         const VkFormat logical_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : image_format;
         VkFormat view_format =
-            stencil ? image_format : g::vulkan_view_format(logical_format, image.format, allow_channel_cast);
+            stencil ? image_format : g::vulkan_view_format(
+                logical_format,image.format,
+                allow_channel_cast || (packed16 && image.format==11));
         VkFormat channels_format = view_format;  // whose channels the T#'s swizzle selects from
         if (view_format == VK_FORMAT_UNDEFINED) {  // a 96-bit texture's T# names RGB32; its image is RGBA32
             view_format = rgb96_view_format(image_format, image.format);
@@ -1155,7 +1217,7 @@ struct DeviceState {
         view_info.viewType = g::vulkan_view_type(image.type);
         view_info.format = view_format;
         VkImageViewUsageCreateInfo sampled_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-        if (r9g9b9e5_as_r32_uint) {
+        if (r9g9b9e5_as_r32_uint || packed16) {
             sampled_usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
             view_info.pNext = &sampled_usage;
         }
@@ -1188,19 +1250,19 @@ struct DeviceState {
                                                                        : VK_IMAGE_ASPECT_COLOR_BIT),
             image.first_mip, image.mip_count, image.first_layer, image.layer_count};
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
-        if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
+        if (v29_packed16::create_view(vk.vkCreateImageView,info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
         leonida::StorageViews views{};
         if (storage) {
             VkImageViewCreateInfo storage_info = view_info;
             storage_info.components = {};
             VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
             const VkFormat storage_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_R32_UINT : view_format;
-            if (r9g9b9e5_as_r32_uint) {
+            if (r9g9b9e5_as_r32_uint || packed16) {
                 storage_info.format = storage_format;
                 storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
                 storage_info.pNext = &storage_usage;
             }
-            if (vk.vkCreateImageView(info.device, &storage_info, nullptr, &entry.storage) != VK_SUCCESS) {
+            if (v29_packed16::create_view(vk.vkCreateImageView,info.device, &storage_info, nullptr, &entry.storage) != VK_SUCCESS) {
                 vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
                 return false;
             }
@@ -1372,12 +1434,20 @@ Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc
 // path, D3D-90's placed one). Each format must map and be the same texel size as the resource's: the host PC
 // runtime refuses other sizes, and a size-mismatched VkImageFormatListCreateInfo is a Vulkan validation error
 // (VUID-VkImageCreateInfo-pNext-06722). A nonzero count with a null list is no list. E_INVALIDARG on a bad format.
-HRESULT castable_view_formats(const Format& format, UINT32 count, const DXGI_FORMAT* castable,
-                              std::vector<VkFormat>& out) {
+// An A8_UNORM texture's own format is always viewable (create_texture adds the image's format), so naming it is a
+// no-op. An A8 render target's VK_FORMAT_A8_UNORM_KHR image (Format::a8_as_alpha) is in a class of its own: no
+// other format can be a view format of it, so any other castable format is refused here, before Vulkan.
+HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format, UINT32 count,
+                              const DXGI_FORMAT* castable, std::vector<VkFormat>& out) {
     if (!count || !castable) return S_OK;
     const bool depth = (format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
     const leonida::BlockFormat own = leonida::block_format(format.format, format.aspects);
     for (UINT32 i = 0; i < count; ++i) {
+        if (resource_format == DXGI_FORMAT_A8_UNORM && castable[i] == DXGI_FORMAT_A8_UNORM) continue;
+        if (format.a8_as_alpha) {
+            log_once("castable format of an A8_UNORM render target not supported (only A8_UNORM is):", castable[i]);
+            return E_INVALIDARG;
+        }
         const Format cast = vulkan_format(castable[i], depth);
         if (cast.format == VK_FORMAT_UNDEFINED) {
             log_once("castable format not supported yet:", castable[i]);
@@ -1748,7 +1818,13 @@ public:
         return std::find(castable_formats_.begin(), castable_formats_.end(), format) != castable_formats_.end();
     }
     bool has_castable_formats() const { return !castable_formats_.empty(); }
+
+    bool packed16_raw() const {
+        return v29_packed16::usage(device_.info.device,image_)!=0;
+    }
+
     bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
+    bool a8_as_alpha() const { return a8_as_alpha_; }
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
@@ -1990,6 +2066,10 @@ public:
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
         TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
         VkImageCreateInfo& info = create.info;
+
+        if (v29_packed16::configuration(info) && !castable.empty())
+            return E_NOTIMPL;
+
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
             // it. Vulkan requires every view format to be in the image's format list, so add it when missing.
@@ -2034,6 +2114,11 @@ public:
             }
             return E_OUTOFMEMORY;
         }
+
+        if (v29_packed16::configuration(info) &&
+            !v29_packed16::remember(device_.info.device,image_,info))
+            return E_OUTOFMEMORY;
+
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
         memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
@@ -2065,6 +2150,7 @@ public:
         binding.sampled_in_general = device_.bindless != nullptr;
         format_ = format.format;
         r9g9b9e5_as_r32_uint_ = format.r9g9b9e5_as_r32_uint;
+        a8_as_alpha_ = format.a8_as_alpha;
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
         binding_ = binding;
@@ -2407,6 +2493,7 @@ private:
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
     bool r9g9b9e5_as_r32_uint_ = false;
+    bool a8_as_alpha_ = false;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
     VkImageAspectFlags aspects_ = 0;
@@ -3591,7 +3678,9 @@ public:
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
-            graphics_.color_formats[i] = vulkan_format(desc.RTVFormats[i], false).format;
+            graphics_.color_formats[i] = desc.RTVFormats[i] == DXGI_FORMAT_A8_UNORM && device_.info.a8_render_target
+                                             ? kA8UnormFormat
+                                             : vulkan_format(desc.RTVFormats[i], false).format;
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
@@ -4499,7 +4588,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("incompatible R9G9B9E5 view format:", int(view.format));
             return false;
         }
-        named = texture_storage_format(view.format, false).format;
+        // An A8 render target is viewed in its own A8 format (Format::a8_as_alpha), other A8 textures through R8.
+        named = resource.a8_as_alpha() ? resource_format : texture_storage_format(view.format, false).format;
         if (g::is_depth_stencil_format(named)) {
             log_once("depth-stencil view format on a colour texture:", int(view.format));
             return false;
@@ -4529,7 +4619,12 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     } else if (code && rgb96) {
         view_format = named;
     } else if (code) {
-        view_format = g::vulkan_view_format(resource_format, code, resource.has_view_format_list());
+
+        view_format = g::vulkan_view_format(
+            resource_format,code,
+            resource.has_view_format_list() ||
+            (resource.packed16_raw() &&
+             named==VK_FORMAT_R16_UINT));
     }
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
@@ -4843,6 +4938,8 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.context->set_mesh_indirect_caps(info.mesh_shader, info.mesh_indirect_count,
+                                               info.max_mesh_indirect_count);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -5180,6 +5277,22 @@ public:
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
+        // One immutable allocation per recorded dispatch, owned by its command-buffer submission.
+        state_.context->set_root_spill_stager(
+            [this](const void* data, std::size_t bytes, std::uint64_t& console_va, std::shared_ptr<void>& hold) -> bool {
+                if (!data || !bytes || bytes > 64 * sizeof(std::uint32_t) || !state_.arena.mapped) return false;
+                VkDeviceSize offset = 0;
+                if (!state_.arena_allocate(bytes, 16, offset, DeviceState::arena_buffer)) {
+                    log_once("GPU address arena full; compute root spill bytes:", int(bytes));
+                    return false;
+                }
+                std::memcpy(state_.arena.mapped + offset, data, bytes);
+                console_va = offset;
+                hold = std::shared_ptr<void>(state_.arena.mapped + offset, [this, offset, bytes](void*) {
+                    state_.arena_release(offset, bytes, DeviceState::arena_buffer);
+                });
+                return true;
+            });
         return true;
     }
 
@@ -5190,6 +5303,7 @@ public:
                 state_.context->vk.vkDeviceWaitIdle(state_.info.device);
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
+            state_.context->set_root_spill_stager(nullptr);
             state_.context->set_bindless_release(nullptr, nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
@@ -5536,6 +5650,11 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+            if (!state_.info.mesh_shader || !state_.context->vk.vkCmdDrawMeshTasksIndirectEXT ||
+                desc->NumArgumentDescs != 1) return E_NOTIMPL;
+            kind = leonida::IndirectKind::dispatch_mesh;
+            break;
         default: return E_NOTIMPL;
         }
         return create_command_signature(kind, desc->ByteStride, riid, out, identity());
@@ -5744,6 +5863,7 @@ public:
         RootArgumentLayout layout;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
+        layout.compute_spill_dwords = compute.ok ? compute.spill_dwords : 0;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = UINT32_MAX;
             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
@@ -5752,7 +5872,8 @@ public:
                     break;
                 }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
+                                         compute.ok ? compute.spill_dword[i] : rt::rootsig::kNoSpill});
         }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
@@ -5952,7 +6073,13 @@ public:
             const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
                                             r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
-                view = {};
+                // Only an A8 render target stored as VK_FORMAT_A8_UNORM_KHR takes an RTV, in its own format: the
+                // attachment view is the image's.
+                const bool plain_2d = !desc || desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D ||
+                                      desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                if (!r || !r->a8_as_alpha() || rd.Format != DXGI_FORMAT_A8_UNORM || !plain_2d ||
+                    (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != DXGI_FORMAT_A8_UNORM))
+                    view = {};
             } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
                        (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
@@ -6897,7 +7024,7 @@ public:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, castable_count, castable, cast_formats);
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -7404,6 +7531,9 @@ public:
                                                        VK_IMAGE_TILING_OPTIMAL, usage, 0, &limits) == VK_SUCCESS &&
                         limits.maxMipLevels > 1)
                         fs->Support1 |= D3D12_FORMAT_SUPPORT1_MIP;
+                    // Render targets are stored as VK_FORMAT_A8_UNORM_KHR, which the device checked can blend.
+                    if (state_.info.a8_render_target)
+                        fs->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE;
                 }
                 return d3d12_trace::result(method, S_OK);
             }
@@ -7829,6 +7959,26 @@ private:
         }
 
         const Format format = state_.texture_format(desc);
+        if (std::getenv("LEONIDA_V24_DIAG") &&
+            !format.format) {
+
+            std::fprintf(stderr,
+                "[v24 ALLOCATION] dimension=%u width=%llu "
+                "height=%u depth=%u mips=%u format=%u "
+                "samples=%u quality=%u layout=0x%x "
+                "flags=0x%x alignment=%llu\n",
+                static_cast<unsigned>(desc.Dimension),
+                static_cast<unsigned long long>(desc.Width),
+                desc.Height,
+                static_cast<unsigned>(desc.DepthOrArraySize),
+                static_cast<unsigned>(desc.MipLevels),
+                static_cast<unsigned>(desc.Format),
+                desc.SampleDesc.Count,desc.SampleDesc.Quality,
+                static_cast<unsigned>(desc.Layout),
+                static_cast<unsigned>(desc.Flags),
+                static_cast<unsigned long long>(desc.Alignment));
+        }
+
         if (!format.format) {
             log_once("GetResourceAllocationInfo format not supported yet:", desc.Format);
             return kInvalidAllocation;
@@ -7918,12 +8068,36 @@ private:
     // shown leaves the slot a null descriptor.
     void write_image_descriptor(const Resource& resource, const TextureView& view,
                                 D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
+
+        if (resource.packed16_raw() && storage &&
+            view.format!=DXGI_FORMAT_R16_UINT) {
+
+            std::fprintf(stderr,
+                "[v29 UNSUPPORTED] packed16 typed UAV format=%u; "
+                "shader pack/unpack conversion required\n",
+                static_cast<unsigned>(view.format));
+
+            if (v29_packed16::enabled("LEONIDA_V29_STRICT"))
+                RaiseException(0xe0290086u,
+                               EXCEPTION_NONCONTINUABLE,0,nullptr);
+
+            return;
+        }
+
         leonida::gfx10::Image image{};
         if (!image_descriptor(resource, view, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
                                                   resource.r9g9b9e5_as_r32_uint());
+
+        if (resource.packed16_raw()) {
+            std::fprintf(stderr,
+                "[v29 DESCRIPTOR] storage=%u code=%u registered=%u\n",
+                unsigned(storage),image.format,unsigned(registered));
+
+            if (!registered) return;
+        }
         if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
@@ -7940,6 +8114,23 @@ private:
         if (!heap || !desc) return finish(E_INVALIDARG);
         if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear,
                                                          acceleration_structures())) {
+            if (std::getenv("LEONIDA_V24_DIAG"))
+                std::fprintf(stderr,
+                    "[v24 REFUSED] reason=%s dimension=%u "
+                    "width=%llu height=%u format=%u "
+                    "samples=%u flags=0x%x layout=0x%x "
+                    "state=0x%x heap=%u heap_flags=0x%x\n",
+                    why, static_cast<unsigned>(desc->Dimension),
+                    static_cast<unsigned long long>(desc->Width),
+                    desc->Height,
+                    static_cast<unsigned>(desc->Format),
+                    desc->SampleDesc.Count,
+                    static_cast<unsigned>(desc->Flags),
+                    static_cast<unsigned>(desc->Layout),
+                    static_cast<unsigned>(state),
+                    static_cast<unsigned>(heap->Type),
+                    static_cast<unsigned>(heap_flags));
+
             log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), dimension")
                          .c_str(),
                      int(desc->Dimension));
@@ -8009,7 +8200,7 @@ private:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, castable_count, castable, cast_formats);
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -8821,6 +9012,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceQueueFamilyProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceFeatures2);
+    LEONIDA_INSTANCE(vkGetPhysicalDeviceFormatProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties2);
     LEONIDA_INSTANCE(vkEnumerateDeviceExtensionProperties);
     LEONIDA_INSTANCE(vkCreateDevice);
@@ -9193,6 +9385,27 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     }
 #endif
 
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    // VK_KHR_maintenance5 brings VK_FORMAT_A8_UNORM_KHR (VulkanDeviceInfo::a8_render_target). It is enabled only where
+    // that format can be sampled, copied (every texture is a transfer source and destination) and is a colour
+    // attachment the GPU can blend; nothing else here relies on it.
+    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+    if (has_device_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) && vkGetPhysicalDeviceFormatProperties) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance5};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        VkFormatProperties a8{};
+        vkGetPhysicalDeviceFormatProperties(info.physical, VK_FORMAT_A8_UNORM_KHR, &a8);
+        const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        info.a8_render_target = maintenance5.maintenance5 == VK_TRUE && (a8.optimalTilingFeatures & needed) == needed;
+        if (info.a8_render_target) {
+            maintenance5.pNext = *v13.next();
+            *v13.next() = &maintenance5;
+        }
+    }
+#endif
+
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     // VK_KHR_shader_fma: OpFmaKHR is a single-rounding multiply-add in SPIR-V (GLSL.std.450 Fma may round twice).
     // Translated shaders built with `rdna2spirv.py --fma khr` need it (index capability FMAKHR, feature
@@ -9314,6 +9527,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+    // Enable only features the physical device reported; the replay checks the enabled limits.
+    enable.multiDrawIndirect = chosen_features.multiDrawIndirect;
+    enable12.drawIndirectCount = chosen12.drawIndirectCount;
+    info.mesh_indirect_count = info.mesh_shader && enable12.drawIndirectCount;
+    info.max_mesh_indirect_count = enable.multiDrawIndirect ? chosen.limits.maxDrawIndirectCount : 1u;
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
     device_info.pQueueCreateInfos = queue_infos.data();
@@ -9330,6 +9548,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+#endif
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    if (info.a8_render_target) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);

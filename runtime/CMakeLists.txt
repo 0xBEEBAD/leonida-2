@@ -108,6 +108,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/xmem.cpp
+    shims/xmem_physical.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
@@ -117,7 +118,14 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
     shims/process.cpp
+    shims/dstorage.cpp
+    shims/xapu_chad.cpp
+    shims/acphal.cpp
+    shims/xg_xs.cpp
   )
+  # The DirectStorage shim protects title buffers with Windows structured exceptions.
+  # clang-cl requires /EHa for that source. MSVC accepts __try normally.
+  set_source_files_properties(shims/dstorage.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang>:/EHa>")
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
@@ -199,11 +207,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     message(STATUS "d3d12.lib not found: root_sig_test and device_proxy_test are not built")
   endif()
 
+  # Console graphics virtual-memory policy. Synthetic inputs only; no GPU, game files or SDK needed.
+  add_executable(d3d12_xs_vmem_test test/d3d12_xs_vmem_test.cpp)
+  target_compile_definitions(d3d12_xs_vmem_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(d3d12_xs_vmem_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(d3d12_xs_vmem_test PRIVATE /OPT:NOREF)
+
   # xmem shim ABI test: resolves the registered xmem.dll exports itself, so xmem.cpp and registry.cpp are compiled
   # into this executable instead of reusing gta6rt's objects (which would duplicate their symbols).
   add_executable(xmem_test
     test/xmem_test.cpp
     shims/xmem.cpp
+    shims/xmem_physical.cpp
     shims/registry.cpp
   )
   target_include_directories(xmem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
@@ -211,6 +226,20 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
+
+  # CPU physical-page aliases over Windows placeholders; all input is synthetic.
+  # Compile the shim registry here as in xmem_test so the test sees the real ABI bindings.
+  add_executable(xmem_physical_test
+    test/xmem_physical_test.cpp
+    shims/xmem.cpp
+    shims/xmem_physical.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xmem_physical_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xmem_physical_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xmem_physical_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xmem_physical_test PRIVATE /OPT:NOREF)
+  target_link_libraries(xmem_physical_test PRIVATE psapi)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -245,6 +274,30 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(int3_skip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
+
+  # Xbox Series DirectStorage. Uses synthetic files; unavailable compression
+  # formats fail explicitly rather than pretending to load game assets.
+  add_executable(dstorage_test
+    test/dstorage_test.cpp
+    shims/dstorage.cpp
+    shims/file_system.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(dstorage_test PRIVATE /OPT:NOREF)
+
+  # Experimental Xbox APU/DSP and AcpHal memory/contexts; synthetic data, no game assets.
+  add_executable(xapu_chad_test test/xapu_chad_test.cpp shims/xapu_chad.cpp shims/registry.cpp)
+  add_executable(acphal_test test/acphal_test.cpp shims/acphal.cpp shims/registry.cpp)
+  add_executable(xg_xs_test test/xg_xs_test.cpp shims/xg_xs.cpp shims/registry.cpp)
+  foreach(tgt IN ITEMS xapu_chad_test acphal_test xg_xs_test)
+    target_include_directories(${tgt} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    target_compile_definitions(${tgt} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(${tgt} PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(${tgt} PRIVATE /OPT:NOREF)
+  endforeach()
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
@@ -547,6 +600,7 @@ if(BUILD_TESTING)
       src/pe_loader.cpp
       shims/registry.cpp
       shims/xmem.cpp
+      shims/xmem_physical.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
     )
@@ -663,6 +717,7 @@ if(BUILD_TESTING)
       src/pe_loader.cpp
       shims/registry.cpp
       shims/xmem.cpp
+      shims/xmem_physical.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
     )
@@ -719,6 +774,62 @@ if(BUILD_TESTING)
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
 
+    # Module TLS index 0 fixture: an EXE built /GA, so its thread_local reads go straight to
+    # ThreadLocalStoragePointer[0] as a game executable's can. The loader must give a mapped executable index 0;
+    # loader_tls_index0_test maps it next to tiny_tls.dll and run_tiny_tls_ga runs it under gta6rt. Ordinary test
+    # code, no game data. The test checks the /GA code shape only where the compiler is MSVC, which implements /GA.
+    add_executable(tiny_tls_ga test/fixtures/tiny_tls_ga.cpp)
+    target_compile_options(tiny_tls_ga PRIVATE /W4 /permissive- /utf-8 /EHsc /GA)
+    set_target_properties(tiny_tls_ga PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    add_executable(loader_tls_index0_test
+      test/loader_tls_index0_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(loader_tls_index0_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_compile_definitions(loader_tls_index0_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+      $<$<CXX_COMPILER_ID:MSVC>:LEONIDA_GA_FIXTURE_IS_GA=1>)
+    target_compile_options(loader_tls_index0_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    # Loaded by the threads scenario before the TLS helper: its DllMain(DLL_THREAD_ATTACH) runs test code first.
+    add_library(tiny_thread_hook SHARED test/fixtures/tiny_thread_hook.cpp)
+    target_compile_definitions(tiny_thread_hook PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_thread_hook PRIVATE /W4 /permissive- /utf-8 /GS-)
+    set_target_properties(tiny_thread_hook PROPERTIES
+      OUTPUT_NAME tiny_thread_hook
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    add_dependencies(loader_tls_index0_test tiny_tls_ga tiny_tls tiny_thread_hook gta6rt_tls_host)
+    # Imports tiny_tls.dll and tiny_tls_cb_only.dll, so gta6rt needs a helper clone for one of them
+    # (check_tls_clone_cleanup.cmake).
+    add_executable(tiny_tls_clones test/fixtures/tiny_tls_clones.cpp)
+    target_link_libraries(tiny_tls_clones PRIVATE tiny_tls tiny_tls_cb_only)
+    target_compile_options(tiny_tls_clones PRIVATE /W4 /permissive- /utf-8)
+    set_target_properties(tiny_tls_clones PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    # One process per scenario: the reservation is once per process. loader_tls_index0 (runs) reserves at start,
+    # loader_tls_index0_threads reserves while threads are being created, loader_tls_index0_noreserve never does.
+    foreach(scenario runs threads noreserve)
+      if(scenario STREQUAL "runs")
+        set(name loader_tls_index0)
+      else()
+        set(name loader_tls_index0_${scenario})
+      endif()
+      add_test(NAME ${name}
+        COMMAND loader_tls_index0_test ${scenario} "$<TARGET_FILE:tiny_tls_ga>" "$<TARGET_FILE:tiny_tls>"
+                "$<TARGET_FILE:tiny_thread_hook>"
+      )
+      set_tests_properties(${name} PROPERTIES TIMEOUT 90)
+    endforeach()
+
     # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so
     # DllMain's only work is that one call. No game files.
     add_library(dll_thread_calls SHARED test/fixtures/dll_thread_calls.cpp)
@@ -737,6 +848,7 @@ if(BUILD_TESTING)
       shims/library_loader.cpp
       shims/registry.cpp
       shims/xmem.cpp
+      shims/xmem_physical.cpp
     )
     target_include_directories(dll_thread_calls_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -841,6 +953,7 @@ if(BUILD_TESTING)
     # The routes are read once per process, so each override case is its own test.
     add_test(NAME xs_proxy_mock_env_slots COMMAND xs_proxy_mock_test --env-slots)
     add_test(NAME xs_proxy_mock_env_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)
+    add_test(NAME xs_proxy_mock_env_slots_74 COMMAND xs_proxy_mock_test --env-slots-74)
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
@@ -874,6 +987,7 @@ if(BUILD_TESTING)
       src/pe_loader.cpp
       shims/registry.cpp
       shims/xmem.cpp
+      shims/xmem_physical.cpp
     )
     target_compile_definitions(bink_decode_test PRIVATE
       WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
@@ -891,6 +1005,7 @@ if(BUILD_TESTING)
       src/pe_loader.cpp
       shims/registry.cpp
       shims/xmem.cpp
+      shims/xmem_physical.cpp
     )
     target_compile_definitions(bink_abi_test PRIVATE
       WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
@@ -908,6 +1023,7 @@ if(BUILD_TESTING)
       src/pe_loader.cpp
       shims/registry.cpp
       shims/xmem.cpp
+      shims/xmem_physical.cpp
     )
     target_compile_definitions(bink_play PRIVATE
       WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
@@ -925,6 +1041,7 @@ if(BUILD_TESTING)
         src/pe_loader.cpp
         shims/registry.cpp
         shims/xmem.cpp
+        shims/xmem_physical.cpp
         shims/d3d12_xs.cpp
         shims/d3d12_xs_device.cpp
       )
@@ -942,6 +1059,7 @@ if(BUILD_TESTING)
         src/pe_loader.cpp
         shims/registry.cpp
         shims/xmem.cpp
+        shims/xmem_physical.cpp
         shims/d3d12_xs.cpp
         shims/d3d12_xs_device.cpp
       )
@@ -960,6 +1078,7 @@ if(BUILD_TESTING)
       src/pe_loader.cpp
       shims/registry.cpp
       shims/xmem.cpp
+      shims/xmem_physical.cpp
     )
     target_compile_definitions(bink_audio_test PRIVATE
       WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
@@ -970,8 +1089,15 @@ if(BUILD_TESTING)
     add_test(NAME bink_audio COMMAND bink_audio_test)
     set_tests_properties(bink_audio PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  if(WIN32 AND TARGET d3d12_xs_vmem_test)
+    add_test(NAME d3d12_xs_vmem COMMAND d3d12_xs_vmem_test)
+  endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+  endif()
+  if(WIN32 AND TARGET xmem_physical_test)
+    add_test(NAME xmem_physical COMMAND xmem_physical_test)
+    set_tests_properties(xmem_physical PROPERTIES TIMEOUT 60)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
@@ -984,6 +1110,18 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET dstorage_test)
+    add_test(NAME dstorage COMMAND dstorage_test)
+  endif()
+  if(WIN32 AND TARGET xapu_chad_test)
+    add_test(NAME xapu_chad COMMAND xapu_chad_test)
+  endif()
+  if(WIN32 AND TARGET acphal_test)
+    add_test(NAME acphal COMMAND acphal_test)
+  endif()
+  if(WIN32 AND TARGET xg_xs_test)
+    add_test(NAME xg_xs COMMAND xg_xs_test)
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
@@ -1101,6 +1239,15 @@ if(BUILD_TESTING)
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
+    # A /GA executable under --run and --init reads its TLS from slot 0, and the trace names gta6rt.exe as the image
+    # whose index 0 moved. No game files are needed.
+    add_test(NAME run_tiny_tls_ga COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_tls_ga>" "-DTRACE_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tls_index0.cmake")
+    # Clone files are deleted when gta6rt exits normally; only the home clone outlives the run, until the next one.
+    add_test(NAME run_tiny_tls_clone_cleanup COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_tls_clones>" "-DTRACE_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tls_clone_cleanup.cmake")
     # BUILD-1457: the stack a game thread gets. gta6rt_stack reads SizeOfStackReserve from the built loader (nothing
     # is run); run_tiny_game_stack asks Windows, on the entry thread and on a thread created with dwStackSize 0.
     add_test(NAME gta6rt_stack COMMAND "${CMAKE_COMMAND}"
@@ -2038,6 +2185,7 @@ if(TARGET Vulkan::Headers)
       src/pe_loader.cpp
       shims/registry.cpp
       shims/xmem.cpp
+      shims/xmem_physical.cpp
     )
     target_link_libraries(d3d12_boot_movie_test PRIVATE gta6rt_d3d12_com user32 psapi)
     target_compile_definitions(d3d12_boot_movie_test PRIVATE
@@ -2717,7 +2865,7 @@ if(TARGET Vulkan::Headers)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
-      target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
+      target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com user32) # console PresentX window
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
 
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the
