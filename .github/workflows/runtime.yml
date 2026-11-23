@@ -525,15 +525,17 @@ jobs:
           VK_DRIVER_FILES="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json" vulkaninfo --summary > "$RUNNER_TEMP/vulkaninfo.txt"
           grep -E 'deviceName|driverInfo|apiVersion' "$RUNNER_TEMP/vulkaninfo.txt"
           grep -q 'driverID *= DRIVER_ID_MOLTENVK' "$RUNNER_TEMP/vulkaninfo.txt"
-  # The CPU and llvmpipe tests again, built with AddressSanitizer, LeakSanitizer and UndefinedBehaviorSanitizer, so an
-  # out-of-bounds read, a leak or undefined behaviour in the parsers and helpers fails the job instead of only giving
-  # wrong results on some machine.
+  # The CPU tests again (ctest, including the llvmpipe cases), built with AddressSanitizer, LeakSanitizer and
+  # UndefinedBehaviorSanitizer, so an out-of-bounds read, a leak or undefined behaviour in the parsers and helpers
+  # fails the job instead of only giving wrong results on some machine. This job does not run run_gpu_tests.py.
   linux-sanitizers:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       SCCACHE_GHA_ENABLED: "true"
-      ASAN_OPTIONS: detect_leaks=1
+      # A smaller quarantine keeps the full ctest run inside the ~7 GB GitHub runner: the default let
+      # depth24_convert get OOM-killed during a local 7 GB VM reproduction (Andretuta, #3014).
+      ASAN_OPTIONS: detect_leaks=1:quarantine_size_mb=32
       UBSAN_OPTIONS: print_stacktrace=1
       # The Vulkan loader unloads llvmpipe at vkDestroyInstance, and LeakSanitizer then reports the 112 bytes the
       # driver still holds (vk_command_replay) with no stack it can name. The loader keeps drivers loaded with this
