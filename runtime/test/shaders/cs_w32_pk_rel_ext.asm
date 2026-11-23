@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Ops merged with CPU-only checks (#1649 packed 16-bit integer ops, #1673 v_swaprel_b32, #1598 s_movrels_b32,
 ; #1539 ds_or/xor_b64), run once on a GPU. Lane 0 of a wave32 group stores eight dwords:
 ;   out[0] = v_pk_add_u16(0xFFFF0001, 0x00010002) clamp         = 0xFFFF0003  (high half saturates)
