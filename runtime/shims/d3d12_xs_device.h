@@ -51,6 +51,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace rt::d3d12_xs {
 
@@ -107,6 +108,18 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 // called. With none registered nothing is done.
 using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
+
+// The first call of each slot the generic thunk takes by number (the PC slots it passes through, the Xbox slots it
+// routes, 48/73/78/79/80 at their configured indices, and the ones it refuses past the PC table; not 0-2, 8, 9, 12,
+// 14, 31, 32, 34-36, 45, 46, 50, 62, 67, 75, 76 and 133, which have handlers of their own) is logged with its caller, the return address in the title's code: "device slot 25 (GetResourceAllocationInfo) first call
+// from game.exe+0x1234". The describer turns that address into the text; gta6rt registers rt::shims::module_offset
+// (module+RVA for a mapped image, host:name.dll+RVA for a host module). With none, or an empty answer, the bare
+// address is logged. Called at most once per slot, from the title's thread.
+using CallerDescriber = std::string (*)(std::uint64_t address);
+void set_caller_describer(CallerDescriber describe);
+// That caller (null before the slot's first forwarded call, and for the slots the proxy handles itself). Test helper;
+// reset_device_proxy_stats clears it with the first-call flag.
+const void* device_slot_first_caller(unsigned slot);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and

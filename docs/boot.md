@@ -80,6 +80,12 @@ Useful switches:
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
+* `LEONIDA_SKIP_ASSERTS=N` steps over up to N int3 in guest code, with or without `--trace`, and prints each one
+  as `[rt] LEONIDA_SKIP_ASSERTS: int3 at <module>+0x... stepped over (k of N)`; the next one after N ends the run as
+  before. An int3 in a host module is never stepped over. The same caveat: each skipped address is a finding
+  ([runtime/README.md](../runtime/README.md), "Guest asserts").
+* The first call of each Xbox device slot that the device proxy forwards by number names its caller:
+  `[rt] d3d12_xs: device slot N (...) first call from <module>+0x...`, the title's call site without a debugger.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their

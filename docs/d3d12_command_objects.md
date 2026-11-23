@@ -751,7 +751,10 @@ today. That is an assumption, not a measurement: the Xbox device was measured at
 1/14/15/16/18/19/27/38/62/76, and slots 8/9/12/36 are exactly the ones this page needs. If the
 Xbox slots differ, a generic forward-to-PC thunk calls the wrong method. The current proxy
 (`runtime/shims/d3d12_xs_device.h:1-18`) forwards every unshadowed slot in PC order and logs
-first calls; a wrong slot would therefore be visible as a misnamed call, not a silent success.
+first calls; a wrong slot would therefore be visible as a misnamed call, not a silent success. Under gta6rt
+the first call of a slot the generic thunk takes by number also names its caller, the return address in the
+title's code as `module+RVA` (`device slot 25 (GetResourceAllocationInfo) first call from <image>+0x…`), so the
+call site of a slot can be found without a debugger (`set_caller_describer`).
 
 Queues and fences are wrapped the same way.
 

@@ -28,6 +28,7 @@
 
 #include <windows.h>
 #include <dxgi1_4.h>
+#include <intrin.h>  // _ReturnAddress
 
 #include <atomic>
 #include <cerrno>
@@ -39,6 +40,7 @@
 #include <iterator>
 #include <new>
 #include <memory>
+#include <string>
 #include <utility>
 
 namespace rt::d3d12_xs {
@@ -155,11 +157,34 @@ const char* slot_name(unsigned slot) {
     }
 }
 
-void note_slot(unsigned slot) {
+std::atomic<CallerDescriber> g_caller_describer{nullptr};
+std::atomic<const void*> g_first_caller[kMaxSlots];
+
+// `caller` is the return address in the title's code for a slot the generic thunk forwards by number, and null for
+// the slots the proxy handles itself. Its first call names the caller as module+RVA (set_caller_describer), so the
+// title's call site of a slot is in the log without a debugger.
+void note_slot(unsigned slot, const void* caller = nullptr) {
     if (slot >= kMaxSlots) return;
     count_hit(g_hits[slot]);
     const bool first = first_call(g_first[slot]);
-    if (first) {
+    if (first && caller) {
+        g_first_caller[slot].store(caller, std::memory_order_relaxed);
+        const CallerDescriber describe = g_caller_describer.load(std::memory_order_acquire);
+        const auto address = reinterpret_cast<std::uint64_t>(caller);
+        std::string where;
+        try {
+            if (describe) where = describe(address);
+        } catch (...) {
+            where.clear();  // out of memory: the bare address below; nothing may unwind into the title's frame
+        }
+        if (where.empty()) {
+            char hex[24];
+            std::snprintf(hex, sizeof hex, "0x%llx", static_cast<unsigned long long>(address));
+            where = hex;
+        }
+        std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call from %s\n", slot, slot_name(slot),
+                     where.c_str());
+    } else if (first) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call\n", slot, slot_name(slot));
     } else if (slot >= 3 && trace_enabled()) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) call\n", slot, slot_name(slot));
@@ -1865,7 +1890,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
     } else {
-        note_slot(Slot);
+        note_slot(Slot, _ReturnAddress());  // the title's call site, logged with the slot's first call
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
@@ -2041,6 +2066,10 @@ void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
     g_placed_at_va_pages.store(hook, std::memory_order_release);
 }
 
+void set_caller_describer(CallerDescriber describe) {
+    g_caller_describer.store(describe, std::memory_order_release);
+}
+
 ID3D12Device* device_proxy_real_device(const void* device) {
     if (!is_device_proxy(device)) return nullptr;
     return static_cast<const DeviceProxy*>(device)->real;
@@ -2162,6 +2191,10 @@ bool device_slot_first_call_seen(unsigned slot) {
     return slot < kMaxSlots && g_first[slot].load(std::memory_order_relaxed);
 }
 
+const void* device_slot_first_caller(unsigned slot) {
+    return slot < kMaxSlots ? g_first_caller[slot].load(std::memory_order_relaxed) : nullptr;
+}
+
 unsigned long device_proxy_ref_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
     return static_cast<const DeviceProxy*>(device)->refs.load(std::memory_order_relaxed);
@@ -2201,6 +2234,7 @@ void reset_device_proxy_stats() {
     for (unsigned slot = 0; slot < kMaxSlots; ++slot) {
         g_hits[slot].store(0, std::memory_order_relaxed);
         g_first[slot].store(false, std::memory_order_relaxed);
+        g_first_caller[slot].store(nullptr, std::memory_order_relaxed);
         g_beyond_warned[slot].store(false, std::memory_order_relaxed);
     }
     for (unsigned slot = 0; slot < kHeapSlots; ++slot) {

@@ -27,6 +27,7 @@
 #include <system_error>
 #include <vector>
 
+#include "assert_skip.h"
 #include "base_reservation.h"
 #include "code_hooks.h"
 #include "host_cpu.h"
@@ -167,11 +168,24 @@ int wmain(int argc, wchar_t** argv) {
     rt::d3d12_trace::set_enabled(trace_d3d12);
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
+    // The first call of each device slot the proxy forwards by number names its caller as module+RVA.
+    rt::d3d12_xs::set_caller_describer(&rt::shims::module_offset);
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");
         return 2;
     }
+    // LEONIDA_SKIP_ASSERTS=N (src/assert_skip.h): up to N int3 in guest code are logged and stepped over. Off unless
+    // set; installed before the first TLS callback, the first image code that runs.
+    if (init || run)
+        if (const unsigned skip_asserts = rt::assert_skip::limit_from_environment()) {
+            if (rt::assert_skip::install(skip_asserts))
+                std::fprintf(stderr, "[rt] LEONIDA_SKIP_ASSERTS=%u: up to %u int3 in guest code are stepped over "
+                                     "(diagnostic)\n", skip_asserts, skip_asserts);
+            else
+                std::fprintf(stderr, "[rt] LEONIDA_SKIP_ASSERTS: AddVectoredExceptionHandler failed (error %lu); off\n",
+                             GetLastError());
+        }
 
     try {
         rt::Loader loader(game_dir);

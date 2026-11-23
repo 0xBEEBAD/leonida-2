@@ -7,6 +7,7 @@
 //   - OpenSharedHandle of a fence (as ID3D12Fence, IUnknown, Fence1), of a non-fence object, of an invalid handle,
 //     and with a null output or IID, with the references of every object it touches;
 //   - allocation failures in the proxy (operator new, the arrays it unwraps), injected in this executable only;
+//   - the first call of a device slot the generic thunk takes by number names its caller (set_caller_describer);
 //   - --fail-virtualalloc / --fail-virtualprotect / --fail-veh: the guard region's setup failing, injected by
 //     patching this executable's own import table before the first proxy table is built (one process each).
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
@@ -16,6 +17,7 @@
 #include <windows.h>
 
 #include <crtdbg.h>
+#include <io.h>  // _dup/_dup2 for the stderr capture
 
 #include <atomic>
 #include <cstdint>
@@ -24,6 +26,7 @@
 #include <cstring>
 #include <iterator>
 #include <new>
+#include <string>
 #include <utility>
 
 namespace {
@@ -967,6 +970,118 @@ int check_tail(bool want_guarded) {
     return 0;
 }
 
+// ---- 10. The caller of a slot taken by number, logged with its first call ----
+
+const void* g_described[8];  // the addresses the describer was given, in order
+unsigned g_describe_calls = 0;
+
+// What gta6rt's rt::shims::module_offset answers for a host module, with this executable's own name.
+std::string describe_caller(std::uint64_t address) {
+    if (g_describe_calls < std::size(g_described)) g_described[g_describe_calls] = reinterpret_cast<const void*>(address);
+    ++g_describe_calls;
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(address), &module))
+        return {};
+    char text[64];
+    std::snprintf(text, sizeof text, "xs_proxy_mock_test.exe+0x%llx",
+                  static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(module)));
+    return text;
+}
+
+bool in_this_executable(const void* address) {
+    HMODULE module = nullptr;
+    return address &&
+           GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              static_cast<LPCWSTR>(address), &module) &&
+           module == GetModuleHandleW(nullptr);
+}
+
+int count_of(const std::string& hay, const char* needle) {
+    int n = 0;
+    for (std::size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) ++n;
+    return n;
+}
+
+// stderr into a file for the length of the check, as d3d12_bundle_test captures its trace.
+struct StderrCapture {
+    std::string path;
+    int saved = -1;
+    StderrCapture() {
+        char temp[MAX_PATH] = {};
+        GetTempPathA(MAX_PATH, temp);
+        path = std::string(temp) + "xs_proxy_mock_callers_" + std::to_string(GetCurrentProcessId()) + ".txt";
+        std::fflush(stderr);
+        std::FILE* out = nullptr;
+        if (fopen_s(&out, path.c_str(), "wb") != 0) out = nullptr;
+        saved = _dup(2);
+        if (out && saved >= 0) _dup2(_fileno(out), 2);
+        if (out) std::fclose(out);
+    }
+    std::string finish() {
+        std::fflush(stderr);
+        if (saved >= 0) {
+            _dup2(saved, 2);
+            _close(saved);
+            saved = -1;
+        }
+        std::string text;
+        std::FILE* in = nullptr;
+        if (fopen_s(&in, path.c_str(), "rb") == 0 && in) {
+            char buffer[4096];
+            for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, in)) > 0;) text.append(buffer, n);
+            std::fclose(in);
+        }
+        DeleteFileA(path.c_str());
+        return text;
+    }
+    ~StderrCapture() { finish(); }
+};
+
+int check_slot_callers() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) < 120);
+    xs::reset_device_proxy_stats();
+    xs::set_caller_describer(&describe_caller);
+    std::string log;
+    {
+        StderrCapture capture;
+        // A PC slot passed through (25 GetResourceAllocationInfo): the first call names its caller, the second does not.
+        raw(device, 25, 0x11, 0x22);
+        raw(device, 25, 0x33, 0x44);
+        // A routed Xbox slot (78 SetFrameIntervalX) and a slot past the PC table (120, refused) are taken by number too.
+        const HRESULT routed = hr_of(raw(device, 78, 0, 16667, 1, 0));
+        const HRESULT refused = hr_of(raw(device, 120));
+        // A slot with a handler of its own (36 CreateFence) logs its first call without a caller.
+        void* fence = make_fence(device);
+        // With no describer the caller is the bare address.
+        xs::set_caller_describer(nullptr);
+        raw(device, 70);
+        log = capture.finish();
+        EXPECT(routed == S_OK && refused == E_NOTIMPL && fence && release(fence) == 0);
+    }
+    EXPECT(mock->calls[25] == 2 && mock->args[25][0] == 0x33 && mock->calls[78] == 0 && mock->calls[70] == 1);
+    EXPECT(g_describe_calls == 3);  // 25, 78 and 120; once each
+    EXPECT(g_described[0] == xs::device_slot_first_caller(25) && in_this_executable(g_described[0]));
+    EXPECT(g_described[1] == xs::device_slot_first_caller(78) && in_this_executable(g_described[1]));
+    EXPECT(g_described[2] == xs::device_slot_first_caller(120) && in_this_executable(g_described[2]));
+    EXPECT(in_this_executable(xs::device_slot_first_caller(70)));
+    EXPECT(xs::device_slot_first_caller(36) == nullptr && xs::device_slot_first_call_seen(36));
+    EXPECT(count_of(log, "device slot 25 (GetResourceAllocationInfo) first call from xs_proxy_mock_test.exe+0x") == 1);
+    EXPECT(count_of(log, "device slot 25 ") == 1);
+    EXPECT(count_of(log, "device slot 78 (Xbox SetFrameIntervalX) first call from xs_proxy_mock_test.exe+0x") == 1);
+    EXPECT(count_of(log, "device slot 120 (forwarded) first call from xs_proxy_mock_test.exe+0x") == 1);
+    EXPECT(count_of(log, "device slot 36 (CreateFence -> fence proxy) first call\n") == 1);
+    EXPECT(count_of(log, "device slot 70 (forwarded) first call from 0x") == 1);
+    // The reset clears the caller with the first-call flag.
+    xs::reset_device_proxy_stats();
+    EXPECT(xs::device_slot_first_caller(25) == nullptr && !xs::device_slot_first_call_seen(25));
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: the first call of a slot taken by number names its caller; handled slots do not\n", g_label);
+    return 0;
+}
+
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
 
 std::atomic<int> g_injected{0};
@@ -1249,7 +1364,8 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_slot_callers() ||
+        check_console_command_list())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
