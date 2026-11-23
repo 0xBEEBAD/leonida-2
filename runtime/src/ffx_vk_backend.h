@@ -58,6 +58,7 @@ public:
 
 private:
     void* module_ = nullptr;
+    void* provider_module_ = nullptr;
     ffx::Context context_ = nullptr;
     ffx::PfnCreateContext create_ = nullptr;
     ffx::PfnDestroyContext destroy_ = nullptr;
