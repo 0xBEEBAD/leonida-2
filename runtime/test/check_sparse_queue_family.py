@@ -33,6 +33,11 @@ CREATE_DEVICE = re.compile(r"^vkCreateDevice\(.*?(?=^vk\w+\(|\Z)", re.M | re.S)
 QUEUE_FAMILY_PROPS = re.compile(r"^vkGetPhysicalDeviceQueueFamilyProperties\(.*?(?=^vk\w+\(|\Z)", re.M | re.S)
 PHYS_DEVICE = re.compile(r"physicalDevice:\s+VkPhysicalDevice\s*=\s*([0-9a-fA-Fx]+)")
 QUEUE_CREATE_COUNT = re.compile(r"queueCreateInfoCount:\s+uint32_t\s*=\s*(\d+)")
+QUEUE_FAMILY_INDEX = re.compile(
+    r"pQueueCreateInfos\[0\]:(?:(?!pQueueCreateInfos\[|enabledLayerCount).)*?queueFamilyIndex:\s+uint32_t\s*=\s*(\d+)",
+    re.S,
+)
+QUEUE_FAMILY_PROP_COUNT = re.compile(r"pQueueFamilyPropertyCount:\s+uint32_t\*\s*=\s*(\d+)")
 VK_QUEUE_GRAPHICS_BIT = 0x1
 VK_QUEUE_COMPUTE_BIT = 0x2
 VK_QUEUE_TRANSFER_BIT = 0x4
@@ -46,12 +51,41 @@ CALL_HEAD = re.compile(r"^(vk\w+)\(", re.M)
 CASE = re.compile(r"^RESULT (LAYER_MAP_(?:DIRECT|COPY|COMPUTE)_COPY_COMPUTE) PASS mapped_mismatch=0/65536 unmapped_nonzero=0/65536$", re.M)
 
 
-def single_sparse_queue_family(path: Path) -> bool:
-    """True when vkCreateDevice uses 1 queue family and the physical device exposes no second sparse-capable family.
+def _pick_sparse_queue_families(families: list[tuple[int, int, int, int, int]],
+                                graphics: int) -> tuple[int, int, int]:
+    """Mirror runtime/src/queue_families.h (pick_queue_families + sparse_capable_queue_families)."""
+    def fine_grained(family: tuple[int, int, int, int, int]) -> bool:
+        return family[2:] == (1, 1, 1)
 
-    Mirrors runtime/src/queue_families.h (pick_queue_families + sparse_capable_queue_families): Leonida only creates
-    a second family when a non-graphics SPARSE_BINDING family supports async compute or fine-grained (1x1x1) transfer.
-    On single-family GPUs (e.g. Intel Xe-LP iGPUs), VK_SHARING_MODE_CONCURRENT is illegal (VUID-00914).
+    compute = copy = graphics
+    have_compute = have_copy = False
+    for i, family in enumerate(families):
+        flags, count = family[0], family[1]
+        if count == 0:
+            continue
+        if not have_compute and (flags & VK_QUEUE_COMPUTE_BIT) and not (flags & VK_QUEUE_GRAPHICS_BIT):
+            compute = i
+            have_compute = True
+        if (not have_copy and (flags & VK_QUEUE_TRANSFER_BIT)
+                and not (flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) and fine_grained(family)):
+            copy = i
+            have_copy = True
+    if not have_copy and have_compute and fine_grained(families[compute]):
+        copy = compute
+    if not (families[compute][0] & VK_QUEUE_SPARSE_BINDING_BIT):
+        compute = graphics
+    if not (families[copy][0] & VK_QUEUE_SPARSE_BINDING_BIT):
+        copy = graphics
+    return graphics, compute, copy
+
+
+def single_sparse_queue_family(path: Path) -> bool:
+    """True when vkCreateDevice uses 1 queue family and the physical device yields only 1 sparse-capable family.
+
+    Mirrors runtime/src/queue_families.h (pick_queue_families + sparse_capable_queue_families): Leonida picks the
+    first non-graphics async compute or fine-grained (1x1x1) DMA transfer family, then falls back to graphics if the
+    chosen family lacks SPARSE_BINDING. On single-family GPUs (e.g. Intel Xe-LP iGPUs), VK_SHARING_MODE_CONCURRENT
+    is illegal (VUID-00914).
     """
     text = path.read_text(encoding="utf-8", errors="replace")
     devices = CREATE_DEVICE.findall(text)
@@ -62,40 +96,70 @@ def single_sparse_queue_family(path: Path) -> bool:
     if not pdev_m or not qci_m or int(qci_m.group(1)) != 1:
         return False
     pdev = pdev_m.group(1)
+    created_graphics: int | None = None
+    if "pQueueCreateInfos[" in devices[0]:
+        qfi_m = QUEUE_FAMILY_INDEX.search(devices[0])
+        if not qfi_m:
+            return False
+        created_graphics = int(qfi_m.group(1))
 
-    families: list[tuple[int, int, int, int, int]] = []
+    families: list[tuple[int, int, int, int, int]] | None = None
+    max_expected = 0
     for call in QUEUE_FAMILY_PROPS.findall(text):
         after = call.split("<after returning from implementation>", 1)
+        if "<before calling into implementation>" in call and len(after) != 2:
+            pm = PHYS_DEVICE.search(call)
+            if pm and pm.group(1) == pdev:
+                return False
+            continue
         body = after[1] if len(after) == 2 else call
         pm = PHYS_DEVICE.search(body)
-        if not pm or pm.group(1) != pdev or "pQueueFamilyProperties[0]:" not in body:
+        if not pm or pm.group(1) != pdev:
             continue
-        parsed: list[tuple[int, int, int, int, int]] = []
-        for chunk in re.split(r"(?=pQueueFamilyProperties\[\d+\]:)", body)[1:]:
+        cnt_m = QUEUE_FAMILY_PROP_COUNT.search(body)
+        if cnt_m:
+            max_expected = max(max_expected, int(cnt_m.group(1)))
+        if "pQueueFamilyProperties[" not in body:
+            continue
+        if not cnt_m:
+            return False
+        expected = int(cnt_m.group(1))
+        if expected <= 0:
+            return False
+        chunks = re.split(r"(?=pQueueFamilyProperties\[\d+\]:)", body)[1:]
+        if len(chunks) != expected:
+            return False
+        parsed: dict[int, tuple[int, int, int, int, int]] = {}
+        for chunk in chunks:
+            im = re.match(r"pQueueFamilyProperties\[(\d+)\]:", chunk)
             fm = re.search(r"queueFlags:\s+VkQueueFlags\s*=\s*(\d+)", chunk)
             cm = re.search(r"queueCount:\s+uint32_t\s*=\s*(\d+)", chunk)
             wm = re.search(r"width:\s+uint32_t\s*=\s*(\d+)", chunk)
             hm = re.search(r"height:\s+uint32_t\s*=\s*(\d+)", chunk)
             dm = re.search(r"depth:\s+uint32_t\s*=\s*(\d+)", chunk)
-            if fm and cm and wm and hm and dm:
-                parsed.append((int(fm.group(1)), int(cm.group(1)), int(wm.group(1)), int(hm.group(1)), int(dm.group(1))))
-        if parsed:
-            families = parsed
-    if not families:
+            if not (im and fm and cm and wm and hm and dm):
+                return False
+            idx = int(im.group(1))
+            if idx >= expected or idx in parsed:
+                return False
+            parsed[idx] = (int(fm.group(1)), int(cm.group(1)), int(wm.group(1)), int(hm.group(1)), int(dm.group(1)))
+        if len(parsed) != expected:
+            return False
+        families = [parsed[i] for i in range(expected)]
+    if not families or len(families) != max_expected:
         return False
 
-    has_graphics_sparse = False
-    has_extra_sparse = False
-    for flags, count, w, h, d in families:
-        if count == 0 or not (flags & VK_QUEUE_SPARSE_BINDING_BIT):
-            continue
-        if flags & VK_QUEUE_GRAPHICS_BIT:
-            has_graphics_sparse = True
-        elif flags & VK_QUEUE_COMPUTE_BIT:
-            has_extra_sparse = True
-        elif (flags & VK_QUEUE_TRANSFER_BIT) and (w, h, d) == (1, 1, 1):
-            has_extra_sparse = True
-    return has_graphics_sparse and not has_extra_sparse
+    graphics = (created_graphics if created_graphics is not None
+                else next((i for i, (flags, count, *_) in enumerate(families)
+                           if count > 0 and (flags & VK_QUEUE_GRAPHICS_BIT)), None))
+    if graphics is None or graphics >= len(families):
+        return False
+    g_flags, g_count = families[graphics][0], families[graphics][1]
+    if g_count == 0 or not (g_flags & VK_QUEUE_GRAPHICS_BIT) or not (g_flags & VK_QUEUE_SPARSE_BINDING_BIT):
+        return False
+
+    direct, compute, copy = _pick_sparse_queue_families(families, graphics)
+    return compute == direct and copy == direct
 
 
 def check_trace(path: Path, expect_exclusive: bool, *, single_family: bool = False) -> tuple[int, int]:
