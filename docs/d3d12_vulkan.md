@@ -3608,7 +3608,9 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     under Wine (`Kev-Ball`), both at 1280x720 to 2560x1440 (#4999).
   - On native Windows (#4999): an **RX 7600** (RDNA3, gfx1102) with AMD's driver 26.11.2 gets **FSR 4.1.2**, 4.56 ms
     to 1080p and 16.98 ms to 4K, every square right, no validation error of the test's own (`RSK2707X`). An RTX 4080
-    (driver 621.01, `CryingLaughing`) and an RTX 5070 Ti (`Kam471`) get FSR 3.1.6, every square right.
+    (driver 621.01, `CryingLaughing`) and an RTX 5070 Ti (`Kam471`) get FSR 3.1.6, every square right. An **RX 9060 XT**
+    (RDNA4) with AMD's driver 26.10.1 offers all three wanted extensions and gets **FSR 4.1.2**: 1.27 ms to 1080p and
+    4.16 ms to 4K (`amarovndres`, #5139).
   - **Device extensions.** The shaders run without any, but they use some: FSR 3.1 compute-shader derivatives, FSR 4
     also cooperative matrices and 8-bit floats. Without the extensions the validation layer reports
     `VUID-VkShaderModuleCreateInfo-pCode-08740`/`-08742` (on Windows and on RADV). The device must enable those of
@@ -3618,7 +3620,8 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     rejects an `OpFConvert` on cooperative-matrix types and an `OpStore` to an image, and three storage images
     (`rw_reprojected_color`, `rw_history_color`, `rw_mlsr_output_color`) get a 3-component `OpImageWrite` on an
     RGBA16F view. With `LEONIDA_VK_VALIDATION=1` the test fails on any other validation error.
-  - Not run on RDNA4 under Windows yet. AMD's DLLs are not in the repository; their licence allows redistribution in binary
+  - The five FSR 4.1.2 shader errors above appear on AMD's Windows driver too (RX 9060 XT, RX 7600), so they are in
+    AMD's shaders, not a RADV quirk. AMD's DLLs are not in the repository; their licence allows redistribution in binary
     form and forbids reverse engineering.
 - **In the layer: the Upscale command.** With `LEONIDA_FFX_PC=1` (off by default) a device of the Vulkan layer
   enables the extensions above and the core features the shaders declare (16-bit storage, variable pointers, int8,
