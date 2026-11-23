@@ -1498,11 +1498,14 @@ differs in the low bits of the result.
 
 ### binary64 VALU on the CPU and Vulkan (`tools/f64_diff.py`, FUZZ-55)
 
-`tools/f64_diff.py` covers the 47 binary64 instruction forms `tools/rdna2spirv.py` translates on main: four rounding
+`tools/f64_diff.py` covers the 50 binary64 instruction forms `tools/rdna2spirv.py` translates on main: four rounding
 ops, add, f64-to-f32 conversion, reciprocal/reciprocal-square-root/square-root, division fixup and scaled FMA, both
-frexp results, all 16 `v_cmp_*_f64` and 16 `v_cmpx_*_f64` predicates, and both class compares. It generates one-lane
+frexp results, `v_ldexp_f64`, conversion from a signed or unsigned 32-bit integer (`v_cvt_f64_i32`, `v_cvt_f64_u32`),
+all 16 `v_cmp_*_f64` and 16 `v_cmpx_*_f64` predicates, and both class compares. It generates one-lane
 programs with VGPR and SGPR pairs, float immediates, inline constants, 32-bit literals where the translator marks
-them as upper-half f64 literals, and full-width literals in other instruction forms; it compares the four exported
+them as upper-half f64 literals (rounding, add, conversion to f32, frexp, `v_ldexp_f64`'s `S0`, reciprocal, reciprocal
+square root, square root, compares and class) and full-width literals in the other two forms, `v_div_fmas_f64` and `v_div_fixup_f64` (which reads a
+printed 32-bit literal as the low word on main); it compares the four exported
 dwords. Compare predicates are read through a mask-to-word operation, and `v_cmpx` cases also export the resulting
 `EXEC` mask. Its reference decodes IEEE binary64 words and uses exact
 `Fraction` arithmetic for finite addition and fused multiply-add; it does not import code from the translator or the
@@ -1510,6 +1513,19 @@ other fuzzer references. It models all four `MODE.FP_ROUND[3:2]` encodings for a
 rejects directed rounding (+infinity and -infinity), so those generated cases are counted skips. Any NaN matches any
 NaN. Binary64 subnormal operands or results for `v_rcp_f64`, `v_rsq_f64` and `v_sqrt_f64`, and subnormal f32 results
 from `v_cvt_f32_f64`, are counted skips because shader drivers may flush them to zero (FTZ).
+
+`v_ldexp_f64` scales the exact value of `S0` by `2^S1` (`S1` is a signed 32-bit word) and rounds once with
+`MODE.FP_ROUND[3:2]`, subnormal results included; zeros, infinities and NaNs (a signalling one too) pass unchanged, as
+the `docs/design.md` row measured on `gfx1036`. Toward zero, a result never rounds up and an overflow gives the largest
+finite value (measured on `gfx1031` in #6218). The translator lowers it with 32-bit integer operations only, so no
+FTZ applies, and it clamps the result words with integer operations rather than `FClamp`: its `clamp` is judged (NaN,
+-0 and negatives give +0, anything above 1.0 gives 1.0). The generator aims `S1` at the subnormal and overflow edges of
+`S0`, often refills `S0` with a subnormal, a boundary value or a significand whose low word is all ones (the rounding
+then carries into the high word), and writes `s_round_mode` 0 or 12 before 30% of the cases. `v_cvt_f64_i32` and
+`v_cvt_f64_u32` are exact for every 32-bit integer, which is never NaN or -0, so their `clamp` is judged too. A module
+with a binary64 operation runs on `tests/spirv_interp.py`, which converts a 32-bit integer to `%double` exactly (it used
+to round through binary32, so `v_cvt_f64_u32` of `0xffffffff` read 2^32) and implements the integer instructions of the
+`v_ldexp_f64` lowering (`SClamp`, `UClamp`, `FindUMsb`, `OpSLessThan`, `OpSGreaterThan`).
 
 `--sweep` (the default) tries each translated form, followed by `--programs N` seeded programs (`--seed S` and
 `--max-ops N` control the campaign). `--no-sweep`, `--ops`, `--no-literals`, `--known`, `--all-failures`,
@@ -1525,13 +1541,29 @@ leaves the precision of these GLSL [extended instructions](https://registry.khro
 implementation-defined for binary64; the GPU oracle therefore counts `v_rsq_f64` and
 `v_sqrt_f64` as unjudged skips instead of requiring bit-exact results. This was confirmed on an NVIDIA RTX 4070 with
 `shaderFloat64`: `v_rsq_f64 3.25` produced matching high 32 bits but zero low 32 bits, unlike the exact reference.
+A `v_div_fmas_f64` whose operands are all constants and whose product underflows against an opposite-signed zero (for
+example `v_div_fmas_f64 v[8:9], 16, 0xa5126aa7ea6efc1f, 0`, reference -0) came back as +0 on an NVIDIA RTX 4070. The same
+`Fma` on runtime operands (a `FragCoord`-derived shader) gives the IEEE -0 there, and the translator emits a plain GLSL
+`Fma`, so the reference and the translator agree with IEEE here. The likely cause is a driver folding an all-constant
+`Fma`; that is a hypothesis from this behaviour only, not checked against the driver, and it was observed on that one
+device. Because any Vulkan driver could do the same, the exclusion is not tied to a vendor: in every `--oracle gpu` run, a
+result that differs from the reference only in the sign of that zero is a counted skip (with a vendor-neutral reason);
+any other difference is still a mismatch. It does not apply to `--oracle hw`, which runs real hardware kernels.
 
 Known divergence probes are excluded and counted by default, then reinserted with `--known`: binary64 output modifiers
 (SHADER-721), binary64 `OpFNegate`/`FAbs` that the CPU interpreter rounds through binary32 (TEST-912, #4172),
-driver-dependent NaN or signed-zero clamp results, and `v_div_fixup_f64` with a NaN `S0` and an ordinary finite
-division. The latter follows the RDNA2 ISA reference (`NaN(S0) -> signed infinity`), while the current translator
-preserves the NaN payload. Therefore `--known` can intentionally return 1 when this known mismatch is reproduced;
-the minimized case is printed. `--oracle gpu` translates the same
+driver-dependent NaN or signed-zero clamp results, and a `v_ldexp_f64` result that a toward-zero `MODE.FP_ROUND` write
+changes (main ignores the write; #6218 fixes it). The CPU translator reproduces only the last of these today, so
+`--known` exits 1 on its probe (`DBL_MAX * 2` gives inf instead of `DBL_MAX`) until #6218 lands, and is clean otherwise.
+Another oracle can reproduce more of them (the RTX 4070 `--oracle gpu` run does for the clamp form); the minimized case
+is printed. `v_div_fixup_f64` with a NaN `S0` is not a known divergence: it gives
+signed infinity, measured on RDNA2 `gfx1036` (TEST-983; the translator has it since #2477), and is compared like any other case.
+The `v_div_fixup_f64` reference follows the `gfx1036` measurements in the `docs/design.md` row (#2477): a NaN in `S1` or
+`S2` passes through unquieted (IEEE off), the underflow cutoff is `exp(S2) - exp(S1) <= -1076` and there is no overflow
+check.
+The `v_div_fmas_f64` reference scales by `2^128` when `exp(S2) > 1023` and by `2^-128` otherwise when VCC is set, as the
+`docs/design.md` row measured on `gfx1036` (it used a fixed `2^64` before).
+`--oracle gpu` translates the same
 fragment shader and runs it through `runtime/build/vk_harness`, comparing the raw RGBA32F output words. It assembles
 the fragment module with `spirv-as` and the full-screen vertex shader with the Vulkan SDK's `glslc`; use `--exe PATH`
 to select another `vk_harness`. It exits 77 if the executable, SDK tools, Vulkan device or required `shaderFloat64`
@@ -1543,7 +1575,11 @@ failing program is re-run alone while it is shrunk. The hardware runs every form
 too, and the kernels start in the game's inferred float MODE (IEEE off, DX10_CLAMP on). `v_rcp_f64`, `v_rsq_f64` and
 `v_sqrt_f64` are counted skips there, because the native results are approximations (PROC-216) and the reference is exact;
 an architecture that cannot set that MODE (gfx1170 and later) or a program the assembler rejects is a counted skip with the
-runner's reason. It exits 77 only when the `tools/hw_oracle` tools or device are missing. The path is covered by
+runner's reason. The kernel runs one thread of a wave32, so EXEC starts as 1: a `v_cmpx` result that the program reads back
+through `exec_lo` is 1 or 0 on hardware, while the translator and Vulkan oracles show the full 32-lane mask
+(`0xffffffff`); the reference models the lane count of the oracle it is compared with (found on `gfx1036` by
+@abnalstlll-byte at 7bd5f01d: `word 1: expected 00000001 ffffffff, actual 00000001 00000001`). It exits 77 only when the
+`tools/hw_oracle` tools or device are missing. The path is covered by
 `tests/test_f64_diff.py` with a fake oracle (routing, `--hw-arch`, exit 77, skips, shrinking); **no AMD hardware run has
 been done for it yet**.
 Exit codes are 0 for no unexpected
