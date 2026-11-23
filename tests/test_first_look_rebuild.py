@@ -28,13 +28,13 @@ REPORT_TOOL_STUB = (
     "from pathlib import Path\n"
     "import sys\n"
     "args = sys.argv[1:]\n"
-    "with Path(__file__).resolve().parents[1].joinpath('tools_called.txt').open('a', encoding='utf-8') as log:\n"
+    "with Path(__file__).resolve().parents[1].joinpath('tools_called.txt').open('a', encoding='utf-8', newline='\\n') as log:\n"
     "    log.write(Path(__file__).name + '\\n')\n"
     "for flag in ('--json', '--out'):\n"
     "    if flag in args:\n"
     "        target = Path(args[args.index(flag) + 1])\n"
     "        if target.suffix:\n"
-    "            target.write_text('{}' if target.suffix == '.json' else '', encoding='utf-8')\n"
+    "            target.write_text('{}' if target.suffix == '.json' else '', encoding='utf-8', newline='\\n')\n"
 )
 REPORT_TOOLS = ("gdk_runtime_calls.py", "find_hash_lookup.py", "exe_checklist.py")
 # The build script leaves a marker; the loader is replaced by an alias that echoes its arguments.
