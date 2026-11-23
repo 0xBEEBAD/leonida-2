@@ -167,6 +167,19 @@ class RuntimeStagingTests(unittest.TestCase):
         self.assertEqual(read(os.path.join(self.out, "game_path.txt")).decode(), os.path.abspath(self.game))
         self.assertEqual(self.entries(), sorted(self.old))
 
+    def test_shader_path_is_staged_with_the_rest(self):
+        # main's shader_path.txt (from --work) goes through the same staging: a failed copy leaves no new one
+        work = os.path.join(self.tmp, "work")
+        make_game.install_runtime(self.game, self.out, self.artifacts, work)
+        self.assertEqual(read(os.path.join(self.out, "shader_path.txt")),
+                         os.fsencode(os.path.join(os.path.abspath(work), "shaders", "spirv"))
+                         if os.name != "nt" else os.path.join(os.path.abspath(work), "shaders", "spirv").encode())
+        os.remove(os.path.join(self.out, "shader_path.txt"))
+        with patch.object(make_game.shutil, "copy2", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(OSError):
+                make_game.install_runtime(self.game, self.out, self.artifacts, work)
+        self.assertNotIn("shader_path.txt", os.listdir(self.out))
+
     def test_missing_output_folder_is_created(self):
         out = os.path.join(self.tmp, "fresh", "out")
         make_game.install_runtime(self.game, out, self.artifacts)
