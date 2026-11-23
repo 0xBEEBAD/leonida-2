@@ -40,10 +40,23 @@ $log = Join-Path $env:TEMP d3d12.log
 python -I tools\boot_trace.py $trace --d3d12 $log
 ```
 
-Windows PowerShell 5.1 writes `2>` as UTF-16LE; the tool names that file instead of parsing it. Use
-`2>&1 | Out-File -Encoding utf8 $log` there, or PowerShell 7, which defaults to UTF-8. The tool strips the BOM that
-5.1 writes with `utf8`, and accepts the `program.exe : ` prefix 5.1 puts in front of the first stderr line when it
-turns it into an error record, so that call is not lost. `cmd /c` writes the lines unchanged.
+Windows PowerShell 5.1 writes `2>` as UTF-16LE; the tool names that file instead of parsing it. Use PowerShell 7,
+which defaults to UTF-8, or capture through `Out-File -Encoding utf8` inside a block that sets
+`$ErrorActionPreference` to `Continue`:
+
+```powershell
+& { $ErrorActionPreference = 'Continue'
+    .\runtime\build\gta6rt.exe --run $exe --game-dir $pkg --trace $trace --trace-d3d12 2>&1 } |
+    Out-File -Encoding utf8 $log
+```
+
+The block matters when the session (or a profile or script) has `$ErrorActionPreference = 'Stop'`: 5.1 then turns
+the first stderr line into a terminating error, the run stops there, and the log holds no `[d3d12-trace]` line, so it
+reads as a run with no D3D12 call. Measured on 5.1.26100 with a stand-in that prints three trace lines to stderr: a
+bare `2>&1 | Out-File` keeps all three with `Continue` and none with `Stop`; the block keeps all three with either
+(`scripts/first_look.ps1` captures its dry run the same way). The tool strips the BOM that 5.1 writes with `utf8`, and
+accepts the `program.exe : ` prefix 5.1 puts in front of the first stderr line when it turns it into an error record,
+so that call is not lost. `cmd /c` writes the lines unchanged.
 
 Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifact; the backend must be Vulkan):
 
