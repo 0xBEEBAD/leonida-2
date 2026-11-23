@@ -8,6 +8,10 @@
 // depth, auto exposure; docs/d3d12_vulkan.md A.3). Then every output pixel must be finite and the centre of every
 // 64-pixel output square near its input value. Prints the provider the loader chose (FSR 4.1 on GPUs AMD ships it
 // for, else 3.1) and the time per upscale. Exits 77 without a Vulkan device or the loader DLL.
+//
+// LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation, and any validation error fails it, except the
+// ones known_provider_error names: those are in AMD's FSR 4.1.2 shaders (this test creates no shader module and
+// dispatches nothing itself), measured on an RX 9070 XT under RADV, and are printed and counted but not failed.
 #include "../src/ffx_vk_backend.h"
 #include "vk_device_pick.h"
 #include "vulkan_loader.h"
@@ -16,6 +20,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iterator>
 #include <vector>
 
 namespace {
@@ -39,6 +46,38 @@ float halton(int i, int base) {
         r += f * float(i % base);
     }
     return r;
+}
+
+// AMD's FSR 4.1.2 Vulkan shaders on RDNA4 (RADV, Mesa 26.3.1; #4999). They declare SPV_NV_cooperative_matrix2, which
+// the device does not offer; spirv-val rejects an OpFConvert on cooperative-matrix types and an OpStore to an image;
+// and three storage images (rw_reprojected_color, rw_history_color, rw_mlsr_output_color) get a 3-component
+// OpImageWrite on an RGBA16F view. Matched by VUID and text, so the same VUID from anything else still fails.
+bool known_provider_error(const VkDebugUtilsMessengerCallbackDataEXT* data) {
+    const char* id = data->pMessageIdName ? data->pMessageIdName : "";
+    const char* text = data->pMessage ? data->pMessage : "";
+    auto is = [&](const char* vuid, const char* needle) {
+        return std::strcmp(id, vuid) == 0 && std::strstr(text, needle) != nullptr;
+    };
+    return is("VUID-VkShaderModuleCreateInfo-pCode-08742", "SPV_NV_cooperative_matrix2") ||
+           is("VUID-VkShaderModuleCreateInfo-pCode-08740", "CooperativeMatrixConversionsNV") ||
+           is("VUID-VkShaderModuleCreateInfo-pCode-08737", "Expected Use of Matrix type and Result Type to be identical") ||
+           is("VUID-StandaloneSpirv-OpTypeImage-06924", "Cannot store to OpTypeImage") ||
+           is("VUID-vkCmdDispatch-OpImageWrite-08795", "OpImageWrite Texel operand only contains 3 components");
+}
+
+unsigned validation_errors = 0, provider_errors = 0;
+
+VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                             VkDebugUtilsMessageTypeFlagsEXT types,
+                                             const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    if (!(severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ||
+        !(types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
+        return VK_FALSE;
+    const bool provider = known_provider_error(data);
+    ++(provider ? provider_errors : validation_errors);
+    std::printf("validation%s: %s\n", provider ? " (AMD's FSR 4 shaders, not counted)" : "",
+                data->pMessage ? data->pMessage : "(no message)");
+    return VK_FALSE;
 }
 
 #define CHECK(x)                                                                \
@@ -71,14 +110,50 @@ int main() {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    const char* validation_env = std::getenv("LEONIDA_VK_VALIDATION");
+    const bool validation = validation_env && std::strcmp(validation_env, "0") != 0;
+    const char* layer = "VK_LAYER_KHRONOS_validation";
+    const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    VkDebugUtilsMessengerCreateInfoEXT messenger{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    messenger.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    messenger.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
+    messenger.pfnUserCallback = on_validation;
+    if (validation) {
+        auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
+            gipa(nullptr, "vkEnumerateInstanceLayerProperties"));
+        uint32_t n = 0;
+        enumerate(&n, nullptr);
+        std::vector<VkLayerProperties> layers(n);
+        enumerate(&n, layers.data());
+        bool found = false;
+        for (const auto& l : layers) found = found || std::strcmp(l.layerName, layer) == 0;
+        if (!found) {
+            std::printf("FAIL LEONIDA_VK_VALIDATION is set but %s is not installed\n", layer);
+            return 1;
+        }
+        ici.pNext = &messenger;   // messages from instance creation itself
+        ici.enabledLayerCount = 1;
+        ici.ppEnabledLayerNames = &layer;
+        ici.enabledExtensionCount = 1;
+        ici.ppEnabledExtensionNames = &debug_utils;
+    }
     if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) {
         std::printf("SKIP no Vulkan instance\n");
         return 77;
     }
+    if (validation) {
+        auto create_messenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+            gipa(inst, "vkCreateDebugUtilsMessengerEXT"));
+        VkDebugUtilsMessengerEXT handle;
+        if (!create_messenger || create_messenger(inst, &messenger, nullptr, &handle) != VK_SUCCESS) {
+            std::printf("FAIL vkCreateDebugUtilsMessengerEXT\n");
+            return 1;
+        }
+    }
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkGetPhysicalDeviceFeatures2);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetPhysicalDeviceMemoryProperties);
-    LOADI(vkCreateDevice); LOADI(vkGetDeviceProcAddr);
+    LOADI(vkCreateDevice); LOADI(vkGetDeviceProcAddr); LOADI(vkEnumerateDeviceExtensionProperties);
     uint32_t count = 0;
     vkEnumeratePhysicalDevices(inst, &count, nullptr);
     std::vector<VkPhysicalDevice> devices(count);
@@ -105,14 +180,36 @@ int main() {
         std::printf("SKIP no graphics+compute queue\n");
         return 77;
     }
-    // No extensions: the upscaler runs on core features (measured with FSR 4.1.2 and 3.1.6 on RADV). Every core
-    // feature the device has is enabled, as the layer's device would have them.
+    // Every core feature the device has, and the backend's wanted extensions it has with all their features.
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
     if (props.apiVersion < VK_API_VERSION_1_3) f12.pNext = nullptr;
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR matrices{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceShaderFloat8FeaturesEXT float8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+    void* const feature_of[] = {&derivatives, &matrices, &float8};   // in wanted_device_extensions order
+    uint32_t available_count = 0;
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &available_count, nullptr);
+    std::vector<VkExtensionProperties> available(available_count);
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &available_count, available.data());
+    std::vector<const char*> extensions;
+    for (std::size_t i = 0; i < std::size(leonida::ffx_vk::wanted_device_extensions); ++i) {
+        const char* name = leonida::ffx_vk::wanted_device_extensions[i];
+        for (const auto& e : available) {
+            if (std::strcmp(e.extensionName, name) != 0) continue;
+            extensions.push_back(name);
+            auto* feature = static_cast<VkBaseOutStructure*>(feature_of[i]);   // prepend to the query chain
+            feature->pNext = static_cast<VkBaseOutStructure*>(f2.pNext);
+            f2.pNext = feature;
+        }
+    }
     vkGetPhysicalDeviceFeatures2(pd, &f2);
+    std::printf("device extensions:");
+    for (const char* name : extensions) std::printf(" %s", name);
+    std::printf("%s\n", extensions.empty() ? " none of the wanted ones" : "");
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family;
@@ -121,6 +218,8 @@ int main() {
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = uint32_t(extensions.size());
+    dci.ppEnabledExtensionNames = extensions.data();
     VkDevice dev = VK_NULL_HANDLE;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LOADD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
@@ -330,7 +429,10 @@ int main() {
         }
     std::printf("non-finite output values: %zu; square centres within 0.1 of the input: %u of %u\n", non_finite,
                 right, squares);
-    const bool ok = non_finite == 0 && right == squares;
+    if (validation)
+        std::printf("validation errors: %u (and %u in AMD's FSR 4 shaders, not counted)\n", validation_errors,
+                    provider_errors);
+    const bool ok = non_finite == 0 && right == squares && validation_errors == 0;
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

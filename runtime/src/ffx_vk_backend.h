@@ -20,6 +20,18 @@
 
 namespace leonida::ffx_vk {
 
+// Device extensions the upscaler's shaders use, as AMD's own Vulkan device setup enables them where the GPU has them
+// (FidelityFX SDK 2.4.0, Kits/Cauldron2/framework/render/vk/device_vk.cpp): compute-shader derivatives (FSR 3.1, and
+// FSR 4's INT8 prepass), cooperative matrices and 8-bit floats (FSR 4's network on RDNA4). The device the context is
+// created on must enable those it has, with all their features: drivers run the shaders without them, but the
+// validation layer then reports VUID-VkShaderModuleCreateInfo-pCode-08740 and -08742 (measured on RADV and on AMD's
+// Windows driver, #4999).
+inline constexpr const char* wanted_device_extensions[] = {
+    "VK_KHR_compute_shader_derivatives",
+    "VK_KHR_cooperative_matrix",
+    "VK_EXT_shader_float8",
+};
+
 struct Device {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;

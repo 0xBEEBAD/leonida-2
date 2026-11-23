@@ -3599,11 +3599,21 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   creates the upscale context with the Vulkan backend descriptor in place of the console one, reports the provider
   the loader chose, and passes dispatches through with `VkImage` resources and a `VkCommandBuffer`. The loader picks
   the newest upscaler the GPU supports. Measured with `ffx_vk_dispatch_test` (procedural inputs, the game's context
-  flags, 1280x720 to 2560x1440, 30 frames) under Wine 11.22 on RADV (Mesa 26.3.1), with no device extensions:
-  - RX 9070 XT (RDNA4): providers 4.1.2, 3.1.6 and 2.3.4; the context gets **FSR 4.1.2**; 0.64 ms per upscale
+  flags, 1280x720 to 2560x1440, 30 frames) under Wine 11.22 on RADV (Mesa 26.3.1):
+  - RX 9070 XT (RDNA4): providers 4.1.2, 3.1.6 and 2.3.4; the context gets **FSR 4.1.2**; 0.66 ms per upscale
     (submit and wait); every square of the checkerboard right and no non-finite value.
-  - Ryzen 7 9800X3D iGPU (RDNA2, 2 CUs): providers 3.1.6 and 2.3.4; the context gets FSR 3.1.6; 15.7 ms.
-  - Not run on Windows yet. AMD's DLLs are not in the repository; their licence allows redistribution in binary
+  - Ryzen 7 9800X3D iGPU (RDNA2, 2 CUs): providers 3.1.6 and 2.3.4; the context gets FSR 3.1.6; 15.8 ms. The same
+    on AMD's Windows driver 32.0.21030.2001 (16.8 ms; `whattheflop`, #4999).
+  - **Device extensions.** The shaders run without any, but they use some: FSR 3.1 compute-shader derivatives, FSR 4
+    also cooperative matrices and 8-bit floats. Without the extensions the validation layer reports
+    `VUID-VkShaderModuleCreateInfo-pCode-08740`/`-08742` (on Windows and on RADV). The device must enable those of
+    `ffx_vk::wanted_device_extensions` it has, as AMD's own sample device does; the test does, and on the iGPU the
+    validation layer is then silent. FSR 4.1.2 on the RX 9070 XT still reports errors in AMD's own shaders, which no
+    device setup removes: they declare `SPV_NV_cooperative_matrix2`, which RADV does not offer on that GPU, spirv-val
+    rejects an `OpFConvert` on cooperative-matrix types and an `OpStore` to an image, and three storage images
+    (`rw_reprojected_color`, `rw_history_color`, `rw_mlsr_output_color`) get a 3-component `OpImageWrite` on an
+    RGBA16F view. With `LEONIDA_VK_VALIDATION=1` the test fails on any other validation error.
+  - Not run on RDNA4 under Windows yet. AMD's DLLs are not in the repository; their licence allows redistribution in binary
     form and forbids reverse engineering. The shim that routes the game's calls here and maps its resources to the
     layer's images is the next step.
 
