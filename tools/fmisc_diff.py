@@ -595,8 +595,12 @@ def check(lines, backends=("translator",), hw=None):
             skips.append(e)
     if "hw" in backends:
         got = hw(lines) if callable(hw) else hw
+        if got is None:
+            raise RuntimeError("no result from the hardware runner")
         if isinstance(got, str):
             skips.append(Skip(f"hardware: {got}"))
+        elif len(got) < 4:
+            raise RuntimeError(f"the hardware runner returned {len(got)} words (expected 4)")
         else:
             problems.append(_diff(lines, want, got, "hardware"))
     if skips and len(skips) == len(backends):
@@ -667,12 +671,31 @@ def vk_verdict(lines, hw, got):
     return "mismatch", f"word {i} ({lines[-N_OBS + i].split(', ')[1]}): hardware 0x{hw[i]:08x}, translated on the GPU 0x{got[i]:08x}"
 
 
+def check_hw_rows(hw, count):
+    """Refuse a hardware batch that can't be compared: no list, the wrong number of results, or a result that is None
+    or has fewer than 4 words. A str result (why the program was skipped) is kept. Runs before both comparison paths,
+    so vk_verdict never sees a row check() would have refused."""
+    if hw is None:
+        raise RuntimeError("no result from the hardware runner")
+    if len(hw) != count:
+        raise RuntimeError(f"the hardware runner returned {len(hw)} results for {count} programs")
+    for i, row in enumerate(hw):
+        if row is None:
+            raise RuntimeError(f"no result from the hardware runner for program {i}")
+        if not isinstance(row, str) and len(row) < 4:
+            raise RuntimeError(f"the hardware runner returned {len(row)} words for program {i} (expected 4)")
+
+
 def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None, wave=32, build=None, work=None):
     counts = {"pass": 0, "mismatch": 0, "skip": {}, "vk": {}}
     failures = []
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
-    hw = oracle.run([hw_kernel(p, wave) for p in progs]) if "hw" in backends else [None] * programs
+    if "hw" in backends:
+        hw = oracle.run([hw_kernel(p, wave) for p in progs])
+        check_hw_rows(hw, len(progs))
+    else:
+        hw = [None] * programs
     vk_failures = []
     if "vk" in backends:
         import vk_fuzz_run
@@ -804,7 +827,8 @@ def main(argv=None):
         for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
             print(f"  skip x{n}: {reason}")
 
-        if "vk" in backends:
+        want_vk = "vk" in backends
+        if want_vk:
             print(f"translated on the Vulkan GPU (wave{a.wave}) against the hardware: "
                   + ", ".join(f"{k} {n}" for k, n in sorted(counts["vk"].items(), key=lambda kv: kv[0].startswith("skip"))))
             for i, detail, lines in vk_bad[: None if a.all_failures else 3]:
@@ -813,7 +837,12 @@ def main(argv=None):
         backends = tuple(b for b in backends if b != "vk")
 
         def check_fn(lines):
-            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l, a.wave)])[0]) if oracle else None)
+            def run_hw_one(l):
+                res = oracle.run([hw_kernel(l, a.wave)])
+                if not res:
+                    raise RuntimeError("the hardware runner returned no result for shrunk program")
+                return res[0]
+            return check(lines, backends, run_hw_one if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")
@@ -829,6 +858,11 @@ def main(argv=None):
     if not counts["pass"]:
         print("no program ran: every one was skipped")
         return 2
+    if want_vk:
+        import vk_fuzz_run
+        if vk_fuzz_run.all_skipped(counts["vk"]):
+            print("no Vulkan program ran: every one was skipped")
+            return 2
     return 0
 
 

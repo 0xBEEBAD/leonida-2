@@ -223,6 +223,8 @@ class Gen:
         weights = {"cmp": 12, "cmpx": 3, "cndmask": 12, "carry": 12, "mad64": 6, "op16": 10, "exec": 10, "smask": 4, "op32": 35}
         self.cats = [(c, sorted(v), weights[c]) for c, v in sorted(cats.items()) if v]
         self.last_mask = None   # the mask written last: a mask read picks it more often than chance
+        if not self.cats:
+            raise ValueError("no ops selected")
 
     def pick_mask(self):
         ms = masks(self.wave)
@@ -231,8 +233,6 @@ class Gen:
     def wrote(self, m):
         self.last_mask = m
         return m
-        if not self.cats:
-            raise ValueError("no ops selected")
 
     def vreg(self):
         return f"v{self.r.choice(DREGS + (0,))}"
@@ -638,8 +638,12 @@ def hw_kernel(prog):
 
 def hw_words(words, wave):
     """The oracle's flat word list -> per lane four words (or a str reason through)."""
+    if words is None:
+        raise RuntimeError("no result from the hardware runner")
     if isinstance(words, str):
         return words
+    if len(words) < 4 * wave:
+        raise RuntimeError(f"the hardware runner returned {len(words)} words (expected {4 * wave})")
     return [tuple(words[4 * lane:4 * lane + 4]) for lane in range(wave)]
 
 
@@ -670,8 +674,12 @@ def check(prog, backends=("translator",), hw=None):
             skips.append(e)
     if "hw" in backends:
         got = hw(prog) if callable(hw) else hw
+        if got is None:
+            raise RuntimeError("no result from the hardware runner")
         if isinstance(got, str):
             skips.append(Skip(f"hardware: {got}"))
+        elif len(got) < prog.wave:
+            raise RuntimeError(f"the hardware runner returned {len(got)} lanes (expected {prog.wave})")
         else:
             problems.append(_diff(prog, want, got, "hardware"))
     if skips and len(skips) == len(backends):
@@ -765,6 +773,9 @@ def run_suite(programs, seed, max_ops, ops, waves=(32,), backends=("translator",
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops, waves[i % len(waves)]) for i in range(programs)]
     if "hw" in backends:
         raw = oracle.run([hw_kernel(p) for p in progs])
+        if raw is None or len(raw) != len(progs):
+            count = 0 if raw is None else len(raw)
+            raise RuntimeError(f"the hardware runner returned {count} results for {len(progs)} programs")
         hw = [hw_words(w, p.wave) for w, p in zip(raw, progs)]
     else:
         hw = [None] * programs
@@ -881,7 +892,8 @@ def main(argv=None):
         for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
             print(f"  skip x{n}: {reason}")
 
-        if "vk" in backends:
+        want_vk = "vk" in backends
+        if want_vk:
             print("translated on the Vulkan GPU against the hardware, every lane: "
                   + ", ".join(f"{k} {n}" for k, n in sorted(counts["vk"].items(), key=lambda kv: kv[0].startswith("skip"))))
             for i, detail, prog in vk_bad[: None if a.all_failures else 3]:
@@ -890,8 +902,12 @@ def main(argv=None):
         backends = tuple(b for b in backends if b != "vk")
 
         def check_fn(prog):
-            return check(prog, backends,
-                         (lambda p: hw_words(oracle.run([hw_kernel(p)])[0], p.wave)) if oracle else None)
+            def run_hw_one(p):
+                res = oracle.run([hw_kernel(p)])
+                if not res:
+                    raise RuntimeError("the hardware runner returned no result for shrunk program")
+                return hw_words(res[0], p.wave)
+            return check(prog, backends, run_hw_one if oracle else None)
         for i, problem, prog in failures[: None if a.all_failures else 1]:
             small = shrink(prog, check_fn)
             print(f"MISMATCH program {i} (wave{prog.wave}): {check_fn(small) or problem}")
@@ -907,6 +923,11 @@ def main(argv=None):
     if not counts["pass"]:   # nothing was compared: every program was skipped
         print("no program ran: every one was skipped")
         return 2
+    if want_vk:
+        import vk_fuzz_run
+        if vk_fuzz_run.all_skipped(counts["vk"]):
+            print("no Vulkan program ran: every one was skipped")
+            return 2
     return 0
 
 

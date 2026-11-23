@@ -32,6 +32,29 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
+
+def barycentric_fallback_override():
+    v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def barycentric_fallback():
+    override = barycentric_fallback_override()
+    if override is not None:
+        return override
+    try:
+        tools = os.path.abspath(os.path.join(HERE, "..", "..", "..", "tools"))
+        r = subprocess.run([sys.executable, "-I", os.path.join(tools, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        answer = json.loads(r.stdout.strip().splitlines()[-1])
+        return answer.get("barycentric_fallback") is True
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return False
+
 # The programs every run needs. Multi-config CMake generators (Visual Studio, Xcode, Ninja Multi-Config) put each of
 # them in build/<Config> instead of build/ (TEST-38).
 TEST_PROGRAMS = ("vk_compute_test", "vk_store_test", "vk_harness")
@@ -83,16 +106,18 @@ SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00
 WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
-                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
-                "cs_mask_vgpr_exec", "cs_w32_fcmpswap", "cs_w32_permlane_fi")
+                "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
+                "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi",
+                "cs_w32_exec_computed")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
-WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
-                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi")
+WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const",
+                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi",
+                     "cs_w32_exec_computed")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -115,6 +140,10 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # 64-bit scalar data ops and v_mad_u64_u32 (derivations in cs_w32_salu64.asm)
             # more ops with CPU-only checks until now (derivations in cs_w32_misc_ext.asm)
             # ops merged on 2026-11-22 with CPU-only checks (derivations in cs_w32_new_ops.asm)
+            # plain 8/16-bit MUBUF stores, one crossing a dword (cs_w32_buffer_store_sub.asm)
+            ("cs_w32_buffer_store_sub", [0x1122AB44, 0xCDEF7788, 0x34AABBCC, 0xDDDDDD12, 0x0102035A, 0x05061234, 0xAB, 0xFFFFCDEF]),
+            # 8/16-bit MUBUF d16 loads and stores (cs_w32_buffer_sub16.asm)
+            ("cs_w32_buffer_sub16", [0xBEEF00AA, 0x00AA1234, 0xBEEFFFAA, 0xFFAA1234, 0xBEEF8899, 0x88991234, 0x1122CD44, 0xABCD7788]),
             # ds_cmpst_f32 and buffer_atomic_fcmpswap: float compare (cs_w32_fcmpswap.asm)
             ("cs_w32_fcmpswap", [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000]),
             ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
@@ -129,6 +158,12 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # ds_cmpst_b32 and the b64 2-address forms (cs_lds_b64_cmpst.asm header)
             ("cs_lds_b64_cmpst", [0x11110001, 0x22220002, 0x33330003, 0x44440004,
                                   0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC]),
+            # ds_wrxchg*_rtn_b64, ds_or_rtn_b64, ds_min_f32, ds_max_rtn_f32 (cs_lds_xchg64_ext.asm header)
+            ("cs_lds_xchg64_ext", [0x11110003, 0x33333333, 0xF00FF000, 0x04030201,
+                               0x40302010, 0x70500705, 0x3FC00000, 0x80000000]),
+            # ds_mskor, ds_and/xor_b64, ds_add_rtn_f32, ds_inc/dec/rsub_u32 (cs_lds_atomics_ext.asm header)
+            ("cs_lds_atomics_ext", [0xF0F11234, 0xAB34CD78, 0x12345678, 0xF0F00F0F,
+                                    0xA5A55A5A, 0x00AA00AA, 0x7FB00000, 0xFE090700]),
             # constant EXEC: each lane takes its own bit (Intel got 16-bit constants wrong for lanes 16-31)
             ("cs_exec_const", [16, 8, 2, 16, 0, 16]),
             # a constant lane mask (saveexec, wrexec, s_and/s_not/s_mov_b64 into EXEC or VCC) gives lane L its bit L,
@@ -139,6 +174,10 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
             # s_andn2_saveexec_b32 / s_andn2_wrexec_b32: EXEC = S0 & ~EXEC, D old / new EXEC, SCC (cs_w32_andn2_exec.asm)
             ("cs_w32_andn2_exec", [1, 8, 16, 2064, 2068, 3, 20, 1544]),
+            # SHADER-1264: a computed value written to exec_lo / exec_hi gives each lane its own bit, not the
+            # whole half for a non-zero value (cs_w32_exec_computed.asm / cs_w64_exec_computed.asm headers)
+            ("cs_w32_exec_computed", [259, 1028, 3088, 7682, 512, 4100, 0, 3]),
+            ("cs_w64_exec_computed", [291, 1028, 11264, 771, 8192, 4132, 0, 3]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
@@ -147,6 +186,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_wqm_w64", [20, 4, 12, 8, 1, 0, 15728895, 20]), ("cs_wqm_w32", [12, 1, 4, 0, 8, 15728880, 4, 32]),
             ("cs_bpermute32", [0, 50, 162, 99, 36, 218, 183, 15]),
             ("cs_w32_partial_scmp", [0, 1, 1, 0, 1, 1, 1, 1]),   # a 20-thread wave32: s_cmp mask, -1
+            # ds_permute_b32 in a 20-thread wave32: a source lane that was never launched sends nothing
+            ("cs_w32_partial_permute", [0, 29, 127, 0, 1, 0, 134, 113]),
             # SHADER-88: v_sin/v_cos reduce the angle in turns (a regression guard, tolerance 1e-3)
             ("cs_w32_sincos", [1, 1, 1, 1, 1, 1]),
             # SHADER-74: v_permlane16/x16 with the source lane off in EXEC (FI / BOUND_CTRL)
@@ -339,12 +380,13 @@ CVT_F32_SAT_CASES = (
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
+# v_pk_mul_lo_u16 with a constant operand (cs_pk_mul_lo_const.asm), measured natively on RDNA2 (gfx1036); lanes 0 and 1.
+PK_MUL_LO_WORDS = [0x00009E88, 0x03675433, 0x00230000, 0x00077F6C] * 2
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
-# LEONIDA_BARY_FALLBACK=1 (set for build.py too): a pixel shader that reads raw barycentrics was translated with
-# --bary-fallback and is drawn through its pass-through geometry shader, <name>.bary_gs.spv.
-BARY_FALLBACK = os.environ.get("LEONIDA_BARY_FALLBACK") == "1"
+# LEONIDA_BARY_FALLBACK=1/0 overrides the device probe for raw barycentrics. Unset, Mesa ANV selects the fallback.
+BARY_FALLBACK = barycentric_fallback()
 # LEONIDA_F16_INTERP_FALLBACK=1 (as build.py reads it): *_f16 interps were translated from decoded-half inputs, with no
 # PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there.
 F16_HALVES = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1"
@@ -506,6 +548,7 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
 TEXTURE_CONSTANTS = {
     "ps_gather_wrap": (5090733.0, 14942181.0, 258623.0, 9702309.0),
     "ps_gather_border": (32776.0, 34935.0, 34680.0, 28679.0),  # SHADER-348: border modes 6 and 7, derived in the .asm
+    "ps_gather4_c_l": (6.0, 9.0, 17459.0, 9.0),  # image_gather4_c_l / _c_l_o / _cl / _c_b_cl_o d16
     "ps_array_resinfo": (8.0, 8.0, 12.0, 1.0),  # binding 3, index 1: two 6-face cubes, one mip
 }
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
@@ -513,7 +556,7 @@ NAN_PAYLOAD_TEST = "ps_nan_payload"
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_persp_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
-                      "ps_texoff_implicit", "ps_texoff_forms",
+                      "ps_texoff_implicit", "ps_texoff_forms", "ps_cbv_modulate",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
                       "ps_mandelbrot", NAN_PAYLOAD_TEST))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
@@ -616,10 +659,10 @@ def timed_out(name, limit):
             "LEONIDA_GPU_TEST_TIMEOUT sets the limit")
 
 
-def run(*cmd, env=None):
+def run(*cmd, env=None, cwd=None):
     limit = gpu_test_timeout()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit, cwd=cwd)
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:
@@ -645,6 +688,14 @@ def run_readback(path, launch, *args, **kwargs):
     return code, output
 
 
+def compute_unsupported(code, output):
+    """A Skip quoting vk_compute_test's "unsupported: ..." line when it exited UNSUPPORTED because the module needs a
+    feature the device lacks (Int64, Float64, OpFmaKHR), in any run mode; None otherwise. Its --require-wave64
+    refusal prints no such line and keeps the callers' own handling, and a 77 without a reason stays a failure."""
+    m = re.search(r"^unsupported: .*", output, re.MULTILINE) if code == UNSUPPORTED else None
+    return Skip(f"SKIP ({m.group(0)})") if m else None
+
+
 def failure(code, output, lines):
     details = "\n".join(output.strip().splitlines()[-lines:])
     return f"exit {code}: {details or 'no test output'}"
@@ -659,6 +710,8 @@ def dump_test(tools, spirv, name, want, words, env=None):
         child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS=str(words))
         code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"),
                         "1", "dump", env=child)
+        if skip := compute_unsupported(code, out):
+            return skip
         if code:
             return failure(code, out, 3)
         if not dump.is_file():
@@ -886,7 +939,7 @@ def words_match(got, want):
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
                  env=None):
     """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
-    narrower than 32 lanes (needs_32_lanes), or a failure diagnostic. `env` adds variables for vk_compute_test
+    narrower than 32 lanes (needs_32_lanes) or a module the device lacks a feature for, or a failure diagnostic. `env` adds variables for vk_compute_test
     (VKC_SGPRS)."""
     shader = os.path.join(spirv, name + ".spv")
     args = []
@@ -903,6 +956,8 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         env = {**(env or {}), "VKC_SUBGROUP_SIZE": str(sg)}
     extra = {"env": dict(os.environ, **env)} if env else {}
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args, **extra)
+    if skip := compute_unsupported(code, out):
+        return skip
     if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
         return None
     if needs_32_lanes:
@@ -1094,6 +1149,19 @@ GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad
 CLAMP_TESTS = ("ps_texture_cl", "ps_texture_b_cl")
 
 
+def table_fetch_test(tools, spirv):
+    tool = os.path.abspath(os.path.join(tools, "vk_texture_test" + EXE))
+    with tempfile.TemporaryDirectory(prefix="table-fetch-") as tmp:
+        for mode in ("fetch-sint", "fetch-uint", "fetch-miss"):
+            raw = os.path.join(tmp, mode + ".raw")
+            code, output = run_readback(raw, run, tool, mode, raw, cwd=spirv)
+            if code == UNSUPPORTED:
+                return Skip(output.strip())
+            if code or f"{mode}: 4096 exact pixels" not in output:
+                return failure(code, output, 3)
+    return ""
+
+
 def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_grad_a16") -> str:
     """Check every pixel of one of the GRADIENT_TESTS samples."""
     vs = os.path.join(spirv, "vs_ids.spv")
@@ -1248,13 +1316,15 @@ def bary_persp_problem(px):
     return f"{wrong} pixels off the perspective-correct reference ({covered} covered); {first}" if wrong else ""
 
 
-def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
+def pixels(tools, spirv, name, fmt, vertex="vs_ids", *, settings=None):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
     sg = subgroup_size(spirv, name)
     env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
-    if name in PIXEL_ENV:
-        env = dict(env or os.environ, **PIXEL_ENV[name])
+    if settings is None:
+        settings = PIXEL_ENV.get(name)
+    if settings:
+        env = dict(env or os.environ, **settings)
     gs = os.path.join(spirv, name + ".bary_gs.spv")
     if BARY_FALLBACK and os.path.isfile(gs):
         env = dict(env or os.environ, VKH_GS=gs, VKH_GS_HELPER="1")
@@ -1270,6 +1340,30 @@ def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     if len(data) != 64 * 64 * 16:  # default harness viewport, four 32-bit components per pixel
         return None, out
     return list(struct.iter_unpack(fmt, data)), out
+
+
+def cbv_modulate_test(tools, spirv):
+    # Both buffers are in bounds. Word zero of each is a decoy for a lost member offset.
+    # A third buffer (gain 2) makes reading descriptor 0 observable in either draw.
+    heap = ("0x1000=0x4000,0x1008=32,0x1018=32,"
+            "0x2000=0x3f800000,0x2010=0x3f000000,"
+            "0x3000=0x3f800000,0x3010=0,0x4010=0x40000000")
+    for address, gain in ((0x2000, 0.5), (0x3000, 0.0)):
+        settings = {"VKH_SGPRS": "0x1000,0", "VKH_HEAP": f"{heap},0x1010={address}"}
+        px, out = pixels(tools, spirv, "ps_cbv_modulate", "<4f", settings=settings)
+        if isinstance(px, Skip):
+            return Skip(out.strip() or "unsupported device")
+        if not px:
+            return f"gain {gain}: {out.strip() or 'no complete readback'}"
+        for i, rgba in enumerate(px):
+            y, x = divmod(i, 64)
+            expected = ((x + 0.5) / 64 * gain, (y + 0.5) / 64 * gain, gain, 1.0)
+            # Interpolated colors use the same tolerance as ps_flat. Black, gain and alpha are exact.
+            tolerance = 1e-6 if gain else 0.0
+            if not (abs(rgba[0] - expected[0]) <= tolerance and abs(rgba[1] - expected[1]) <= tolerance
+                    and rgba[2:] == expected[2:]):
+                return f"gain {gain} at ({x},{y}): got {rgba}, expected {expected}"
+    return ""
 
 
 def texture_constant_test(tools, spirv, name):
@@ -1615,6 +1709,8 @@ def pixel_test(tools, spirv, name):
         return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs: no --bary-fallback / --f16-interp-fallback)")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
+    if name == "ps_cbv_modulate":
+        return cbv_modulate_test(tools, spirv)
     if name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
         return texoff_test(tools, spirv, name)
     if name == "ps_interp_f16_high" and BARY_FALLBACK and not F16_HALVES:   # with F16_HALVES it reads decoded halves
@@ -1746,6 +1842,8 @@ def main():
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
+    results.append(("cs_pk_mul_lo_const", compute_test(tools, spirv, "cs_pk_mul_lo_const", "1", "dump",
+                                                       expected_words=PK_MUL_LO_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
@@ -1755,7 +1853,8 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_d16", ["load-d16"]),
+    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_tfe", ["load"]),
+                       ("cs_imgload_d16", ["load-d16"]), ("cs_imgload_d16_tfe", ["load-d16"]),
                        ("cs_sample_lz_int_d16", ["load-d16"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
@@ -1780,6 +1879,7 @@ def main():
     results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))
     for name in MIP_TEST_PASSES:
         results.append((name, texture_mip_test(tools, spirv, name)))
+    results.append(("ps_table_fetch", table_fetch_test(tools, spirv)))
     for name in GRADIENT_TESTS:
         results.append((name, texture_gradient_a16_test(tools, spirv, name)))
     for name, problem in results:

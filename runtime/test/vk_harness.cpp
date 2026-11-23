@@ -36,6 +36,15 @@
 #include "vk_pc_tail.h"
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
+#include "spirv_capability.h"
+
+// VK_KHR_pipeline_binary is newer than some Vulkan header sets (CI images, an older SDK). Guard the feature so the
+// harness still builds there; VKH_BINARY_OUT/VKH_BINARY_IN then report unsupported and exit 77.
+#if defined(VK_KHR_pipeline_binary) && defined(VK_KHR_maintenance5)
+#define VKH_PIPELINE_BINARY 1
+#else
+#define VKH_PIPELINE_BINARY 0
+#endif
 
 #include <cctype>
 #include <cstddef>
@@ -452,9 +461,15 @@ int main(int argc, char** argv) {
     // size, the data.
     const char* bin_out = std::getenv("VKH_BINARY_OUT");
     const char* bin_in = std::getenv("VKH_BINARY_IN");
+#if VKH_PIPELINE_BINARY
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
     VkPhysicalDeviceMaintenance5FeaturesKHR m5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+#endif
     if (bin_out || bin_in) {
+#if !VKH_PIPELINE_BINARY
+        std::fprintf(stderr, "unsupported: these Vulkan headers have no VK_KHR_pipeline_binary\n");
+        return 77;
+#else
         VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         VkPhysicalDevicePipelineBinaryFeaturesKHR pbq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
         q.pNext = &pbq;
@@ -468,6 +483,7 @@ int main(int argc, char** argv) {
         enable.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
         pbf.pipelineBinaries = VK_TRUE; pbf.pNext = chain; chain = &pbf;
         m5.maintenance5 = VK_TRUE; m5.pNext = chain; chain = &m5;
+#endif
     }
     for (auto e : enable) std::fprintf(stderr, "enabled %s\n", e);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -507,9 +523,18 @@ int main(int argc, char** argv) {
         }
         feats.shaderFloat64 = VK_TRUE;
     }
-    if (need_heap || mesh_compute) {
-        if (!f2q.features.shaderInt64) { std::fprintf(stderr, "unsupported: 64-bit addresses need shaderInt64\n"); return 77; }
-        feats.shaderInt64 = VK_TRUE;   // heap and --mesh-compute output addresses are 64-bit
+    // shaderInt64 only when a stage has 64-bit integers. Heap and --mesh-compute addresses are 64-bit, but rdna2spirv.py
+    // builds them from 32-bit pairs unless the shader also does 64-bit arithmetic (SHADER-423), so the module decides,
+    // not VKH_HEAP (TEST-468).
+    bool needs_int64 = leonida::vk_test::needs_shader_int64(fs_code);
+    for (const char* p : std::initializer_list<const char*>{argv[1], mesh_vs_path, gs_path})
+        if (p && !needs_int64) needs_int64 = leonida::vk_test::needs_shader_int64(read_spv(p));
+    if (needs_int64) {
+        if (!f2q.features.shaderInt64) {
+            std::fprintf(stderr, "unsupported: a stage declares Int64 and the device has no shaderInt64\n");
+            return 77;
+        }
+        feats.shaderInt64 = VK_TRUE;
     }
     if (tex_rgba_path) {
         if (!f2q.features.shaderSampledImageArrayDynamicIndexing) {
@@ -739,6 +764,7 @@ int main(int argc, char** argv) {
         gpi.pDepthStencilState = &ds_state;
     }
     gpi.layout = pl; gpi.renderPass = rp;
+#if VKH_PIPELINE_BINARY
     VkPipelineCreateFlags2CreateInfoKHR capture{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
     std::vector<VkPipelineBinaryKHR> in_bins;
     VkPipelineBinaryInfoKHR bin_info{VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR};
@@ -777,7 +803,9 @@ int main(int argc, char** argv) {
         gpi.pNext = &bin_info;
         std::fprintf(stderr, "pipeline from %u binaries in %s\n", count, bin_in);
     }
+#endif
     VkPipeline pipe; CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe));
+#if VKH_PIPELINE_BINARY
     if (bin_out) {
         auto vkCreatePipelineBinariesKHR = reinterpret_cast<PFN_vkCreatePipelineBinariesKHR>(
             vkGetDeviceProcAddr(dev, "vkCreatePipelineBinariesKHR"));
@@ -814,6 +842,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "wrote %u pipeline binaries to %s\n", count, bin_out);
     }
+#endif
     VkPipeline cpipe = VK_NULL_HANDLE;
     if (mesh_compute) {
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
