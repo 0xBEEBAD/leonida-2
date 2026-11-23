@@ -1286,12 +1286,13 @@ python -I tests/test_fmisc_diff.py
 
 ### binary64 VALU on the CPU and Vulkan (`tools/f64_diff.py`, FUZZ-55)
 
-`tools/f64_diff.py` covers the 47 binary64 instruction forms `tools/rdna2spirv.py` translates on main: four rounding
+`tools/f64_diff.py` covers the 50 binary64 instruction forms `tools/rdna2spirv.py` translates on main: four rounding
 ops, add, f64-to-f32 conversion, reciprocal/reciprocal-square-root/square-root, division fixup and scaled FMA, both
-frexp results, all 16 `v_cmp_*_f64` and 16 `v_cmpx_*_f64` predicates, and both class compares. It generates one-lane
+frexp results, `v_ldexp_f64`, conversion from a signed or unsigned 32-bit integer (`v_cvt_f64_i32`, `v_cvt_f64_u32`),
+all 16 `v_cmp_*_f64` and 16 `v_cmpx_*_f64` predicates, and both class compares. It generates one-lane
 programs with VGPR and SGPR pairs, float immediates, inline constants, 32-bit literals where the translator marks
-them as upper-half f64 literals (rounding, add, conversion to f32, frexp, reciprocal, reciprocal square root, square root,
-compares and class) and full-width literals in the other two forms, `v_div_fmas_f64` and `v_div_fixup_f64` (which reads a
+them as upper-half f64 literals (rounding, add, conversion to f32, frexp, `v_ldexp_f64`'s `S0`, reciprocal, reciprocal
+square root, square root, compares and class) and full-width literals in the other two forms, `v_div_fmas_f64` and `v_div_fixup_f64` (which reads a
 printed 32-bit literal as the low word on main); it compares the four exported
 dwords. Compare predicates are read through a mask-to-word operation, and `v_cmpx` cases also export the resulting
 `EXEC` mask. Its reference decodes IEEE binary64 words and uses exact
@@ -1300,6 +1301,19 @@ other fuzzer references. It models all four `MODE.FP_ROUND[3:2]` encodings for a
 rejects directed rounding (+infinity and -infinity), so those generated cases are counted skips. Any NaN matches any
 NaN. Binary64 subnormal operands or results for `v_rcp_f64`, `v_rsq_f64` and `v_sqrt_f64`, and subnormal f32 results
 from `v_cvt_f32_f64`, are counted skips because shader drivers may flush them to zero (FTZ).
+
+`v_ldexp_f64` scales the exact value of `S0` by `2^S1` (`S1` is a signed 32-bit word) and rounds once with
+`MODE.FP_ROUND[3:2]`, subnormal results included; zeros, infinities and NaNs (a signalling one too) pass unchanged, as
+the `docs/design.md` row measured on `gfx1036`. Toward zero, a result never rounds up and an overflow gives the largest
+finite value (measured on `gfx1031` in #6218). The translator lowers it with 32-bit integer operations only, so no
+FTZ applies, and it clamps the result words with integer operations rather than `FClamp`: its `clamp` is judged (NaN,
+-0 and negatives give +0, anything above 1.0 gives 1.0). The generator aims `S1` at the subnormal and overflow edges of
+`S0`, often refills `S0` with a subnormal, a boundary value or a significand whose low word is all ones (the rounding
+then carries into the high word), and writes `s_round_mode` 0 or 12 before 30% of the cases. `v_cvt_f64_i32` and
+`v_cvt_f64_u32` are exact for every 32-bit integer, which is never NaN or -0, so their `clamp` is judged too. A module
+with a binary64 operation runs on `tests/spirv_interp.py`, which converts a 32-bit integer to `%double` exactly (it used
+to round through binary32, so `v_cvt_f64_u32` of `0xffffffff` read 2^32) and implements the integer instructions of the
+`v_ldexp_f64` lowering (`SClamp`, `UClamp`, `FindUMsb`, `OpSLessThan`, `OpSGreaterThan`).
 
 `--sweep` (the default) tries each translated form, followed by `--programs N` seeded programs (`--seed S` and
 `--max-ops N` control the campaign). `--no-sweep`, `--ops`, `--no-literals`, `--known`, `--all-failures`,
@@ -1326,9 +1340,11 @@ any other difference is still a mismatch. It does not apply to `--oracle hw`, wh
 
 Known divergence probes are excluded and counted by default, then reinserted with `--known`: binary64 output modifiers
 (SHADER-721), binary64 `OpFNegate`/`FAbs` that the CPU interpreter rounds through binary32 (TEST-912, #4172),
-and driver-dependent NaN or signed-zero clamp results. The CPU translator reproduces none of these today, so
-`--known` is clean there; it can still return 1 where one reproduces (the RTX 4070 `--oracle gpu` run does for the
-clamp form), and the minimized case is printed. `v_div_fixup_f64` with a NaN `S0` is not a known divergence: it gives
+driver-dependent NaN or signed-zero clamp results, and a `v_ldexp_f64` result that a toward-zero `MODE.FP_ROUND` write
+changes (main ignores the write; #6218 fixes it). The CPU translator reproduces only the last of these today, so
+`--known` exits 1 on its probe (`DBL_MAX * 2` gives inf instead of `DBL_MAX`) until #6218 lands, and is clean otherwise.
+Another oracle can reproduce more of them (the RTX 4070 `--oracle gpu` run does for the clamp form); the minimized case
+is printed. `v_div_fixup_f64` with a NaN `S0` is not a known divergence: it gives
 signed infinity, measured on RDNA2 `gfx1036` (TEST-983; the translator has it since #2477), and is compared like any other case.
 The `v_div_fixup_f64` reference follows the `gfx1036` measurements in the `docs/design.md` row (#2477): a NaN in `S1` or
 `S2` passes through unquieted (IEEE off), the underflow cutoff is `exp(S2) - exp(S1) <= -1076` and there is no overflow
