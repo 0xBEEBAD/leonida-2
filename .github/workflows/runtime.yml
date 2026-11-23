@@ -533,8 +533,9 @@ jobs:
     timeout-minutes: 30
     env:
       SCCACHE_GHA_ENABLED: "true"
-      # A smaller quarantine keeps the full ctest run inside the ~7 GB GitHub runner: the default let
-      # depth24_convert get OOM-killed during a local 7 GB VM reproduction (Andretuta, #3014).
+      # A smaller quarantine keeps the full ctest run inside a constrained runner's memory: the default let
+      # depth24_convert get OOM-killed in Andretuta's ~7 GB VM reproduction (#3014); public ubuntu-24.04
+      # runners have 16 GB, so this is a safety margin, not a hard requirement.
       ASAN_OPTIONS: detect_leaks=1:quarantine_size_mb=32
       UBSAN_OPTIONS: print_stacktrace=1
       # The Vulkan loader unloads llvmpipe at vkDestroyInstance, and LeakSanitizer then reports the 112 bytes the
