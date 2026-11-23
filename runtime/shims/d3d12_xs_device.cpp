@@ -1458,11 +1458,7 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
 }
 
 bool supports_depth_uav(const DeviceProxy* self, const D3D12_RESOURCE_DESC& desc) {
-    constexpr auto flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    return self->depth_stencil_uav_provider && (desc.Flags & flags) == flags &&
-           desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-           (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_R16_TYPELESS) &&
-           desc.DepthOrArraySize && desc.MipLevels == 1 && desc.SampleDesc.Count == 1;
+    return self->depth_stencil_uav_provider && depth_uav_description(desc);
 }
 
 D3D12_RESOURCE_DESC depth_image_desc(D3D12_RESOURCE_DESC desc) {

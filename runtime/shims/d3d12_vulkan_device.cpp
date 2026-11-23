@@ -52,6 +52,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -1375,11 +1376,24 @@ Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc
 // runtime refuses other sizes, and a size-mismatched VkImageFormatListCreateInfo is a Vulkan validation error
 // (VUID-VkImageCreateInfo-pNext-06722). A nonzero count with a null list is no list. E_INVALIDARG on a bad format.
 HRESULT castable_view_formats(const Format& format, UINT32 count, const DXGI_FORMAT* castable,
-                              std::vector<VkFormat>& out) {
+                              std::vector<VkFormat>& out, bool depth_uav_planes = false) {
     if (!count || !castable) return S_OK;
     const bool depth = (format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
     const leonida::BlockFormat own = leonida::block_format(format.format, format.aspects);
     for (UINT32 i = 0; i < count; ++i) {
+        if (depth_uav_planes) {
+            // Attachment and sampled views use the original depth image's VkFormat. Each typed UAV
+            // already has its own image; putting its colour format on the depth image is invalid.
+            const DXGI_FORMAT view = castable[i];
+            const bool valid = format.format == VK_FORMAT_D16_UNORM
+                ? view == DXGI_FORMAT_R16_TYPELESS || view == DXGI_FORMAT_D16_UNORM ||
+                  view == DXGI_FORMAT_R16_UNORM || view == DXGI_FORMAT_R16_UINT
+                : view == DXGI_FORMAT_R32G8X24_TYPELESS || view == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+                  view == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || view == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ||
+                  view == DXGI_FORMAT_R32_FLOAT || view == DXGI_FORMAT_R8_UINT;
+            if (!valid) return E_INVALIDARG;
+            continue;
+        }
         const Format cast = vulkan_format(castable[i], depth);
         if (cast.format == VK_FORMAT_UNDEFINED) {
             log_once("castable format not supported yet:", castable[i]);
@@ -6811,15 +6825,23 @@ public:
         if (texture_mip_region(*desc)) return d3d12_trace::result(method, E_INVALIDARG);
         // A count with a null array is no list (as on the PC runtime). The layer reports relaxed format casting, so
         // a real list is passed through; only buffers are refused.
-        const D3D12_RESOURCE_DESC base = resource_desc(*desc);
+        D3D12_RESOURCE_DESC base = resource_desc(*desc);
         if (const char* why = barrier_layout_refusal(base, layout)) {
             log_once((std::string(method) + " refused (" + why + "), layout").c_str(), int(layout));
             return d3d12_trace::result(method, E_INVALIDARG);
         }
+        // The Xbox slot-127 bridge forwards the logical texture to Device10. Validate its layout above,
+        // then allocate the depth attachment and enable the typed storage planes before returning it.
+        std::optional<D3D12_HEAP_FLAGS> storage_heap_flags;
+        if (xbox_depth_uav(base)) {
+            storage_heap_flags = heap_flags & D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
+            heap_flags &= ~*storage_heap_flags;
+            base.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
         // D3D12_BARRIER_LAYOUT has no acceleration-structure value; an AS buffer's state comes through the
         // legacy CreateCommittedResource path. Buffers here start COMMON, as before.
         return create_committed_validated(method, heap, heap_flags, &base, D3D12_RESOURCE_STATE_COMMON, clear,
-                                          castable_count, castable, riid, out);
+                                          castable_count, castable, riid, out, storage_heap_flags);
     }
 
     // Device9. The creator ID only groups queues for tools; one creator is as good as another here.
@@ -7898,6 +7920,10 @@ private:
         return value > UINT64_MAX - (to - 1) ? UINT64_MAX / to * to : (value + to - 1) / to * to;
     }
 
+    bool xbox_depth_uav(const D3D12_RESOURCE_DESC& desc) const {
+        return rt::d3d12_xs::depth_uav_description(desc) && rt::d3d12_xs::is_device_proxy(outer_);
+    }
+
     // Lays `count` resources out one after another; `each` (optional) gets every resource's offset, size and
     // alignment. As on the PC runtime, the total is rounded up to the largest alignment (1 for no resources) and
     // saturates near 2^64 rather than wrapping.
@@ -7907,7 +7933,13 @@ private:
         D3D12_RESOURCE_ALLOCATION_INFO total{0, 1};
         bool failed = count && !descs;
         for (UINT i = 0; i < count; ++i) {
-            const D3D12_RESOURCE_ALLOCATION_INFO one = failed ? kInvalidAllocation : allocation(get(i));
+            D3D12_RESOURCE_ALLOCATION_INFO one = kInvalidAllocation;
+            if (!failed) {
+                auto desc = get(i);
+                // The boot stack charges XMem for the guest placement; storage planes are private to Vulkan.
+                if (xbox_depth_uav(desc)) desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                one = allocation(desc);
+            }
             failed = failed || one.SizeInBytes == UINT64_MAX;
             if (failed) {
                 if (each) each[i] = {UINT64_MAX, one.Alignment, UINT64_MAX};
@@ -8096,7 +8128,8 @@ private:
     HRESULT create_committed_validated(const char* method, const D3D12_HEAP_PROPERTIES* heap,
                                        D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc,
                                        D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
-                                       UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
+                                       UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out,
+                                       std::optional<D3D12_HEAP_FLAGS> storage_heap_flags = std::nullopt) {
         const auto finish = [&](HRESULT hr) { return method ? d3d12_trace::result(method, hr) : hr; };
         if (out) *out = nullptr;
         if (!heap || !desc) return finish(E_INVALIDARG);
@@ -8118,7 +8151,8 @@ private:
                      int(desc->Dimension));
             return finish(E_INVALIDARG);
         }
-        return finish(create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out));
+        return finish(create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out,
+                                       storage_heap_flags));
     }
 
     // Shared by CreateCommittedResource, CreateCommittedResource3 and CreateReservedResource*. A castable-format list
@@ -8127,7 +8161,8 @@ private:
     // runtime.
     HRESULT create_committed(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                              const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
-                             UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
+                             UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out,
+                             std::optional<D3D12_HEAP_FLAGS> storage_heap_flags) {
         if (out) *out = nullptr;
         if (!heap || !desc) return E_INVALIDARG;
         if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -8171,9 +8206,10 @@ private:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, castable_count, castable, cast_formats);
+                hr = castable_view_formats(format, castable_count, castable, cast_formats, storage_heap_flags.has_value());
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
+                if (SUCCEEDED(hr) && storage_heap_flags) hr = resource->enable_depth_stencil_uav(*storage_heap_flags);
             }
         }
         if (FAILED(hr)) {

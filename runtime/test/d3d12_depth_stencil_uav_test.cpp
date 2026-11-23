@@ -78,13 +78,40 @@ struct GuestAllocation {
     ~GuestAllocation() { if (address) VirtualFree(address, 0, MEM_RELEASE); }
 };
 
-enum class Texture { committed, committed_array, placed, placed_array };
+enum class Texture { committed, committed3, placed };
 
-int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind, DXGI_FORMAT format, Handoff handoff) {
-    const bool array = kind == Texture::committed_array || kind == Texture::placed_array;
-    const bool placed = kind == Texture::placed || kind == Texture::placed_array;
+// The boot stack's Xbox slot 127 forwards this call to the real device's CreateCommittedResource3.
+// Test the actual thunk when present, or the same normalized input at its destination on a standalone build.
+HRESULT create_committed3(ID3D12Device* device, ID3D12Device* xbox, const D3D12_HEAP_PROPERTIES& heap,
+                          const D3D12_RESOURCE_DESC& desc, D3D12_BARRIER_LAYOUT initial,
+                          const D3D12_CLEAR_VALUE& clear, ID3D12Resource** out,
+                          UINT castable_count = 0, const DXGI_FORMAT* castable = nullptr) {
+    D3D12_RESOURCE_DESC1 input{desc.Dimension, desc.Alignment, desc.Width, desc.Height, desc.DepthOrArraySize,
+        desc.MipLevels, desc.Format, desc.SampleDesc, desc.Layout, desc.Flags, {}};
+    if (xbox && rt::d3d12_xs::device_slot_overridden(127)) {
+        using Slot127 = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+            const D3D12_RESOURCE_DESC1*, D3D12_BARRIER_LAYOUT, const D3D12_CLEAR_VALUE*,
+            ID3D12ProtectedResourceSession*, UINT, const DXGI_FORMAT*, REFIID, void**);
+        const auto create = reinterpret_cast<Slot127>(d3d12test::slot(xbox, 127));
+        return create(xbox, &heap, D3D12_HEAP_FLAG_NONE, &input, initial, &clear, nullptr,
+                      castable_count, castable, IID_PPV_ARGS(out));
+    }
+    Ref<ID3D12Device10> device10;
+    const HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&device10.p));
+    if (FAILED(hr)) return hr;
+    input.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    return device10->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &input, initial, &clear, nullptr,
+                                              castable_count, castable, IID_PPV_ARGS(out));
+}
+
+int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind, UINT16 layers,
+        DXGI_FORMAT format, Handoff handoff) {
+    const bool array = layers > 1;
+    // Array views cover the last two layers so the shader reaches slice 5 in the six-layer case.
+    const UINT first_slice = array ? layers - 2u : 0;
+    const bool placed = kind == Texture::placed;
+    const bool modern = kind == Texture::committed3;
     const bool depth16 = format == DXGI_FORMAT_R16_TYPELESS;
-    const UINT layers = array ? 3 : 1;
     const UINT planes = depth16 ? 1 : 2;
     const UINT subresources = planes * layers;
     const char* fixture = array ? LEONIDA_DEPTH_STENCIL_ARRAY_SPV : LEONIDA_DEPTH_STENCIL_2D_SPV;
@@ -122,29 +149,44 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
     CHECK(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device))));
     Ref<ID3D12Device> xbox;
     CHECK(SUCCEEDED(rt::d3d12_xs::create_device_proxy(device, IID_PPV_ARGS(&xbox.p)))); // takes ownership
-    rt::d3d12::set_device_outer(device, xbox.p);
-    if (!enhanced && !array && !depth16) CHECK(placeddepthtest::check_alias_lifetime(device, xbox.p));
-
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width;
     desc.Height = height;
     desc.MipLevels = 1;
-    desc.DepthOrArraySize = static_cast<UINT16>(layers);
+    desc.DepthOrArraySize = layers;
     desc.SampleDesc.Count = 1;
     desc.Format = format;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    D3D12_HEAP_PROPERTIES props{};
+    props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_CLEAR_VALUE optimized{};
+    optimized.Format = depth16 ? DXGI_FORMAT_D16_UNORM : DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    optimized.DepthStencil.Depth = 1.0f;
+    auto normalized = desc;
+    normalized.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (modern) {
+        // The standalone PC Device10 retains its ordinary rejection of the combined creation flags.
+        Ref<ID3D12Resource> refused;
+        CHECK(create_committed3(device, nullptr, props, desc, D3D12_BARRIER_LAYOUT_COMMON,
+                                optimized, &refused.p) == E_INVALIDARG && !refused.p);
+    }
+    rt::d3d12::set_device_outer(device, xbox.p);
+    if (!enhanced && !array && !depth16) CHECK(placeddepthtest::check_alias_lifetime(device, xbox.p));
     using CreateFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
                                       const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
                                       REFIID, void**);
     // The baseline uses PC sizing. In builds with the Xbox slot-25 dependency, size the placement through
     // the console's return-buffer-first ABI; keep native footprints for the host pixel readback.
-    auto native_depth = desc;
-    native_depth.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    auto native_depth = normalized;
     native_depth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     auto size = device->GetResourceAllocationInfo(0, 1, &native_depth);
     CHECK(size.SizeInBytes > 0 && size.SizeInBytes != UINT64_MAX);
+    if (modern) {
+        const auto logical = device->GetResourceAllocationInfo(0, 1, &normalized);
+        CHECK(logical.SizeInBytes == size.SizeInBytes && logical.Alignment == size.Alignment);
+    }
     if (rt::d3d12_xs::device_slot_overridden(25)) {
         using SizeFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*,
                                                                 UINT, UINT, const D3D12_RESOURCE_DESC*);
@@ -155,8 +197,6 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
               xbox_size.Alignment >= size.Alignment);
         size = xbox_size;
     }
-    D3D12_HEAP_PROPERTIES props{};
-    props.Type = D3D12_HEAP_TYPE_DEFAULT;
     GuestAllocation guest;
     Ref<ID3D12Resource> texture, alias;
     const auto create_texture = reinterpret_cast<CreateFn>(d3d12test::slot(xbox.p, 76));
@@ -172,6 +212,30 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
         CHECK(SUCCEEDED(place(xbox.p, va, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
                               IID_PPV_ARGS(&alias.p))));
         CHECK(texture.p != alias.p && texture->GetGPUVirtualAddress() == va && alias->GetGPUVirtualAddress() == va);
+    } else if (modern) {
+        // Exercise the exact no-list overload as well as lists naming both the attachment and its writable planes.
+        const DXGI_FORMAT d16_views[] = {DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_UINT};
+        const DXGI_FORMAT d32s8_views[] = {DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+            DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8_UINT};
+        const UINT count = layers == 3 ? UINT(depth16 ? std::size(d16_views) : std::size(d32s8_views)) : 0;
+        const DXGI_FORMAT* castable = count ? (depth16 ? d16_views : d32s8_views) : nullptr;
+        CHECK(SUCCEEDED(create_committed3(device, xbox.p, props, desc, D3D12_BARRIER_LAYOUT_COMMON,
+                                          optimized, &texture.p, count, castable)) && texture.p);
+        if (!array) {
+            Ref<ID3D12Resource> refused;
+            CHECK(create_committed3(device, xbox.p, props, desc, D3D12_BARRIER_LAYOUT_RENDER_TARGET,
+                                    optimized, &refused.p) == E_INVALIDARG && !refused.p);
+            auto wrong_clear = optimized;
+            wrong_clear.Format = DXGI_FORMAT_D32_FLOAT;
+            CHECK(create_committed3(device, xbox.p, props, desc, D3D12_BARRIER_LAYOUT_COMMON,
+                                    wrong_clear, &refused.p) == E_INVALIDARG && !refused.p);
+            const DXGI_FORMAT incompatible = DXGI_FORMAT_R32G32_FLOAT;
+            CHECK(create_committed3(device, xbox.p, props, desc, D3D12_BARRIER_LAYOUT_COMMON,
+                                    optimized, &refused.p, 1, &incompatible) == E_INVALIDARG && !refused.p);
+            // The PC Device10 endpoint returns S_FALSE for a successful validation-only call.
+            CHECK(create_committed3(device, nullptr, props, desc, D3D12_BARRIER_LAYOUT_COMMON,
+                                    optimized, nullptr) == S_FALSE);
+        }
     } else {
         const auto heap_flags = !enhanced && !array && !depth16
             ? D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS : D3D12_HEAP_FLAG_NONE;
@@ -219,7 +283,7 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
         D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
         view.ViewDimension = array ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY : D3D12_UAV_DIMENSION_TEXTURE2D;
         view.Format = depth16 ? DXGI_FORMAT_R16_UINT : plane == 0 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8_UINT;
-        if (array) view.Texture2DArray = {0, 1, 2, plane};
+        if (array) view.Texture2DArray = {0, first_slice, 2, plane};
         else view.Texture2D.PlaneSlice = plane;
         const D3D12_CPU_DESCRIPTOR_HANDLE handle{base + plane * step};
         device->CreateUnorderedAccessView(texture.p, nullptr, &view, handle);
@@ -231,7 +295,7 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
     srv.Format = depth16 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.ViewDimension = array ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
-    if (array) srv.Texture2DArray = {0, 1, 1, 2, 0, 0.0f};
+    if (array) srv.Texture2DArray = {0, 1, first_slice, 2, 0, 0.0f};
     else srv.Texture2D.MipLevels = 1;
     const D3D12_CPU_DESCRIPTOR_HANDLE sampled{base + 2 * step};
     device->CreateShaderResourceView(texture.p, &srv, sampled);
@@ -245,7 +309,7 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
         std::memset(reinterpret_cast<void*>(invalid.ptr), 0x55, sizeof(zero));
         D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
         view.ViewDimension = array ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY : D3D12_UAV_DIMENSION_TEXTURE2D;
-        if (array) view.Texture2DArray = {0, 1, 2, plane};
+        if (array) view.Texture2DArray = {0, first_slice, 2, plane};
         else view.Texture2D.PlaneSlice = plane;
         view.Format = plane == 0 ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R32_FLOAT;
         device->CreateUnorderedAccessView(texture.p, nullptr, &view, invalid);
@@ -315,11 +379,19 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
 
     const float depth_seed[] = {0.5f, 0.25f, 1.0f};
     const UINT8 stencil_seed[] = {0x5a, 0x37, 0xcb};
-    const UINT16 d16_seed[] = {0, 0xffff, 257};
+    const UINT16 d16_seed[] = {0, 0xffff, 257, 514, 771, 1028};
     const auto flags = depth16 ? D3D12_CLEAR_FLAG_DEPTH : D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+    if (modern) {
+        Ref<ID3D12GraphicsCommandList7> list;
+        CHECK(SUCCEEDED(graphics.list->QueryInterface(IID_PPV_ARGS(&list.p))));
+        enhanced_transition(list.p, texture.p, D3D12_BARRIER_SYNC_ALL,
+            D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_LAYOUT_COMMON, D3D12_BARRIER_SYNC_DEPTH_STENCIL,
+            D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE);
+    }
     for (UINT layer = 0; layer < layers; ++layer)
         graphics.list->ClearDepthStencilView({depth_handle.ptr + dsv_step * layer}, flags,
-            depth16 ? float(d16_seed[layer]) / 65535.0f : depth_seed[layer], stencil_seed[layer], 0, nullptr);
+            depth16 ? float(d16_seed[layer]) / 65535.0f : depth_seed[layer], depth16 ? 0 : stencil_seed[layer],
+            0, nullptr);
 
     const bool compute_copy = handoff == Handoff::compute_transitions;
     // Graphics-side transfers use ordinary cross-queue UAV layout. With maintenance10 the compute family can
@@ -410,19 +482,19 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
         const UINT bytes = plane ? 1 : depth16 ? 2 : 4;
         for (UINT y = 0; y < height; ++y) {
             for (UINT x = 0; x < width; ++x) {
-                const bool in_view = !array || layer >= 1;
+                const bool in_view = layer >= first_slice;
                 const bool cleared = in_view && (plane ? x == 3 && y == 2 : x == 1 && y == 3);
                 UINT32 expected = 0;
                 if (depth16) {
                     expected = cleared ? d16_clear[0] : d16_seed[layer];
-                    if (layer == (array ? 2u : 0u) && x == 2 && y == 1) expected ^= 0x1357u;
+                    if (layer == layers - 1u && x == 2 && y == 1) expected ^= 0x1357u;
                 } else if (plane == 0) {
                     float depth = cleared ? depth_clear[0] : depth_seed[layer];
-                    if (layer == (array ? 1u : 0u) && x == 2 && y == 1) depth *= 0.25f;
+                    if (layer == first_slice && x == 2 && y == 1) depth *= 0.25f;
                     std::memcpy(&expected, &depth, sizeof(depth));
                 } else {
                     expected = cleared ? stencil_clear[0] : stencil_seed[layer];
-                    if (layer == (array ? 2u : 0u) && x == 5 && y == 3) expected ^= 0xffu;
+                    if (layer == layers - 1u && x == 5 && y == 3) expected ^= 0xffu;
                 }
                 UINT32 actual = 0;
                 std::memcpy(&actual, mapped + layouts[sub].Offset + y * layouts[sub].Footprint.RowPitch + x * bytes, bytes);
@@ -435,8 +507,10 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
         }
     }
     readback->Unmap(0, nullptr);
-    std::printf("slot %u, %ux%u, %u layers, %u planes, %s barriers, graphics family %u, shader family %u, "
-                "plane transfers on %s: every pixel matched\n", placed ? 133u : 76u, width, height, layers, planes,
+    const char* path = placed ? "slot 133" : "slot 76";
+    if (modern) path = rt::d3d12_xs::device_slot_overridden(127) ? "slot 127" : "CreateCommittedResource3";
+    std::printf("%s, %ux%u, %u layers, %u planes, %s barriers, graphics family %u, shader family %u, "
+                "plane transfers on %s: every pixel matched\n", path, width, height, UINT(layers), planes,
                 enhanced ? "enhanced" : "legacy", vk.family, handoff == Handoff::direct ? vk.family : vk.compute_family,
                 compute_copy ? "compute" : "graphics");
     return 0;
@@ -455,19 +529,24 @@ int main() {
         return 77;
     }
     const auto d32s8 = DXGI_FORMAT_R32G8X24_TYPELESS, d16 = DXGI_FORMAT_R16_TYPELESS;
-    if (run(vk, 9, 7, false, Texture::committed, d32s8, Handoff::direct) ||
-        run(vk, 2560, 1440, true, Texture::committed, d32s8, Handoff::direct) ||
-        run(vk, 9, 7, true, Texture::placed, d16, Handoff::graphics_transitions)) return 1;
+    if (run(vk, 9, 7, false, Texture::committed, 1, d32s8, Handoff::direct) ||
+        run(vk, 2560, 1440, true, Texture::committed, 1, d32s8, Handoff::direct) ||
+        run(vk, 9, 7, true, Texture::placed, 1, d16, Handoff::graphics_transitions)) return 1;
     for (const auto format : {d32s8, d16}) {
-        if (run(vk, 9, 7, false, Texture::committed_array, format, Handoff::graphics_transitions) ||
-            run(vk, 13, 9, true, Texture::placed_array, format, Handoff::graphics_transitions)) return 1;
+        if (run(vk, 9, 7, false, Texture::committed, 3, format, Handoff::graphics_transitions) ||
+            run(vk, 13, 9, true, Texture::placed, 3, format, Handoff::graphics_transitions)) return 1;
         const auto vk_format = format == d16 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT_S8_UINT;
         if (compute_transfers(vk, vk_format, format != d16)) {
-            if (run(vk, 9, 7, true, Texture::placed_array, format, Handoff::compute_transitions)) return 1;
+            if (run(vk, 9, 7, true, Texture::placed, 3, format, Handoff::compute_transitions)) return 1;
         } else {
             std::printf("compute-side depth transfers unavailable for VkFormat %u; graphics-side handoff tested\n",
                         unsigned(vk_format));
         }
     }
+    // Array lengths reported by the Xbox boot trace. The texels are synthetic.
+    constexpr UINT16 reported_layers[] = {1, 3, 6};
+    for (const UINT16 layers : reported_layers)
+        if (run(vk, 9, 7, true, Texture::committed3, layers, d16, Handoff::graphics_transitions)) return 1;
+    if (run(vk, 9, 7, true, Texture::committed3, 3, d32s8, Handoff::graphics_transitions)) return 1;
     return vk.validation_errors() ? 1 : 0;
 }

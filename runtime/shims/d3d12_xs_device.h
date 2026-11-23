@@ -77,6 +77,12 @@ using DxgiAdapterProvider = HRESULT (*)(ID3D12Device* real, REFIID riid, void** 
 bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
 // Called before publishing an Xbox resource when the backend can implement its depth/stencil UAV views.
 using DepthStencilUavProvider = HRESULT (*)(ID3D12Resource* resource, D3D12_HEAP_FLAGS storage_heap_flags);
+inline bool depth_uav_description(const D3D12_RESOURCE_DESC& desc) {
+    constexpr auto flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return (desc.Flags & flags) == flags && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_R16_TYPELESS) &&
+           desc.DepthOrArraySize && desc.MipLevels == 1 && desc.SampleDesc.Count == 1;
+}
 using ValidateDepthPlacement = bool (*)(const D3D12_RESOURCE_DESC&, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*);
 bool set_depth_stencil_uav_provider(void* device, DepthStencilUavProvider provider,
                                     ValidateDepthPlacement validate_placement = nullptr);

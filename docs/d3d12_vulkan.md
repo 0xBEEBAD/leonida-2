@@ -2468,8 +2468,11 @@ The trace will enumerate them.
   `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` → `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` → concurrent
   sharing, `DENY_*` → omit the corresponding usage. Buffers get the union of usages their states and flags imply;
   images copy dimension, format, mip levels, array layers and sample count.
-- Xbox depth textures with `ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS` can use either committed creation
-  (slot 76) or placement at a guest address (slot 133). The supported shapes are single-sample, single-mip 2D
+- Xbox depth textures with `ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS` can use legacy committed creation
+  (slot 76), `CreateCommittedResource3` (forwarded by Xbox slot 127 in the boot stack), or placement at a guest
+  address (slot 133). The Device10 path validates the requested initial layout and clear value against the logical
+  texture. Xbox allocation queries return the attachment's placement size for XMem accounting; the writable
+  planes are private backend allocations. The supported shapes are single-sample, single-mip 2D
   textures and 2D arrays. For `R32G8X24_TYPELESS`, use `R32_FLOAT` on depth plane 0 and `R8_UINT` on stencil
   plane 1. For `R16_TYPELESS`, use `R16_UINT` on plane 0 to access the raw D16 bits. An array UAV selects a
   contiguous range of layers. The depth/stencil and shader-resource views continue to use the attachment image.
