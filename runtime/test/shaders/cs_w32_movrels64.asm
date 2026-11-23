@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; s_movrels_b64 (#1598, merged with CPU-only checks; #1850's cs_w32_pk_rel_ext covers s_movrels_b32 only): D = the
 ; SGPR pair at S0 + M0 (RDNA2 ISA SOP1). s20..s27 hold W[k] = 0x5EED0000 + 0x111 * k. Lane 0 stores eight dwords:
 ;   out[0], out[1] = s_movrels_b64 s[10:11], s[20:21] with M0 = 1 (an odd pair): W[1], W[2]  = 0x5EED0111 0x5EED0222
