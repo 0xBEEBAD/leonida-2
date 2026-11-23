@@ -1579,6 +1579,8 @@ static bool readable_range(const void* ptr, std::size_t bytes) {
     return true;
 }
 
+static std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -1599,13 +1601,21 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::uint64_t size = 0;
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
-                console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
+            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Require a plausible aligned
+            // canonical VA and a matching non-zero heap byte size so normal stack-allocated 16-byte PC descs with
+            // adjacent stack data never enter this path by accident.
+            const std::uint64_t min_size = std::uint64_t(desc->NumDescriptors) * 16ull;
+            const std::uint64_t max_size = std::uint64_t(desc->NumDescriptors) * 128ull;
+            const bool plausible_console_va = address >= 0x10000ull && address < 0x0000800000000000ull &&
+                                              (address & 0xffull) == 0;
+            const bool plausible_size = desc->NumDescriptors > 0 && size >= min_size && size <= max_size &&
+                                        (size & 0xfull) == 0;
+            if (plausible_console_va && plausible_size) {
+                if (const auto handler = g_console_descriptor_heap.load(std::memory_order_acquire)) {
+                    console_extended = true;
+                    hr = handler(self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
+                                 __uuidof(ID3D12DescriptorHeap), &created);
+                }
             }
         }
     }
@@ -2039,6 +2049,10 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler) {
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
     g_placed_at_va_pages.store(hook, std::memory_order_release);
+}
+
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
+    g_console_descriptor_heap.store(handler, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {

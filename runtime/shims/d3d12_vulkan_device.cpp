@@ -5008,6 +5008,7 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        rt::d3d12_xs::set_console_descriptor_heap_handler(&create_console_descriptor_heap);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -5499,6 +5500,7 @@ public:
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
+    DeviceState& state() { return state_; }
     IUnknown* holder() { return identity(); }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
@@ -9999,7 +10001,7 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     if (!d) return E_INVALIDARG;
 
     auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
+    heap->attach_device(d->holder());
     if (!heap->ok()) {
         heap->Release();
         return E_OUTOFMEMORY;

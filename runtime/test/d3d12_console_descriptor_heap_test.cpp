@@ -24,6 +24,7 @@ struct Ref {
         return &p;
     }
     T* get() const { return p; }
+    T* operator->() const { return p; }
 };
 
 bool check_console_addressed_heap(ID3D12Device* device) {
@@ -64,13 +65,13 @@ bool check_console_addressed_heap(ID3D12Device* device) {
 }
 
 bool check_xs_proxy_slot14(ID3D12Device* real_device) {
-    void* proxy_raw = nullptr;
-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
+    Ref<ID3D12Device> proxy;
+    real_device->AddRef();
+    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(proxy.put()))) || !proxy.get()) {
+        real_device->Release();
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
-    Ref<ID3D12Device> proxy;
-    proxy.p = static_cast<ID3D12Device*>(proxy_raw);
 
     struct ConsoleDescriptorHeapDesc {
         D3D12_DESCRIPTOR_HEAP_DESC desc{};
@@ -90,10 +91,13 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
                      static_cast<unsigned long>(hr));
         return false;
     }
-    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
-    if (cpu.ptr != static_cast<SIZE_T>(console.address)) {
+    // Heap proxy slot 9 uses the Xbox ABI (returns the 8-byte handle in RAX, not via hidden RDX pointer).
+    auto** vtbl = *reinterpret_cast<void***>(heap.get());
+    using XboxGetHandleFn = std::uint64_t(STDMETHODCALLTYPE*)(void*);
+    const std::uint64_t cpu = reinterpret_cast<XboxGetHandleFn>(vtbl[9])(heap.get());
+    if (cpu != console.address) {
         std::fprintf(stderr, "proxy CPU heap start mismatch: got 0x%llx want 0x%llx\n",
-                     static_cast<unsigned long long>(cpu.ptr),
+                     static_cast<unsigned long long>(cpu),
                      static_cast<unsigned long long>(console.address));
         return false;
     }
