@@ -318,7 +318,9 @@ the rasteriser, not the layer, explained every one:
 
 Float formats (R16F, RGBA16F, BC6H) hold HDR values up to 34 in the game's textures, so their tolerance is relative
 to the expected value. A seam-heavy model may have up to 5% of its pixels reported, not 1%: a flattened 3D model
-stacks front and back layers whose edges cross many pixel centres (1.4% on one model).
+stacks front and back layers whose edges cross many pixel centres (1.4% on one model). That limit depends on the
+model, not the GPU, so pick one that covers a few thousand pixels: thin models covering 500 to 1,600 pixels have
+reached 5 to 8% seam pixels and fail it before any colour is compared.
 
 Re-run on four game models (37 textures across the 20 formats, 4 to 10 thousand covered pixels each, up to 37
 texels per pixel): all 148 draws pass on an RTX 3060, 0 channels over. The missed-sRGB control (BC1 sRGB declared
