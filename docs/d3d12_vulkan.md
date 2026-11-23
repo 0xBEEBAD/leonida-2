@@ -2940,8 +2940,16 @@ SDL2 `src/render/direct3d12/SDL_render_d3d12_xbox.cpp` (zlib).
     entries carry a `PlaneIndex`; display entries carry `PercentScanned`.
 11. Xbox titles do not handle `DXGI_ERROR_DEVICE_REMOVED`/`RESET`.
 
-*Not measured:* vtable slots of all `*X` methods, exact `D3D12XBOX_*` struct layouts and sizes, enum values, and
-whether the token is exactly 64 bits in the ABI. The samples give argument counts and field names only.
+*Public corroboration (not measured here).* XCL, a GPL-2.0-only compatibility layer that runs retail Xbox Series
+titles, records `PresentX` at queue slot 30 for the older runtime layout (XDefiant, Minecraft, Fortnite) and 32 for
+a newer one (Unicorn Overlord), and the four frame calls at device slots 78-81: `SetFrameIntervalX`,
+`ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` (0-based, `QueryInterface` = 0). The Apache-2.0
+ebiten Xbox binding has the same device order, declares `D3D12XBOX_PRESENT_PLANE_PARAMETERS` as a 0x48-byte x64
+struct and `D3D12XBOX_PRESENT_PARAMETERS` as 0x20 bytes, and stores the token in 64 bits. So the plane and
+present-parameter layouts and the token width in `runtime/shims/xbox_present.h` are no longer guesses; the enum
+values and the `SuspendX`/`ResumeX` slots still are. XCL returns `S_FALSE` from a timed-out `WaitFrameEventX`
+where this layer returns `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`. The full comparison is in
+[d3d12_xs_surface.md §7.1](d3d12_xs_surface.md#71-public-sources-for-the-presentation-and-device-abi).
 
 *Hypothesis (the game is not observed):* a GDKX title follows this pattern, so the DXGI swapchain shim (D3D-2)
 is probably **not** on its boot path. What is on it: `D3D12XboxCreateDevice`, `IDXGIDevice1`/`IDXGIAdapter`/
@@ -2968,10 +2976,11 @@ Layer plan:
 
 **What is implemented (the presentation core).** Everything in the plan above that does not need a slot exists as
 methods of `rt::d3d12::XboxPresentation` (`runtime/shims/xbox_present.h`), on top of the presenter of section 3.2 and
-`leonida::FramePacer` (`runtime/src/frame_pacer.h`, no Vulkan, no Windows headers). The struct layouts, constant
-values, HRESULTs and the 64-bit token are **our own provisional definitions**: the samples give call shapes and field
-names only, so the real slots, layouts and enum values are still unmeasured and the class is the surface the proxy
-will forward to. The queue-side calls ignore which queue they came on (one `VkQueue` behind all of them).
+`leonida::FramePacer` (`runtime/src/frame_pacer.h`, no Vulkan, no Windows headers). The plane and present-parameter
+layouts and the 64-bit token are confirmed on x64 by the public code cited above; the constant values and HRESULTs
+are **our own provisional definitions**, because the samples give call shapes and field names only and the enum
+values are still unmeasured. The class is the surface the proxy will forward to. The queue-side calls ignore which
+queue they came on (one `VkQueue` behind all of them).
 
 - *Frame pacing* (`FramePacer`, time from an injectable clock; real time is a steady timer, a host vblank source
   can replace it). `SetFrameIntervalX` takes the interval as a period in microseconds and the latency, and starts
@@ -3185,9 +3194,10 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   second (GameDVR) output, resolving multisampled planes, a mutable-format swapchain (an sRGB/UNORM
   alternation recreates the swapchain; `VK_KHR_swapchain_mutable_format` is not enabled on the device), a host-vblank clock (the timer drifts from the
   display; with FIFO presents the swapchain holds the queue to the real refresh anyway), render statistics,
-  `PercentScanned` of frames shown at a vblank (a scan position is never measured), and the vtable wiring. Slots to measure (all unknown): the device's `SetFrameIntervalX`,
-  `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` and the queue's `PresentX`, `SuspendX`, `ResumeX`
-  (the list is in the header).
+  `PercentScanned` of frames shown at a vblank (a scan position is never measured), and the vtable wiring. The
+  public slots are the device's `SetFrameIntervalX`/`ScheduleFrameEventX`/`WaitFrameEventX`/`GetFrameStatisticsX`
+  at 78-81 and `PresentX` at queue 30 (older runtime layout) or 32 (newer); `SuspendX`/`ResumeX` have no public
+  slot. Nothing here is wired to those slots yet, and the game's own runtime is not observed.
 - *Tests*: `frame_pacer_test` (fake clock: interval, offset, late waits, timeouts, latency blocking, tokens,
   statistics, suspend/resume, a real 10 ms timer; no GPU) and `xbox_present_test` (the Vulkan device, reading the
   swapchain image back: blank, solid, two colours, source rectangles, RGBA/BGRA/sRGB sources, 2 planes, plane composition
@@ -3493,7 +3503,7 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Binning | The GDK topic index names Xbox binning modes (NDA content) | Should be a no-op if the game uses it only as an optimisation: it changes how a render pass uses on-chip memory, not the result. Log and ignore for the first boot; revisit for performance. **Open** whether the game relies on binning for correctness. |
 | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
 | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; 1-2 planes composed into the Vulkan swapchain (placement, filter, alpha overlay, HDR10 conversions). Call shapes known; slots/layouts **Open**. |
-| Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
+| Device slots 48/73/78/79/80/81 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) and observed slot-81 call shape | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79), `WaitFrameEventX` (80) and `GetFrameEventsX` (81) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists, and `GetFrameEventsX` reports zero pending `0x38`-byte frame events (`S_OK`, `*pNumEvents = 0`). The six indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT`, `LEONIDA_XS_WAIT_EVENT_SLOT` and `LEONIDA_XS_FRAME_EVENTS_SLOT` (default 81; accepted range 3..127; invalid values are logged once and ignored, and a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
 | Indirect argument type 105 | The retail title's startup creates five one-argument command signatures (device slot 41) with no root signature; one has type 105 and a 12-byte stride. Its two `ExecuteIndirect` sites, read statically, set the compute state first, as the `DISPATCH` sites do, and pass one command from the same argument buffer, on a second command list | `d3d12_xs_device.cpp` creates it as `DISPATCH` (`D3D12_DISPATCH_ARGUMENTS`). What the console does differently for it is **Open**. |
 | Device slot 61 | The retail title's boot under `gta6rt --run` (stop 20 of the RT-5 measurements in #6910): called as `(desc, dest handle)` once per sampler | `d3d12_xs_device.cpp` routes it to the PC `CreateSampler` (slot 22) with the description's PC `D3D12_SAMPLER_DESC` prefix; the PC slot 61 is `CreateMetaCommand`. The layout of the description beyond the PC fields is **Open**. |
 | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
