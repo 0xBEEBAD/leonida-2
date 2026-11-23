@@ -1384,6 +1384,9 @@ code with the translator, and compares the four exported words bit for bit. The 
 - `frexp_mant` sets the exponent to 14, `frexp_exp` gives the exponent that goes with it, `ldexp` takes S1 as an
   i16 clamped to [-64, 64] and rounds to nearest even into the denormal range.
 - `clamp` on `frexp_mant` and `ldexp` takes a NaN or a negative result to +0.
+- An output multiplier (`mul:2`, `mul:4`, `div:2`) changes nothing on these f16 results, and `clamp` still acts. On
+  `frexp_exp`'s integer result `clamp` changes nothing either. Both were measured on gfx1036 in the game's MODE
+  (f16 denormals kept); see the `design.md` rows for the f16 output modifiers and for `v_frexp`/`v_ldexp_f16`.
 
 `tests/test_f16misc_diff.py` pins the model to the gfx1036 words in `tests/semantic`: all 120 `min3`/`max3` rows of
 `test_alu_min3_max3_med3_16_hw.py`, 718 of the 719 `v_fma_mix*` rows of `test_alu_vop3_mods_hw.py` (the other is a
@@ -1392,8 +1395,9 @@ reference of `test_alu_frexp_ldexp_f16.py` on every f16 input.
 
 Sources are VGPRs, SGPRs, a literal and integer and float inline constants, within the GFX10 literal and
 constant-bus limits. Modifiers are `neg`/`abs` on VOP3 register sources, `op_sel` on sources and the destination,
-`op_sel_hi` on the `v_fma_mix*` sources, and `clamp`. Output multipliers on f16 results are not generated
-(SHADER-297 is open). `--self-test` pins five refused forms as expected rejections.
+`op_sel_hi` on the `v_fma_mix*` sources, `clamp`, and an output multiplier on the VOP3 forms of `min3`/`max3`,
+`frexp_mant`, `frexp_exp` and `ldexp`. `--self-test` pins the two refused forms, `neg` and `clamp` on
+`v_pk_fmac_f16`, as expected rejections.
 
 A NaN the model computes matches any NaN, since payloads are not modelled. A NaN that only passes through is
 compared exactly. Some programs are counted as not judged, with the reason:
