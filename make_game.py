@@ -1712,7 +1712,8 @@ def install_runtime(game: str, out: str, artifacts: list) -> None:
     Everything is written to a staging folder inside `out` (same filesystem), and only once all of it is there is
     it published (publish(): all files or none). A failure while copying (disk full, an interrupt) or while
     publishing (a destination file held open) leaves the previous install untouched and no staging folder behind,
-    instead of a new gta6rt.exe next to an old gta6rt_tls_host.dll."""
+    instead of a new gta6rt.exe next to an old gta6rt_tls_host.dll. The one exception is a rollback that is itself
+    blocked (IncompleteRollback): the staging folder, which then holds the old files, is kept for recovery."""
     os.makedirs(out, exist_ok=True)
     stage = tempfile.mkdtemp(prefix=".runtime-staging-", dir=out)
     try:
@@ -1736,8 +1737,23 @@ def install_runtime(game: str, out: str, artifacts: list) -> None:
             os.chmod(launcher, os.stat(launcher).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             staged.append("gta6rt.sh")
         publish(stage, out, staged)
-    finally:
+    except IncompleteRollback:
+        raise                               # the staging folder holds old files that are not back in place
+    except BaseException:
         shutil.rmtree(stage, ignore_errors=True)
+        raise
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+class IncompleteRollback(OSError):
+    """publish() failed, and putting the previous files back failed too (on Windows, another process opened a file
+    already published, so it cannot be renamed back). `stage` holds the old copies (<name>.old) not restored."""
+
+    def __init__(self, cause: BaseException, stage: str, failures: list):
+        self.cause, self.stage, self.failures = cause, stage, failures
+        detail = "; ".join(f"{name}: {e}" for name, e in failures)
+        super().__init__(f"{cause}; restoring the previous files failed too ({detail}). The old copies not put back "
+                         f"are in {stage} as <name>.old")
 
 
 def publish(stage: str, out: str, names: list) -> None:
@@ -1761,13 +1777,19 @@ def publish(stage: str, out: str, names: list) -> None:
                     os.replace(backup, target)
                 raise
             done.append((name, had_old))
-    except BaseException:
+    except BaseException as cause:
+        failures = []                       # every step is tried, so one blocked file does not stop the rest
         for name, had_old in reversed(done):
             target, backup = os.path.join(out, name), os.path.join(stage, name + ".old")
-            if had_old:
-                os.replace(backup, target)
-            else:
-                os.remove(target)
+            try:
+                if had_old:
+                    os.replace(backup, target)
+                else:
+                    os.remove(target)
+            except OSError as e:
+                failures.append((name, e))
+        if failures:
+            raise IncompleteRollback(cause, os.path.abspath(stage), failures) from cause
         raise
 
 
@@ -1788,6 +1810,10 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
     try:
         install_runtime(game, out, artifacts)
+    except IncompleteRollback as e:
+        fail(f"runtime: could not install into {out}, and the previous files could not all be put back: {e}. "
+             "Close the programs holding them, then move each <name>.old from there back into place (or run the stage "
+             "again, which installs the new files).")
     except OSError as e:
         fail(f"runtime: could not install into {out} ({e}); the previous files there are unchanged. If a program has "
              "one of them open (a running gta6rt.exe, an antivirus scan), close it and run the stage again.")

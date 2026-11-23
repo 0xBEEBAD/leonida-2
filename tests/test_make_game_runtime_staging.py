@@ -132,6 +132,31 @@ class RuntimeStagingTests(unittest.TestCase):
         for name in (second, "game_path.txt"):
             self.assertEqual(read(os.path.join(self.out, name)), self.old[name])
 
+    def test_blocked_rollback_keeps_the_old_files_and_says_where(self):
+        # @Desamodeth on #5278: a second reader opens the new exe after it was published, so moving the old exe back
+        # fails too. The old copy must not be deleted with the staging folder, and the error must name the folder.
+        real = os.replace
+        calls = []
+
+        def replace(src, dst):
+            calls.append(os.path.basename(dst))
+            if len(calls) == 3:                     # moving the old DLL aside (the DLL is held open)
+                raise PermissionError(13, "Access is denied", dst)
+            if len(calls) == 4:                     # putting the old exe back (the new one is now held open)
+                raise PermissionError(13, "Access is denied", dst)
+            return real(src, dst)
+
+        exe, dll = make_game.RUNTIME_FILES[:2]
+        with patch.object(make_game.os, "replace", replace):
+            with self.assertRaises(make_game.IncompleteRollback) as raised:
+                make_game.install_runtime(self.game, self.out, self.artifacts)
+        e = raised.exception
+        self.assertEqual([name for name, _ in e.failures], [exe])
+        self.assertIn(e.stage, str(e))
+        self.assertEqual(read(os.path.join(e.stage, exe + ".old")), self.old[exe])   # kept for recovery
+        self.assertEqual(read(os.path.join(self.out, dll)), self.old[dll])
+        self.assertEqual(read(os.path.join(self.out, "game_path.txt")), self.old["game_path.txt"])
+
     def test_runtime_build_in_the_output_folder_is_left_in_place(self):
         # --runtime-build pointing at --out: the runtime files are already there and are not copied onto themselves
         artifacts = [os.path.join(self.out, name) for name in make_game.RUNTIME_FILES]
