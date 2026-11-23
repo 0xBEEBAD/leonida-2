@@ -21,6 +21,7 @@
 // IN THE SOFTWARE.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ffx {
@@ -128,6 +129,23 @@ struct QueryDescUpscaleGetRenderResolutionFromQualityMode {
     uint32_t* pOutRenderWidth;
     uint32_t* pOutRenderHeight;
 };
+
+// ffx_upscale.h: the memory the upscaler would allocate for these sizes. `device` is the API's device (for Vulkan a
+// VkDeviceContext*); the console title passes its ID3D12Device here (docs/d3d12_vulkan.md A.3: device at +0x10).
+constexpr StructType QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2 = effect_sub_id(EFFECT_ID_UPSCALE, 0x09);
+struct EffectMemoryUsage {
+    uint64_t totalUsageInBytes;
+    uint64_t aliasableUsageInBytes;
+};
+struct QueryDescUpscaleGetGPUMemoryUsageV2 {
+    Header header;
+    void* device;
+    Dimensions2D maxRenderSize;
+    Dimensions2D maxUpscaleSize;
+    uint32_t flags;
+    EffectMemoryUsage* gpuMemoryUsageUpscaler;
+};
+static_assert(offsetof(QueryDescUpscaleGetGPUMemoryUsageV2, device) == 0x10, "measured: the device at +0x10");
 
 enum : uint32_t { QUALITY_MODE_NATIVEAA = 0, QUALITY_MODE_QUALITY = 1, QUALITY_MODE_PERFORMANCE = 3 };
 

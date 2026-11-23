@@ -233,50 +233,68 @@ std::string provider(std::uint64_t context) {
     return entry->upscaler ? entry->upscaler->provider() : std::string{};
 }
 
+namespace {
+
+// Caller holds g_loose_mutex.
+bool load_loose() {
+    std::string error;
+    if (!g_loose_loaded) g_loose_loaded = g_loose.load(error);
+    return g_loose_loaded;
+}
+
+// Where a query carries the title's ID3D12Device (docs/d3d12_vulkan.md A.3), or null.
+void** device_slot(ffx::Header* desc) {
+    if (desc->type == ffx::QUERY_DESC_TYPE_GET_VERSIONS)
+        return &reinterpret_cast<ffx::QueryDescGetVersions*>(desc)->device;
+    if (desc->type == ffx::QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2)
+        return &reinterpret_cast<ffx::QueryDescUpscaleGetGPUMemoryUsageV2*>(desc)->device;
+    return nullptr;
+}
+
+}  // namespace
+
 ffx::ReturnCode query(std::uint64_t context, ffx::Header* desc) {
     if (!desc) return ffx::RETURN_ERROR_PARAMETER;
-    if (context) {
-        std::shared_ptr<Entry> entry = find(context);
-        if (!entry) return ffx::RETURN_ERROR;
-        std::lock_guard lock(entry->mutex);
-        return entry->upscaler ? entry->upscaler->query(desc) : ffx::RETURN_ERROR;
-    }
+    void** const slot = device_slot(desc);
+    void* const named = slot ? *slot : nullptr;
     DeviceRecord record;
     VkDevice device = VK_NULL_HANDLE;
-    ID3D12Device* named = nullptr;
-    if (desc->type == ffx::QUERY_DESC_TYPE_GET_VERSIONS)
-        named = static_cast<ID3D12Device*>(reinterpret_cast<ffx::QueryDescGetVersions*>(desc)->device);
     {
         std::lock_guard lock(g_mutex);
         if (named) {
-            const rt::d3d12::VulkanDeviceInfo* info = rt::d3d12::vulkan_device_info(named);
+            const rt::d3d12::VulkanDeviceInfo* info = rt::d3d12::vulkan_device_info(static_cast<ID3D12Device*>(named));
             auto it = info ? g_devices.find(info->device) : g_devices.end();
             if (it == g_devices.end()) return ffx::RETURN_ERROR_PARAMETER;
             device = it->first;
             record = it->second;
-        } else if (!g_devices.empty()) {
+        } else if (!context && !g_devices.empty()) {
             device = g_devices.begin()->first;
             record = g_devices.begin()->second;
         }
     }
-    if (!device) return ffx::RETURN_NO_PROVIDER;
-    std::lock_guard lock(g_loose_mutex);
-    if (!g_loose_loaded) {
-        std::string error;
-        if (!g_loose.load(error)) return ffx::RETURN_NO_PROVIDER;
-        g_loose_loaded = true;
-    }
+    // AMD's code reads the device as a Vulkan one: for this call only it is the layer's, the title's is put back.
     ffx::VkDeviceContext vulkan{device, record.physical, reinterpret_cast<void*>(record.get_device_proc)};
-    if (named) {
-        ffx::QueryDescGetVersions versions = *reinterpret_cast<ffx::QueryDescGetVersions*>(desc);
-        versions.device = &vulkan;   // the outputs still go to the title's arrays
-        return g_loose.query(&versions.header);
-    }
-    ffx::CreateBackendVKDesc backend{{ffx::CREATE_CONTEXT_DESC_TYPE_BACKEND_VK, desc->pNext}, vulkan};
-    ffx::Header* const chain = desc->pNext;
-    desc->pNext = &backend.header;   // for this call only: the title's chain is restored before returning
-    const ffx::ReturnCode rc = g_loose.query(desc);
-    desc->pNext = chain;
+    if (named) *slot = &vulkan;
+    const auto run = [&]() -> ffx::ReturnCode {
+        if (context) {
+            std::shared_ptr<Entry> entry = find(context);
+            if (!entry) return ffx::RETURN_ERROR;
+            std::lock_guard lock(entry->mutex);
+            return entry->upscaler ? entry->upscaler->query(desc) : ffx::RETURN_ERROR;
+        }
+        if (!device) return ffx::RETURN_NO_PROVIDER;
+        std::lock_guard lock(g_loose_mutex);
+        if (!load_loose()) return ffx::RETURN_NO_PROVIDER;
+        if (named) return g_loose.query(desc);
+        ffx::CreateBackendVKDesc backend{{ffx::CREATE_CONTEXT_DESC_TYPE_BACKEND_VK, desc->pNext}, vulkan};
+        ffx::Header* const chain = desc->pNext;
+        desc->pNext = &backend.header;   // likewise the title's chain is restored
+        const ffx::ReturnCode rc = g_loose.query(desc);
+        desc->pNext = chain;
+        return rc;
+    };
+    const ffx::ReturnCode rc = run();
+    if (named) *slot = named;
     return rc;
 }
 
@@ -289,12 +307,7 @@ ffx::ReturnCode configure(std::uint64_t context, const ffx::Header* desc) {
         return entry->upscaler ? entry->upscaler->configure(desc) : ffx::RETURN_ERROR;
     }
     std::lock_guard lock(g_loose_mutex);
-    if (!g_loose_loaded) {
-        std::string error;
-        if (!g_loose.load(error)) return ffx::RETURN_NO_PROVIDER;
-        g_loose_loaded = true;
-    }
-    return g_loose.configure(desc);
+    return load_loose() ? g_loose.configure(desc) : ffx::RETURN_NO_PROVIDER;
 }
 
 }  // namespace rt::ffx_upscale

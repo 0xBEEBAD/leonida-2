@@ -37,7 +37,10 @@ constexpr UINT FRAMES = 30;
 constexpr const char* kDlls[] = {"amd_fidelityfx_loader_xbox.dll", "amd_fidelityfx_upscaler_xbox.dll"};
 constexpr const char* kNames[] = {"ffxCreateContext", "ffxDestroyContext", "ffxConfigure", "ffxQuery", "ffxDispatch"};
 
-struct XboxBackendDesc {   // what the title chains: BACKEND_ID_XBOX sub-id 2, the device at +0x10
+// What the title chains: type 0x01000002, measured from the console DLL (docs/d3d12_vulkan.md A.3), the device at +0x10.
+// Written out here rather than shared with the shim, so a wrong id in the shim fails this test.
+constexpr ffx::StructType kXboxBackendDesc = 0x01000002u;
+struct XboxBackendDesc {
     ffx::Header header;
     void* device;
 };
@@ -102,7 +105,7 @@ int main(int argc, char** argv) {
     CHECK(query(nullptr, &quality.header) == ffx::RETURN_OK && ratio == 1.5f);
 
     // The console chain: upscale, then the version the console DLL wants, then its backend with the device.
-    XboxBackendDesc backend{{ffx::backend_sub_id(ffx::BACKEND_ID_XBOX, 0x02), nullptr}, device.p};
+    XboxBackendDesc backend{{kXboxBackendDesc, nullptr}, device.p};
     ffx::CreateContextDescUpscaleVersion version{{ffx::CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION, &backend.header},
                                                  ffx::upscaler_version(4, 1, 1)};
     ffx::CreateContextDescUpscale upscale{{ffx::CREATE_CONTEXT_DESC_TYPE_UPSCALE, &version.header},
@@ -115,13 +118,38 @@ int main(int argc, char** argv) {
     CHECK(query(&context, &provider.header) == ffx::RETURN_OK && provider.versionName);
     std::printf("context provider: %s\n", provider.versionName);
 
+    // Queries that carry the title's device, with and without a context: the shim hands AMD's code the layer's
+    // Vulkan device instead and puts the title's back.
+    for (ffx::Context* on : {static_cast<ffx::Context*>(nullptr), &context}) {
+        ffx::EffectMemoryUsage usage{};
+        ffx::QueryDescUpscaleGetGPUMemoryUsageV2 memory{{ffx::QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2, nullptr},
+                                                        device.p, {RW, RH}, {OW, OH}, upscale.flags, &usage};
+        const ffx::ReturnCode rc = query(on, &memory.header);
+        std::printf("GPU memory usage (%s): %s, %llu bytes\n", on ? "context" : "no context", ffx::return_code_name(rc),
+                    static_cast<unsigned long long>(usage.totalUsageInBytes));
+        CHECK(rc == ffx::RETURN_OK && usage.totalUsageInBytes > 0 && memory.device == device.p);
+        uint64_t n = 8;
+        ffx::QueryDescGetVersions listed{{ffx::QUERY_DESC_TYPE_GET_VERSIONS, nullptr},
+                                         ffx::CREATE_CONTEXT_DESC_TYPE_UPSCALE, device.p, &n, ids, names};
+        const ffx::ReturnCode listed_rc = query(on, &listed.header);
+        std::printf("GET_VERSIONS (%s): %s\n", on ? "context" : "no context", ffx::return_code_name(listed_rc));
+        // AMD's loader lists versions only without a context (measured: ERROR_UNKNOWN_DESCTYPE with one, 4.1.2/3.1.6).
+        CHECK((on ? listed_rc == ffx::RETURN_ERROR_UNKNOWN_DESCTYPE : listed_rc == ffx::RETURN_OK && n > 0) &&
+              listed.device == device.p);
+    }
+
     // Refused: no upscale description, no backend descriptor.
     ffx::Context refused = nullptr;
-    ffx::Header other{ffx::backend_sub_id(ffx::BACKEND_ID_XBOX, 0x02), nullptr};
+    ffx::Header other{kXboxBackendDesc, nullptr};
     CHECK(create(&refused, &other, nullptr) == ffx::RETURN_ERROR_UNKNOWN_DESCTYPE && !refused);
     ffx::CreateContextDescUpscale lonely = upscale;
     lonely.header.pNext = nullptr;
     CHECK(create(&refused, &lonely.header, nullptr) == ffx::RETURN_ERROR_PARAMETER && !refused);
+    // A backend under a BACKEND_ID_XBOX id is not the console descriptor (the console DLL refuses those too).
+    XboxBackendDesc wrong_backend{{ffx::backend_sub_id(ffx::BACKEND_ID_XBOX, 0x02), nullptr}, device.p};
+    ffx::CreateContextDescUpscale wrong = upscale;
+    wrong.header.pNext = &wrong_backend.header;
+    CHECK(create(&refused, &wrong.header, nullptr) == ffx::RETURN_ERROR_PARAMETER && !refused);
 
     Scene scene;
     CHECK(scene.create(device.p));

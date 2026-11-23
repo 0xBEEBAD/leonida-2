@@ -31,8 +31,9 @@
 
 namespace {
 
-// The console backend descriptor: BACKEND_ID_XBOX sub-id 2, {header, device}.
-constexpr ffx::StructType kXboxBackendDesc = ffx::backend_sub_id(ffx::BACKEND_ID_XBOX, 0x02);
+// The console backend descriptor, {header, device}. Its type is measured from the console DLL (docs/d3d12_vulkan.md
+// A.3): 0x01000002, inside BACKEND_ID_VK's range; the DLL refuses BACKEND_ID_XBOX ids.
+constexpr ffx::StructType kXboxBackendDesc = 0x01000002u;
 struct XboxBackendDesc {
     ffx::Header header;
     void* device;   // the title's ID3D12Device (the Xbox-ABI proxy over the layer's device)
@@ -53,7 +54,7 @@ std::uint64_t id_of(const ffx::Context* context) {
 }
 
 leonida::ResourceId id_of(const ffx::Resource& resource) {
-    return reinterpret_cast<leonida::ResourceId>(resource.resource);
+    return rt::d3d12::resource_id(static_cast<const ID3D12Resource*>(resource.resource));
 }
 
 ffx::ReturnCode ffxCreateContext(ffx::Context* context, ffx::Header* desc, const void* /*memory callbacks*/) {
