@@ -80,6 +80,9 @@ std::shared_ptr<Entry> find(std::uint64_t context) {
 void destroy_entries(VkDevice device, const DeviceRecord& record, std::vector<std::shared_ptr<Entry>> entries) {
     if (entries.empty()) return;
     {
+        // A replay records an upscale and submits it under the tracker lock: taking it first means a batch recorded
+        // with these upscalers has been submitted, so the wait covers it.
+        std::lock_guard tracker(record.context->tracker_mutex());
         std::lock_guard submit(record.context->submit_mutex());
         record.context->vk.vkDeviceWaitIdle(device);
     }

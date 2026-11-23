@@ -1276,6 +1276,8 @@ public:
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
+    // Held by a queue from recording a batch until it is submitted (lock order: tracker, then submit).
+    std::mutex& tracker_mutex() { return tracker_mutex_; }
 
     void mark_device_lost() noexcept {
         device_lost_.store(true, std::memory_order_release);
