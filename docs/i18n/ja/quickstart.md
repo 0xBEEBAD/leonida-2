@@ -83,7 +83,7 @@ python -I make_game.py --game "D:\path\to\your\package" --wav   # Opus を PCM W
 python -I make_game.py --wave64-emulate off            # auto（既定）、on、off のいずれか
 ```
 
-ステージは `check` → `shaders` → `assets` → `runtime` → `pipelines` の順に実行されます。`pipelines` は
+ステージは最初に必ず `check` が実行され、続いて選択されている `shaders`・`assets`・`runtime` が互いに依存しないため並列に実行されます。`pipelines` は翻訳済みシェーダーの準備ができ、さらに `runtime` を含む実行では `vk_pipeline_check` の再ビルドが完了した時点で開始されるため、残りの `assets` と並行して進められます。`pipelines` は
 翻訳済みの各シェーダーをあなたの GPU ドライバー上で生成してパイプラインキャッシュを保存するので、初回起動時の
 コンパイルが不要になります。最も時間がかかるのはシェーダーの翻訳で、`--jobs` 個のプロセスで実行されます
 （既定では CPU スレッド数の半分）。
