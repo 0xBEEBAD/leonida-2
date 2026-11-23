@@ -182,15 +182,24 @@ static int run(int argc, char** argv) {
             }
             heap_file_at = parsed;
         }
-        std::ifstream hf(heap_file_path, std::ios::binary);
-        heap_file.assign(std::istreambuf_iterator<char>(hf), {});
-        if (heap_file.empty()) {
+        // The size is checked on the open file before anything is read, so a file that can't fit is refused
+        // without reading it into memory (@shdann on #5878).
+        std::ifstream hf(heap_file_path, std::ios::binary | std::ios::ate);
+        const std::streamoff length = hf ? static_cast<std::streamoff>(hf.tellg()) : std::streamoff(-1);
+        if (length <= 0) {
             std::fprintf(stderr, "VKC_HEAP_FILE: cannot read %s\n", heap_file_path.c_str());
             return 2;
         }
-        if (heap_file.size() > (1ull << 32) - heap_file_at) {   // the file's last byte too must be inside the heap
-            std::fprintf(stderr, "VKC_HEAP_FILE: %s (%zu bytes) at 0x%llx runs past the 4 GiB heap\n",
-                         heap_file_path.c_str(), heap_file.size(), static_cast<unsigned long long>(heap_file_at));
+        if (static_cast<unsigned long long>(length) > (1ull << 32) - heap_file_at) {   // the last byte too must fit
+            std::fprintf(stderr, "VKC_HEAP_FILE: %s (%lld bytes) at 0x%llx runs past the 4 GiB heap\n",
+                         heap_file_path.c_str(), static_cast<long long>(length),
+                         static_cast<unsigned long long>(heap_file_at));
+            return 2;
+        }
+        heap_file.resize(static_cast<std::size_t>(length));
+        hf.seekg(0);
+        if (!hf.read(heap_file.data(), length)) {
+            std::fprintf(stderr, "VKC_HEAP_FILE: cannot read %s\n", heap_file_path.c_str());
             return 2;
         }
     }
