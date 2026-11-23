@@ -77,4 +77,5 @@ The four xmem rows are the ones a return of 0 stops: 8 sites.
 
 A site found here is code that can stop the title, not proof that the boot reaches it: nothing ran. Only
 straight-line code after each call is read. A result stored and tested later, or a failure path that logs before it
-stops, is not seen, so each count is a lower bound. #6915 records the stops one run reached, in order.
+stops, is not seen, and a stray call byte pair inside another instruction could add a false site (rare). Each count
+is a heuristic count that can miss sites or include false matches. #6915 records the stops one run reached, in order.
