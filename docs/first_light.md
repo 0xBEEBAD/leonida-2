@@ -261,7 +261,44 @@ LEONIDA_FIRST_LIGHT_TEX_DIR=~/leonida-work/first_light/out_tex ctest --test-dir 
 Without `LEONIDA_FIRST_LIGHT_TEX_DIR` the test prints SKIP and exits 77. The drawn image is written next to the
 inputs as `d3d12_textured.raw`; it stays in the user's folder.
 
-## 9. Limits and next
+## 9. Every texture format the game uses, through the layer
+
+The package's 357,115 TTPF descriptors use 20 DXGI formats (counted with `ttpf_mips.py` on a 1.0.2.1 copy):
+- BC1: 174,674, plus 82,177 sRGB.
+- BC7: 52,612, plus 25,226 sRGB.
+- BC5: 6,904. BC4: 4,656. BC3: 3,045, plus 3,880 sRGB.
+- BC6H: 1,000 UF16 and 25 SF16.
+- RGBA8: 1,774. R16F: 947. A8: 121. BGRA8: 50, plus 4 sRGB. R8: 8.
+- RGBA16 UNORM: 5. RGBA16F: 3. BC2: 2. RGBA8 sRGB: 2.
+
+`first_light.py --texture-dds <file>` takes one exported texture (`ttpf_mips.py export … --mips 1`) and writes its mip
+0 to `texture.bin` in its own format, BC blocks included. `d3d12_first_light_textured` uploads it through
+`CopyTextureRegion` and draws it with `$PS_PassthroughCopy`. The CPU reference decodes the texture with
+`ttpf_mips.decode_pixels`, then applies each format's rules:
+- sRGB is linearised per texel, before filtering.
+- A8 samples as (0, 0, 0, a).
+- R8, BC4 and R16F sample as (r, 0, 0, 1). BC5 samples as (r, g, 0, 1).
+- An alpha the decoder doesn't give is not compared.
+
+One game texture per format, each with at least 64 distinct values, on an RTX 3060:
+
+| formats | worst error | tolerance |
+|---|---:|---:|
+| RGBA8, R8, R16F, BC7, BC7 sRGB, BC2 | ≤ 0.003 | 2/255 |
+| A8, BGRA8, BGRA8 sRGB | ≤ 2/255 except ≤ 4 edge texels | 2/255 |
+| BC4, BC5 | 0.0089 | 3/255 |
+| BC1, BC3 | 0.020 | 6/255 |
+| BC1 sRGB, BC3 sRGB | 0.026 | 7/255 |
+| BC6H UF16, SF16 | 0.033 | 0.04 |
+
+The wider tolerances are decoder arithmetic, not the layer. The BC1/BC3 colour palette on the RTX 3060 follows
+integer weights: regenerating the reference with `(43a + 21b + 32) >> 6` instead of `(2a + b) / 3` cuts the channels
+off by more than 2/255 five- to sevenfold. BC4/BC5 interpolate their 8-entry palette above 8 bits. A wrong mapping is
+far outside every tolerance: declaring the BC1 sRGB texture as BC1 UNORM (a missed sRGB decode) gives a worst error
+of 0.31 with 28,829 channels over, and fails. The three formats not run here are RGBA16 UNORM, RGBA16F and RGBA8
+sRGB, 10 textures in all; no 2D one of them exported in the size this sweep uses.
+
+## 10. Limits and next
 
 * The camera draw (section 7) runs in `vk_harness` only. Through the D3D12 layer, s9 and the table it points at
   have to come from root arguments, which `d3d12_first_light_test` does not set up yet.

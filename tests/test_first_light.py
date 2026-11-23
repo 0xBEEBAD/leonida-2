@@ -18,6 +18,7 @@ import contextlib
 from contextlib import redirect_stdout
 import io
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -1053,6 +1054,53 @@ class LayerTexturedOracleTests(unittest.TestCase):
                 f.write("\ts_load_dwordx8 s[4:11], s[8:9], null\n")
             self.assertEqual(fl.tsharp_load_offset(listing), 0)
             self.assertEqual(fl.tsharp_load_offset(os.path.join(tmp, "missing.s")), 0)
+
+    @staticmethod
+    def _dds(path, width, height, fmt, payload):
+        head = bytearray(148)
+        head[0:4] = b"DDS "
+        struct.pack_into("<I", head, 4, 124)
+        struct.pack_into("<II", head, 12, height, width)
+        head[84:88] = b"DX10"
+        struct.pack_into("<I", head, 128, fmt)
+        with open(path, "wb") as f:
+            f.write(bytes(head) + payload)
+
+    def test_dds_channel_rules(self):
+        # A8 samples as (0, 0, 0, a); R8 as (r, 0, 0, 1); an sRGB texel is linearised before filtering; a BC1 block
+        # decodes through ttpf_mips; an RGBA8 alpha is not predicted (NaN, so the layer test skips it).
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "t.dds")
+            self._dds(p, 2, 1, 65, bytes([0, 255]))
+            w, h, fmt, payload = fl.read_dds_mip0(p)
+            self.assertEqual((w, h, fmt), (2, 1, 65))
+            self.assertEqual(fl.dds_texels(w, h, fmt, payload), [(0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)])
+            self._dds(p, 1, 1, 61, bytes([255]))
+            self.assertEqual(fl.dds_texels(*fl.read_dds_mip0(p)), [(1.0, 0.0, 0.0, 1.0)])
+            self._dds(p, 1, 1, 91, bytes([0, 0, 188, 255]))               # B8G8R8A8_SRGB: R = 188
+            (r, g, b, a), = fl.dds_texels(*fl.read_dds_mip0(p))
+            self.assertAlmostEqual(r, fl.srgb_to_linear(188 / 255), places=6)
+            self.assertTrue(math.isnan(a))
+            block = struct.pack("<HHI", 0xF800, 0x001F, 0)                 # BC1: every texel index 0 = pure red
+            self._dds(p, 4, 4, 71, block)
+            texels = fl.dds_texels(*fl.read_dds_mip0(p))
+            self.assertEqual(len(texels), 16)
+            self.assertEqual(texels[5][:3], (1.0, 0.0, 0.0))
+
+    def test_dds_rejects_unsupported_or_short(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "t.dds")
+            self._dds(p, 4, 4, 2, bytes(256))                             # R32G32B32A32_FLOAT: not a game format
+            with self.assertRaises(SystemExit):
+                fl.read_dds_mip0(p)
+            self._dds(p, 8, 8, 71, bytes(8))                              # BC1 8x8 needs 32 bytes
+            with self.assertRaises(SystemExit):
+                fl.read_dds_mip0(p)
+
+    def test_dds_tolerance_keeps_mapping_errors_out(self):
+        # Every per-format tolerance stays far below a mapping error (a missed sRGB decode measured 0.31).
+        for fmt in fl.DDS_FORMATS:
+            self.assertLess(fl.dds_tolerance(fmt), 0.05, fmt)
 
     def test_ramp_texels_hold_their_own_centre(self):
         texels, data = fl.ramp_texture(4)

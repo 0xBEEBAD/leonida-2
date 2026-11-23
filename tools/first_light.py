@@ -682,6 +682,111 @@ def tsharp_load_offset(listing: str) -> int:
     return int(m.group(1), 0)
 
 
+# DDS formats d3d12_first_light_textured can upload, by DXGI code: (block edge, bytes per texel or block, channel rule,
+# scale to [0, 1] or None for float data, sRGB). Channel rules: "rgb" (alpha not predicted), "r" (r, 0, 0, 1),
+# "rg" (r, g, 0, 1), "a" (0, 0, 0, a). These are the formats the game's TTPF pools use (docs/first_light.md section 8).
+DDS_FORMATS = {
+    28: (1, 4, "rgb", 255.0, False), 29: (1, 4, "rgb", 255.0, True),
+    87: (1, 4, "rgb", 255.0, False), 91: (1, 4, "rgb", 255.0, True),
+    10: (1, 8, "rgb", None, False), 11: (1, 8, "rgb", 255.0, False),
+    54: (1, 2, "r", None, False), 61: (1, 1, "r", 255.0, False), 65: (1, 1, "a", 255.0, False),
+    71: (4, 8, "rgb", 255.0, False), 72: (4, 8, "rgb", 255.0, True),
+    74: (4, 16, "rgb", 255.0, False), 77: (4, 16, "rgb", 255.0, False), 78: (4, 16, "rgb", 255.0, True),
+    80: (4, 8, "r", 255.0, False), 83: (4, 16, "rg", 255.0, False),
+    95: (4, 16, "rgb", None, False), 96: (4, 16, "rgb", None, False),
+    98: (4, 16, "rgb", 255.0, False), 99: (4, 16, "rgb", 255.0, True),
+}
+
+
+def srgb_to_linear(c: float) -> float:
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def read_dds_mip0(path: str):
+    """(width, height, DXGI format, mip-0 payload) of a DX10-header DDS, as ttpf_mips.py export writes it."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:4] != b"DDS " or data[84:88] != b"DX10":
+        raise SystemExit(f"{path}: not a DX10 DDS")
+    height, width = struct.unpack_from("<II", data, 12)
+    fmt = struct.unpack_from("<I", data, 128)[0]
+    if fmt not in DDS_FORMATS:
+        raise SystemExit(f"{path}: DXGI format {fmt} is not one d3d12_first_light_textured uploads")
+    block, nbytes = DDS_FORMATS[fmt][:2]
+    size = -(-width // block) * -(-height // block) * nbytes
+    payload = data[148:148 + size]
+    if len(payload) != size:
+        raise SystemExit(f"{path}: mip 0 is cut short")
+    return width, height, fmt, payload
+
+
+def dds_texels(width: int, height: int, fmt: int, payload: bytes):
+    """The texture as (r, g, b, a) floats per texel in linear space, NaN where the format's alpha isn't predicted."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ttpf_mips
+    block, _, rule, scale, srgb = DDS_FORMATS[fmt]
+    bw, bh = -(-width // block), -(-height // block)
+    px = ttpf_mips.decode_pixels(fmt, payload, bw, bh)
+    if px is None:
+        raise SystemExit(f"DXGI format {fmt}: no CPU decoder")
+    row = bw * block
+    nan = float("nan")
+    out = []
+    for y in range(height):
+        for x in range(width):
+            r, g, b = (v / scale if scale else v for v in px[y * row + x])
+            if srgb:
+                r, g, b = srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)
+            out.append({"rgb": (r, g, b, nan), "r": (r, 0.0, 0.0, 1.0), "rg": (r, g, 0.0, 1.0),
+                        "a": (0.0, 0.0, 0.0, r)}[rule])
+    return out
+
+
+def dds_tolerance(fmt: int) -> float:
+    """The per-channel tolerance of a format's draw against the CPU decode. The BC1/BC2/BC3 colour palette and BC6H
+    are where hardware decoders legitimately round differently from ttpf_mips's exact arithmetic: on an RTX 3060
+    the BC1/BC3 palette follows integer weights ((43*a + 21*b + 32) >> 6 fits five to seven times better than
+    (2a + b) / 3), up to about 5/255 after filtering, more once sRGB is linearised. A wrong format mapping, swizzle
+    or a missed sRGB decode is off by 0.2 or more, far outside these."""
+    if fmt in (95, 96):
+        return 0.04
+    if fmt in (72, 78):
+        return 7.0 / 255.0
+    if fmt in (71, 74, 77):
+        return 6.0 / 255.0
+    if fmt in (80, 83):     # BC4/BC5: the hardware interpolates the 8-entry palette above the CPU's 8-bit rounding
+        return 3.0 / 255.0
+    return 2.0 / 255.0
+
+
+def write_dds_inputs(out_dir: str, dds: str, vertices, indices, width: int, height: int) -> dict:
+    """texture.bin (the DDS's mip 0 in its own format) and expected.raw (its CPU decode sampled bilinearly with clamp
+    at each covered pixel's UV) for d3d12_first_light_textured."""
+    tw, th, fmt, payload = read_dds_mip0(dds)
+    texels = dds_texels(tw, th, fmt, payload)
+    data = struct.pack("<III", tw, th, fmt) + payload
+    with open(os.path.join(out_dir, "texture.bin"), "wb") as f:
+        f.write(data)
+    expected = bytearray()
+    uvs, ambiguous = uv_map(vertices, indices, width, height)
+    covered = 0
+    for k, uv in enumerate(uvs):
+        if uv is None:
+            expected += struct.pack("<4f", -1.0, -1.0, -1.0, -1.0)
+        elif k in ambiguous:
+            covered += 1
+            expected += struct.pack("<4f", 0.0, 0.0, 0.0, AMBIGUOUS)
+        else:
+            covered += 1
+            expected += struct.pack("<4f", *sample_bilinear_clamp(texels, tw, th, uv[0], uv[1]))
+    with open(os.path.join(out_dir, "expected.raw"), "wb") as f:
+        f.write(expected)
+    return {"layer_texture": f"dds:{fmt}", "layer_texture_size": [tw, th], "layer_texture_format": fmt,
+            "layer_texture_sha256": hashlib.sha256(data).hexdigest(), "expected_covered": covered,
+            "expected_ambiguous": len(ambiguous),
+            "texture_tolerance": dds_tolerance(fmt)}
+
+
 def write_textured_inputs(out_dir: str, vertices, indices, width: int, height: int) -> dict:
     """texture.bin and expected.raw for d3d12_first_light_textured_test: the ramp, and the CPU reference of the
     draw (the texture sampled at each covered pixel's UV, -1 elsewhere, in the harness's row order)."""
@@ -1065,6 +1170,8 @@ def main(argv=None) -> int:
         "--dds",
         help="an exported DDS texture (e.g. BCPack-decoded TTPF albedo) to bind via set-0 T# and sampler S#",
     )
+    ap.add_argument("--texture-dds", metavar="DDS",
+                    help="like --texture ramp, but with a DX10 DDS's mip 0 uploaded in its own format (BC included)")
     ap.add_argument("--texture", choices=["ramp"],
                     help="also write texture.bin and expected.raw for d3d12_first_light_textured_test "
                          "(pick a --ps that samples one texture through a table at s8)")
@@ -1286,8 +1393,11 @@ def main(argv=None) -> int:
         )
         if tex_probes:
             manifest["rgba_probes"] = tex_probes
-    if a.texture and vertices:
-        manifest.update(write_textured_inputs(out_dir, vertices, indices, a.width, a.height))
+    if (a.texture or a.texture_dds) and vertices:
+        if a.texture_dds:
+            manifest.update(write_dds_inputs(out_dir, a.texture_dds, vertices, indices, a.width, a.height))
+        else:
+            manifest.update(write_textured_inputs(out_dir, vertices, indices, a.width, a.height))
         # The SGPR the PS reads its T# table pointer from; d3d12_first_light_textured pads the root signature to it.
         manifest["layer_ptr_sgpr"] = next(
             (int(r["sgpr"]) for r in (meta["ps"].get("user_sgpr_reads") or [])

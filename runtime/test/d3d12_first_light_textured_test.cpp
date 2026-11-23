@@ -48,12 +48,35 @@ std::string stage_hash(const leonida::Json& manifest, std::string_view stage) {
     return hash && hash->kind == leonida::Json::Kind::string ? hash->string : std::string();
 }
 
-UINT texel_bytes(DXGI_FORMAT format) {
+// A texture.bin format: its block edge (1 for plain texels, 4 for BC) and the bytes of one texel or block. These are
+// the formats the game's TTPF pools use (docs/first_light.md section 8).
+struct TexelLayout {
+    UINT block = 0;
+    UINT bytes = 0;
+};
+TexelLayout texel_layout(DXGI_FORMAT format) {
     switch (format) {
     case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return 4;
-    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
-    default: return 0;
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return {1, 4};
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM: return {1, 8};
+    case DXGI_FORMAT_R16_FLOAT: return {1, 2};
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_A8_UNORM: return {1, 1};
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_UNORM: return {4, 8};
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_UNORM:
+    case DXGI_FORMAT_BC6H_UF16:
+    case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_UNORM:
+    case DXGI_FORMAT_BC7_UNORM_SRGB: return {4, 16};
+    default: return {};
     }
 }
 
@@ -127,10 +150,12 @@ int main() {
     std::memcpy(&tex_w, texture.data(), 4);
     std::memcpy(&tex_h, texture.data() + 4, 4);
     std::memcpy(&tex_format, texture.data() + 8, 4);
-    const UINT texel = texel_bytes(DXGI_FORMAT(tex_format));
-    EXPECT(texel && tex_w && tex_h && tex_w <= 16384 && tex_h <= 16384);
-    EXPECT(texture.size() == 12 + std::size_t(tex_w) * tex_h * texel);
-    const UINT tex_row = tex_w * texel, tex_pitch = (tex_row + 255) / 256 * 256;
+    const TexelLayout texel = texel_layout(DXGI_FORMAT(tex_format));
+    EXPECT(texel.bytes && tex_w && tex_h && tex_w <= 16384 && tex_h <= 16384);
+    // Rows of texels, or of 4x4 blocks for a BC format: the payload is tightly packed either way.
+    const UINT tex_rows = (tex_h + texel.block - 1) / texel.block;
+    const UINT tex_row = (tex_w + texel.block - 1) / texel.block * texel.bytes, tex_pitch = (tex_row + 255) / 256 * 256;
+    EXPECT(texture.size() == 12 + std::size_t(tex_rows) * tex_row);
     const std::size_t tex_offset = (index_offset + index_bytes + 511) / 512 * 512;
 
     std::vector<Pixel> pixels(std::size_t(width) * height);
@@ -213,7 +238,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ib_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&index_buffer.p))));
-        const auto upload_desc = buffer_desc(tex_offset + std::size_t(tex_pitch) * tex_h);
+        const auto upload_desc = buffer_desc(tex_offset + std::size_t(tex_pitch) * tex_rows);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
@@ -244,7 +269,7 @@ int main() {
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         std::memcpy(up, mesh.data() + 8, vertex_bytes);
         std::memcpy(up + index_offset, mesh.data() + 8 + vertex_bytes, index_bytes);
-        for (UINT row = 0; row < tex_h; ++row)
+        for (UINT row = 0; row < tex_rows; ++row)
             std::memcpy(up + tex_offset + std::size_t(row) * tex_pitch, texture.data() + 12 + std::size_t(row) * tex_row,
                         tex_row);
 
@@ -388,6 +413,7 @@ int main() {
             }
             ++compared;
             for (int c = 0; c < 4; ++c) {
+                if (std::isnan(want[c])) continue;  // a channel the reference can't predict (an unknown alpha)
                 const double e = std::fabs(double(got[c]) - double(want[c]));
                 worst = std::max(worst, e);
                 sum += e;
