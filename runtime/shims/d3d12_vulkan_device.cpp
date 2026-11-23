@@ -2243,7 +2243,7 @@ public:
         }
         if (FAILED(support)) return support;
         device_.share(info);
-        const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
+        VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
         if (created != VK_SUCCESS) {
             if (created == VK_ERROR_OUT_OF_HOST_MEMORY || created == VK_ERROR_OUT_OF_DEVICE_MEMORY)
                 return E_OUTOFMEMORY;
@@ -2253,11 +2253,25 @@ public:
             }
             return E_OUTOFMEMORY;
         }
+        // Some drivers advertise VK_EXT_host_image_copy yet allow no memory type for a HOST_TRANSFER image
+        // (NVIDIA Pascal / 582.78: memoryTypeBits == 0), or fail to allocate one. Staging copies do not need
+        // that usage, so recreate the image without it and continue on that path, as for a refused format above.
         VkMemoryRequirements requirements{};
-        vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
-        memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
-        if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
-            return E_OUTOFMEMORY;
+        for (;;) {
+            vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
+            if (requirements.memoryTypeBits != 0) {
+                memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
+                if (memory_ && vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) == VK_SUCCESS) break;
+                if (memory_) { vk.vkFreeMemory(device_.info.device, memory_, nullptr); memory_ = VK_NULL_HANDLE; }
+            }
+            if (!host_transfer_) return E_OUTOFMEMORY;
+            vk.vkDestroyImage(device_.info.device, image_, nullptr);
+            image_ = VK_NULL_HANDLE;
+            host_transfer_ = false;
+            info.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+            created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
+            if (created != VK_SUCCESS) return E_OUTOFMEMORY;
+        }
 
         leonida::ResourceBinding binding{};
         binding.image = image_;
