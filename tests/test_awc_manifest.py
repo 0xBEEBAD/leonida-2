@@ -355,26 +355,29 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
 
-    def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
+    def test_failed_replace_of_read_only_staged_manifest_removes_writable_temp(self):
         out = os.path.join(self.tmp.name, "manifest.json")
         previous = '{"previous": true}\n'
         with open(out, "w", encoding="utf-8") as f:
             f.write(previous)
-        os.chmod(out, 0o444)
-        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
-        made_writable = []
+        staged_modes = []
         real_chmod = os.chmod
 
         def chmod(path, mode, *args, **kwargs):
-            if isinstance(path, str) and os.path.basename(path).startswith(".awc_manifest-") and mode == 0o600:
-                made_writable.append(path)
+            if isinstance(path, str) and os.path.basename(path).startswith(".awc_manifest-"):
+                staged_modes.append((path, mode))
             return real_chmod(path, mode, *args, **kwargs)
 
-        with mock.patch.object(awc_manifest, "replace_retry", side_effect=OSError("replace denied")), \
+        def denied_replace(staged, _destination):
+            os.chmod(staged, 0o444)
+            raise OSError("replace denied")
+
+        with mock.patch.object(awc_manifest, "replace_retry", side_effect=denied_replace), \
                 mock.patch.object(awc_manifest.os, "chmod", chmod):
             with self.assertRaises(OSError):
                 awc_manifest.write_manifest([], 0, 0, "json", out)
-        self.assertEqual(len(made_writable), 1)
+        self.assertEqual([mode for _, mode in staged_modes[-2:]], [0o444, 0o600])
+        self.assertEqual(staged_modes[-2][0], staged_modes[-1][0])
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), previous)
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])
