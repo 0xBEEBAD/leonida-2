@@ -89,6 +89,23 @@ int main() {
     check(override_upscaler(6, 0) == 7 && override_upscaler(7, 1) == 7, "--upscaler-picker RVA,7 makes every pick 7");
     upscaler_kind_slot() = 0;
 
+    Mod fsr, game_choice, fsr_off;
+    check(parse_mod(R"({"upscaler":{"use":"fsr","picker_rva":"7E93F0"}})", "u1", fsr, error) && fsr.upscaler.set &&
+              fsr.upscaler.kind == 7 && fsr.upscaler.picker_rva == 0x7E93F0,
+          "an \"upscaler\" section with use fsr and the picker's RVA parses");
+    check(parse_mod(R"({"upscaler":{"use":"game","picker_rva":"7E93F0"}})", "u2", game_choice, error) &&
+              game_choice.upscaler.kind == 0,
+          "use game leaves the game's choice");
+    check(!parse_mod(R"({"upscaler":{"use":"dlss","picker_rva":"7E93F0"}})", "x", fsr_off, error) &&
+              !parse_mod(R"({"upscaler":{"use":"fsr"}})", "x", fsr_off, error) &&
+              !parse_mod(R"({"upscaler":{"use":"fsr","picker_rva":"zz"}})", "x", fsr_off, error),
+          "an unknown upscaler, a missing RVA and a bad RVA are refused");
+    check(parse_mod(R"({"enabled":false,"upscaler":{"use":"fsr","picker_rva":"7E93F0"}})", "u3", fsr_off, error),
+          "a disabled upscaler mod parses");
+    check(upscaler_of({fsr, fsr_off}).kind == 7 && upscaler_of({fsr, game_choice}).kind == 0 &&
+              !upscaler_of({fsr_off}).set,
+          "the last enabled upscaler mod decides; a disabled one is skipped");
+
     const auto dir = std::filesystem::temp_directory_path() / "leonida_mods_test";
     std::filesystem::remove_all(dir);
     write(dir / "a_mandy" / "mod.json",

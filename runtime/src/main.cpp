@@ -155,6 +155,21 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "[rt] mods: first-person view (value %u) for %s%s\n", camera.first_person_value,
                          camera.contexts.empty() ? "every context" : "the listed contexts",
                          view_mode_getter_rva ? "" : "; not applied: no --view-mode-getter RVA for this executable");
+        // The upscaler: --upscaler-picker wins; else the enabled mod's "upscaler" section.
+        if (const leonida::mods::UpscalerChoice up = leonida::mods::upscaler_of(mods.mods);
+            up.set && up.kind && !upscaler_picker_rva) {
+            upscaler_picker_rva = up.picker_rva;
+            upscaler_kind = up.kind;
+        }
+        if (upscaler_picker_rva && upscaler_kind == 7) {
+            // FSR needs the PC upscaler shim: without it the game's FFX calls reach the package's console DLL.
+            wchar_t ffx_pc[8] = {};
+            if (GetEnvironmentVariableW(L"LEONIDA_FFX_PC", ffx_pc, 8) != 1 || ffx_pc[0] != L'1') {
+                std::fprintf(stderr, "[rt] mods: FSR upscaler not applied: it needs LEONIDA_FFX_PC=1 (the PC upscaler "
+                                     "shim, docs/modding.md \"Upscaler\")\n");
+                upscaler_picker_rva = 0;
+            }
+        }
         if (leonida::mods::active().size())
             std::fprintf(stderr, archetype_lookup_rva ? "[rt] mods: %zu archetype swap(s) loaded\n"
                                  : "[rt] mods: %zu archetype swap(s) loaded; not applied: no --archetype-lookup RVA for "

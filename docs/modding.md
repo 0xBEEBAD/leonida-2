@@ -147,10 +147,23 @@ Series S (console type 6, which the game reads from the registry, `runtime/shims
 Series X configuration renders through the game's upscaler. Measured by a static look at the 1.0.2.1 executable;
 nothing executed.
 
-`--upscaler-picker RVA[,KIND]` (hex RVA, decimal `KIND`, default 7) replaces every result of that function with
-`KIND`, through the same result-override hook as the view-mode getter (`leonida::mods::override_upscaler`). With the
-default console type (Series X) and the PC upscaler shim (`LEONIDA_FFX_PC=1`, `LEONIDA_FFX_DIR`), the game keeps its
-Series X configuration and upscales through FSR:
+In short: the game asks one question, "which upscaler?", and the runtime answers it instead. The game keeps its
+Series X resolution and settings, and its FSR calls go to AMD's PC FSR through the upscaler shim.
+
+**The mod** `mods/fsr_series_x` does it: set `"enabled": true` in its `mod.json` and run with the PC upscaler shim
+(`LEONIDA_FFX_PC=1`, `LEONIDA_FFX_DIR`). Without the shim the runtime leaves the game's choice alone and says so,
+because the game's FFX calls would otherwise reach the package's console DLL. An `"upscaler"` section takes `"use"`:
+`"fsr"` or `"game"`, and the picker's `"picker_rva"` for that executable version; the last enabled mod with one
+decides.
+
+```json
+{ "name": "FSR in the Series X configuration", "enabled": true, "game_version": "1.0.2.1",
+  "upscaler": { "use": "fsr", "picker_rva": "7E93F0" } }
+```
+
+The command line does the same and wins over the mods: `--upscaler-picker RVA[,KIND]` (hex RVA, decimal `KIND`,
+default 7) replaces every result of the picker with `KIND`, through the same result-override hook as the view-mode
+getter (`leonida::mods::override_upscaler`).
 
 ```powershell
 $env:LEONIDA_FFX_PC = '1'
@@ -167,4 +180,5 @@ picker is the function whose result is passed to it, and it tests the console ty
 with the RVA prints how many direct calls were redirected, which should match the table.
 
 **Not yet seen running:** the game doesn't reach its first frame under `gta6rt` yet, so the effect is unmeasured.
-The FSR render size per quality mode is the FFX wrapper's own choice. ctest `mods` checks the override.
+The FSR render size per quality mode is the FFX wrapper's own choice. ctest `mods` checks the override and the
+`"upscaler"` section.

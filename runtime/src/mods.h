@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -60,6 +61,14 @@ struct CameraView {
     std::vector<uint32_t> contexts;
 };
 
+// "upscaler": which upscaler the game's upscaler picker answers (docs/modding.md, "Upscaler"). `use`: "fsr" (7, AMD's
+// FFX upscaler) or "game" (leave the game's choice); `picker_rva`: the picker's RVA in this executable version (hex).
+struct UpscalerChoice {
+    bool set = false;         // the mod has an "upscaler" section
+    uint32_t kind = 0;        // 0 = the game's choice
+    uint32_t picker_rva = 0;
+};
+
 struct Mod {
     std::string folder;  // the folder name under mods/
     std::string name;
@@ -67,6 +76,7 @@ struct Mod {
     bool enabled = true;
     std::vector<ArchetypeSwap> archetype_swaps;
     CameraView camera;
+    UpscalerChoice upscaler;
 };
 
 struct LoadResult {
@@ -146,6 +156,22 @@ inline bool parse_mod(std::string_view text, const std::string& folder, Mod& mod
             }
             mod.archetype_swaps.push_back(std::move(swap));
         }
+    }
+    if (const Json* up = root.find("upscaler")) {
+        const Json* use = up->kind == Json::Kind::object ? up->find("use") : nullptr;
+        if (!use || use->kind != Json::Kind::string || (use->string != "fsr" && use->string != "game")) {
+            error = "\"upscaler\": \"use\" must be \"fsr\" or \"game\"";
+            return false;
+        }
+        const Json* rva = up->find("picker_rva");
+        char* end = nullptr;
+        const unsigned long value =
+            rva && rva->kind == Json::Kind::string ? std::strtoul(rva->string.c_str(), &end, 16) : 0;
+        if (!value || !end || *end) {
+            error = "\"upscaler\": \"picker_rva\" must be the picker's RVA in hex, e.g. \"7E93F0\"";
+            return false;
+        }
+        mod.upscaler = {true, use->string == "fsr" ? 7u : 0u, static_cast<uint32_t>(value)};
     }
     if (const Json* cam = root.find("camera")) {
         if (cam->kind != Json::Kind::object) {
@@ -244,6 +270,14 @@ inline ArchetypeSwaps& active_slot() {
 }
 inline void set_active(ArchetypeSwaps swaps) { active_slot() = std::move(swaps); }
 inline const ArchetypeSwaps& active() { return active_slot(); }
+
+// The upscaler choice of the enabled mods: the last one (in folder order) with an "upscaler" section decides.
+inline UpscalerChoice upscaler_of(const std::vector<Mod>& mods) {
+    UpscalerChoice choice;
+    for (const Mod& m : mods)
+        if (m.enabled && m.upscaler.set) choice = m.upscaler;
+    return choice;
+}
 
 // The camera override of the enabled mods: the last one (in folder order) with a "camera" section decides.
 inline CameraView camera_of(const std::vector<Mod>& mods) {
