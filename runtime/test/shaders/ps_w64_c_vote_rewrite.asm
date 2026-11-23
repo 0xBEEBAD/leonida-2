@@ -5,7 +5,8 @@
 ; a wave64 the wave with pixel (0, 0) runs it in every lane and writes v6 = 1; on two 32-lane subgroups the half
 ; without pixel (0, 0) votes "no" and keeps v6 = 0. r0 = v6, r1 = pixel (0, 0).
 ; Run: vk_harness vs_ids.spv ps_w64_c_vote_rewrite.spv out.raw with VKH_SUBGROUP_SIZE=64 and 32: r1 equal, r0 differs
-; in the pixels of the other half (the detector must call this shader tier C; main called it tier A).
+; in the pixels of the other half (the detector must call this shader tier C, tainted-branch; before SHADER-820 it
+; called it tier A).
 ; mattr: +wavefrontsize64,-wavefrontsize32
 v_interp_p1_f32_e32 v2, v0, attr0.x
 v_interp_p2_f32_e32 v2, v1, attr0.x
