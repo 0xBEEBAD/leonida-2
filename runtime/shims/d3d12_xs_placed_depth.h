@@ -55,7 +55,7 @@ private:
 
 class PlacedDepthTextures {
 public:
-    // The valid legacy state and optimized clear are checked for each caller before looking up an alias.
+    // The initial barrier layout and optimized clear are checked for each caller before looking up an alias.
     // Reusing a live compatible placement retains both the attachment image and its writable plane images.
     template<class Create>
     HRESULT create(UINT64 address, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_ALLOCATION_INFO allocation,

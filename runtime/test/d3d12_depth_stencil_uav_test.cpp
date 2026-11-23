@@ -201,15 +201,19 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
     Ref<ID3D12Resource> texture, alias;
     const auto create_texture = reinterpret_cast<CreateFn>(d3d12test::slot(xbox.p, 76));
     if (placed) {
-        using PlaceFn = HRESULT(WINAPI*)(void*, UINT64, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+        using PlaceFn = HRESULT(WINAPI*)(void*, UINT64, const D3D12_RESOURCE_DESC*, D3D12_BARRIER_LAYOUT,
                                          const D3D12_CLEAR_VALUE*, REFIID, void**);
         const auto place = reinterpret_cast<PlaceFn>(d3d12test::slot(xbox.p, 133));
         guest.address = VirtualAlloc(nullptr, SIZE_T(size.SizeInBytes), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         CHECK(guest.address);
         const auto va = reinterpret_cast<UINT64>(guest.address);
-        CHECK(SUCCEEDED(place(xbox.p, va, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+        const auto layout = enhanced ? D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS : D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE;
+        CHECK(SUCCEEDED(place(xbox.p, va, &desc, layout, nullptr,
                               IID_PPV_ARGS(&texture.p))));
-        CHECK(SUCCEEDED(place(xbox.p, va, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+        Ref<ID3D12Resource> rejected;
+        CHECK(place(xbox.p, va, &desc, D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr,
+                    IID_PPV_ARGS(&rejected.p)) == E_INVALIDARG && !rejected.p);
+        CHECK(SUCCEEDED(place(xbox.p, va, &desc, D3D12_BARRIER_LAYOUT_SHADER_RESOURCE, nullptr,
                               IID_PPV_ARGS(&alias.p))));
         CHECK(texture.p != alias.p && texture->GetGPUVirtualAddress() == va && alias->GetGPUVirtualAddress() == va);
     } else if (modern) {

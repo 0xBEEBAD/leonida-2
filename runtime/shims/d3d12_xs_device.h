@@ -7,6 +7,7 @@
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
+//   slot 133  CreatePlacedResourceX(va, desc, layout, clear, iid, out), routed by resource type.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
@@ -50,6 +51,7 @@
 #include <d3d12.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 namespace rt::d3d12_xs {
@@ -83,7 +85,8 @@ inline bool depth_uav_description(const D3D12_RESOURCE_DESC& desc) {
            (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_R16_TYPELESS) &&
            desc.DepthOrArraySize && desc.MipLevels == 1 && desc.SampleDesc.Count == 1;
 }
-using ValidateDepthPlacement = bool (*)(const D3D12_RESOURCE_DESC&, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*);
+using ValidateDepthPlacement = bool (*)(const D3D12_RESOURCE_DESC& native, std::uint32_t layout,
+                                        const D3D12_CLEAR_VALUE* clear);
 bool set_depth_stencil_uav_provider(void* device, DepthStencilUavProvider provider,
                                     ValidateDepthPlacement validate_placement = nullptr);
 
@@ -117,9 +120,26 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
+// Device slot 133 (the console's CreatePlacedResourceX) routes supported depth UAVs to the proxy's depth provider.
+// Other resources use this handler, registered by the Vulkan layer (rt::d3d12::create_buffer_at_host_address).
+// It creates buffers on the title's pages at `va`. With no applicable provider the slot answers E_NOTIMPL.
+// `layout` is the title's third argument, a D3D12_BARRIER_LAYOUT (0xFFFFFFFF = UNDEFINED), measured on a retail
+// boot: 0x6 SHADER_RESOURCE, 0x3 UNORDERED_ACCESS, as PC CreatePlacedResource2 takes it.
+using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
+                                      std::uint32_t layout, REFIID riid, void** out);
+void set_placed_at_va_handler(PlacedAtVaHandler handler);
+
+// Called by slot 133 for a buffer, before the handler, with the buffer's range [va, va + width). gta6rt registers
+// rt::xmem::commit_physical_range: xmem commits physical pages on first touch, so a range the title has mapped but
+// not written yet is still reserved, and the handler's import refuses reserved pages (it would answer with its
+// fallback buffer, which the title's writes never reach). A false return is logged once and the handler is still
+// called. With none registered nothing is done.
+using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
+void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the
+// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 76 and 133. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
@@ -167,8 +187,29 @@ unsigned allocator_proxy_table_size();
 std::uint64_t allocator_slot_hits(unsigned slot);
 bool allocator_slot_first_call_seen(unsigned slot);
 std::uint64_t allocator_table_overruns();
+// Command list proxies created by device slot 73 (CreateCommandListX):
+bool is_command_list_proxy(const void* list);
+ID3D12GraphicsCommandList* command_list_proxy_real_list(const void* list);
+unsigned command_list_proxy_table_size();
+std::uint64_t list_slot_hits(unsigned slot);
+bool list_slot_first_call_seen(unsigned slot);
+
 // Heap slots 0-2, 7 (GetDevice -> device proxy) and 9/10 (handle conversion).
 bool heap_slot_overridden(unsigned slot);
+
+// Console list slot mapping: returns PC vtable slot or ~0u if console-only / unforwarded.
+inline constexpr unsigned kListNotForwarded = ~0u;
+inline constexpr unsigned console_to_pc_list_slot(unsigned slot) {
+    if (slot <= 26) return slot;               // PC order, measured
+    if (slot <= 30) return kListNotForwarded;  // console-only extras
+    if (slot <= 59) return slot - 4;           // PC chain, shifted +4
+    if (slot == 60) return 58;                 // EndEvent (no console SetMarker/BeginEvent)
+    if (slot == 61) return 59;                 // ExecuteIndirect (Package)
+    if (slot == 85) return 16;                 // CopyTextureRegionX -> CopyTextureRegion
+    if (slot == 146) return 80;                // D3D12_BARRIER_GROUP (Package; PC GCL7)
+    return kListNotForwarded;
+}
+
 
 // Number of live references on a device proxy. Test helper for the heap's GetDevice/lifetime checks.
 unsigned long device_proxy_ref_count(const void* device);
