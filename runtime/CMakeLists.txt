@@ -618,6 +618,7 @@ if(BUILD_TESTING)
       shims/xmem.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
+      shims/d3d12_console_heap_stub.cpp
     )
     target_include_directories(pe_loader_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -759,6 +760,7 @@ if(BUILD_TESTING)
       shims/xmem.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
+      shims/d3d12_console_heap_stub.cpp
     )
     target_include_directories(test_pe_loader_bounds PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -783,6 +785,7 @@ if(BUILD_TESTING)
       shims/xmem.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
+      shims/d3d12_console_heap_stub.cpp
     )
     target_include_directories(pe_loader_fuzz PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1305,6 +1308,7 @@ if(LEONIDA_D3D12_SHIM_TESTS)
     shims/d3d12_xs.cpp
     shims/registry.cpp
     shims/d3d12_xs_device.cpp
+    shims/d3d12_console_heap_stub.cpp
   )
   target_include_directories(d3d12_xs_root_signature_test PRIVATE shims)
   target_compile_definitions(d3d12_xs_root_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
