@@ -1235,6 +1235,9 @@ and driver-dependent NaN or signed-zero clamp results. The CPU translator reprod
 `--known` is clean there; it can still return 1 where one reproduces (the RTX 4070 `--oracle gpu` run does for the
 clamp form), and the minimized case is printed. `v_div_fixup_f64` with a NaN `S0` is not a known divergence: it gives
 signed infinity, measured on RDNA2 `gfx1036` (TEST-983; the translator has it since #2477), and is compared like any other case.
+The `v_div_fixup_f64` reference follows the `gfx1036` measurements in the `docs/design.md` row (#2477): a NaN in `S1` or
+`S2` passes through unquieted (IEEE off), the underflow cutoff is `exp(S2) - exp(S1) <= -1076` and there is no overflow
+check.
 `--oracle gpu` translates the same
 fragment shader and runs it through `runtime/build/vk_harness`, comparing the raw RGBA32F output words. It assembles
 the fragment module with `spirv-as` and the full-screen vertex shader with the Vulkan SDK's `glslc`; use `--exe PATH`
