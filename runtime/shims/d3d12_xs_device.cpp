@@ -1579,6 +1579,9 @@ static bool readable_range(const void* ptr, std::size_t bytes) {
     return true;
 }
 
+// Registered by the Vulkan layer (set_console_descriptor_heap_handler).
+std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -1601,9 +1604,11 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
             // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
             // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
+            const ConsoleDescriptorHeapHandler handler =
+                g_console_descriptor_heap.load(std::memory_order_acquire);
+            if (address != 0 && handler) {
                 console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
+                hr = handler(
                     self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
                     __uuidof(ID3D12DescriptorHeap), &created);
             }
@@ -2031,6 +2036,10 @@ ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap) {
 unsigned device_proxy_slot_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
     return static_cast<const DeviceProxy*>(device)->slot_count;
+}
+
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
+    g_console_descriptor_heap.store(handler, std::memory_order_release);
 }
 
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {

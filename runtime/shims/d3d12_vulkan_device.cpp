@@ -5500,6 +5500,13 @@ public:
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
     IUnknown* holder() { return identity(); }
+    // A descriptor heap whose handle starts report the console's address (create_console_descriptor_heap).
+    DescriptorHeap* new_console_descriptor_heap(const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uint64_t address,
+                                                std::uint64_t size) {
+        auto* heap = new DescriptorHeap(state_, desc, address, size);
+        heap->attach_device(identity());
+        return heap;
+    }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
@@ -9998,8 +10005,7 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
 
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
+    auto* heap = d->new_console_descriptor_heap(*desc, console_address, console_size);
     if (!heap->ok()) {
         heap->Release();
         return E_OUTOFMEMORY;
