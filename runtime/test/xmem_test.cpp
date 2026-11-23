@@ -369,10 +369,27 @@ void test_physical_pages(const PhysicalApi& api) {
         VirtualQuery(window, &info, sizeof(info));
         check(info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READWRITE,
               "a mapped page is a read-write view with the window's protection");
+        check(info.AllocationBase == window && info.RegionSize == kPages * kPage64k,
+              "consecutive pages of one allocation are mapped as one view");
     }
+
+    // A page unmapped or remapped inside that view splits it; its neighbours keep their pages.
+    void* const middle = window + kPage64k;
+    check(api.scatter(&middle, 1, nullptr) == TRUE && reserved_only(window + kPage64k),
+          "a page inside a view unmaps on its own");
+    check(page_holds(window, 0x1000u) && page_holds(window + 2 * kPage64k, 0x3000u) &&
+              page_holds(window + 3 * kPage64k, 0x4000u),
+          "the pages around it stay mapped with their contents");
+    check(api.map(middle, 1, &pages[1]) == middle && page_holds(window + kPage64k, 0x2000u),
+          "a page maps again into the gap");
 
     check(api.map(window, kPages, nullptr) == window, "XMemMapPhysicalPages with no page array unmaps");
     check(reserved_only(window) && reserved_only(window + 3 * kPage64k), "unmapped pages are reserved again");
+    // The split above left the range as several host placeholders; the whole run maps again over them.
+    check(api.map(window, kPages, pages) == window && page_holds(window, 0x1000u) &&
+              page_holds(window + 3 * kPage64k, 0x4000u),
+          "a run maps again over a range an earlier partial unmap split");
+    check(api.map(window, kPages, nullptr) == window && reserved_only(window), "and unmaps again");
 
     // Remap in reverse order into the other window: each page keeps its contents.
     uint64_t reversed[kPages];
@@ -441,6 +458,47 @@ void test_physical_pages(const PhysicalApi& api) {
 }
 
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
+// A run longer than one host view is mapped as capped views, so unmapping one page inside it only remaps the rest of
+// that view; every other page keeps its contents.
+void test_long_run(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 1100;  // more than the 1024-page view cap
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    std::vector<uint64_t> pages(kPages);
+    uint64_t count = kPages;
+    check(window && api.allocate(0x280, &count, pages.data()) == TRUE, "a long run's window and pages are allocated");
+    if (!window || count != kPages) return;
+    check(api.map(window, kPages, pages.data()) == window, "a run longer than the view cap maps");
+    MEMORY_BASIC_INFORMATION info{};
+    VirtualQuery(window, &info, sizeof(info));
+    check(info.State == MEM_COMMIT && info.RegionSize == 1024 * kPage64k, "it is mapped as views of at most 1024 pages");
+    for (uint64_t i = 0; i < kPages; ++i) fill_page(window + i * kPage64k, static_cast<uint32_t>(i + 1));
+    void* const hole = window + 10 * kPage64k;
+    check(api.scatter(&hole, 1, nullptr) == TRUE && reserved_only(hole), "a page inside the first view unmaps");
+    bool kept = true;
+    for (uint64_t i = 0; i < kPages; ++i) {
+        if (i != 10) kept &= page_holds(window + i * kPage64k, static_cast<uint32_t>(i + 1));
+    }
+    check(kept, "every other page of the run keeps its contents");
+    // Several pages across the boundary of two capped views unmap together; the pages on both sides stay.
+    check(api.map(window + 1000 * kPage64k, 50, nullptr) == window + 1000 * kPage64k &&
+              reserved_only(window + 1000 * kPage64k) && reserved_only(window + 1049 * kPage64k),
+          "a multi-page range across two views unmaps");
+    check(page_holds(window + 999 * kPage64k, 1000u) && page_holds(window + 1050 * kPage64k, 1051u),
+          "the pages on both sides of it keep their contents");
+    // Mapping other pages over the middle of a live run replaces just those pages.
+    check(api.map(window + 500 * kPage64k, 3, &pages[600]) == window + 500 * kPage64k &&
+              page_holds(window + 500 * kPage64k, 601u) && page_holds(window + 502 * kPage64k, 603u),
+          "pages mapped over the middle of a live run replace it there");
+    check(page_holds(window + 499 * kPage64k, 500u) && page_holds(window + 503 * kPage64k, 504u),
+          "and the run's pages around them keep their contents");
+    check(api.map(window, kPages, nullptr) == window && reserved_only(window) &&
+              reserved_only(window + (kPages - 1) * kPage64k),
+          "the whole run unmaps");
+    check(api.free_pages(kPages, pages.data()) == TRUE, "the long run's pages are freed");
+    check(api.map(window, 1, pages.data()) == nullptr && reserved_only(window), "a freed page does not map again");
+}
+
 void test_placeholders(const PhysicalApi& api) {
     auto* const base = static_cast<uint8_t*>(
         api.virtual_alloc(nullptr, 6 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
@@ -746,6 +804,7 @@ int main() {
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
+        test_long_run(physical);
         test_placeholders(physical);
         test_write_combine_window(physical);
     }
