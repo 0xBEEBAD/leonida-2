@@ -1314,11 +1314,13 @@ implementation-defined for binary64; the GPU oracle therefore counts `v_rsq_f64`
 `v_sqrt_f64` as unjudged skips instead of requiring bit-exact results. This was confirmed on an NVIDIA RTX 4070 with
 `shaderFloat64`: `v_rsq_f64 3.25` produced matching high 32 bits but zero low 32 bits, unlike the exact reference.
 A `v_div_fmas_f64` whose operands are all constants and whose product underflows against an opposite-signed zero (for
-example `v_div_fmas_f64 v[8:9], 16, 0xa5126aa7ea6efc1f, 0`, reference -0) came back as +0 on the RTX 4070. The same `Fma`
-on runtime operands (a `FragCoord`-derived shader) gives the IEEE -0, and the translator emits a plain GLSL `Fma`, so the
-reference and the translator agree with IEEE here. The likely cause is the driver folding an all-constant `Fma`; that is a
-hypothesis from this behaviour only, not checked against the driver. A GPU result that differs from
-the reference only in the sign of that zero is a counted skip with that reason; any other difference is still a mismatch.
+example `v_div_fmas_f64 v[8:9], 16, 0xa5126aa7ea6efc1f, 0`, reference -0) came back as +0 on an NVIDIA RTX 4070. The same
+`Fma` on runtime operands (a `FragCoord`-derived shader) gives the IEEE -0 there, and the translator emits a plain GLSL
+`Fma`, so the reference and the translator agree with IEEE here. The likely cause is a driver folding an all-constant
+`Fma`; that is a hypothesis from this behaviour only, not checked against the driver, and it was observed on that one
+device. Because any Vulkan driver could do the same, the exclusion is not tied to a vendor: in every `--oracle gpu` run, a
+result that differs from the reference only in the sign of that zero is a counted skip (with a vendor-neutral reason);
+any other difference is still a mismatch. It does not apply to `--oracle hw`, which runs real hardware kernels.
 
 Known divergence probes are excluded and counted by default, then reinserted with `--known`: binary64 output modifiers
 (SHADER-721), binary64 `OpFNegate`/`FAbs` that the CPU interpreter rounds through binary32 (TEST-912, #4172),
@@ -1343,7 +1345,11 @@ failing program is re-run alone while it is shrunk. The hardware runs every form
 too, and the kernels start in the game's inferred float MODE (IEEE off, DX10_CLAMP on). `v_rcp_f64`, `v_rsq_f64` and
 `v_sqrt_f64` are counted skips there, because the native results are approximations (PROC-216) and the reference is exact;
 an architecture that cannot set that MODE (gfx1170 and later) or a program the assembler rejects is a counted skip with the
-runner's reason. It exits 77 only when the `tools/hw_oracle` tools or device are missing. The path is covered by
+runner's reason. The kernel runs one thread of a wave32, so EXEC starts as 1: a `v_cmpx` result that the program reads back
+through `exec_lo` is 1 or 0 on hardware, while the translator and Vulkan oracles show the full 32-lane mask
+(`0xffffffff`); the reference models the lane count of the oracle it is compared with (found on `gfx1036` by
+@abnalstlll-byte at 7bd5f01d: `word 1: expected 00000001 ffffffff, actual 00000001 00000001`). It exits 77 only when the
+`tools/hw_oracle` tools or device are missing. The path is covered by
 `tests/test_f64_diff.py` with a fake oracle (routing, `--hw-arch`, exit 77, skips, shrinking); **no AMD hardware run has
 been done for it yet**.
 Exit codes are 0 for no unexpected
