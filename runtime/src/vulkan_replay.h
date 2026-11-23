@@ -3741,6 +3741,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                  VkAccessFlags dst_access, VkPipelineStageFlags dst_stages) {
                 detail::restrict_to_queue(vk, src_stages, src_access);
                 detail::restrict_to_queue(vk, dst_stages, dst_access);
+                // Flush before adding this barrier's stages, so they go out with it rather than with the full batch.
+                if (from != to && batch.count == std::size(batch.images)) flush();
                 batch.src_stages |= src_stages;
                 batch.dst_stages |= dst_stages;
                 if (from == to) {
@@ -3748,7 +3750,6 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     batch.memory_dst |= dst_access;
                     return;
                 }
-                if (batch.count == std::size(batch.images)) flush();
                 VkImageMemoryBarrier& barrier = batch.images[batch.count++];
                 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
                 barrier.srcAccessMask = src_access;

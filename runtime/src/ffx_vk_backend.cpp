@@ -8,11 +8,13 @@ namespace leonida::ffx_vk {
 
 namespace {
 constexpr const char* loader_name = "amd_fidelityfx_loader_vk.dll";
+constexpr const char* provider_name = "amd_fidelityfx_upscaler_vk.dll";
 }
 
 Upscaler::~Upscaler() {
     if (context_ && destroy_) destroy_(&context_, nullptr);
     if (module_) FreeLibrary(static_cast<HMODULE>(module_));
+    if (provider_module_) FreeLibrary(static_cast<HMODULE>(provider_module_));
 }
 
 bool Upscaler::load(std::string& error) {
@@ -21,8 +23,9 @@ bool Upscaler::load(std::string& error) {
     char dir[MAX_PATH] = {};
     std::size_t length = 0;
     if (getenv_s(&length, dir, sizeof(dir), "LEONIDA_FFX_DIR") == 0 && length > 1) {
-        // The loader finds amd_fidelityfx_upscaler_vk.dll next to itself, so the folder goes on the DLL search path.
-        SetDllDirectoryA(dir);
+        // The loader asks for the provider by name; loading it first by full path lets that resolve without changing
+        // the process-wide DLL search path.
+        if (!provider_module_) provider_module_ = LoadLibraryA((std::string(dir) + "\\" + provider_name).c_str());
         path = std::string(dir) + "\\" + loader_name;
     }
     HMODULE module = LoadLibraryA(path.c_str());
