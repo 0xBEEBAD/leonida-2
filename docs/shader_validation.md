@@ -680,9 +680,13 @@ The first seven are the gfx103x encodings; `--ops gfx103x` keeps only those.
 The reference uses Python integers and shares no code with the translator. It takes the exact sum
 `sum(S0.elem[k] * S1.elem[k]) + acc` modulo 2^32, or under `clamp` saturates it to
 `[-2^31, 2^31-1]` (signed) or `[0, 2^32-1]` (unsigned). `tests/test_dot_diff.py` checks it against
-the 15 words measured on gfx1036 in `tests/semantic/test_alu_dot4_i8.py`: the plain form, both
-source orders of `v_dot4c_i32_i8`, and `op_sel` 2 / `op_sel_hi` 5. It is compared with the
-translation run in `spirv_mini_interp`, on the four exported mrt0 words, bit for bit.
+the rows measured on gfx1036 in `tests/semantic/test_alu_dot4_i8.py`: 10 operand sets (`MEASURED`),
+each of which gave one word as `v_dot4_i32_i8`, as `v_dot4c_i32_i8` and with the two sources swapped,
+and 5 more under `op_sel` 2 / `op_sel_hi` 5 (`MEASURED_OP_SEL`). Saturation under `clamp` is measured on
+hardware only for `v_dot4_i32_i8` (its two overflowing cases give 0x7fffffff and 0x80000000); for the other ops
+the reference takes it from the ISA documentation, so a misreading the translator shares would not show
+here. It is compared with the translation run in `spirv_mini_interp`, on the four exported mrt0 words,
+bit for bit.
 
 **Programs and sources.**
 - Programs follow the `sad_diff.py` shape: seeds in v8..v15 and s4..s7, then family ops writing
@@ -724,8 +728,12 @@ Four mutations of the translator's dot lowering are all caught by a default run
 |---|---|
 | unsigned `clamp` that never saturates | 32 + 192 |
 | `u4` lanes sign-extended | 91 + 116 |
-| `op_sel_hi` ignored on `v_dot4_i32_i8` | 8 sweep |
+| `op_sel_hi[0]` ignored on `v_dot4_i32_i8` (S0's byte pairs 2..3 always from the high half) | 8 sweep |
 | `v_dot2_i32_i16` product carry dropped | 4 grid, missed by the sweep and by 200 random programs |
+
+The counts belong to these exact one-line changes and move with the mutation. On the same run, ignoring
+`op_sel_hi[1]` instead fails 10 sweep programs, ignoring both 13, and reading S1's byte pairs 2..3 from the
+low half (an `op_sel_hi[1]` taken as 0) fails 64.
 
 ### Images on the GPU (`tools/image_fuzz.py`)
 
