@@ -180,6 +180,9 @@ enum GameInputFocusPolicy : uint32_t { GameInputDefaultFocusPolicy = 0 };
 
 using GameInputCallbackToken = uint64_t;
 constexpr GameInputCallbackToken kInvalidCallbackToken = 0;
+// GAMEINPUT_CURRENT_CALLBACK_TOKEN_VALUE: inside a callback, StopCallback / UnregisterCallback take it as the callback
+// that is running; outside one it names nothing.
+constexpr GameInputCallbackToken kCurrentCallbackToken = 0xFFFFFFFFFFFFFFFFull;
 
 // Error codes (facility 0x38A).
 constexpr HRESULT GAMEINPUT_E_DEVICE_DISCONNECTED = static_cast<HRESULT>(0x838A0001L);
