@@ -118,6 +118,15 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
             name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" ||
             name == "ApuCreateHeap")
             return ReturnClass::HResult;
+    } else if (dll == "xapu.dll") {
+        if (name == "XApuConnect" || name == "XApuDisconnect" ||
+            name == "XApuEnqueueCommand" || name == "XApuDequeueResult")
+            return ReturnClass::HResult;
+    } else if (dll == "chad.dll") {
+        if (name == "XDspConnectWithMaximumStreamLimit" || name == "XDspActivate" ||
+            name == "XDspDeactivate" || name == "XDspDisconnect" ||
+            name == "XDspSubmitCommand")
+            return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
         for (const char* n : kNotHResult)
