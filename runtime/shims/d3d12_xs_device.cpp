@@ -41,6 +41,16 @@
 #include <memory>
 #include <utility>
 
+// Xbox slot 14's console CreateDescriptorHeap helper: defined in d3d12_vulkan_device.cpp and declared in
+// d3d12_com.h. Declared here instead of including d3d12_com.h, because that header pulls in gfx10_descriptors.h and
+// vulkan_backend.h, and this translation unit is also compiled by the standalone proxy tests, which do not carry the
+// Vulkan include path.
+namespace rt::d3d12 {
+HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                       D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
+                                       REFIID riid, void** out);
+}  // namespace rt::d3d12
+
 namespace rt::d3d12_xs {
 namespace {
 
