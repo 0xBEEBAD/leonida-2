@@ -1238,6 +1238,8 @@ signed infinity, measured on RDNA2 `gfx1036` (TEST-983; the translator has it si
 The `v_div_fixup_f64` reference follows the `gfx1036` measurements in the `docs/design.md` row (#2477): a NaN in `S1` or
 `S2` passes through unquieted (IEEE off), the underflow cutoff is `exp(S2) - exp(S1) <= -1076` and there is no overflow
 check.
+The `v_div_fmas_f64` reference scales by `2^128` when `exp(S2) > 1023` and by `2^-128` otherwise when VCC is set, as the
+`docs/design.md` row measured on `gfx1036` (it used a fixed `2^64` before).
 `--oracle gpu` translates the same
 fragment shader and runs it through `runtime/build/vk_harness`, comparing the raw RGBA32F output words. It assembles
 the fragment module with `spirv-as` and the full-screen vertex shader with the Vulkan SDK's `glslc`; use `--exe PATH`
