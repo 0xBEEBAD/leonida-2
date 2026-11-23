@@ -11,7 +11,7 @@ Nothing was run. `tools/import_fail_fast.py` reads the file: it finds each impor
 after each call up to the test of the result and follows both sides of the branch for a few instructions. The method
 and its limits are in the tool's docstring. No code or data of the executable is quoted here, only names, counts and
 conditions. Measured on SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`. The bindings below
-are those of `main` `56e607ac`.
+are those of `main` `829e5ede`.
 
 ```powershell
 python -I tools/import_fail_fast.py game_scarlett_master.exe
@@ -31,12 +31,13 @@ to another register before the test. At the other, the failing side reaches `int
 
 | Import | Calls | Fatal | Stops when | Note |
 |---|---:|---:|---|---|
-| `xmem.dll!XMemVirtualAlloc` | 23 | 14 | `rax == 0` | `docs/xmem_exe_calls.md`: the shim at `main` refuses all 23 calls (each passes an attribute word), so the first of these 14 that the boot reaches stops it |
+| `xmem.dll!XMemVirtualAlloc` | 23 | 14 | `rax == 0` | Since #6908 the shim takes the attribute word and drops the `PAGE_GRAPHICS_*` bits. It still refuses the 2 MiB page mode (`allocation_type` `0x20003000`, `ERROR_NOT_SUPPORTED`), which 4 of these 14 sites pass; the other 10 reach `VirtualAlloc`. The 6 calls it refuses for `0x4000` or `0x40000` (`docs/xmem_exe_calls.md`) are not among the 14 |
 | `XMemGetWorkingSetStatistics` | 3 | 2 | `eax == 0` | The shim returns `FALSE` only for a null output or a failed `GetProcessMemoryInfo`; both sites pass a stack buffer |
 | `XMemTransferMemory` | 1 | 1 | `eax == 0` | The shim returns `TRUE` |
 | `CreateFileW` | 13 | 1 | `rax == -1` | One open that has no failure path: the file must exist where `runtime/shims/file_system.cpp` maps it |
 | `GetModuleHandleW` | 3 | 1 | `rax == 0` | Two calls in a row, for `api-ms-win-core-synch-l1-2-0.dll` and then `kernel32.dll`; the title stops when both give `NULL` |
 | `_configure_narrow_argv` | 1 | 1 | `eax != 0` | The CRT's start-up; the shim returns 0 |
+| `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` | 1 | 1 | `eax < 0` | The shim (#6792) returns `S_OK` |
 
 ### No binding at `main`: what the default return does
 
@@ -50,7 +51,6 @@ under `fail` too unless `runtime/shims/registry.cpp` lists it as returning an `H
 | `XMemMapPhysicalPagesScatter` | 2 | 2 | `eax == 0` | yes |
 | `XMemIsToolsMemAvailable` | 1 | 1 | `eax == 0` | yes, where reached: the function holding the site has 6 callers, and each calls it only after one helper returns true (the first after an allocation failed) |
 | `AcpHal.dll!ApuCreateHeap` | 1 | 1 | `eax < 0` | no: 0 is `S_OK`, with the output unset |
-| `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` | 1 | 1 | `eax < 0` | no, as above |
 | `GameInput.dll!#1` | 1 | 1 | `eax < 0` | no. The executable imports `GameInput.dll` by ordinal 1 only, and the shim table names `GameInputCreate`. The site zeroes an out pointer before the call and calls the object's `AddRef` after it, so ordinal 1 is `GameInputCreate(IGameInput**)`, which #3410 binds |
 
 The four xmem rows are the ones a return of 0 stops: 8 sites.
