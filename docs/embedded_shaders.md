@@ -393,3 +393,13 @@ reason to run again, a second run that leaves no duplicate containers, the repor
 every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` index (found by the
 container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
 creates a pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.
+
+**Retail executable (`exe_shaders()`).** After `bvh_shaders()`, `make_game.py`'s `shaders` stage runs
+`exe_shaders()` on `<game>/game_scarlett_master.exe` when present (skipping cleanly and dropping any stale
+`<work>/shaders/spirv/exe/index.json` and `exe_build.json` when the package has no executable). It runs the same
+four tools into `<work>/shaders/exe` and `<work>/shaders/spirv/exe` (without `--max-shared-memory`, since the
+executable's containers are 1 VS + 9 PS graphics shaders), tracking inputs in `exe_build.json` and logging
+translated/missing counts on every run. Measured on 1.0.2.1: 10 of 10 programs translate and pass `spirv-val`
+natively and with `--wave64-emulate`, and `vk_pipeline_check` passes 10/10 modules and 10/10 pipelines (0 failed, 0 skipped) on an AMD Radeon RX 9070 XT
+(RADV GFX1201, Mesa 26.2.6) and an AMD Ryzen 7 9800X3D integrated GPU (RADV RAPHAEL_MENDOCINO, Mesa 26.2.6).
+`ShaderLibrary::load` does not read `<shaders>/exe` yet (a separate runtime change). `tests/test_exe_shaders_stage.py` covers the step on synthetic VS/PS `PSV0` containers without game data.
