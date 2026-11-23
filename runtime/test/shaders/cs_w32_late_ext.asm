@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; Ops merged with CPU-only checks (#1954 ds_mskor, #1974 v_add/sub_nc_i16 clamp, #1948 s_buffer_load constant
 ; SGPR offset), run once on a GPU. Lane 0 of a wave32 group stores eight dwords:
 ;   out[0] = ds_mskor_rtn_b32 old value (LDS 0x12345678, DATA 0xFF00, DATA2 0xAB00)          = 0x12345678
