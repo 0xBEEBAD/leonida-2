@@ -2275,7 +2275,10 @@ public:
                 retry = host_transfer_;  // a failed allocation/bind retries on the staging path too
             }
             if (!retry) return E_OUTOFMEMORY;
-            log_once("host-transfer image has no memory type; using staging copies, format", int(info.format));
+            log_once(requirements.memoryTypeBits == 0 || device_.info.force_host_transfer_retry
+                         ? "host-transfer image has no memory type; using staging copies, format"
+                         : "host-transfer image could not be bound; using staging copies, format",
+                     int(info.format));
             vk.vkDestroyImage(device_.info.device, image_, nullptr);
             image_ = VK_NULL_HANDLE;
             host_transfer_ = false;
