@@ -491,6 +491,9 @@ if(BUILD_TESTING)
   # VulkanContext::view's attachment-view cache (runtime/src/image_view_cache.h): pure stdlib, no Vulkan instance.
   add_executable(image_view_cache_test test/image_view_cache_test.cpp)
   add_test(NAME image_view_cache COMMAND image_view_cache_test)
+  # DeviceState's border colour table and replaced views (runtime/src/descriptor_tables.h): pure stdlib.
+  add_executable(descriptor_tables_test test/descriptor_tables_test.cpp)
+  add_test(NAME descriptor_tables COMMAND descriptor_tables_test)
 
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
