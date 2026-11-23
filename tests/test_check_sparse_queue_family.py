@@ -138,6 +138,61 @@ CONCURRENT_TRACE = (checker.SPARSE_FLAGS + ")\n"
                     "    pQueueFamilyIndices[1]: const uint32_t = 1\n") * 6
 
 
+def make_queue_trace(pdev: str, families: list[tuple[int, int, tuple[int, int, int]]],
+                     created_families: int, buffers: str) -> str:
+    entries = []
+    for i, (flags, count, (w, h, d)) in enumerate(families):
+        entries.append(
+            f"        pQueueFamilyProperties[{i}]: VkQueueFamilyProperties = 0x{i:x}:\n"
+            f"            queueFlags: VkQueueFlags = {flags}\n"
+            f"            queueCount: uint32_t = {count}\n"
+            f"            minImageTransferGranularity: VkExtent3D = 0:\n"
+            f"                width: uint32_t = {w}\n"
+            f"                height: uint32_t = {h}\n"
+            f"                depth: uint32_t = {d}\n"
+        )
+    return (
+        "vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties) returns void:\n"
+        "<before calling into implementation>\n"
+        f"    physicalDevice: VkPhysicalDevice = {pdev}\n"
+        "<after returning from implementation>\n"
+        f"    physicalDevice: VkPhysicalDevice = {pdev}\n"
+        f"    pQueueFamilyPropertyCount: uint32_t* = {len(families)}\n"
+        + "".join(entries)
+        + "vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice) returns VkResult:\n"
+        "<before calling into implementation>\n"
+        f"    physicalDevice: VkPhysicalDevice = {pdev}\n"
+        f"        queueCreateInfoCount: uint32_t = {created_families}\n"
+        + buffers
+    )
+
+
+SINGLE_FAMILY_TRACE = make_queue_trace(
+    "000002C74B774620",
+    [(15, 1, (1, 1, 1)), (32, 2, (1, 1, 1))],  # graphics+compute+transfer+sparse, plus video-decode only
+    created_families=1,
+    buffers=EXCLUSIVE_TRACE,
+)
+NO_ASYNC_SPARSE_TRACE = make_queue_trace(
+    "000002C74B774620",
+    [(15, 1, (1, 1, 1)), (6, 2, (1, 1, 1)), (4, 1, (1, 1, 1))],  # async compute & copy lack SPARSE_BINDING_BIT (8)
+    created_families=1,
+    buffers=EXCLUSIVE_TRACE,
+)
+MULTI_FAMILY_DROPPED_TRACE = make_queue_trace(
+    "000001C77C556640",
+    [(15, 16, (1, 1, 1)), (12, 2, (1, 1, 1)), (14, 8, (1, 1, 1))],
+    created_families=1,
+    buffers=EXCLUSIVE_TRACE,
+)
+MULTI_FAMILY_OK_TRACE = make_queue_trace(
+    "000001C77C556640",
+    [(15, 16, (1, 1, 1)), (12, 2, (1, 1, 1)), (14, 8, (1, 1, 1))],
+    created_families=3,
+    buffers=CONCURRENT_TRACE,
+)
+
+
 class TraceTest(unittest.TestCase):
     def check(self, text):
         with tempfile.TemporaryDirectory() as td:
@@ -220,6 +275,48 @@ class MainTest(unittest.TestCase):
             self.run_main(fake_run)
         self.assertEqual(len(calls), 2)
         self.assertEqual([c.get("VK_INSTANCE_LAYERS") for c in calls], ["VK_LAYER_LUNARG_api_dump", None])
+
+    def run_main_with_trace(self, trace: str, *, extra_argv: list[str] | None = None,
+                            validation_out: str = PASS_OUT) -> int:
+        def fake_run(argv, cwd, env, **kwargs):
+            if env.get("VK_INSTANCE_LAYERS") == "VK_LAYER_LUNARG_api_dump":
+                (Path(cwd) / "sparse_create_info.log").write_text(trace, encoding="utf-8")
+                return Completed(0, PASS_OUT)
+            return Completed(0, validation_out)
+
+        with tempfile.TemporaryDirectory() as td:
+            exe = Path(td) / "t.exe"
+            exe.write_bytes(b"")
+            with mock.patch.object(checker.subprocess, "run", side_effect=fake_run), \
+                 mock.patch.object(sys, "argv", ["check", str(exe), *(extra_argv or [])]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                return checker.main()
+
+    def test_single_sparse_family_device_skips_with_77(self) -> None:
+        self.assertEqual(self.run_main_with_trace(SINGLE_FAMILY_TRACE), 77)
+        self.assertEqual(self.run_main_with_trace(NO_ASYNC_SPARSE_TRACE), 77)
+
+    def test_single_sparse_family_baseline_mode_skips_with_77(self) -> None:
+        self.assertEqual(self.run_main_with_trace(SINGLE_FAMILY_TRACE, extra_argv=["--expect-baseline-exclusive"]), 77)
+
+    def test_multi_sparse_family_device_creating_one_family_still_fails(self) -> None:
+        with self.assertRaises(AssertionError):
+            self.run_main_with_trace(MULTI_FAMILY_DROPPED_TRACE)
+
+    def test_single_family_device_with_concurrent_buffers_fails(self) -> None:
+        bad = make_queue_trace("000002C74B774620", [(15, 1, (1, 1, 1))], created_families=1, buffers=CONCURRENT_TRACE)
+        with self.assertRaises(AssertionError):
+            self.run_main_with_trace(bad)
+
+    def test_single_family_device_validation_error_still_fails(self) -> None:
+        with self.assertRaises(AssertionError):
+            self.run_main_with_trace(
+                SINGLE_FAMILY_TRACE,
+                validation_out=PASS_OUT + "Validation Error: [ VUID-vkCmdDraw-None-02699 ] synthetic\n",
+            )
+
+    def test_multi_family_device_passes_concurrent_contract(self) -> None:
+        self.assertEqual(self.run_main_with_trace(MULTI_FAMILY_OK_TRACE), 0)
 
 
 if __name__ == "__main__":

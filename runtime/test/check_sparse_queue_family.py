@@ -29,6 +29,14 @@ SPARSE_FLAGS = "VkBufferCreateFlags = 7 (VK_BUFFER_CREATE_SPARSE_BINDING_BIT"
 MODE = re.compile(r"sharingMode:\s+VkSharingMode = (VK_SHARING_MODE_\w+)")
 COUNT = re.compile(r"queueFamilyIndexCount:\s+uint32_t = (\d+)")
 INDICES = re.compile(r"pQueueFamilyIndices\[(\d+)\]:\s+const uint32_t = (\d+)")
+CREATE_DEVICE = re.compile(r"^vkCreateDevice\(.*?(?=^vk\w+\(|\Z)", re.M | re.S)
+QUEUE_FAMILY_PROPS = re.compile(r"^vkGetPhysicalDeviceQueueFamilyProperties\(.*?(?=^vk\w+\(|\Z)", re.M | re.S)
+PHYS_DEVICE = re.compile(r"physicalDevice:\s+VkPhysicalDevice\s*=\s*([0-9a-fA-Fx]+)")
+QUEUE_CREATE_COUNT = re.compile(r"queueCreateInfoCount:\s+uint32_t\s*=\s*(\d+)")
+VK_QUEUE_GRAPHICS_BIT = 0x1
+VK_QUEUE_COMPUTE_BIT = 0x2
+VK_QUEUE_TRANSFER_BIT = 0x4
+VK_QUEUE_SPARSE_BINDING_BIT = 0x8
 # Each of the two runs gets 30 s, so both together stay inside the CTest TIMEOUT of 65 s (runtime/CMakeLists.txt).
 RUN_TIMEOUT = 30
 ACCESS_VIOLATION = 0xC0000005   # STATUS_ACCESS_VIOLATION, as Windows reports it in the exit code
@@ -38,7 +46,59 @@ CALL_HEAD = re.compile(r"^(vk\w+)\(", re.M)
 CASE = re.compile(r"^RESULT (LAYER_MAP_(?:DIRECT|COPY|COMPUTE)_COPY_COMPUTE) PASS mapped_mismatch=0/65536 unmapped_nonzero=0/65536$", re.M)
 
 
-def check_trace(path: Path, expect_exclusive: bool) -> tuple[int, int]:
+def single_sparse_queue_family(path: Path) -> bool:
+    """True when vkCreateDevice uses 1 queue family and the physical device exposes no second sparse-capable family.
+
+    Mirrors runtime/src/queue_families.h (pick_queue_families + sparse_capable_queue_families): Leonida only creates
+    a second family when a non-graphics SPARSE_BINDING family supports async compute or fine-grained (1x1x1) transfer.
+    On single-family GPUs (e.g. Intel Xe-LP iGPUs), VK_SHARING_MODE_CONCURRENT is illegal (VUID-00914).
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    devices = CREATE_DEVICE.findall(text)
+    if len(devices) != 1:
+        return False
+    pdev_m = PHYS_DEVICE.search(devices[0])
+    qci_m = QUEUE_CREATE_COUNT.search(devices[0])
+    if not pdev_m or not qci_m or int(qci_m.group(1)) != 1:
+        return False
+    pdev = pdev_m.group(1)
+
+    families: list[tuple[int, int, int, int, int]] = []
+    for call in QUEUE_FAMILY_PROPS.findall(text):
+        after = call.split("<after returning from implementation>", 1)
+        body = after[1] if len(after) == 2 else call
+        pm = PHYS_DEVICE.search(body)
+        if not pm or pm.group(1) != pdev or "pQueueFamilyProperties[0]:" not in body:
+            continue
+        parsed: list[tuple[int, int, int, int, int]] = []
+        for chunk in re.split(r"(?=pQueueFamilyProperties\[\d+\]:)", body)[1:]:
+            fm = re.search(r"queueFlags:\s+VkQueueFlags\s*=\s*(\d+)", chunk)
+            cm = re.search(r"queueCount:\s+uint32_t\s*=\s*(\d+)", chunk)
+            wm = re.search(r"width:\s+uint32_t\s*=\s*(\d+)", chunk)
+            hm = re.search(r"height:\s+uint32_t\s*=\s*(\d+)", chunk)
+            dm = re.search(r"depth:\s+uint32_t\s*=\s*(\d+)", chunk)
+            if fm and cm and wm and hm and dm:
+                parsed.append((int(fm.group(1)), int(cm.group(1)), int(wm.group(1)), int(hm.group(1)), int(dm.group(1))))
+        if parsed:
+            families = parsed
+    if not families:
+        return False
+
+    has_graphics_sparse = False
+    has_extra_sparse = False
+    for flags, count, w, h, d in families:
+        if count == 0 or not (flags & VK_QUEUE_SPARSE_BINDING_BIT):
+            continue
+        if flags & VK_QUEUE_GRAPHICS_BIT:
+            has_graphics_sparse = True
+        elif flags & VK_QUEUE_COMPUTE_BIT:
+            has_extra_sparse = True
+        elif (flags & VK_QUEUE_TRANSFER_BIT) and (w, h, d) == (1, 1, 1):
+            has_extra_sparse = True
+    return has_graphics_sparse and not has_extra_sparse
+
+
+def check_trace(path: Path, expect_exclusive: bool, *, single_family: bool = False) -> tuple[int, int]:
     rows = path.read_text(encoding="utf-8", errors="replace").splitlines()
     records = 0
     for i, line in enumerate(rows):
@@ -53,8 +113,11 @@ def check_trace(path: Path, expect_exclusive: bool) -> tuple[int, int]:
             raise AssertionError(f"incomplete API dump sparse VkBuffer at line {i+1}")
         sharing, n = mode.group(1), int(count.group(1))
         indices = [(int(slot), int(family)) for slot, family in INDICES.findall(tail)]
-        if expect_exclusive:
+        if expect_exclusive or single_family:
             if sharing != "VK_SHARING_MODE_EXCLUSIVE" or n != 0 or indices:
+                if single_family and not expect_exclusive:
+                    raise AssertionError(f"invalid sparse buffer on single-family device at line {i+1}: "
+                                         f"{sharing}, count={n}, indices={indices}")
                 raise AssertionError(f"baseline negative control not reproduced at line {i+1}")
         elif (sharing != "VK_SHARING_MODE_CONCURRENT" or n < 2 or len(indices) != n
               or len({slot for slot, _ in indices if slot < n}) != n
@@ -101,13 +164,18 @@ def main() -> int:
         if not candidates:
             print("SKIP 77: Vulkan SDK VK_LAYER_LUNARG_api_dump unavailable or did not write trace")
             return 77
-        calls, infos = check_trace(candidates[0], args.expect_baseline_exclusive)
+        single_family = single_sparse_queue_family(candidates[0])
+        calls, infos = check_trace(candidates[0], args.expect_baseline_exclusive, single_family=single_family)
         validation_out, skip = run_pass(exe, validation_env, path)
         if skip:
             return skip
         errors = [line for line in validation_out.splitlines() if "Validation Error" in line or "VUID-" in line]
         if errors:
             raise AssertionError(f"Khronos validation reported {len(errors)} error line(s); first: {errors[0][:300]}")
+        if single_family:
+            print(f"SKIP 77: GPU exposes only 1 sparse-capable queue family; cross-family CONCURRENT sparse buffer "
+                  f"contract requires 2+ families ({calls} EXCLUSIVE sparse VkBuffer creations and Khronos validation passed)")
+            return 77
         kinds = sorted(CASE.findall(dump_out))
         print(f"GPU PASS: {len(kinds)} COPY/COMPUTE sparse queue cases, mapped 65,536 bytes exact, unmapped 65,536 zeros")
         print(f"VK API CONTRACT PASS: {calls} sparse VkBuffer creations / {infos} create-info records = "
