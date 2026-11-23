@@ -76,6 +76,9 @@ Useful switches:
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
+  `python -I tools/int3_cause.py game_scarlett_master.exe exe+0x...` reads, from the file alone, which branch sends
+  the game to an `int3`, its condition (`eax < 0`) and the import, vtable slot or function whose result it tests. An
+  `int3` that ends a function that never returns is read at that function's call sites.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
