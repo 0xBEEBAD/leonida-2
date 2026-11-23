@@ -7,8 +7,8 @@
 // (docs/d3d12_vulkan.md A.3), and 1920x1080 -> 3840x2160 (4K, Performance). An RGBA16F checkerboard of 32-pixel squares
 // (1.0 / 0.0), depth 0 (far, inverted) and zero motion go through 30 upscales with a Halton(2,3) jitter, using the
 // game's measured context flags (HDR, inverted depth, auto exposure). Then every output value must be finite and the
-// centre of every output square near its input value. Prints the provider the loader chose (FSR 4.1 on GPUs AMD ships it
-// for, else 3.1) and the time per upscale. Exits 77 without a Vulkan device or the loader DLL.
+// centre of every output square near its input value. Prints the provider the loader chose for the GPU and driver
+// (FSR 4.1 or 3.1, docs/d3d12_vulkan.md A.3) and the time per upscale. Exits 77 without a Vulkan device or the loader DLL.
 //
 // LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation, and any validation error fails it, except the
 // ones known_provider_error names: those are in AMD's FSR 4.1.2 shaders (this test creates no shader module and
