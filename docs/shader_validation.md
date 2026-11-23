@@ -1734,7 +1734,8 @@ code with the translator:
 - **norm / pknorm:** `round_even(clamp(x, lo, 1) * 32767 or 65535)`, rounded once from the exact product. A NaN
   gives 0, and f16 denormals are values.
 - **Destination halves:** norm keeps `D[31:16]`. pknorm writes `S0`'s result to the low half and `S1`'s to the
-  high half.
+  high half. With the destination `op_sel` bit of the f16 forms, `S0`'s result goes to `D[31:16]`, `D[15:0]` is 0
+  and `S1`'s result is dropped (measured on gfx1036, the `v_cvt_pknorm_*_f16` row of [design.md](design.md)).
 
 `tests/test_cvt_diff.py` checks the reference against three things:
 - the 12 `pknorm_f32` near-tie words measured on gfx1036 (`tests/semantic/test_alu_cvt_pknorm_f32.py`);
@@ -1748,14 +1749,14 @@ code with the translator:
   constant is its f16 value in a 16-bit operand.
 - Modifiers:
   - `neg`/`abs` on every register source of the `_e64`/VOP3 forms;
-  - `op_sel:[a,b,0]` on the f16 pknorm register sources;
-  - the measured no-ops: `clamp`, `mul:2`, `mul:4` and `div:2` on norm, and `clamp` on `pknorm_f32`.
+  - `op_sel:[a,b,c]` on the f16 pknorm forms: `a` and `b` pick the high half of a register source, `c` is the
+    destination bit above;
+  - the measured no-ops: `clamp`, `mul:2`, `mul:4` and `div:2` on norm, and `clamp` on pknorm of both widths.
 - Every program is encodable on GFX10: at most one literal and two constant-bus reads.
-- `--self-test` pins the forms the translator refuses: `clamp`, an output multiplier or a destination `op_sel` on
-  `pknorm_f16`, and an output multiplier on `pknorm_f32`.
+- `--self-test` pins the forms the translator refuses: an output multiplier on pknorm of either width.
 
 **Stages.**
-1. A sweep of every source kind with every modifier setting (1,132 programs).
+1. A sweep of every source kind with every modifier setting (1,948 programs).
 2. An edge grid (4,428 cases, four per program). Inputs are zeros, denormals, ±0.5 and its neighbours, the 1/32767
    and 1/65535 steps, 2^23 and 2^31 neighbours, the largest finite values, ±inf, and quiet and signalling NaNs. It
    also takes 144 f32 near ties of `x * 32767` and `x * 65535`, and every f16 in (0, 1] within 1/256 of a tie. That
@@ -1775,7 +1776,9 @@ python -I tests/test_cvt_diff.py
 
 **Results.** Seeds 776521 to 776524 (`--programs 25000 --max-ops 8`) and 776525 to 776528 (`--programs 100000
 --max-ops 8`) match bit for bit, with zero mismatches and zero skips: 4 x 27,239 and 4 x 102,239 programs.
-`--exhaustive-f16` matches 49,152 of 49,152 programs.
+`--exhaustive-f16` matches 49,152 of 49,152 programs. Those runs predate the generation of the f16 destination
+`op_sel` and of `clamp` on `pknorm_f16`; with both, seed 776539 (`--programs 2000 --max-ops 8`) matches 5,055 of
+5,055 programs.
 
 Nine mutations of the translator's lowerings, run with `--programs 300 --seed 2` (failing programs per stage):
 
@@ -1793,6 +1796,14 @@ Nine mutations of the translator's lowerings, run with `--programs 300 --seed 2`
 
 The grid is the only stage that catches the `norm_f16` and denormal mutations. The last one is a translation the
 interpreter calls undefined, so it shows up as skips; that is why a skip exits 1.
+
+That table predates the generation of the f16 destination `op_sel` and of `clamp` on `pknorm_f16`. With both
+generated, on the same seed and program count, two more mutations of those lowerings:
+
+| Mutation | Sweep | Grid | Random |
+|---|---|---|---|
+| `pknorm_f16` ignores the destination `op_sel` | 676 | 0 | 33 |
+| `pknorm_i16_f16` `clamp` clamps to [0, 1] | 31 | 0 | 11 |
 
 ### `v_mad_f32`, `v_mac_f32`, `v_mad_legacy_f32` denormal flush on RDNA1 (`tools/mad_denorm_probe.py`, SHADER-340)
 
