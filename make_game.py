@@ -41,6 +41,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1705,6 +1706,41 @@ def build_pipeline_check(jobs: int) -> None:
                 "or VULKAN_SDK); the CMake output above says which is missing.")
 
 
+def install_runtime(game: str, out: str, artifacts: list) -> None:
+    """Puts the runtime files, game_path.txt and (off Windows) gta6rt.sh in `out`, staged first (RT-249).
+
+    Everything is written to a staging folder inside `out` (same filesystem), and only once all of it is there does
+    each file replace its old copy with os.replace, which is atomic per file. A copy that fails (disk full, a file
+    locked by a running gta6rt.exe, an interrupt) leaves the previous install untouched and no staging folder
+    behind, instead of a new gta6rt.exe next to an old gta6rt_tls_host.dll."""
+    os.makedirs(out, exist_ok=True)
+    stage = tempfile.mkdtemp(prefix=".runtime-staging-", dir=out)
+    try:
+        staged = []
+        for built in artifacts:
+            name = os.path.basename(built)
+            target = os.path.join(out, name)
+            # --runtime-build may be the output folder itself (a runtime build unpacked where the port goes): the
+            # file is in place then, and copying it onto itself raises SameFileError.
+            if os.path.exists(target) and os.path.samefile(built, target):
+                continue
+            shutil.copy2(built, os.path.join(stage, name))
+            staged.append(name)
+        with open(os.path.join(stage, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(os.path.abspath(game))
+        staged.append("game_path.txt")
+        if os.name != "nt":
+            launcher = os.path.join(stage, "gta6rt.sh")
+            with open(launcher, "w", encoding="utf-8", newline="\n") as f:
+                f.write(WINE_LAUNCHER)
+            os.chmod(launcher, os.stat(launcher).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            staged.append("gta6rt.sh")
+        for name in staged:
+            os.replace(os.path.join(stage, name), os.path.join(out, name))
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1) -> None:
     if runtime_build:
         log(f"runtime: using the build in {runtime_build}")
@@ -1720,21 +1756,8 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     for built in artifacts:
         if not os.path.isfile(built):
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
-    os.makedirs(out, exist_ok=True)
-    for built in artifacts:
-        # --runtime-build may be the output folder itself (a runtime build unpacked where the port goes): the
-        # files are in place then, and copying a file onto itself raises SameFileError.
-        if not os.path.exists(os.path.join(out, os.path.basename(built))) or \
-                not os.path.samefile(built, os.path.join(out, os.path.basename(built))):
-            shutil.copy2(built, out)
-    with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
-        f.write(os.path.abspath(game))
-    start = os.path.join(out, "gta6rt.exe")
-    if os.name != "nt":
-        start = os.path.join(out, "gta6rt.sh")
-        with open(start, "w", encoding="utf-8", newline="\n") as f:
-            f.write(WINE_LAUNCHER)
-        os.chmod(start, os.stat(start).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    install_runtime(game, out, artifacts)
+    start = os.path.join(out, "gta6rt.exe" if os.name == "nt" else "gta6rt.sh")
     image = os.path.join(game, v["expected_exe"])
     if not os.path.isfile(image):
         log(f"runtime: built, but {v['expected_exe']} is missing from your copy, so there is nothing to run yet.")
