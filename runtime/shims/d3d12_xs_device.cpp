@@ -25,6 +25,9 @@
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "d3d12_com.h"
+#endif
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -1601,12 +1604,14 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
             // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
             // non-zero console VA is present; normal PC 16-byte descs never enter it.
+#ifdef LEONIDA_VULKAN_DEVICE
             if (address != 0) {
                 console_extended = true;
                 hr = rt::d3d12::create_console_descriptor_heap(
                     self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
                     __uuidof(ID3D12DescriptorHeap), &created);
             }
+#endif
         }
     }
     if (!console_extended)
