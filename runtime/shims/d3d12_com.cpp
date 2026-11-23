@@ -440,6 +440,7 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
+        if (stub_pipeline_) return;  // as record_draw
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
@@ -787,6 +788,7 @@ public:
             if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
                 return check(false);
         }
+        if (stub_pipeline_) return;  // as record_draw: the arguments were checked, nothing is recorded
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
         cmd.stride = stride;
@@ -1141,6 +1143,7 @@ private:
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
     std::uintptr_t graphics_pipeline_ = 0;
+    bool stub_pipeline_ = false;  // the bound pipeline state is a LEONIDA_STUB_PIPELINES stub (set_pipeline)
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
@@ -1201,7 +1204,10 @@ private:
         hold(state);
         compute_pipeline_ = compute_pipeline_id(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
-        if (state && !compute_pipeline_ && !graphics_pipeline_)
+        // A LEONIDA_STUB_PIPELINES stub holds no pipeline: what is drawn or dispatched while it is bound is dropped
+        // (record_draw, record_dispatch, DispatchMesh), where no pipeline at all makes the list invalid.
+        stub_pipeline_ = pipeline_is_stub(state);
+        if (state && !compute_pipeline_ && !graphics_pipeline_ && !stub_pipeline_)
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
     }
 
@@ -1236,6 +1242,7 @@ private:
     }
 
     void record_dispatch(UINT x, UINT y, UINT z) {
+        if (stub_pipeline_) return;  // a stubbed pipeline: nothing to run, and the list stays valid
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
@@ -1255,6 +1262,7 @@ private:
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
+        if (stub_pipeline_) return;  // a stubbed pipeline: nothing to run, and the list stays valid
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.

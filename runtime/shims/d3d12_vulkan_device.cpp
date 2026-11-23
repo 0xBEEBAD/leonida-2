@@ -3151,9 +3151,10 @@ public:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
     // LEONIDA_STUB_PIPELINES=1 (diagnostic): a pipeline whose translated shader is missing is created without a
-    // Vulkan pipeline. It is never registered, so SetPipelineState leaves no PSO bound and its draws and dispatches
-    // are recorded as no-ops (D3D-482). No game shader runs; the boot gets past a title that refuses to go on when
-    // pipeline creation fails.
+    // Vulkan pipeline. It is never registered; the command list sees that it is this device's pipeline state with no
+    // pipeline in it (pipeline_is_stub) and records nothing for the draws and dispatches made while it is bound
+    // (D3D-482), so the list stays valid. No game shader runs; the boot gets past a title that refuses to go on
+    // when pipeline creation fails.
     static bool stub_pipelines() {
         wchar_t v[8] = {};
         const DWORD n = GetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", v, 8);
@@ -8335,6 +8336,11 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->graphics() ? p->id() : 0;
+}
+
+bool pipeline_is_stub(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && !p->graphics() && !p->compute();
 }
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {

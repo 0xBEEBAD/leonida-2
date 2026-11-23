@@ -78,7 +78,9 @@ Useful switches:
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
   for its program) as a no-op stub instead of failing `CreateGraphicsPipelineState` / `CreateComputePipelineState`.
-  The stub is never registered, so `SetPipelineState` binds no PSO and its draws and dispatches are no-ops (D3D-482).
+  The stub is never registered. A command list that binds it drops the draws, dispatches and indirect commands made
+  while it is bound, and stays valid: `Close` succeeds and the list holds none of them (D3D-482). With no pipeline
+  state bound at all the same calls still make `Close` fail, as before.
   Diagnostic only, like `LEONIDA_SKIP_INT3`: it follows a boot past every pipeline the title creates without
   translating or running a game shader, so nothing the title draws reaches the screen. Each stub is logged with a
   power-of-two count.
