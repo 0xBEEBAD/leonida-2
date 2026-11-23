@@ -434,7 +434,6 @@ int check_levels() {
             void* const va = reinterpret_cast<void*>(0x7f0000000000ull);
             const HRESULT r133 = hr_of(raw(device, 133, word(va), word(&xbox_desc), 0xFFFFFFFFull, 0,
                                            word(&resource_iid), word(&placed)));
-            xs::set_placed_at_va_handler(nullptr);
             EXPECT(r133 == S_OK && placed == reinterpret_cast<void*>(0x1330));
             EXPECT(seen_real == xs::device_proxy_real_device(device) && seen_va == va);
             EXPECT(static_cast<std::uint32_t>(seen_desc.Flags) == 0x4);
@@ -442,6 +441,20 @@ int check_levels() {
             EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
             EXPECT(seen_layout == 0xFFFFFFFFu);  // the title's third word, passed through as the barrier layout
             EXPECT(xs::device_slot_overridden(133));
+
+            // A committed depth provider without a placement validator leaves slot 133 to the generic handler.
+            EXPECT(xs::set_depth_stencil_uav_provider(device, [](ID3D12Resource*, D3D12_HEAP_FLAGS) -> HRESULT {
+                return E_UNEXPECTED;
+            }));
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            xbox_desc.Format = DXGI_FORMAT_R16_TYPELESS;
+            xbox_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            placed = nullptr;
+            EXPECT(hr_of(raw(device, 133, word(va), word(&xbox_desc), 3, 0, word(&resource_iid), word(&placed))) == S_OK);
+            EXPECT(placed == reinterpret_cast<void*>(0x1330) && seen_layout == 3 && seen_desc.Flags == xbox_desc.Flags);
+            xs::set_placed_at_va_handler(nullptr);
+            EXPECT(hr_of(raw(device, 133)) == E_NOTIMPL);
+            EXPECT(xs::set_depth_stencil_uav_provider(device, nullptr));
         }
 
         // 133 with a pages hook (set_placed_at_va_pages_hook): a buffer's range [va, va + width) is handed to it

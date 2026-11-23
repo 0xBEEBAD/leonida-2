@@ -1759,7 +1759,6 @@ HRESULT create_depth_uav_backing(DeviceProxy* self, const D3D12_HEAP_PROPERTIES*
 
 HRESULT proxy_create_placed_depth(DeviceProxy* self, UINT64 address, const D3D12_RESOURCE_DESC& desc,
                                   std::uint32_t layout, const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
-    if (!self->validate_depth_placement) return E_NOTIMPL;
     const auto native = depth_image_desc(desc);
     if (!self->validate_depth_placement(native, layout, clear)) return E_INVALIDARG;
     const auto alloc = self->real->GetResourceAllocationInfo(0, 1, &native);
@@ -1820,9 +1819,10 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     if (out) *out = nullptr;
     // An unhandled slot past the PC vtable is refused before inspecting any of its arguments.
     const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
-    if (!handler && !self->validate_depth_placement) return E_NOTIMPL;
+    const bool can_place_depth = self->depth_stencil_uav_provider && self->validate_depth_placement;
+    if (!handler && !can_place_depth) return E_NOTIMPL;
     if (!out || !xbox_desc || !riid) return E_POINTER;
-    if (supports_depth_uav(self, *xbox_desc))
+    if (can_place_depth && depth_uav_description(*xbox_desc))
         return proxy_create_placed_depth(self, reinterpret_cast<UINT64>(va), *xbox_desc, layout, clear, *riid, out);
     if (!handler) return E_NOTIMPL;
     // An integer mask: a D3D12_RESOURCE_FLAGS constant past the SDK's last enumerator is not a constant expression
