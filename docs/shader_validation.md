@@ -1231,10 +1231,11 @@ implementation-defined for binary64; the GPU oracle therefore counts `v_rsq_f64`
 
 Known divergence probes are excluded and counted by default, then reinserted with `--known`: binary64 output modifiers
 (SHADER-721), binary64 `OpFNegate`/`FAbs` that the CPU interpreter rounds through binary32 (TEST-912, #4172),
-driver-dependent NaN or signed-zero clamp results, and `v_div_fixup_f64` with a NaN `S0` and an ordinary finite
-division. The latter follows the RDNA2 ISA reference (`NaN(S0) -> signed infinity`), while the current translator
-preserves the NaN payload. Therefore `--known` can intentionally return 1 when this known mismatch is reproduced;
-the minimized case is printed. `--oracle gpu` translates the same
+and driver-dependent NaN or signed-zero clamp results. The CPU translator reproduces none of these today, so
+`--known` is clean there; it can still return 1 where one reproduces (the RTX 4070 `--oracle gpu` run does for the
+clamp form), and the minimized case is printed. `v_div_fixup_f64` with a NaN `S0` is not a known divergence: it gives
+signed infinity, measured on RDNA2 `gfx1036` (TEST-983; the translator has it since #2477), and is compared like any other case.
+`--oracle gpu` translates the same
 fragment shader and runs it through `runtime/build/vk_harness`, comparing the raw RGBA32F output words. It assembles
 the fragment module with `spirv-as` and the full-screen vertex shader with the Vulkan SDK's `glslc`; use `--exe PATH`
 to select another `vk_harness`. It exits 77 if the executable, SDK tools, Vulkan device or required `shaderFloat64`
