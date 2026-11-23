@@ -247,9 +247,15 @@ void merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDe
                      static_cast<int>(result));
 }
 
-// Writes what this device compiled for the next launch (D3D-704). Called once the device is idle, before the cache
-// is destroyed. Past the cap nothing is written: the blob from an earlier, smaller session stays, which is better
-// than replacing it with one the next launch would keep refusing to save.
+bool startup_cache_checkpoints_enabled() {
+    static const bool enabled = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"LEONIDA_STARTUP_CACHE_CHECKPOINTS", value, 2) == 1 && value[0] == L'1';
+    }();
+    return enabled;
+}
+
+// Writes the session cache at a startup checkpoint or during device teardown. The size cap applies to either write.
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
     const std::size_t limit = pipeline_cache_save_limit();
@@ -270,8 +276,7 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
     }
     std::vector<char> data;
     try {
-        // Room to spare in case the driver counts the blob short between the query and the read. Nothing creates
-        // pipelines while the device is torn down, so this is a belt-and-braces margin, not a retry loop.
+        // Leave room in case another thread grows the cache between the size query and the read.
         data.resize(size + (size >> 4));
     } catch (const std::bad_alloc&) {
         std::fprintf(stderr,
@@ -705,6 +710,7 @@ struct DeviceState {
     leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
     std::once_flag pipeline_cache_once;
     VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
+    std::mutex startup_cache_checkpoint_mutex;
 
     VkPipelineCache pipeline_cache() {
         std::call_once(pipeline_cache_once, [this] {
@@ -3903,9 +3909,21 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
+        const VkPipelineCache cache = device_.pipeline_cache();
+        const bool checkpoint = cache && startup_cache_checkpoints_enabled();
+        const ULONGLONG started = checkpoint ? GetTickCount64() : 0;
+        if (vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &pipeline_.pipeline) != VK_SUCCESS)
             return E_FAIL;
+        if (checkpoint && GetTickCount64() - started >= 500) {
+            const std::unique_lock lock(device_.startup_cache_checkpoint_mutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                try {
+                    save_session_pipeline_cache(vk, dev, cache);
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[rt] d3d12: pipeline cache checkpoint failed (%s)\n", error.what());
+                }
+            }
+        }
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
