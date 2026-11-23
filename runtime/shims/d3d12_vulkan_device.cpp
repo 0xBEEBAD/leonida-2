@@ -6594,11 +6594,16 @@ public:
         }
         if (r) {
             write_image_descriptor(*r, view, destination, false);
-        } else if (view.format == DXGI_FORMAT_UNKNOWN || view.format == rd.Format) {
-            // Swapchain images have one mip and a typed Vulkan format with no view format list.
+        } else if (view.format == DXGI_FORMAT_UNKNOWN || view.format == rd.Format ||
+                   (back_buffer->srgb_view_format != VK_FORMAT_UNDEFINED &&
+                    vulkan_format(view.format, false).format == back_buffer->srgb_view_format)) {
+            // Swapchain images have one mip and a typed Vulkan format. An 8-bit UNORM one is also viewable in its
+            // sRGB format (host-measured on WARP), which the offscreen image lists (dxgi_swapchain.h).
             const TextureBacking backing{
                 rd, back_buffer->image, back_buffer->format, back_buffer->aspects, back_buffer->swapchain_image_address};
             write_image_descriptor(backing, view, destination, false);
+        } else {
+            log_once("back-buffer shader-resource view format not supported; format", int(view.format));
         }
     }
 
