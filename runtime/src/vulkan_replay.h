@@ -812,6 +812,7 @@ enum class ReplayResult {
 // LOCAL DIAGNOSTIC: the arena's host mapping and size, for dumps of what a shader would read.
 inline std::uint8_t* g_local_arena_mapped = nullptr;
 inline std::uint64_t g_local_arena_size = 0;
+inline std::atomic<std::uint64_t> g_local_last_cb96{0};  // title address of the last 96-byte constant view created
 
 // LOCAL DIAGNOSTIC: which check returned unresolved_resource (first 3 times per source line).
 inline ReplayResult local_unresolved_at(int line) {
@@ -2265,6 +2266,12 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                         } else {
                             std::fprintf(stderr, "[rt] localdbg:   title table guess is not readable title memory\n");
                         }
+                    }
+                    if (const std::uint64_t cb = g_local_last_cb96.load()) {
+                        const float* f3 = reinterpret_cast<const float*>(cb);
+                        std::fprintf(stderr, "[rt] localdbg:   96-byte constants in title memory at draw time:");
+                        for (int w = 0; w < 24; ++w) std::fprintf(stderr, " %g", f3[w]);
+                        std::fprintf(stderr, "\n");
                     }
                     {   // what sits just before the vertices in the title's ring
                         const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(view.va - 0x60);

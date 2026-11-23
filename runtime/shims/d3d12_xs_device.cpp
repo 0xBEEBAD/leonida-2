@@ -24,6 +24,7 @@
 // 78 SetFrameIntervalX, 79 ScheduleFrameEventX and 80 WaitFrameEventX. The slots can be moved with LEONIDA_XS_*_SLOT
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
+#include "../src/vulkan_replay.h"
 #include "title_window.h"
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
@@ -2750,6 +2751,8 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
+    if (desc && desc->SizeInBytes == 96 && desc->BufferLocation < 0x100000000ull)
+        leonida::g_local_last_cb96.store(desc->BufferLocation);
     {   // LOCAL DIAGNOSTIC
         static std::atomic<int> said{0};
         const int n = said.fetch_add(1);
@@ -2758,6 +2761,15 @@ void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
             std::fprintf(stderr, "[rt] localdbg: CreateCBV #%d dest=0x%llx -> 0x%llx location=0x%llx size=%u\n", n,
                          static_cast<unsigned long long>(dest.ptr), static_cast<unsigned long long>(t.ptr),
                          desc ? static_cast<unsigned long long>(desc->BufferLocation) : 0ull, desc ? desc->SizeInBytes : 0u);
+            MEMORY_BASIC_INFORMATION q{};
+            if (desc && desc->BufferLocation && desc->BufferLocation < 0x100000000ull &&
+                VirtualQuery(reinterpret_cast<const void*>(desc->BufferLocation), &q, sizeof(q)) && q.State == MEM_COMMIT &&
+                !(q.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                const float* f = reinterpret_cast<const float*>(desc->BufferLocation);
+                std::fprintf(stderr, "[rt] localdbg:   constants now:");
+                for (int w = 0; w < 24 && w * 4u < desc->SizeInBytes; ++w) std::fprintf(stderr, " %g", f[w]);
+                std::fprintf(stderr, "\n");
+            }
         }
     }
     self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));

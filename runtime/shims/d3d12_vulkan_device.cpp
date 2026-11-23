@@ -6710,6 +6710,14 @@ public:
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
+        const rt::rootsig::StagePackResult local_stage = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex);
+        const bool local_stage_layout = local_graphics_stage_layout() && local_stage.ok;
+        if (local_graphics_stage_layout()) {
+            static std::atomic<int> said{0};
+            if (said.fetch_add(1) < 3)
+                std::fprintf(stderr, "[rt] d3d12: local: graphics root arguments in the console stage layout (from s%u): %s\n",
+                             local_stage.base, local_stage.ok ? "ok" : local_stage.error.c_str());
+        }
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = UINT32_MAX;
             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
@@ -6717,6 +6725,7 @@ public:
                     first = d;
                     break;
                 }
+            if (local_stage_layout) first = local_stage.first_sgpr[i];
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
                                          table_view_descriptors(parsed.sig.params[i])});

@@ -10,6 +10,8 @@
 // - the CPU handle of an RTV or DSV points at a leonida::TargetView in the device's descriptor heap.
 #pragma once
 
+#include <cstdlib>
+
 #include <windows.h>
 #include <d3d12.h>
 #include <memory>
@@ -371,6 +373,14 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 //     exist, because a mesh shader (s16) and a pixel shader (s8) share one push-constant block);
 //   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
+// LOCAL EXPERIMENT: LEONIDA_GRAPHICS_STAGE_LAYOUT=1 lays graphics root arguments out as the console does for the
+// vertex, pixel and geometry stages (rt::rootsig::pack_stage: from s8, a descriptor table in one dword) instead of
+// from s0 with two dwords per address.
+inline bool local_graphics_stage_layout() {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_GRAPHICS_STAGE_LAYOUT"); return v && *v == '1'; }();
+    return on;
+}
+
 struct RootArgumentLayout {
     struct Parameter {
         rt::rootsig::ParamType type;
