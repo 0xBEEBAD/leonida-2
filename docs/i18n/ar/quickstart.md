@@ -60,7 +60,7 @@ python -I make_game.py --check --full-check
 python -I make_game.py --game "D:\path\to\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 ```
 
-ترتيب المراحل هو `check` ثم `shaders` ثم `assets` ثم `runtime` ثم `pipelines`.
+تعمل مرحلة `check` دائمًا أولاً؛ بعد ذلك، تعمل `shaders` و`assets` و`runtime` معًا في نفس الوقت عند طلبها (فهي لا تعتمد على بعضها البعض). تبدأ `pipelines` بمجرد جاهزية برامج التظليل المترجمة، وفي حال تضمن التشغيل مرحلة `runtime`، بعد قيام تلك المرحلة بإعادة بناء `vk_pipeline_check`؛ لذا يمكنها أن تعمل أثناء اكتمال مرحلة `assets`.
 يمكن اختيار مراحل بعينها باستخدام `--stages shaders,assets`. عادةً ما تستغرق ترجمة برامج التظليل أطول وقت،
 ويمكن ضبط عدد عملياتها باستخدام `--jobs`. اترك `--wave64-emulate` على القيمة الافتراضية `auto` ما لم تحتج إلى تجاوز اختيار الأداة.
 يضيف `--wav` نسخًا بصيغة PCM WAV من مسارات Ogg Opus ويزيد المساحة المطلوبة.

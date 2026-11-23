@@ -118,7 +118,7 @@ python -I make_game.py --game "D:\pfad\zum\paket" --wav   # dekodiert Opus zusä
 python -I make_game.py --wave64-emulate auto           # auto (Standard), on oder off
 ```
 
-Die Stufen laufen in dieser Reihenfolge: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
+`check` läuft immer zuerst; danach laufen `shaders`, `assets` und `runtime` gleichzeitig, wenn sie angefordert werden (sie hängen nicht voneinander ab). `pipelines` startet, sobald die übersetzten Shader bereit sind und, falls der Durchlauf `runtime` enthält, sobald diese Stufe `vk_pipeline_check` neu kompiliert hat: sie kann also laufen, während `assets` beendet wird.
 
 - **`--wave64-emulate`**: emuliert Wave64-Compute- und -Mesh-Shader auf GPUs mit 32 breiten Subgroups (NVIDIA und
   Intel). Der Standard `auto` fragt `vulkaninfo` und schaltet die Emulation selbst ein, wenn sie gebraucht wird.

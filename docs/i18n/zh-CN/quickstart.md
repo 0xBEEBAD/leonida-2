@@ -94,7 +94,7 @@ python -I make_game.py --game "D:\path\to\package" --wav  # 额外把 Ogg Opus �
 python -I make_game.py --wave64-emulate auto              # auto（默认）、on 或 off
 ```
 
-阶段顺序：`check` → `shaders` → `assets` → `runtime` → `pipelines`。`pipelines` 阶段在你的 GPU 驱动上创建每个
+`check` 始终最先运行；随后，`shaders`、`assets` 和 `runtime` 在请求时会并行运行（它们互不依赖）。一旦翻译后的着色器准备就绪，并且（如果本次运行包含 `runtime`）该阶段已重新编译了 `vk_pipeline_check`，`pipelines` 便会启动，因此它可以在 `assets` 完成期间并行运行。`pipelines` 阶段在你的 GPU 驱动上创建每个
 翻译后的着色器并检查能否编译，报告必须跳过的着色器，并把管线缓存保存到 `--out` 里的 `pipeline_cache.bin`；
 runtime 目前还不加载这个缓存，所以它不会加快首次启动。
 
