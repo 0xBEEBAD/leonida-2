@@ -126,14 +126,28 @@ python -I tools/cpu_ref.py <listing.s> --json
 python -I tests/test_cpu_ref.py
 ```
 
-The scalar ALU has its own differential fuzzer (FUZZ-4), `tools/salu_diff.py`: a separate reference for 87
+The scalar ALU has its own differential fuzzer (FUZZ-4), `tools/salu_diff.py`: a separate reference for 117
 SOP1/SOP2/SOPC/SOPK opcodes with SCC kept explicit, seeded programs, the translated SPIR-V run in
 `tests/semantic/spirv_mini_interp.py`, and failing programs shrunk to the instructions that matter.
 64-bit mask ops are left out by default (the translator models them as wave masks), and `s_bfe_*` control
 words stay inside offset + width <= 32 unless `--bfe-any`. Its docstring lists the known divergences.
 
+The SCC selects `s_cmov_b32`, `s_cmovk_i32` and `s_cmov_b64` (on plain data pairs) keep D when SCC is 0. When the
+opcodes include `s_movrels_b32`/`s_movrels_b64`, a program sets M0 to 0..7 after the seeds, and each relative read
+stays inside the seeded SGPRs. An odd M0 gives no `s_movrels_b64` (an odd-aligned pair is unmeasured). These
+rows matched gfx1035 in `tools/int_hw_probe.py` below. Five translator mutations of them, `--programs 2000
+--seed 2 --max-ops 8` (mismatching programs, default / `--branches`):
+
+| Mutation | Default | `--branches` |
+|---|---|---|
+| `s_cmov_b32` ignores SCC | 11 | 137 |
+| `s_cmovk_i32` zero-extends its immediate | 1 | 52 |
+| `s_cmov_b64` keeps the high word | 6 | 96 |
+| `s_movrels` ignores M0 | 32 | 43 |
+| `s_movrels_b64` reads the high word without M0 | 7 | 9 |
+
 `--branches` puts SCC into control flow, one lane: after an SCC producer comes either a chain of 1..3 consumers
-(`s_cselect_b32`, `s_addc_u32`, `s_subb_u32`) or `s_cbranch_scc0`/`scc1` forward over the next 1..3 scalar
+(`s_cselect_b32`, `s_addc_u32`, `s_subb_u32` and the three `s_cmov` forms) or `s_cbranch_scc0`/`scc1` forward over the next 1..3 scalar
 instructions (no loops or nesting), and half the instructions are SCC producers. The listing carries
 `; encoding:` placeholders of each instruction's size, which places the branch targets. It is a flag so that the
 default seeds keep their programs; translator oracle only.
