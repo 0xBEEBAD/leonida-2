@@ -1290,7 +1290,9 @@ python -I tests/test_fmisc_diff.py
 ops, add, f64-to-f32 conversion, reciprocal/reciprocal-square-root/square-root, division fixup and scaled FMA, both
 frexp results, all 16 `v_cmp_*_f64` and 16 `v_cmpx_*_f64` predicates, and both class compares. It generates one-lane
 programs with VGPR and SGPR pairs, float immediates, inline constants, 32-bit literals where the translator marks
-them as upper-half f64 literals, and full-width literals in other instruction forms; it compares the four exported
+them as upper-half f64 literals (rounding, add, conversion to f32, frexp, reciprocal, reciprocal square root, square root,
+compares and class) and full-width literals in the other two forms, `v_div_fmas_f64` and `v_div_fixup_f64` (which reads a
+printed 32-bit literal as the low word on main); it compares the four exported
 dwords. Compare predicates are read through a mask-to-word operation, and `v_cmpx` cases also export the resulting
 `EXEC` mask. Its reference decodes IEEE binary64 words and uses exact
 `Fraction` arithmetic for finite addition and fused multiply-add; it does not import code from the translator or the
