@@ -52,9 +52,12 @@ in the image.
 
 - On an AMD Zen 2 or later host every flagged user-mode instruction runs as on the console.
 - On an Intel host the SSE4a, CLZERO and MONITORX sites, and on Intel client CPUs before Ice Lake the CLWB sites,
-  stop the game with `STATUS_ILLEGAL_INSTRUCTION` if it reaches them. They need a replacement before such a host can
-  run those paths: the instructions have plain equivalents (CLZERO zeroes a 64-byte line, CLWB is a write-back hint,
-  MONITORX/MWAITX is a wait that may return early, `insertq` is a bit-field insert into the low quadword).
+  raise `STATUS_ILLEGAL_INSTRUCTION` when reached. `gta6rt` emulates them (`runtime/src/cpu_emulation.h`, see
+  [runtime/README.md](../runtime/README.md), "PE loader"): CLZERO zeroes the 64-byte line, CLWB is a write-back hint
+  with nothing to do on coherent memory, MWAITX returns at once (an early return is one the manual allows), and
+  `insertq`/`extrq` are bit-field operations on the low quadword. `cpu_emulation_test` checks each form against the
+  CPU on a host that has it and against the handler on one that does not (an i7-10700K: all four lacking, all checks
+  pass).
 - The CPUID sites see the host's vendor, family and features, not the console's. What the game does with the
   answers is not measured here.
 
