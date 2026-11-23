@@ -3647,6 +3647,16 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   the functions as the loader binds them: on the RX 9070 XT the title's device is offered 4.1.2, 3.1.6 and 2.3.4,
   the context gets FSR 4.1.2 and 30 dispatches give the checkerboard; `d3d12_ffx_shim_off` checks that nothing is
   registered with the switch off. The game's own call sequence is unmeasured until its executable runs.
+- **Which console mode calls FSR.** Rockstar's statement on the console versions (reported in November 2026 by
+  [VideoCardz](https://videocardz.com/newz/gta-vi-uses-amd-fsr-4-on-xbox-series-s-renders-at-720p-with-ray-traced-global-illumination)
+  and [Alt Char](https://www.altchar.com/game-news/gta-vi-uses-amds-fsr-4-on-xbox-series-s-but-not-on-series-x-aOvqJ1G7YxhJ)):
+  the Series S renders at 720p and upscales to 1080p with FSR Upscaling 4, which is the one configuration the
+  package's DLL builds; the Series X (and PS5) renders at 1440p and reaches 4K with Rockstar's own TAA, not FSR.
+  The runtime reports a Series X by default (`XSystemGetDeviceType` in `runtime/shims/xgameruntime.cpp`), so the
+  title would take its TAA path and never call FSR; `LEONIDA_DEVICE_TYPE=6` reports a Series S (Lockhart), the mode
+  that calls it. That the title picks its mode from the device type is an assumption until it runs. The TAA path
+  needs nothing from the layer beyond the translated shaders; running FSR in the Series X mode would mean replacing
+  the title's TAA pass with an upscale on its inputs, which needs the title running to find that pass.
 
 ### A.4 Other DLLs and the executable
 
