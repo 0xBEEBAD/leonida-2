@@ -1369,6 +1369,55 @@ test `test_valu_mul_legacy_denorm.py` checks the exact bit patterns and the two 
 output scaling. This is a translation for the **inferred game MODE**, not a claim of correctly handling dynamic
 denormal-preserving or IEEE modes; native gfx1013 measurements of these new fixtures were not available.
 
+### f16 misc ops (`tools/f16misc_diff.py`)
+
+None of the other fuzzers generates these eleven f16 ops: `v_min3_f16`, `v_max3_f16`, `v_frexp_mant_f16`,
+`v_frexp_exp_i16_f16`, `v_ldexp_f16`, `v_fmamk_f16`, `v_fmaak_f16`, `v_pk_fmac_f16`, `v_fma_mix_f32`,
+`v_fma_mixlo_f16` and `v_fma_mixhi_f16`. `tools/f16misc_diff.py` runs them through the translator and
+`tests/semantic/spirv_mini_interp.py`, against an exact-rational model of the `docs/design.md` rows that shares no
+code with the translator, and compares the four exported words bit for bit. The model:
+
+- f16 operands and results keep denormals. An f32 operand of `v_fma_mix*` reads a denormal as a zero of its sign
+  (SHADER-298).
+- Every fma rounds once, from the exact value.
+- `min3`/`max3` ignore a NaN operand and order -0 below +0.
+- `frexp_mant` sets the exponent to 14, `frexp_exp` gives the exponent that goes with it, `ldexp` takes S1 as an
+  i16 clamped to [-64, 64] and rounds to nearest even into the denormal range.
+- `clamp` on `frexp_mant` and `ldexp` takes a NaN or a negative result to +0.
+
+`tests/test_f16misc_diff.py` pins the model to the gfx1036 words in `tests/semantic`: all 120 `min3`/`max3` rows of
+`test_alu_min3_max3_med3_16_hw.py`, 718 of the 719 `v_fma_mix*` rows of `test_alu_vop3_mods_hw.py` (the other is a
+clamp of -0, not judged) and the 24 measured `frexp`/`ldexp` rows. It also checks the model against the semantic
+reference of `test_alu_frexp_ldexp_f16.py` on every f16 input.
+
+Sources are VGPRs, SGPRs, a literal and integer and float inline constants, within the GFX10 literal and
+constant-bus limits. Modifiers are `neg`/`abs` on VOP3 register sources, `op_sel` on sources and the destination,
+`op_sel_hi` on the `v_fma_mix*` sources, and `clamp`. Output multipliers on f16 results are not generated
+(SHADER-297 is open). `--self-test` pins five refused forms as expected rejections.
+
+A NaN the model computes matches any NaN, since payloads are not modelled. A NaN that only passes through is
+compared exactly. Some programs are counted as not judged, with the reason:
+- reading such a NaN as bits;
+- an all-NaN `min3`/`max3` (the hardware returns src0's bits);
+- the clamp of a NaN or a -0 through `FClamp`;
+- an f32 denormal result of `v_fma_mix_f32`.
+
+Stages:
+1. A sweep of every source kind with every op and form.
+2. An edge grid of special values with fma near ties and cancellations.
+   - Some near ties are off the tie by less than half an f32 ulp. There, an fma rounded to f32 and then to f16
+     gives a different word, which is the bug class SHADER-55 fixed.
+3. Random seeded programs.
+
+`--exhaustive-f16` adds every f16 input through `frexp_mant`, `frexp_exp` and `ldexp`. A translator skip exits 1,
+as a mismatch does.
+
+```
+python -I tools/f16misc_diff.py --programs 3000 --seed 11 --max-ops 8
+python -I tools/f16misc_diff.py --exhaustive-f16 --programs 0 --no-sweep
+python -I tests/test_f16misc_diff.py
+```
+
 
 ### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
 
