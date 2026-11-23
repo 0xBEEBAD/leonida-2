@@ -1,9 +1,8 @@
 # Model recovery
 
-Measured state of `tools/rpf9dump models` on the Xbox Series 1.0.2.1 package, and the
-upstream `rpf9-explorer` fixes that close it. The fixes are merged upstream and the submodule is
-pinned at `e293917`, where a full ten-archive re-count recovers **382,781 models** (**0 decode
-failures**), up from 350,251 at `917e9b9` and 190,792 at `c3708fb`.
+Measured model recovery on the Xbox Series 1.0.2.1 package. At the `rpf9-explorer` pin
+`16134b0`, the ten-archive scan recovers **383,997 models** with **zero readback or decode
+failures**. The previous pin `e293917` recovered 382,781.
 
 Before the fix, the exporter did not reject any vertex or index layout in the tested archives. It
 dropped valid models in three validation paths, all in `third_party/rpf9-explorer` at commit
@@ -12,18 +11,16 @@ dropped valid models in three validation paths, all in `third_party/rpf9-explore
 ## Upstream status
 
 [Leonida issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
-fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged, and
-`third_party/rpf9-explorer` is now pinned at upstream `e293917` (was `917e9b9`, originally
-`48557ea`). Commits up to `917e9b9` added the `packs.rpf` drawable-dictionary roots (one drawable
+fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged.
+`third_party/rpf9-explorer` now pins `16134b0`, the merge of
+[rpf9-explorer PR #26](https://github.com/breadbbbb/rpf9-explorer/pull/26) (ASSET-430).
+Commits up to `917e9b9` added the `packs.rpf` drawable-dictionary roots (one drawable
 per entry), the TTPF compact/array/cubemap/volume layouts, and the external drawable-skeleton
 reader. Commits `917e9b9..e293917` add upstream `v1.2` model-discovery changes (PRs #8–#12:
 optional fragment pointers, skipping texture dictionaries in drawable-dictionary scans, 16-bit
 bone-palette indices, probe-count parity, and zero-radius drawables) plus BCPack BC1/BC3/BC4/BC5
-decoding (PR #7). A full ten-archive re-count at `e293917` recovers **382,781 models** (**+32,530**
-over `917e9b9`'s 350,251) with **0 decode failures**, **55,417 fragments** and **2,636,248,990
-triangles** (the `levels.rpf` cells from a full export, see the table note), and the earlier
-`917e9b9`, `c3708fb`, and `48557ea` measurements are kept below as controls. This page records the
-measured state; it is not a competing patch.
+decoding (PR #7). The re-counts below keep these earlier revisions as controls, including
+the full `levels.rpf` export at `e293917`.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
 Leonida, including 169 previously rejected candidates (also verified after archive readback). A
@@ -34,7 +31,40 @@ triangles). Issue #29's run uses its own recognized-candidate set and covers pri
 the pre-fix counts below use `rpf9dump`'s page-scan candidates and export every recovered
 drawable/LOD variant. The two sets are different scopes, not contradictory.
 
-### `packs.rpf` after the pin bump
+### Full-archive re-count at `16134b0` (ASSET-430)
+
+On the same ten `MODEL_ARCHIVES`, a read-only scan followed by segment readback and
+`RageModelDecoder.Decode` gave the counts below. No index cache or OBJ export was used.
+Candidates count archive offsets; a drawable dictionary can yield more than one model.
+
+| Decoder | `levels.rpf` candidates | Models | Rejects | All candidates | All models | All rejects |
+|---|---:|---:|---:|---:|---:|---:|
+| Previous Leonida pin `e293917` | 235,330 | 343,327 | 71 | 270,819 | 382,781 | 72 |
+| Upstream before PR #26 (`4566315`) | 235,580 | 343,641 | 7 | 271,970 | 383,996 | 8 |
+| Current pin `16134b0` | 235,580 | **343,642** | **6** | 271,970 | **383,997** | **7** |
+
+The bump preserves all previously recovered entries and their measured boundaries and geometry
+counts. Of the 1,216 added models, 1,151 came from newly discovered candidates, and 65 were
+among the 71 historical `levels.rpf` rejects. Upstream [PR #18](https://github.com/breadbbbb/rpf9-explorer/pull/18)
+already recovers 64 of those 71 by decoding large mesh index buffers. Upstream
+[PR #19](https://github.com/breadbbbb/rpf9-explorer/pull/19) adds discovery at 16-byte boundaries
+within pages. Outside `levels.rpf`, only `packs.rpf` (26,585 → 27,484 models) and
+`shared_minigame000.rpf` (1,294 → 1,296) gained models.
+
+**ASSET-430 adds one fragment, not 65.** Its page map and three checksum-verified zlib
+streams agree on one system block followed by two graphics blocks. A short secondary-LOD
+bone palette had made the extent probe ask for more system bytes. Recovery now honors the
+validated split, leaves the unavailable hashes unset, and retains strict geometry checks.
+Both readers agreed on readback; all four LODs decoded, and an independent check matched
+the primary LOD's 17 meshes, 5,091 vertices and 7,156 triangles. The six remaining fragment
+candidates lack drawable LOD pointers and fail bounds validation; no drawable geometry was
+validated for them. The separate `textures.rpf` texture-dictionary reject is unchanged.
+
+The pin also brings other merged upstream work, including Opus timing, RbPlus tiling, external
+BCPack history support and LOD selection. The counts above measure model recovery, not a new
+texture or audio export.
+
+### `packs.rpf` at the earlier pins
 
 `packs.rpf`'s `.#dr` pages are drawable-dictionary roots, not drawables, so the old candidate
 scan never saw them. The dictionary walk recovers **23,720 dictionary children** from that
@@ -44,7 +74,7 @@ upstream `v1.2` began recovering zero-radius fragments. The archive total is the
 (23,720 + 2,865), against 314 at `c3708fb`. A full `rpf9dump models` export at `917e9b9`
 reported **`ok=24,034 fail=0 skip=0` in 263 s** (0 embedded textures); the OBJs and manifest are
 local. The 314 `48557ea`/`c3708fb` entries in the table below are the pre-pin control, not the
-current `packs.rpf` result.
+`e293917` `packs.rpf` result.
 
 ### Full-archive re-count at `e293917`
 
@@ -104,11 +134,11 @@ What moved between `917e9b9` and `e293917`:
   [rpf9-explorer#12](https://github.com/breadbbbb/rpf9-explorer/pull/12) recovers all 11 zero-radius
   dictionary children in `core_restofworld` (797 → 808); `story000_restofworld.rpf` already
   recovered its 3 models at `917e9b9`, so its delta is 0.
-- **Remaining 72 rejects (down from 1,282 at `917e9b9`).** Aside from the single texture-dictionary
-  candidate in `textures.rpf`, all 71 remaining rejects are in `levels.rpf` (0 texture dictionaries,
-  0 zlib checksum errors). Sampled headers are fragment candidates (`LooksLikeFragment == true`)
-  whose `ProbeRequiredExtents` reports `MetadataComplete == false` on the first zlib block with
-  `RequiredSystemBytes` extending into subsequent 16-byte-aligned zlib continuation blocks.
+- **72 rejects at `e293917` (down from 1,282 at `917e9b9`).** One is the `textures.rpf`
+  texture dictionary; 71 are `levels.rpf` fragment candidates. In sampled cases, the first
+  zlib block did not satisfy the metadata probe. That alone was not the cause of rejection:
+  the [ASSET-430 re-count](#full-archive-re-count-at-16134b0-asset-430) distinguishes already
+  fixed mesh index handling, the short secondary palette, and failed drawable validation.
 
 Method checks: sharded 4 MiB `FindCandidateOffsets` was verified exact-equal against the
 single-threaded scan on `packs.rpf` (`26,389 == 26,389`), and `tools/rpf9dump models` end-to-end
@@ -117,7 +147,7 @@ OBJ + manifest export was spot-checked on `story000_restofworld.rpf` (`ok=3 fail
 
 ### Other archives at `917e9b9`
 
-A fresh scan/recover at the new pin (no cache; `models/3`) shows the same pattern in every
+A fresh scan/recover at `917e9b9` (no cache; `models/3`) shows the same pattern in every
 archive with drawable dictionaries: the `c3708fb` recovery is the non-child count, and the new
 entries are dictionary children.
 
@@ -135,7 +165,7 @@ entries are dictionary children.
 
 ### Re-count at `e293917`
 
-A full `rpf9dump models` re-run over the same archives at the current pin (the manifests are
+A full `rpf9dump models` re-run over the same archives at `e293917` (the manifests are
 local; `levels.rpf` was exported separately, see the table note above):
 
 | Archive | Rows | Non-fragment | Fragments | Delta vs `917e9b9` |
@@ -254,7 +284,7 @@ reproduced the ten-archive total. The `48557ea` column is the pre-fix control:
 | **Total** | **190,792** | **155,598** | **190,792** |
 
 The `packs.rpf` row is the pre-dictionary-root control: at `917e9b9` that archive recovers
-24,034 models (26,585 at `e293917`), and the other archives' new-pin counts are in the table above.
+24,034 models (26,585 at `e293917`), and the other archives' `e293917` counts are in the table above.
 The rows here are the `c3708fb` measurements (190,792 models); the `917e9b9` re-count is 350,251,
 and the `e293917` re-count outside `levels.rpf` is 39,454. The `e293917` triangle totals of all ten
 archives, `levels.rpf` included, are in the table above.
@@ -804,14 +834,8 @@ jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconst
 ## What to do next
 
 1. **Done:** [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged upstream.
-2. **Done:** the pin is `e293917` (was `917e9b9`, originally `48557ea`).
-3. **Done:** all ten `MODEL_ARCHIVES` were re-counted and read-back decoded at `e293917` (**382,781
-   models**, **0 decode failures**; table above, `levels.rpf` geometry from a full export).
-4. Investigate the 71 remaining unrecovered fragment candidates in `levels.rpf` (and the 1
-   texture-dictionary candidate in `textures.rpf`) if further upstream recovery is wanted.
-5. Keep issue #29 in sync with the `e293917` counts.
-3. **Done:** `tools/rpf9dump models` was re-run over the model-bearing archives at `e293917`;
-   the six non-`levels.rpf` archives total 39,454 rows (+3,203, almost all recovered fragments).
-   `levels.rpf` has the same 343,327 rows in a full export (50,731 fragments, 2,509,947,536
-   triangles).
-4. Keep the README and issue #29 in sync with the new counts.
+2. **Done:** pin the merge of [rpf9-explorer PR #26](https://github.com/breadbbbb/rpf9-explorer/pull/26)
+   and read back all recovered models across the ten archives (383,997 models, zero readback
+   or decode failures).
+3. A full `levels.rpf` OBJ export at `16134b0` is separate from the recovery count and was
+   not run; the historical full export used `e293917`.

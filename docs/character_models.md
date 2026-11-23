@@ -1,6 +1,6 @@
 # Character models and ped parts
 
-Measured from the pinned `e293917` export of `packs.rpf` (`tools/rpf9dump models`): **26,585
+Measured from the historical `e293917` export of `packs.rpf` (`tools/rpf9dump models`): **26,585
 manifest rows**, **11,335 unique names**, **23,720 `.#dr` drawable rows** and **2,865 `.#ft`
 fragment rows**. One row is one LOD or variant, so these are row counts, not character counts.
 
