@@ -1136,7 +1136,13 @@ class LayerTexturedOracleTests(unittest.TestCase):
         got, ambiguous = fl.uv_map(vertices, indices, 16, 12)
         for py in range(12):
             for px in range(16):
-                self.assertEqual(got[py * 16 + px], fl.uv_at(vertices, indices, px, py, 16, 12), (px, py))
+                want = fl.uv_at(vertices, indices, px, py, 16, 12)
+                # uv_map measures in pixels and uv_at in NDC, so the same UV can differ in the last bits.
+                if want is None:
+                    self.assertIsNone(got[py * 16 + px], (px, py))
+                else:
+                    for g, w in zip(got[py * 16 + px], want):
+                        self.assertAlmostEqual(g, w, places=12, msg=(px, py))
         self.assertTrue(any(g is None for g in got) and any(g is not None for g in got))
         self.assertEqual(ambiguous, set())   # overlapping interiors, not a seam: draw order decides
 
@@ -1159,6 +1165,40 @@ class LayerTexturedOracleTests(unittest.TestCase):
         for k in range(32 * 32):
             if k not in seam_f:
                 self.assertEqual(forward[k], backward[k], k)
+
+    def test_a_sample_just_off_an_edge_is_an_edge_sample(self):
+        # @throny's finding (#4251): pixel centres 1e-5 off a triangle edge were given to one triangle by the exact
+        # float test, while the GPU, which snaps vertices to 1/256 pixel, gave them to the one behind. Two layers
+        # with different UVs whose upper triangle's edge passes 0.001 pixel from a column of pixel centres: those
+        # samples are reported, not guessed. 0.02 pixel away is past EDGE_PX, so the upper triangle owns it.
+        def tri(pts, uv):
+            return [((x / 64) * 2 - 1, (y / 64) * 2 - 1, 0.5, uv[0], uv[1]) for x, y in pts]
+        for off, column_ambiguous in ((0.001, True), (-0.001, True), (0.02, False)):
+            with self.subTest(off=off):
+                below = tri([(2, 2), (60, 2), (2, 60)], (0.25, 0.75))
+                above = tri([(20.5 + off, 10), (40, 10), (20.5 + off, 40)], (0.75, 0.25))
+                _, seam = fl.uv_map(below + above, [0, 1, 2, 3, 4, 5], 64, 64)
+                self.assertEqual(bool(seam) and {k % 64 for k in seam} == {20}, column_ambiguous)
+
+    def test_band_widens_only_where_the_texture_changes_at_pixel_scale(self):
+        # The band is how much the reference moves when the sample moves by BAND_PX: zero over a flat texture, and
+        # under strong minification (here 16 texels per pixel across a hard edge) wide enough for the GPU's snapped
+        # position.
+        flat = [(0.5, 0.5, 0.5, 1.0)] * 64
+        edge = [((1.0 if x >= 4 else 0.0), 0.0, 0.0, 1.0) for y in range(8) for x in range(8)]
+        uv = (4.0 / 8, 0.5)
+        grads = [(16.0 / 8, 0.0, 0.0, 16.0 / 8)]
+        _, band, _ = fl.reference_pixels(flat, 8, 8, [uv], set(), grads)
+        self.assertEqual(struct.unpack("<4f", band), (0.0, 0.0, 0.0, 0.0))
+        _, band, _ = fl.reference_pixels(edge, 8, 8, [uv], set(), grads)
+        self.assertGreater(struct.unpack("<4f", band)[0], 0.2)
+        # At one texel per pixel the same edge moves the sample by only BAND_PX of a texel.
+        _, band, _ = fl.reference_pixels(edge, 8, 8, [uv], set(), [(1.0 / 8, 0.0, 0.0, 1.0 / 8)])
+        self.assertLessEqual(struct.unpack("<4f", band)[0], fl.BAND_PX + 1e-6)
+
+    def test_float_formats_get_a_relative_tolerance(self):
+        relative = {f for f, spec in fl.DDS_FORMATS.items() if spec[3] is None}
+        self.assertEqual(relative, {10, 54, 95, 96})
 
     def test_an_interior_hides_earlier_edges(self):
         # @whattheflop's second fixture (#2906): an inner triangle whose left edge (x = 24.5, on pixel centres) lies

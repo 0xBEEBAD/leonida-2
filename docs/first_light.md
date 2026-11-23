@@ -303,6 +303,27 @@ off by more than 2/255 five- to sevenfold. BC4/BC5 interpolate their 8-entry pal
 far outside every tolerance: declaring the BC1 sRGB texture as BC1 UNORM (a missed sRGB decode) gives a worst error
 of 0.31 with 28,829 channels over, and fails.
 
+**What the reference allows for, and why (@throny, #4251).** With other models and textures than the ones above,
+the first version of this check failed on a few hundred of 29,000 channels with a tiny mean error. Two effects of
+the rasteriser, not the layer, explained every one:
+- **Edge ownership.** The GPU snaps vertices to its sub-pixel grid (1/256 pixel) before it tests coverage, so a
+  pixel centre a hair from an edge (1e-5 pixel was enough) can go to the triangle behind it. A sample within
+  `EDGE_PX` (1/128 pixel) of an edge is now an edge sample. Where the triangles under it give different UVs, it is
+  reported, not compared.
+- **Minification with only mip 0.** On one game model the texture covers about 37 texels per pixel, so the same
+  sub-pixel shift moves the UV by a tenth of a texel. Every failing channel there was the reference moved by 0.002
+  to 0.02 pixel. `expected_band.raw` gives each pixel and channel how much the reference changes when the sample
+  moves by `BAND_PX` (1/32 pixel) along the triangle's UV gradient. The harness adds that to the format's
+  tolerance, so it widens only where the texture changes fast at that pixel's scale.
+
+Float formats (R16F, RGBA16F, BC6H) hold HDR values up to 34 in the game's textures, so their tolerance is relative
+to the expected value. A seam-heavy model may have up to 5% of its pixels reported, not 1%: a flattened 3D model
+stacks front and back layers whose edges cross many pixel centres (1.4% on one model).
+
+Re-run on four game models (37 textures across the 20 formats, 4 to 10 thousand covered pixels each, up to 37
+texels per pixel): all 148 draws pass on an RTX 3060, 0 channels over. The missed-sRGB control (BC1 sRGB declared
+as UNORM) still fails with the band: 9,992 channels over on the most minified model.
+
 ## 10. Limits and next
 
 * The camera draw (section 7) runs in `vk_harness` only. Through the D3D12 layer, s9 and the table it points at

@@ -393,6 +393,13 @@ int main() {
     const auto expected = read_file(dir / "expected.raw");
     EXPECT(expected.size() == pixels.size() * sizeof(Pixel));
     const double tolerance = number(manifest, "texture_tolerance", 4.0 / 255.0);
+    // expected_band.raw (optional): per pixel and channel, how much the reference itself changes when the sample
+    // position moves by the GPU's sub-pixel snapping; it is added to the tolerance. A float format's tolerance is
+    // relative to the expected value (HDR texels go well above 1).
+    const auto band = read_file(dir / "expected_band.raw");
+    EXPECT(band.empty() || band.size() == expected.size());
+    const leonida::Json* relative_key = manifest.find("texture_tolerance_relative");
+    const bool relative = relative_key && relative_key->kind == leonida::Json::Kind::boolean && relative_key->boolean;
     unsigned covered = 0, compared = 0, coverage_mismatch = 0, over = 0, ambiguous = 0;
     double worst = 0.0, sum = 0.0;
     for (UINT vk_y = 0; vk_y < height; ++vk_y) {
@@ -412,12 +419,16 @@ int main() {
                 continue;
             }
             ++compared;
+            Pixel slack{};
+            if (!band.empty())
+                std::memcpy(slack.data(), band.data() + (std::size_t(vk_y) * width + x) * sizeof(Pixel), sizeof(Pixel));
             for (int c = 0; c < 4; ++c) {
                 if (std::isnan(want[c])) continue;  // a channel the reference can't predict (an unknown alpha)
                 const double e = std::fabs(double(got[c]) - double(want[c]));
                 worst = std::max(worst, e);
                 sum += e;
-                if (e > tolerance) ++over;
+                const double scale = relative ? std::max(1.0, std::fabs(double(want[c]))) : 1.0;
+                if (e > tolerance * scale + double(slack[c])) ++over;
             }
         }
     }
@@ -426,7 +437,9 @@ int main() {
                 compared, worst, compared ? sum / (compared * 4.0) : 0.0, over, tolerance, coverage_mismatch,
                 ambiguous);
     EXPECT(compared > 0);
-    EXPECT(ambiguous <= covered / 100);  // seams are edges: a large count means the reference is wrong
+    // Seams are edges, so a large count means the reference is wrong. A flattened 3D model stacks its front and back
+    // layers, and their edges cross many pixel centres within the snapping distance (1.4% on one game model).
+    EXPECT(ambiguous <= covered / 20);
     // Coverage is the same rasterisation as d3d12_first_light; the CPU reference marks pixel centres inside a
     // triangle, so only edge pixels may disagree.
     EXPECT(coverage_mismatch <= covered / 100);

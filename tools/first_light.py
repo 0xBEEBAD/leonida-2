@@ -590,10 +590,12 @@ def sample_bilinear_clamp(texels, w: int, h: int, u: float, v: float):
                  for c in range(4))
 
 
-def edge_side(a, b, c, weights):
+def edge_side(a, b, c, weights, zero=None):
     """For a sample on exactly one edge of triangle abc: (the edge's endpoints as a sorted pair of positions, the
-    side of that edge the third vertex is on). None for a sample inside, or on a vertex (two zero weights)."""
-    zero = [i for i, w in enumerate(weights) if w <= 1e-6]
+    side of that edge the third vertex is on). None for a sample inside, or on a vertex (two zero weights). `zero`
+    lists the edges (by opposite vertex) the sample is on, when the caller has measured that itself."""
+    if zero is None:
+        zero = [i for i, w in enumerate(weights) if w <= 1e-6]
     if len(zero) != 1:
         return None
     verts = (a, b, c)
@@ -609,12 +611,36 @@ def edge_side(a, b, c, weights):
 
 AMBIGUOUS = -2.0  # expected.raw alpha for a covered pixel whose colour depends on the rasteriser's edge rule
 
+# How close to an edge, in pixels, a sample is treated as on it. The GPU snaps vertices to its sub-pixel grid
+# (Vulkan's subPixelPrecisionBits, 8 on common GPUs: 1/256 pixel) before it tests coverage, so a pixel centre
+# within two grid steps of an edge can land on either side. The reference can't tell which, so such a sample is
+# an edge sample, like one exactly on it. Exact float weights (1e-6) left samples 1e-5 off an edge to one triangle
+# while the GPU gave them to its neighbour (@throny, #4251).
+EDGE_PX = 1.0 / 128.0
 
-def uv_map(vertices, indices, width: int, height: int):
+
+def edge_distances(a, b, c, px: float, py: float):
+    """Signed distances, in pixels, from the sample (px, py) to the three edges of abc (positions already in
+    pixels), each edge by its opposite vertex; positive inside, for either winding. None for a degenerate
+    triangle."""
+    area2 = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    if abs(area2) < 1e-9:
+        return None
+    out = []
+    for p, q, r in ((b, c, a), (c, a, b), (a, b, c)):
+        length = math.hypot(q[0] - p[0], q[1] - p[1])
+        cross = (q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0])
+        out.append(cross / length if area2 > 0 else -cross / length)
+    return out
+
+
+def uv_map(vertices, indices, width: int, height: int, grads=None):
     """uv_at for every pixel centre at once (the last covering triangle wins), by triangle bounding box, plus the
     pixels whose UV the edge rule decides: a sample on a shared edge between triangles that give it different
     UVs (a UV seam). Vulkan gives such a sample to exactly one of them by its tie-break rule, which this reference
-    does not model, so those pixels are reported instead of guessed. Returns (uvs, ambiguous pixel indices)."""
+    does not model, so those pixels are reported instead of guessed. Returns (uvs, ambiguous pixel indices).
+    With `grads` (a list of width * height), each pixel with a UV also gets its triangle's UV per pixel,
+    (du/dx, du/dy, dv/dx, dv/dy)."""
     found = [None] * (width * height)
     hits = {}  # pixel -> [(uv, on_edge)] in draw order
     for i in range(0, len(indices), 3):
@@ -624,26 +650,42 @@ def uv_map(vertices, indices, width: int, height: int):
         px1 = min(width - 1, int(((max(xs) + 1) * 0.5) * width - 0.5) + 1)
         py0 = max(0, int(((min(ys) + 1) * 0.5) * height - 0.5) - 1)
         py1 = min(height - 1, int(((max(ys) + 1) * 0.5) * height - 0.5) + 1)
+        pix = [((v[0] + 1) * 0.5 * width, (v[1] + 1) * 0.5 * height) for v in (a, b, c)]
+        heights = None
+        grad = uv_gradient(pix, (a[3], b[3], c[3]), (a[4], b[4], c[4])) if grads is not None else None
         for py in range(py0, py1 + 1):
             for px in range(px0, px1 + 1):
                 x, y = pixel_ndc(px, py, width, height)
-                weights = barycentric(x, y, a[0], a[1], b[0], b[1], c[0], c[1])
-                if weights:
-                    k = py * width + px
-                    uv = (
-                        weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
-                        weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],
-                    )
-                    hits.setdefault(k, []).append((uv, min(weights) <= 1e-6, edge_side(a, b, c, weights)))
+                sx, sy = (x + 1) * 0.5 * width, (y + 1) * 0.5 * height
+                dist = edge_distances(*pix, sx, sy)
+                if dist is None or min(dist) < -EDGE_PX:
+                    continue
+                if heights is None:  # each vertex's distance to its opposite edge: weight = distance / height
+                    heights = edge_distances(*pix, *pix[0])[0], edge_distances(*pix, *pix[1])[1], \
+                        edge_distances(*pix, *pix[2])[2]
+                weights = [d / h for d, h in zip(dist, heights)]
+                near = [i for i, d in enumerate(dist) if abs(d) <= EDGE_PX]
+                k = py * width + px
+                uv = (
+                    weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
+                    weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],
+                )
+                hits.setdefault(k, []).append((uv, bool(near), edge_side(a, b, c, weights, near)))
+                if min(dist) >= 0:
                     found[k] = uv
+                    if grads is not None:
+                        grads[k] = grad
     # The colour a pixel ends with comes from the last triangle that owns its sample. A hit strictly inside a
     # triangle owns it and hides every earlier hit. A hit on an edge may not own it: the tie-break rule decides, so
     # the hit before it is still a candidate. Walk from the latest hit back to the first interior one (@whattheflop,
     # #2906). Two or more edge hits there with the same UV are an edge both triangles share, drawn after anything
     # older: the rule gives the sample to exactly one of them, so that UV is the colour's. Otherwise the pixel is
     # ambiguous when the candidates' UVs differ (a UV seam, or a lone edge over an older interior).
+    # Two triangles meeting on an edge with continuous UVs give a sample near it (within EDGE_PX) UVs that differ by
+    # their gradients times that distance; 1e-4 (a twentieth of a texel at 512) keeps those together, while a seam's
+    # UVs differ by far more.
     def same(p, q):
-        return abs(p[0] - q[0]) <= 1e-6 and abs(p[1] - q[1]) <= 1e-6
+        return abs(p[0] - q[0]) <= 1e-4 and abs(p[1] - q[1]) <= 1e-4
 
     ambiguous = set()
     for k, entries in hits.items():
@@ -666,6 +708,59 @@ def uv_map(vertices, indices, width: int, height: int):
         if any(not same(uv, candidates[0]) for uv in candidates[1:]):
             ambiguous.add(k)
     return found, ambiguous
+
+
+def uv_gradient(pix, us, vs):
+    """(du/dx, du/dy, dv/dx, dv/dy) per pixel over a triangle with pixel-space corners `pix`."""
+    (x0, y0), (x1, y1), (x2, y2) = pix
+    det = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+    if abs(det) < 1e-12:
+        return (0.0, 0.0, 0.0, 0.0)
+    out = []
+    for t in (us, vs):
+        out += [((t[1] - t[0]) * (y2 - y0) - (t[2] - t[0]) * (y1 - y0)) / det,
+                ((t[2] - t[0]) * (x1 - x0) - (t[1] - t[0]) * (x2 - x0)) / det]
+    return tuple(out)
+
+
+# How far, in pixels, the GPU's sample position may be from the one the reference uses: the vertices are snapped
+# to a 1/256-pixel grid before the UV is interpolated. Under strong minification (a whole texture in a few pixels,
+# with only mip 0 bound) that shift moves the UV by a good part of a texel: on one game model at 37 texels per pixel
+# the GPU's values were the reference's moved by 0.002 pixel (median), 0.02 (90th percentile) (@throny, #4251).
+BAND_PX = 1.0 / 32.0
+
+
+def reference_pixels(texels, tw: int, th: int, uvs, ambiguous, grads):
+    """expected.raw and expected_band.raw for d3d12_first_light_textured: the texture sampled bilinearly with clamp
+    at each covered pixel's UV, and per channel how much that sample changes when the pixel's position moves by up
+    to BAND_PX (the UV moved along the triangle's gradient). The harness adds the band to the format's tolerance, so
+    it only widens where the texture changes fast at that pixel's scale; a wrong format or swizzle is off everywhere.
+    """
+    expected, band = bytearray(), bytearray()
+    covered = 0
+    offsets = [(dx * BAND_PX, dy * BAND_PX) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
+    for k, uv in enumerate(uvs):
+        if uv is None:
+            expected += struct.pack("<4f", -1.0, -1.0, -1.0, -1.0)
+            band += struct.pack("<4f", 0.0, 0.0, 0.0, 0.0)
+            continue
+        covered += 1
+        if k in ambiguous:
+            expected += struct.pack("<4f", 0.0, 0.0, 0.0, AMBIGUOUS)
+            band += struct.pack("<4f", 0.0, 0.0, 0.0, 0.0)
+            continue
+        centre = sample_bilinear_clamp(texels, tw, th, uv[0], uv[1])
+        dudx, dudy, dvdx, dvdy = grads[k]
+        widest = [0.0] * 4
+        for ox, oy in offsets:
+            moved = sample_bilinear_clamp(texels, tw, th, uv[0] + dudx * ox + dudy * oy, uv[1] + dvdx * ox + dvdy * oy)
+            for c in range(4):
+                d = abs(moved[c] - centre[c])
+                if d > widest[c]:
+                    widest[c] = d
+        expected += struct.pack("<4f", *centre)
+        band += struct.pack("<4f", *widest)
+    return expected, band, covered
 
 
 def tsharp_load_offset(listing: str) -> int:
@@ -767,24 +862,19 @@ def write_dds_inputs(out_dir: str, dds: str, vertices, indices, width: int, heig
     data = struct.pack("<III", tw, th, fmt) + payload
     with open(os.path.join(out_dir, "texture.bin"), "wb") as f:
         f.write(data)
-    expected = bytearray()
-    uvs, ambiguous = uv_map(vertices, indices, width, height)
-    covered = 0
-    for k, uv in enumerate(uvs):
-        if uv is None:
-            expected += struct.pack("<4f", -1.0, -1.0, -1.0, -1.0)
-        elif k in ambiguous:
-            covered += 1
-            expected += struct.pack("<4f", 0.0, 0.0, 0.0, AMBIGUOUS)
-        else:
-            covered += 1
-            expected += struct.pack("<4f", *sample_bilinear_clamp(texels, tw, th, uv[0], uv[1]))
+    grads = [None] * (width * height)
+    uvs, ambiguous = uv_map(vertices, indices, width, height, grads)
+    expected, band, covered = reference_pixels(texels, tw, th, uvs, ambiguous, grads)
     with open(os.path.join(out_dir, "expected.raw"), "wb") as f:
         f.write(expected)
+    with open(os.path.join(out_dir, "expected_band.raw"), "wb") as f:
+        f.write(band)
     return {"layer_texture": f"dds:{fmt}", "layer_texture_size": [tw, th], "layer_texture_format": fmt,
             "layer_texture_sha256": hashlib.sha256(data).hexdigest(), "expected_covered": covered,
             "expected_ambiguous": len(ambiguous),
-            "texture_tolerance": dds_tolerance(fmt)}
+            "texture_tolerance": dds_tolerance(fmt),
+            # Float formats hold values above 1 (HDR): their tolerance scales with the expected value.
+            "texture_tolerance_relative": DDS_FORMATS[fmt][3] is None, "band_px": BAND_PX}
 
 
 def write_textured_inputs(out_dir: str, vertices, indices, width: int, height: int) -> dict:
@@ -793,20 +883,13 @@ def write_textured_inputs(out_dir: str, vertices, indices, width: int, height: i
     texels, data = ramp_texture()
     with open(os.path.join(out_dir, "texture.bin"), "wb") as f:
         f.write(data)
-    expected = bytearray()
-    covered = 0
-    uvs, ambiguous = uv_map(vertices, indices, width, height)
-    for k, uv in enumerate(uvs):
-        if uv is None:
-            expected += struct.pack("<4f", -1.0, -1.0, -1.0, -1.0)
-        elif k in ambiguous:
-            covered += 1
-            expected += struct.pack("<4f", 0.0, 0.0, 0.0, AMBIGUOUS)
-        else:
-            covered += 1
-            expected += struct.pack("<4f", *sample_bilinear_clamp(texels, RAMP_SIZE, RAMP_SIZE, uv[0], uv[1]))
+    grads = [None] * (width * height)
+    uvs, ambiguous = uv_map(vertices, indices, width, height, grads)
+    expected, band, covered = reference_pixels(texels, RAMP_SIZE, RAMP_SIZE, uvs, ambiguous, grads)
     with open(os.path.join(out_dir, "expected.raw"), "wb") as f:
         f.write(expected)
+    with open(os.path.join(out_dir, "expected_band.raw"), "wb") as f:
+        f.write(band)
     # layer_* keys: "texture" and files["texture"] belong to the --dds harness path (harness_env reads them).
     return {"layer_texture": "ramp", "layer_texture_size": [RAMP_SIZE, RAMP_SIZE],
             "layer_texture_format": "R16G16B16A16_FLOAT",
@@ -1404,7 +1487,8 @@ def main(argv=None) -> int:
              if r.get("kind") in ("ptr32_lo", "ptr64_lo")), DEFAULT_PTR_SGPR)
         manifest["layer_tsharp_offset"] = tsharp_load_offset(
             os.path.join(work, "shaders", "dxbc", "disasm", picked[1]["name"] + ".s"))
-        manifest["files"].update(layer_texture="texture.bin", expected="expected.raw")
+        manifest["files"].update(layer_texture="texture.bin", expected="expected.raw",
+                                 expected_band="expected_band.raw")
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")
