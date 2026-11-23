@@ -161,7 +161,8 @@ decides.
   "upscaler": { "use": "fsr", "picker_rva": "7E93F0" } }
 ```
 
-The command line does the same and wins over the mods: `--upscaler-picker RVA[,KIND]` (hex RVA, decimal `KIND`,
+The command line does the same and wins over the mods (FSR, kind 7, also needs `LEONIDA_FFX_PC=1` there):
+`--upscaler-picker RVA[,KIND]` (hex RVA, decimal `KIND`,
 default 7) replaces every result of the picker with `KIND`, through the same result-override hook as the view-mode
 getter (`leonida::mods::override_upscaler`).
 
@@ -177,7 +178,8 @@ gta6rt.exe --run game_scarlett_master.exe --game-dir <package> --upscaler-picker
 To find it in another version: the FFX wrapper's `ffxCreateContext` call is in a class whose one instance is a
 static; a short function returns that instance for upscaler 7 (another static for 6, null for anything else). The
 picker is the function whose result is passed to it, and it tests the console type the registry gave. `--dry-run`
-with the RVA prints how many direct calls were redirected, which should match the table.
+with the RVA prints how many direct calls were redirected, which should match the table; an RVA with no direct call
+(a stale mod, another version) logs `not hooked: no direct call to it` instead, for every hook option.
 
 **Not yet seen running:** the game doesn't reach its first frame under `gta6rt` yet, so the effect is unmeasured.
 The FSR render size per quality mode is the FFX wrapper's own choice. ctest `mods` checks the override and the

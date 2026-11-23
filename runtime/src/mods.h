@@ -305,6 +305,33 @@ inline uint32_t override_view_mode(uint32_t result, uint32_t context) {
     return v.first_person_value;
 }
 
+// A hook option's value (gta6rt --upscaler-picker, --archetype-lookup, --view-mode-getter): "RVA" or "RVA,N", a nonzero
+// hex RVA (a 0x prefix allowed), then optionally a comma and a decimal N up to `max_second`. Parsed in place, with
+// nothing allowed after the last number; false on anything else, and `rva`/`second` are then left as they were.
+inline bool parse_hook_option(const wchar_t* text, uint32_t& rva, bool& has_second, uint32_t& second,
+                              uint32_t max_second) {
+    const auto digit = [](wchar_t c, bool hex) {
+        return (c >= L'0' && c <= L'9') || (hex && ((c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F')));
+    };
+    if (!text || !digit(text[0], true)) return false;  // wcstoul would also take spaces and a sign
+    wchar_t* end = nullptr;
+    const unsigned long long r = std::wcstoull(text, &end, 16);
+    if (end == text || r == 0 || r > 0xffffffffull) return false;
+    if (*end == L'\0') {
+        rva = static_cast<uint32_t>(r);
+        has_second = false;
+        return true;
+    }
+    const wchar_t* n_text = end + 1;
+    if (*end != L',' || !digit(*n_text, false)) return false;
+    const unsigned long long n = std::wcstoull(n_text, &end, 10);
+    if (*end != L'\0' || n > max_second) return false;
+    rva = static_cast<uint32_t>(r);
+    has_second = true;
+    second = static_cast<uint32_t>(n);
+    return true;
+}
+
 // The upscaler the hooked upscaler picker returns (gta6rt --upscaler-picker RVA[,KIND], docs/modding.md): 0 keeps the
 // game's choice. In 1.0.2.1 the picker returns 7 (AMD's FFX upscaler) on Series S and 6 (the game's own) otherwise.
 inline uint32_t& upscaler_kind_slot() {

@@ -89,6 +89,28 @@ int main() {
     check(override_upscaler(6, 0) == 7 && override_upscaler(7, 1) == 7, "--upscaler-picker RVA,7 makes every pick 7");
     upscaler_kind_slot() = 0;
 
+    {
+        uint32_t rva = 0, n = 0;
+        bool has_n = false;
+        check(parse_hook_option(L"7E93F0", rva, has_n, n, 255) && rva == 0x7E93F0 && !has_n, "RVA alone parses");
+        check(parse_hook_option(L"7E93F0,6", rva, has_n, n, 255) && rva == 0x7E93F0 && has_n && n == 6,
+              "RVA,KIND parses both numbers");
+        check(parse_hook_option(L"0x7e93f0,7", rva, has_n, n, 255) && rva == 0x7E93F0 && n == 7,
+              "a 0x prefix and lower-case hex are taken");
+        rva = 0x1234;
+        n = 9;
+        const wchar_t* const bad[] = {L"7E93F0x", L"7E93F0,6x", L"7E93F0,", L"7E93F0,,6", L",6", L"", L"0", L" 7E93F0",
+                                      L"-7E93F0", L"+7E93F0", L"7E93F0,256", L"7E93F0,-1", L"1FFFFFFFF", L"zz"};
+        bool all_refused = true;
+        for (const wchar_t* t : bad) all_refused = all_refused && !parse_hook_option(t, rva, has_n, n, 255);
+        check(all_refused && rva == 0x1234 && n == 9,
+              "trailing garbage, an empty or zero RVA, a sign or space, a second number past the limit and an RVA past "
+              "32 bits are refused, leaving the outputs alone");
+        check(parse_hook_option(L"1A2B3C0,1", rva, has_n, n, 1) && !parse_hook_option(L"1A2B3C0,2", rva, has_n, n, 1),
+              "the limit on the second number holds (archetype lookup: argument 0 or 1)");
+        check(!parse_hook_option(nullptr, rva, has_n, n, 255), "a null text is refused");
+    }
+
     Mod fsr, game_choice, fsr_off;
     check(parse_mod(R"({"upscaler":{"use":"fsr","picker_rva":"7E93F0"}})", "u1", fsr, error) && fsr.upscaler.set &&
               fsr.upscaler.kind == 7 && fsr.upscaler.picker_rva == 0x7E93F0,
