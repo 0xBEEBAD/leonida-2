@@ -3630,7 +3630,20 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   0.49 ms per execute and wait; 9800X3D iGPU FSR 3.1.6, 10.1 ms; every square right. Under the validation layer
   with synchronization validation, the layer reports nothing; what remains are FSR 4.1.2's own shader errors listed
   above, and storage-image format warnings on FSR's internal images (`rw_recurrent_0`, `rw_accumulation`, ...).
-  Not yet done: the shim that answers the game's five FFX calls and records these commands.
+- **The FFX shim (`shims/ffx_shim.cpp`).** With `LEONIDA_FFX_PC=1` in the process environment it registers, before
+  `main`, the five functions for both `amd_fidelityfx_loader_xbox.dll` and `amd_fidelityfx_upscaler_xbox.dll`
+  (which one the title calls needs its executable); the shims then own both modules, and the package's copies are
+  never mapped. Without it nothing is registered and the title loads the package's DLLs as before.
+  `ffxCreateContext` takes the upscale description and the device of the console backend descriptor (`0x01000002`,
+  device at `+0x10`) from the chain; the console version descriptor and any provider override are not passed on,
+  and the backend attaches the SDK 2.4.0 `FFX_UPSCALER_VERSION` (4.1.2) instead. `ffxDispatch` records one Upscale
+  into the title's list; `ffxQuery` and `ffxConfigure` pass through (a context-less `GET_VERSIONS` gets the
+  device's Vulkan handles, other context-less queries the Vulkan backend; a context-less global debug configure for
+  effect 0 is sent for the upscaler, as AMD's PC loader answers effect 0 with `FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE`).
+  Other description types are `FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE`, logged once. `d3d12_ffx_shim_test` calls
+  the functions as the loader binds them: on the RX 9070 XT the title's device is offered 4.1.2, 3.1.6 and 2.3.4,
+  the context gets FSR 4.1.2 and 30 dispatches give the checkerboard; `d3d12_ffx_shim_off` checks that nothing is
+  registered with the switch off. The game's own call sequence is unmeasured until its executable runs.
 
 ### A.4 Other DLLs and the executable
 

@@ -41,4 +41,12 @@ void destroy(std::uint64_t context);
 // The provider the loader chose for `context`, e.g. "4.1.2"; empty when there is no such context.
 std::string provider(std::uint64_t context);
 
+// ffxQuery and ffxConfigure for the FFX shim; the descriptions are data and pass through unchanged, except:
+// - with no context (0), they go to AMD's loader on its own. A GET_VERSIONS query names a D3D12 device, which is
+//   replaced by that device's Vulkan handles; any other query gets the Vulkan backend of a device with the upscaler
+//   chained in front of its own chain for the call, as the FFX API wants a backend for a context-less query.
+// - an unknown context is FFX_API_RETURN_ERROR.
+ffx::ReturnCode query(std::uint64_t context, ffx::Header* desc);
+ffx::ReturnCode configure(std::uint64_t context, const ffx::Header* desc);
+
 }  // namespace rt::ffx_upscale

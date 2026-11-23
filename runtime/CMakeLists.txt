@@ -1626,6 +1626,16 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_ffx_upscale COMMAND d3d12_ffx_upscale_test)
     set_tests_properties(d3d12_ffx_upscale PROPERTIES SKIP_RETURN_CODE 77)
 
+    # RT-344 part 2: the FFX shim as the title calls it, on (the table registers before main) and off.
+    add_executable(d3d12_ffx_shim_test test/d3d12_ffx_shim_test.cpp shims/ffx_shim.cpp shims/registry.cpp)
+    target_link_libraries(d3d12_ffx_shim_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_ffx_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_ffx_shim_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_ffx_shim COMMAND d3d12_ffx_shim_test)
+    set_tests_properties(d3d12_ffx_shim PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_FFX_PC=1")
+    add_test(NAME d3d12_ffx_shim_off COMMAND d3d12_ffx_shim_test --expect-off)
+    set_tests_properties(d3d12_ffx_shim_off PROPERTIES ENVIRONMENT "LEONIDA_FFX_PC=0")
+
     # Milestone M0: a window, 60 cleared frames presented through the proxy on Vulkan.
     add_executable(d3d12_present_test test/d3d12_present_test.cpp)
     target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32 dxgi)
@@ -2180,6 +2190,9 @@ if(TARGET Vulkan::Headers)
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
+      # RT-344: the FFX upscale shim registers itself before main (with LEONIDA_FFX_PC=1), so it is a source of the
+      # executable: in the static library nothing would reference it and the linker would leave it out.
+      target_sources(gta6rt PRIVATE shims/ffx_shim.cpp)
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
 
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the

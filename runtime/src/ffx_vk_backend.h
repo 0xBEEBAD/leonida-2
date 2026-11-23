@@ -69,6 +69,10 @@ public:
     // Records one upscale into `desc.commandList` (a VkCommandBuffer). Each resource is a VkImage in the layout its
     // `state` names: COMPUTE_READ is SHADER_READ_ONLY_OPTIMAL, UNORDERED_ACCESS is GENERAL.
     ffx::ReturnCode dispatch(const ffx::DispatchDescUpscale& desc);
+    // ffxQuery and ffxConfigure on the context, or without one before create (a loaded but context-less Upscaler):
+    // the descriptions pass through unchanged.
+    ffx::ReturnCode query(ffx::Header* desc);
+    ffx::ReturnCode configure(const ffx::Header* desc);
 
 private:
     void* module_ = nullptr;
@@ -77,6 +81,7 @@ private:
     ffx::PfnDestroyContext destroy_ = nullptr;
     ffx::PfnQuery query_ = nullptr;
     ffx::PfnDispatch dispatch_ = nullptr;
+    ffx::PfnConfigure configure_ = nullptr;
     std::string provider_;
 };
 

@@ -66,6 +66,10 @@ struct Entry {
 
 std::mutex g_mutex;
 std::map<VkDevice, DeviceRecord> g_devices;
+// AMD's loader without a context, for context-less queries and configures; loaded on first use.
+std::mutex g_loose_mutex;
+leonida::ffx_vk::Upscaler g_loose;
+bool g_loose_loaded = false;
 std::map<std::uint64_t, std::shared_ptr<Entry>> g_contexts;
 std::uint64_t g_next = 1;
 
@@ -227,6 +231,70 @@ std::string provider(std::uint64_t context) {
     if (!entry) return {};
     std::lock_guard lock(entry->mutex);
     return entry->upscaler ? entry->upscaler->provider() : std::string{};
+}
+
+ffx::ReturnCode query(std::uint64_t context, ffx::Header* desc) {
+    if (!desc) return ffx::RETURN_ERROR_PARAMETER;
+    if (context) {
+        std::shared_ptr<Entry> entry = find(context);
+        if (!entry) return ffx::RETURN_ERROR;
+        std::lock_guard lock(entry->mutex);
+        return entry->upscaler ? entry->upscaler->query(desc) : ffx::RETURN_ERROR;
+    }
+    DeviceRecord record;
+    VkDevice device = VK_NULL_HANDLE;
+    ID3D12Device* named = nullptr;
+    if (desc->type == ffx::QUERY_DESC_TYPE_GET_VERSIONS)
+        named = static_cast<ID3D12Device*>(reinterpret_cast<ffx::QueryDescGetVersions*>(desc)->device);
+    {
+        std::lock_guard lock(g_mutex);
+        if (named) {
+            const rt::d3d12::VulkanDeviceInfo* info = rt::d3d12::vulkan_device_info(named);
+            auto it = info ? g_devices.find(info->device) : g_devices.end();
+            if (it == g_devices.end()) return ffx::RETURN_ERROR_PARAMETER;
+            device = it->first;
+            record = it->second;
+        } else if (!g_devices.empty()) {
+            device = g_devices.begin()->first;
+            record = g_devices.begin()->second;
+        }
+    }
+    if (!device) return ffx::RETURN_NO_PROVIDER;
+    std::lock_guard lock(g_loose_mutex);
+    if (!g_loose_loaded) {
+        std::string error;
+        if (!g_loose.load(error)) return ffx::RETURN_NO_PROVIDER;
+        g_loose_loaded = true;
+    }
+    ffx::VkDeviceContext vulkan{device, record.physical, reinterpret_cast<void*>(record.get_device_proc)};
+    if (named) {
+        ffx::QueryDescGetVersions versions = *reinterpret_cast<ffx::QueryDescGetVersions*>(desc);
+        versions.device = &vulkan;   // the outputs still go to the title's arrays
+        return g_loose.query(&versions.header);
+    }
+    ffx::CreateBackendVKDesc backend{{ffx::CREATE_CONTEXT_DESC_TYPE_BACKEND_VK, desc->pNext}, vulkan};
+    ffx::Header* const chain = desc->pNext;
+    desc->pNext = &backend.header;   // for this call only: the title's chain is restored before returning
+    const ffx::ReturnCode rc = g_loose.query(desc);
+    desc->pNext = chain;
+    return rc;
+}
+
+ffx::ReturnCode configure(std::uint64_t context, const ffx::Header* desc) {
+    if (!desc) return ffx::RETURN_ERROR_PARAMETER;
+    if (context) {
+        std::shared_ptr<Entry> entry = find(context);
+        if (!entry) return ffx::RETURN_ERROR;
+        std::lock_guard lock(entry->mutex);
+        return entry->upscaler ? entry->upscaler->configure(desc) : ffx::RETURN_ERROR;
+    }
+    std::lock_guard lock(g_loose_mutex);
+    if (!g_loose_loaded) {
+        std::string error;
+        if (!g_loose.load(error)) return ffx::RETURN_NO_PROVIDER;
+        g_loose_loaded = true;
+    }
+    return g_loose.configure(desc);
 }
 
 }  // namespace rt::ffx_upscale
