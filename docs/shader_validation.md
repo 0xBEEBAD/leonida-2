@@ -809,6 +809,8 @@ rows of `docs/design.md` (measured on gfx1035, SHADER-137). These have not been 
 - `v_lshlrev_b64`, `v_lshrrev_b64` and `v_ashrrev_i64` write a VGPR pair, odd first registers included. S1 is a
   VGPR pair, an SGPR pair or an integer inline constant sign-extended to 64 bits. A 32-bit literal or a float inline
   constant as S1 is not generated: how either widens to 64 bits for an integer operand is not measured.
+- These shifts read at most one scalar value (their GFX10 constant-bus limit is one, not two). With an SGPR pair as
+  S1, the shift count is a VGPR or an inline constant; the assembler rejects an SGPR or a literal there.
 
 ```
 python -I tools/vint_diff.py --programs 2000 --seed 1
