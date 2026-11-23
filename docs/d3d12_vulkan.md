@@ -3592,6 +3592,20 @@ on a PC device behind the Xbox-ABI proxy). Measured:
     that path (measured with `fsr_dispatch_test` and `LEONIDA_FSR_NO_STANDIN=1`).
   - `xmem.dll!XMemGetWorkingSetStatistics` takes two arguments, `(0x20000001, stats*)`, at all seven call sites;
     the one-argument shim wrote through the constant. Fixed in `runtime/shims/xmem.cpp`.
+- **AMD's PC upscaler instead of the translated one (RT-344).** The same five FFX calls can be answered by AMD's
+  signed `amd_fidelityfx_loader_vk.dll` from the public FidelityFX SDK (v2.4.0: `Kits/FidelityFX/signedbin`), on the
+  layer's own `VkDevice`. Since SDK 2.4.0 the upscaler's Vulkan backend is at feature parity with DX12, so this needs
+  no D3D12 device. `runtime/src/ffx_vk_backend.{h,cpp}` loads it (from `LEONIDA_FFX_DIR`, else next to the program),
+  creates the upscale context with the Vulkan backend descriptor in place of the console one, reports the provider
+  the loader chose, and passes dispatches through with `VkImage` resources and a `VkCommandBuffer`. The loader picks
+  the newest upscaler the GPU supports. Measured with `ffx_vk_dispatch_test` (procedural inputs, the game's context
+  flags, 1280x720 to 2560x1440, 30 frames) under Wine 11.22 on RADV (Mesa 26.3.1), with no device extensions:
+  - RX 9070 XT (RDNA4): providers 4.1.2, 3.1.6 and 2.3.4; the context gets **FSR 4.1.2**; 0.64 ms per upscale
+    (submit and wait); every square of the checkerboard right and no non-finite value.
+  - Ryzen 7 9800X3D iGPU (RDNA2, 2 CUs): providers 3.1.6 and 2.3.4; the context gets FSR 3.1.6; 15.7 ms.
+  - Not run on Windows yet. AMD's DLLs are not in the repository; their licence allows redistribution in binary
+    form and forbids reverse engineering. The shim that routes the game's calls here and maps its resources to the
+    layer's images is the next step.
 
 ### A.4 Other DLLs and the executable
 
