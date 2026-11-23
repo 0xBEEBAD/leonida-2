@@ -502,6 +502,33 @@ if(BUILD_TESTING)
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
 
+    add_executable(module_names_test test/module_names_test.cpp src/pe_loader.cpp shims/registry.cpp)
+    target_include_directories(module_names_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(module_names_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(module_names_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(module_names_test PRIVATE /OPT:NOREF)
+    add_dependencies(module_names_test gta6rt_tls_host tiny_dll)
+    add_test(NAME module_names COMMAND module_names_test "$<TARGET_FILE:tiny_dll>")
+
+    add_executable(tiny_module_names test/fixtures/tiny_module_names.cpp)
+    target_compile_definitions(tiny_module_names PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_module_names PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    set_target_properties(tiny_module_names PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
+
+    # Native Windows and --dry-run/--init/--run share original renamed fixtures, including an ACP-named import.
+    if(NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME run_module_names COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_module_names.py"
+          "--loader=$<TARGET_FILE:gta6rt>" "--guest=$<TARGET_FILE:tiny_module_names>"
+          "--importer=$<TARGET_FILE:tiny_exe>" "--dependency=$<TARGET_FILE:tiny_dll>"
+          "--work-dir=${CMAKE_CURRENT_BINARY_DIR}"
+          "--report=${CMAKE_CURRENT_BINARY_DIR}/module-names-results.json")
+        set_tests_properties(run_module_names PROPERTIES TIMEOUT 90)
+      endif()
+    endif()
+
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The xmem and d3d12_xs tables
     # are linked too so the optional LEONIDA_GAME_DIR run classifies the shipped modules' imports exactly like
     # gta6rt does (no d3d12.lib is needed: d3d12_xs resolves its host entry points at run time).
@@ -1451,6 +1478,31 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_queue_handover_shared_queue COMMAND d3d12_queue_handover_test --shared-queue)
     set_tests_properties(d3d12_queue_handover_two_queues d3d12_queue_handover_shared_queue PROPERTIES
                          SKIP_RETURN_CODE 77 TIMEOUT 400 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    # More D3D12 queues than Vulkan queues: they share VkQueues, keeping fences and Wait-before-Signal (section 4.4).
+    # The _one_queue runs make every GPU look like the Intel UHD 770 (one family, one VkQueue): every queue shares it.
+    add_executable(d3d12_queue_share_test test/d3d12_queue_share_test.cpp)
+    target_link_libraries(d3d12_queue_share_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_queue_share_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_queue_share_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_queue_share COMMAND d3d12_queue_share_test)
+    add_test(NAME d3d12_queue_share_one_queue COMMAND d3d12_queue_share_test)
+    set_tests_properties(d3d12_queue_share d3d12_queue_share_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    add_test(NAME d3d12_queue_wait_one_queue COMMAND d3d12_queue_wait_test)
+    set_tests_properties(d3d12_queue_wait_one_queue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    set_tests_properties(d3d12_queue_share_one_queue d3d12_queue_wait_one_queue PROPERTIES
+                         ENVIRONMENT "LEONIDA_VK_MAX_QUEUES_PER_FAMILY=1;LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1")
+    # A misspelt case or count is refused with the usage line (exit code 2) before a device exists, instead of
+    # passing with nothing run. No GPU needed.
+    set(_share_bad_arguments "case_typo|--case|typo" "iterations_zero|--iterations|0"
+        "iterations_word|--iterations|banana" "iterations_too_many|--iterations|99999999999")
+    foreach(_bad IN LISTS _share_bad_arguments)
+      string(REPLACE "|" ";" _bad "${_bad}")
+      list(POP_FRONT _bad _bad_name)
+      add_test(NAME d3d12_queue_share_rejects_${_bad_name} COMMAND d3d12_queue_share_test ${_bad})
+      set_tests_properties(d3d12_queue_share_rejects_${_bad_name} PROPERTIES TIMEOUT 60
+                           PASS_REGULAR_EXPRESSION "\nusage: d3d12_queue_share_test ")
+    endforeach()
 
     # XDXR acceleration structures through BuildRaytracingAccelerationStructure (docs/d3d12_vulkan.md 4.8): the
     # device builds them, tools/xdxr_bvh.py checks them.
@@ -2628,6 +2680,12 @@ if(TARGET Vulkan::Headers)
                  "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
                  "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" ${_trace_runner})
         set_tests_properties(run_tiny_frame PROPERTIES SKIP_RETURN_CODE 77)
+        # The queue test settings are for the tests only: left set, they must not shrink the game's device.
+        add_test(NAME run_tiny_frame_queue_test_settings COMMAND "${Python3_EXECUTABLE}" -I
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
+                 "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" --queue-test-settings
+                 ${_trace_runner})
+        set_tests_properties(run_tiny_frame_queue_test_settings PROPERTIES SKIP_RETURN_CODE 77)
       endif()
     endif()
 
