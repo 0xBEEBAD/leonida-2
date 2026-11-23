@@ -14,8 +14,13 @@ v_lshl_add_u32 v3, v1, 4, v3
 v_add_nc_u32_e32 v3, v0, v3
 v_add_nc_u32_e32 v3, 1000, v3
 s_cmp_eq_u32 s8, 0
-s_cbranch_scc0 6
+s_cbranch_scc0 11
 image_load v4, v0, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm
+; The sampled and formatless coherent reads must agree; a mismatch changes the result.
+image_load v5, v0, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm glc dlc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v5, v4, v5
+v_add_nc_u32_e32 v3, v3, v5
 v_add_nc_u32_e32 v3, v3, v4
 image_store v3, v0, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm
 s_endpgm
@@ -27,8 +32,13 @@ v_add_nc_u32_e32 v3, v3, v4
 image_store v3, v[0:1], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_1D_ARRAY unorm
 s_endpgm
 s_cmp_eq_u32 s8, 2
-s_cbranch_scc0 6
+s_cbranch_scc0 11
 image_load v4, v[0:2], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_3D unorm
+; A sliced UAV must see the same texel via the rebased sampled alias and the sliced storage view.
+image_load v5, v[0:2], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_3D unorm glc dlc
+s_waitcnt vmcnt(0)
+v_xor_b32_e32 v5, v4, v5
+v_add_nc_u32_e32 v3, v3, v5
 v_add_nc_u32_e32 v3, v3, v4
 image_store v3, v[0:2], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_3D unorm
 s_endpgm

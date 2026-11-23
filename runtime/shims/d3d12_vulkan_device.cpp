@@ -7319,17 +7319,17 @@ private:
                 return;
             }
             if (new_uav && state_.info.robust_image_access) {
-                const bool storage_read = view.type == g::ImageType::image_1d_array;
                 if (sampled && !state_.sampled_usable(view_format)) {
                     log_once("texture view format does not support sampled access:", view_format);
                     return;
                 }
-                // Vulkan 1.3 allows formatless access based on the actual view's features, even on caller-owned
-                // devices. Packed RGB9E5 only exposes formatted raw R32_UINT storage, so it does not need these.
+                // All three dimensions use Unknown-format storage writes and can use Unknown-format reads
+                // (image_load glc, or any image_load on a 1D array). Check the actual storage view's format.
+                // Packed RGB9E5 only exposes formatted raw R32_UINT storage, so it does not need these bits.
                 if (!packed_storage) {
-                    const auto features = state_.optimal_features(storage_format);
-                    if (!(features & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) ||
-                        (storage_read && !(features & VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT))) {
+                    constexpr auto required = VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                                              VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+                    if ((state_.optimal_features(storage_format) & required) != required) {
                         log_once("texture view format lacks the required formatless storage image access:", storage_format);
                         return;
                     }

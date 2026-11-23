@@ -25,6 +25,28 @@ namespace {
 using Microsoft::WRL::ComPtr;
 namespace g = leonida::gfx10;
 constexpr auto uav_heap = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+constexpr auto formatless_read = VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
+constexpr auto formatless_write = VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+
+// Only the layer sees the masked capabilities. The real device and validation layer see the unmodified driver.
+PFN_vkGetInstanceProcAddr real_instance_proc = nullptr;
+PFN_vkGetPhysicalDeviceFormatProperties2 real_format_properties = nullptr;
+VkFormatFeatureFlags2 missing_format_features = 0;
+
+VKAPI_ATTR void VKAPI_CALL masked_format_properties(VkPhysicalDevice physical, VkFormat format,
+                                                   VkFormatProperties2* properties) {
+    real_format_properties(physical, format, properties);
+    if (format != VK_FORMAT_R32_UINT) return;
+    for (auto* next = static_cast<VkBaseOutStructure*>(properties->pNext); next; next = next->pNext)
+        if (next->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3)
+            reinterpret_cast<VkFormatProperties3*>(next)->optimalTilingFeatures &= ~missing_format_features;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL masked_instance_proc(VkInstance instance, const char* name) {
+    if (std::strcmp(name, "vkGetPhysicalDeviceFormatProperties2") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(masked_format_properties);
+    return real_instance_proc(instance, name);
+}
 
 // Numeric values are also the branches selected by cs_texture_uav.asm.
 enum class Kind : UINT { one_d, array, volume, two_d, float_volume, float_array, atomic_volume };
@@ -359,6 +381,65 @@ bool check_refusals(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE slot) {
     return true;
 }
 
+bool check_formatless_features(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE slot, bool sliced) {
+    using enum Kind;
+    const auto check = [&](Kind kind, const D3D12_RESOURCE_DESC& shape, UINT first, UINT count) {
+        ComPtr<ID3D12Resource> resource;
+        EXPECT(create_texture(device, shape, &resource));
+        const auto view = uav(kind, 1, first, count);
+        device->CreateUnorderedAccessView(resource.Get(), nullptr, &view, slot);
+        const auto valid = read_slot(slot);
+        g::Image decoded{};
+        EXPECT(g::decode(valid, decoded) && decoded.first_mip == 1 && decoded.mip_count == 1);
+        for (const auto missing : {formatless_read, formatless_write, formatless_read | formatless_write}) {
+            std::memcpy(reinterpret_cast<void*>(slot.ptr), valid.data(), sizeof(valid));
+            missing_format_features = missing;
+            device->CreateUnorderedAccessView(resource.Get(), nullptr, &view, slot);
+            missing_format_features = 0;
+            if (read_slot(slot) != g::ImageWords{}) {
+                std::fprintf(stderr, "kind %u first slice %u: accepted mip 1 UAV without format features %#llx\n",
+                             UINT(kind), first, static_cast<unsigned long long>(missing));
+                return false;
+            }
+        }
+        return true;
+    };
+    EXPECT(check(one_d, texture(one_d, 1), 0, 1));
+    EXPECT(check(array, texture(array, 4), 1, 2));
+    // The mask applies to the R32_UINT view, not its typeless resource's backing format.
+    const auto volume_shape = texture(volume, 8, DXGI_FORMAT_R32_TYPELESS);
+    EXPECT(check(volume, volume_shape, 0, ~0u));
+    if (sliced) EXPECT(check(volume, volume_shape, 1, 2));
+    return true;
+}
+
+bool check_packed_formatless_exemption(ID3D12Device* device, vktest::Device& vk,
+                                       D3D12_CPU_DESCRIPTOR_HANDLE slot, bool sliced) {
+    VkFormatProperties features{};
+    vk.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+        vk.physical, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &features);
+    if (features.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+        std::puts("Packed R32_UINT exemption not exercised: native RGB9E5 storage");
+        return true;
+    }
+    constexpr auto format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    ComPtr<ID3D12Resource> resource;
+    if (!create_texture(device, texture(Kind::volume, 8, format), &resource)) {
+        std::puts("Packed R32_UINT exemption not exercised: no emulated RGB9E5 3D storage");
+        return true;
+    }
+    const UINT first = sliced ? 1 : 0, count = sliced ? 2 : 4;
+    const auto view = uav(Kind::volume, 1, first, count, format);
+    missing_format_features = formatless_read | formatless_write;
+    device->CreateUnorderedAccessView(resource.Get(), nullptr, &view, slot);
+    missing_format_features = 0;
+    const auto key = read_slot(slot);
+    g::Image decoded{};
+    EXPECT(g::decode(key, decoded) && decoded.first_mip == 1 && (key[4] & g::volume_uav_flag));
+    EXPECT(key[7] == (g::volume_uav_word(first, count) | g::packed_uav_flag));
+    return true;
+}
+
 bool check_standalone(bool sliced) {
     ComPtr<ID3D12Device> device;
     EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device))));
@@ -428,7 +509,11 @@ bool check_cpu_clear(ID3D12Device* device, vktest::Device& vk, D3D12_CPU_DESCRIP
 
 bool test(vktest::Device& vk, const char* shader, bool enable_slices) {
     rt::d3d12::VulkanDeviceInfo info{};
-    info.get_instance_proc = vk.instance_proc;
+    real_instance_proc = vk.instance_proc;
+    real_format_properties = vk.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties2>(
+        "vkGetPhysicalDeviceFormatProperties2");
+    EXPECT(real_format_properties);
+    info.get_instance_proc = masked_instance_proc;
     info.instance = vk.instance;
     info.physical = vk.physical;
     info.device = vk.device;
@@ -463,6 +548,8 @@ bool test(vktest::Device& vk, const char* shader, bool enable_slices) {
 
     using enum Kind;
     EXPECT(check_refusals(device.Get(), source));
+    EXPECT(check_formatless_features(device.Get(), source, info.sliced_3d_uav));
+    EXPECT(check_packed_formatless_exemption(device.Get(), vk, source, info.sliced_3d_uav));
     Compute compute(vk);
     if (shader) EXPECT(compute.create(device.Get(), shader));
     auto* dispatch = shader ? &compute : nullptr;

@@ -1450,10 +1450,11 @@ The layer's descriptor model:
   whole-mip and partial UAVs, distinguishes them from SRVs in the hash table, and rebases typed sampled fetches;
   see the contract in `docs/design.md`.
   Without those features a partial W view is logged and left null, not made writable across the whole mip.
-  These new dimensions require storage-write-without-format support for the typed view format and, for the
-  storage-only 1D array bindings, storage-read-without-format as well. Vulkan 1.3 permits the
-  SPIR-V capabilities even when the legacy `shaderStorageImage{Read,Write}WithoutFormat` bits are not enabled;
-  the caller-owned device test leaves both bits off and checks the per-format path.
+  Shader-visible 1D, 1D-array and 3D UAVs require both formatless storage read and write support for the actual
+  Vulkan view format. `image_load ... glc` uses the storage view for 1D and 3D, and 1D-array loads always use it.
+  The emulated RGB9E5 raw `R32_UINT` storage view is formatted and is exempt. Vulkan 1.3 permits these SPIR-V
+  capabilities even without the legacy `shaderStorageImage{Read,Write}WithoutFormat` feature bits. The
+  caller-owned device test leaves both legacy bits off and masks each per-format bit to verify safe rejection.
   `ClearUnorderedAccessView*` refuses partial W ranges and 1D/3D format reinterprets: the transfer clear
   cannot target a slice interval or guarantee preserving the reinterpreted bits.
   Shader access to the new UAVs requires `robustImageAccess` (whole-mip CPU clears do not).
@@ -1803,8 +1804,7 @@ The trace will enumerate them.
     Typed buffer UAVs: the layer writes their V# (section 3.4, "Buffer UAVs"); `rdna2spirv.py` `FORMATS`
     determines which buffer formats the translator can decode.
   - The UAV atomic bits other than exchange for `R32_UINT` where Vulkan reports storage image atomics.
-    The translator and set 0 use the formatted `r32ui` views for 2D and 3D. There is no `image_atomic_swap`,
-    and `R32_SINT` gets no `r32ui` view.
+    The translator and set 0 use the formatted `r32ui` views for 2D and 3D; `R32_SINT` gets no `r32ui` view.
   - `MULTISAMPLE_RENDERTARGET` for depth formats, from the same usages `MULTISAMPLE_QUALITY_LEVELS` queries.
   - No integer resolve, no 1D block-compressed. Depth formats are 2D and cube only: no 3D, shader reads, UAVs,
     buffer or vertex use, and no 1D, which native D3D12 allows but the layer's resource creation refuses.
