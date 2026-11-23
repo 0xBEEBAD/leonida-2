@@ -991,10 +991,10 @@ struct Prepared {
     VkDeviceSize fill_scratch_offset = 0;
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
-    std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
+    std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws; Upscale: its first image in
+                               // PreparedList::upscale_images
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
-    std::uint64_t xdxr_bytes = 0;
-    std::vector<ResourceBinding> upscale_images;  // Upscale: its images in UpscaleImage order (absent: no VkImage)     // CopyAccelerationStructure: the most bytes the copy may write
+    std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
 
@@ -2153,6 +2153,10 @@ public:
     // first draw_count entries are this list's, and the rest keep their vectors' storage for later draws.
     std::vector<detail::PreparedDraw> draws;
     std::size_t draw_count = 0;
+    // The Upscale commands' images, upscale_image_count per command (Prepared::draw names the first), kept like
+    // draws: the first upscale_image_used entries are this list's. Other commands carry nothing for them.
+    std::vector<ResourceBinding> upscale_images;
+    std::size_t upscale_image_used = 0;
     std::vector<detail::PreparedQuery> queries;
     VkQueryPool segment_pool = VK_NULL_HANDLE;
     std::uint32_t segment_base = 0;
@@ -2365,6 +2369,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.list = &list;
     out.commands.assign(commands.size(), {});
     out.draw_count = 0;
+    out.upscale_image_used = 0;
     out.queries.clear();
     out.segment_pool = VK_NULL_HANDLE;
     out.segment_base = out.segment_count = 0;
@@ -2834,13 +2839,19 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const ResourceId ids[upscale_image_count] = {up->color,    up->depth,    up->motion_vectors,
                                                          up->output,   up->exposure, up->reactive,
                                                          up->transparency_and_composition};
-            p.upscale_images.assign(upscale_image_count, ResourceBinding{});
+            const std::size_t first = out.upscale_image_used;
+            if (out.upscale_images.size() < first + upscale_image_count)
+                out.upscale_images.resize(first + upscale_image_count);
             for (std::size_t k = 0; k < upscale_image_count; ++k) {
+                ResourceBinding& slot = out.upscale_images[first + k];
+                slot = ResourceBinding{};
                 if (!ids[k]) continue;   // optional, and the required ones were checked when recorded
                 const ResourceBinding* image = resolve(ids[k]);
                 if (!image || !image->image) return ReplayResult::unresolved_resource;
-                p.upscale_images[k] = *image;
+                slot = *image;
             }
+            p.draw = std::uint32_t(first);
+            out.upscale_image_used = first + upscale_image_count;
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             if (vk.xdxr_check) {
                 if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
@@ -3694,38 +3705,76 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
         } else if (const auto* up = std::get_if<Upscale>(&command)) {
             if (p.skip) continue;
-            // As detail::round_trip, for every image at once: the inputs to the shader-resource layout and the output
-            // to the UAV layout (the D3D12 states the upscaler requires of them), the upscale, then each back.
+            // As detail::round_trip, for every image at once and in one barrier each way: the inputs to the
+            // shader-resource layout and the output to the UAV layout (the D3D12 states the upscaler requires of
+            // them), the upscale, then each back. Pieces already in place get a memory dependency only.
             const ResourceId ids[upscale_image_count] = {up->color,    up->depth,    up->motion_vectors,
                                                          up->output,   up->exposure, up->reactive,
                                                          up->transparency_and_composition};
+            const ResourceBinding* bindings = &prepared.upscale_images[p.draw];
             constexpr std::size_t output = 3;
+            constexpr VkPipelineStageFlags compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
             UpscaleImage images[upscale_image_count];
             LayoutPieces pieces[upscale_image_count];
             VulkanAccess states[upscale_image_count]{};
-            VkImageSubresourceRange ranges[upscale_image_count]{};
-            const VkAccessFlags reads = VK_ACCESS_SHADER_READ_BIT;
-            const VkAccessFlags writes = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            // At most two pieces per image (depth and stencil apart); more flush the batch early.
+            struct Batch {
+                VkImageMemoryBarrier images[2 * upscale_image_count];
+                std::uint32_t count = 0;
+                VkAccessFlags memory_src = 0, memory_dst = 0;
+                VkPipelineStageFlags src_stages = 0, dst_stages = 0;
+            } batch;
+            const auto flush = [&] {
+                if (!batch.count && !batch.memory_src && !batch.memory_dst) return;
+                VkPipelineStageFlags src = batch.src_stages, dst = batch.dst_stages;
+                VkAccessFlags memory_src = batch.memory_src, memory_dst = batch.memory_dst;
+                detail::restrict_to_queue(vk, src, memory_src);
+                detail::restrict_to_queue(vk, dst, memory_dst);
+                VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, memory_src, memory_dst};
+                const bool any_memory = batch.memory_src || batch.memory_dst;
+                vk.pipeline_barrier(command_buffer, src, dst, 0, any_memory ? 1 : 0, any_memory ? &memory : nullptr,
+                                    0, nullptr, batch.count, batch.images);
+                batch = Batch{};
+            };
+            const auto add = [&](const ResourceBinding& b, const VkImageSubresourceRange& range, VkImageLayout from,
+                                 VkImageLayout to, VkAccessFlags src_access, VkPipelineStageFlags src_stages,
+                                 VkAccessFlags dst_access, VkPipelineStageFlags dst_stages) {
+                detail::restrict_to_queue(vk, src_stages, src_access);
+                detail::restrict_to_queue(vk, dst_stages, dst_access);
+                batch.src_stages |= src_stages;
+                batch.dst_stages |= dst_stages;
+                if (from == to) {
+                    batch.memory_src |= src_access;
+                    batch.memory_dst |= dst_access;
+                    return;
+                }
+                if (batch.count == std::size(batch.images)) flush();
+                VkImageMemoryBarrier& barrier = batch.images[batch.count++];
+                barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                barrier.srcAccessMask = src_access;
+                barrier.dstAccessMask = dst_access;
+                barrier.oldLayout = from;
+                barrier.newLayout = to;
+                barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.image = b.image;
+                barrier.subresourceRange = detail::layout_range(b, range);
+            };
             for (std::size_t k = 0; k < upscale_image_count; ++k) {
-                const ResourceBinding& b = p.upscale_images[k];
+                const ResourceBinding& b = bindings[k];
                 if (!b.image) continue;
                 states[k] = vulkan_access(k == output ? d3d12_state::unordered_access
                                                       : d3d12_state::non_pixel_shader_resource, false);
                 const VkImageLayout layout = image_layout(b, states[k].layout);
-                ranges[k] = {b.aspects, 0, b.mip_levels, 0, b.array_layers};
-                pieces[k] = detail::current(tracker, ids[k], ranges[k], layout);
+                const VkImageSubresourceRange range{b.aspects, 0, b.mip_levels, 0, b.array_layers};
+                pieces[k] = detail::current(tracker, ids[k], range, layout);
                 detail::initialize(vk, command_buffer, b, ids[k], pieces[k], layout, tracker);
-                for (const auto& piece : pieces[k]) {
-                    if (piece.layout == layout)
-                        detail::memory_barrier(vk, command_buffer, states[k].access, states[k].stages,
-                                               k == output ? writes : reads, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                    else
-                        detail::image_barrier(vk, command_buffer, b, piece.range, piece.layout, layout, states[k].access,
-                                              states[k].stages, k == output ? writes : reads,
-                                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                }
+                const VkAccessFlags access = k == output ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                                                         : VK_ACCESS_SHADER_READ_BIT;
+                for (const auto& piece : pieces[k])
+                    add(b, piece.range, piece.layout, layout, states[k].access, states[k].stages, access, compute);
                 images[k] = {b.image, b.format, b.width, b.height, layout};
             }
+            flush();
             if (!vk.upscale(command_buffer, *up, images)) {
                 static std::atomic<bool> logged{false};
                 if (!logged.exchange(true))
@@ -3734,16 +3783,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             for (std::size_t k = 0; k < upscale_image_count; ++k) {
                 if (!images[k].image) continue;
-                for (const auto& piece : pieces[k]) {
-                    if (piece.layout == images[k].layout)
-                        detail::memory_barrier(vk, command_buffer, k == output ? writes : reads,
-                                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, states[k].access, states[k].stages);
-                    else
-                        detail::image_barrier(vk, command_buffer, p.upscale_images[k], piece.range, images[k].layout,
-                                              piece.layout, k == output ? writes : reads,
-                                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, states[k].access, states[k].stages);
-                }
+                const VkAccessFlags access = k == output ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                                                         : VK_ACCESS_SHADER_READ_BIT;
+                for (const auto& piece : pieces[k])
+                    add(bindings[k], piece.range, images[k].layout, piece.layout, access, compute, states[k].access,
+                        states[k].stages);
             }
+            flush();
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build);
