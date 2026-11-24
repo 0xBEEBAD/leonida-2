@@ -395,6 +395,27 @@ It needs shader Int64 support; a device that lacks it reports a skip. This is a 
 independent of wave64 emulation. On RTX 3080 Ti (616.92, Windows 11), all 640 words matched; replacing the count
 mask with 31 or the arithmetic shift with a logical shift made the test fail at words 66 and 251 respectively.
 
+`cs_w32_frexp_ldexp` checks `v_frexp_mant_f32`, `v_frexp_exp_i32_f32`, `v_ldexp_f32`, `v_frexp_mant_f64` and
+`v_frexp_exp_i32_f64`, which the translator computes with integer ops on the float's words. 64 records of a binary32
+value, an `ldexp` exponent and a binary64 value are loaded at run time: normals, the clamp of the exponent at ±512
+and beyond, results that overflow to an infinity and that fall below the smallest normal, binary32 denormals (read
+as zero), binary64 subnormals (normalized; single fraction bits on both sides of the dword boundary and patterns
+with several), zeros, infinities and NaNs. Each thread stores the five results, `v_frexp_mant_f32` with a `neg`
+source and `v_ldexp_f32` with an `abs` source run with the odd threads turned off, whose destination must keep the
+word it held. The expected words come from an oracle written from the rows of [design.md](design.md)
+(`frexp_mant_f32`, `frexp_exp_i32_f32`, `ldexp_f32` and `frexp_f64` in `check.py`), and
+`tests/test_gpu_frexp_ldexp.py` checks it against `math.frexp` and `math.ldexp` wherever those agree with the
+hardware. Both GPU runners compare all 768 heap words, the 256 unchanged input words included. Run it alone with
+`python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_frexp_ldexp --require-pass`.
+On an RTX 4070 Ti (NVIDIA 620.70.06, Linux) and on llvmpipe (Mesa 26.2.6, LLVM 23.1.4) all 768 words match. While
+the binary32 ops still applied `neg` and `abs` with `OpFNegate` and `FAbs`, six words differed on the 4070 Ti and none
+on llvmpipe: every NaN source under a modifier came back as `0x7fffffff`, the driver's default NaN (word 419 is the
+first: the mantissa of the negated `0x7fc00000`). Rules broken one at a time each failed the test on both devices:
+the mantissa given the exponent field 127 (word 0) or, for binary64, 1023 (word 5), the exponent subtracting 127
+(word 1), `v_ldexp_f32` without its clamp (word 258) or overflowing to the largest finite value (word 106), a
+binary32 denormal not read as zero (word 352), the binary64 subnormal exponent off by one in the low or in the high
+dword (words 134 and 150), and the fixture without its `v_cmpx` (word 15).
+
 `cs_w32_cmp_f64` checks the 32 binary64 vector compares, `v_cmp_*_f64` into VCC and `v_cmpx_*_f64` on EXEC, with
 256 memory-fed operand pairs: the product of 16 values (±inf, ±max, the 1-ULP neighbours of ±1, the smallest
 subnormals, ±0, the smallest normal, a NaN whose payload is only in the low dword and a negative quiet NaN). Each

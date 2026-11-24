@@ -39,6 +39,7 @@ from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute
 from check import shift64_test   # dynamic 64-bit vector shifts and overlapping destinations
 from check import cmp_f64_test   # the 32 binary64 vector compares on memory-fed operands
 from check import round_f64_test   # the four binary64 roundings on memory-fed inputs
+from check import frexp_ldexp_test   # binary32 and binary64 frexp, and v_ldexp_f32, on memory-fed records
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -998,6 +999,10 @@ def run_suite(a, work: str) -> int:
         if name in CLIP_CASES:
             detail = clip_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
+        elif name == "cs_w32_frexp_ldexp":
+            detail = frexp_ldexp_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "768 words exact (64 records, eight results each, and unchanged inputs)"))
         elif name == "cs_w32_shift64":
             detail = shift64_test(a.build, spirv_dir, cs_env)
             results.append((name, None if isinstance(detail, Skip) else not detail,

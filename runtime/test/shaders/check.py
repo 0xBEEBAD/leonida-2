@@ -581,6 +581,116 @@ def round_f64_test(tools, spirv, env=None):
         return dump_test(tools, spirv, "cs_w32_round_f64", expected, len(expected), child, judge=round_f64_problem)
 
 
+# cs_w32_frexp_ldexp.asm: per thread a binary32 word with the exponent v_ldexp_f32 adds to it (a 32-bit word, signed),
+# and a binary64 pattern.
+FREXP_LDEXP_F32 = (
+    (0x3F800000, 0), (0x3F800000, 1), (0x3F800000, 0xFFFFFFFF), (0x3FC00000, 10),               # 1 and 1.5
+    (0xBFC00000, 0xFFFFFFF6), (0x3F7FFFFF, 127), (0x3EAAAAAB, 3), (0xBF400000, 4),              # -1.5 by 2^-10, ...
+    (0x47F12065, 0xFFFFFFEC), (0xC0490FDB, 100), (0x42F6E979, 0xFFFFFF7E), (0x3F000000, 0),     # 123456.79 by 2^-20
+    (0x3F800000, 127), (0x3F800000, 128), (0x3F800000, 0xFFFFFF82), (0x3F800000, 0xFFFFFF81),   # 1 by 2^127 .. 2^-127
+    (0x00800000, 0xFFFFFFFF), (0x00800000, 1), (0x00800000, 253), (0x00800000, 254),            # the smallest normal
+    (0x00800001, 0xFFFFFFFF), (0x7F7FFFFF, 1), (0x7F7FFFFF, 0xFFFFFFFF), (0x7F7FFFFF, 0),       # the largest finite
+    (0x7F7FFFFF, 0xFFFFFF03), (0x7F7FFFFF, 0xFFFFFF02), (0xFF7FFFFF, 2), (0x7F000000, 1),       # ... by 2^-253, 2^-254
+    (0x40000000, 512), (0x40000000, 0xFFFFFE00), (0x40000000, 513), (0x40000000, 0xFFFFFDFF),   # the clamp at +-512
+    (0x3F800000, 0x7FFFFFFF), (0xBF800000, 0x80000000), (0x00800000, 0x7FFFFFFF), (0x7F7FFFFF, 0x80000000),
+    (0x3F000000, 0xFFFFFF83), (0x3F000000, 0xFFFFFF82), (0x7F000000, 0), (0x00FFFFFF, 0xFFFFFFFF),
+    (0x00000000, 5), (0x80000000, 0xFFFFFFFB), (0x00000000, 0x7FFFFFFF), (0x80000000, 0x80000000),   # zeros
+    (0x00000001, 10), (0x807FFFFF, 300), (0x007FFFFF, 0), (0x00400000, 1),                      # denormals
+    (0x7F800000, 0xFFFFFFFB), (0xFF800000, 500), (0x7F800000, 0x80000000), (0xFF800000, 0),     # infinities
+    (0x7FC00000, 3), (0x7F800001, 0xFFFFFFFD), (0xFFC12345, 1000), (0xFF800001, 0xFFFFFC18),    # NaNs
+    (0x3F800001, 23), (0xBF7FFFFF, 0xFFFFFFE9), (0x41200000, 0xFFFFFF80), (0x3DCCCCCD, 130),
+    (0x4B800000, 0xFFFFFF6A), (0x33800000, 150), (0x7EFFFFFF, 1), (0x01000000, 0xFFFFFFFE))
+FREXP_F64 = (
+    0x3FF0000000000000, 0xBFF0000000000000, 0x3FE8000000000000, 0x4008000000000000,   # 1, -1, 0.75, 3
+    0x7E37E43C8800759C, 0x01A56E1FC2F8F359, 0x7FEFFFFFFFFFFFFF, 0xFFEFFFFFFFFFFFFF,   # 1e300, 1e-300, +-max
+    0x0010000000000000, 0x8010000000000000, 0x3FF0000000000001, 0x400921FB54442D18,   # +-min normal, 1 + ulp, pi
+    0x3FB999999999999A, 0xBFB999999999999A, 0x4330000000000000, 0x0170000000000000,   # +-0.1, 2^52, 2^-1000
+    0x0000000000000001, 0x8000000000000001, 0x000FFFFFFFFFFFFF, 0x800FFFFFFFFFFFFF,   # subnormals: the smallest, largest
+    0x0000000080000000, 0x0000000100000000, 0x0008000000000000, 0x00000001FFFFFFFF,   # bit 31, bit 32, bit 51, 33 bits
+    0x0000000180000000, 0x000000000000FFFF, 0x8000000100000001, 0x0004000000000001,   # bits on both sides of the dwords
+    0x0000000000000002, 0x0000000000008000, 0x0000000000010000, 0x0000000040000000,   # single bits 1, 15, 16, 30
+    0x0000000200000000, 0x0000800000000000, 0x0001000000000000, 0x0004000000000000,   # single bits 33, 47, 48, 50
+    0x800000000000ABCD, 0x80000000FFFFFFFF, 0x8000FFFF00000000, 0x000ABCDEF0123456,
+    0x0000000000000000, 0x8000000000000000, 0x7FF0000000000000, 0xFFF0000000000000,   # zeros and infinities
+    0x7FF8000000000000, 0x7FF0000000000001, 0xFFF8000012345678, 0xFFF0000080000000,   # NaNs
+    0x3FE0000000000000, 0xBFE0000000000000, 0x7FE0000000000000, 0x0020000000000000,   # +-0.5, 2^1023, 2^-1021
+    0x4059000000000000, 0xC08F400000000000, 0x3F50624DD2F1A9FC, 0x41DFFFFFFFC00000,   # 100, -1000, 0.001, 2^31 - 1
+    0x3FEFFFFFFFFFFFFF, 0xBFEFFFFFFFFFFFFF, 0x001FFFFFFFFFFFFF, 0x801FFFFFFFFFFFFF,
+    0x43E0000000000000, 0xC3E0000000000000, 0x3CA0000000000000, 0x7FD0000000000001)
+FREXP_LDEXP_KEPT = 0xDEADBEEF   # the word an inactive lane keeps
+
+
+def frexp_mant_f32(x):
+    """v_frexp_mant_f32 on a binary32 word (docs/design.md): a normal keeps its sign and fraction and gets the
+    exponent field 126; a zero or a denormal, read as zero, gives a zero of its sign; an infinity or a NaN comes
+    back unchanged."""
+    exponent = x >> 23 & 0xFF
+    if exponent == 0:
+        return x & 0x80000000
+    return x if exponent == 255 else x & 0x807FFFFF | 126 << 23
+
+
+def frexp_exp_i32_f32(x):
+    """v_frexp_exp_i32_f32: the exponent field minus 126 for a normal, as a 32-bit word; 0 for everything else."""
+    exponent = x >> 23 & 0xFF
+    return (exponent - 126) & 0xFFFFFFFF if 0 < exponent < 255 else 0
+
+
+def ldexp_f32(x, n):
+    """v_ldexp_f32: the 32-bit word n, read as signed and clamped to [-512, 512], is added to the exponent field of
+    a normal x. A field above 254 gives an infinity of x's sign and one of 0 or below a zero of its sign (there are
+    no denormal results). A zero or a denormal gives a zero of its sign, and an infinity or a NaN comes back."""
+    exponent, sign = x >> 23 & 0xFF, x & 0x80000000
+    if exponent == 0:
+        return sign
+    if exponent == 255:
+        return x
+    exponent += max(-512, min(512, n - (1 << 32) if n & 0x80000000 else n))
+    if exponent > 254:
+        return sign | 0x7F800000
+    return sign if exponent <= 0 else x & 0x807FFFFF | exponent << 23
+
+
+def frexp_f64(bits):
+    """(v_frexp_mant_f64, v_frexp_exp_i32_f64) of a binary64 pattern, the exponent as a 32-bit word. A normal gets
+    the exponent field 1022 and gives its field minus 1022. A subnormal is normalized: its top fraction bit, at
+    position p, becomes the implicit one, and the exponent is p - 1073. A zero keeps its sign and an infinity or a
+    NaN comes back unchanged, all three with exponent 0."""
+    exponent, fraction, sign = bits >> 52 & 0x7FF, bits & ((1 << 52) - 1), bits & (1 << 63)
+    if exponent == 0x7FF:
+        return bits, 0
+    if exponent:
+        return sign | 1022 << 52 | fraction, (exponent - 1022) & 0xFFFFFFFF
+    if not fraction:
+        return sign, 0
+    top = fraction.bit_length() - 1
+    return sign | 1022 << 52 | (fraction << (52 - top)) & ((1 << 52) - 1), (top - 1073) & 0xFFFFFFFF
+
+
+def frexp_ldexp_words():
+    """cs_w32_frexp_ldexp: the input heap and the full expected readback, eight result words per thread and then
+    the records {x, n, d.lo, d.hi}."""
+    results, inputs = [], []
+    for thread, ((x, n), d) in enumerate(zip(FREXP_LDEXP_F32, FREXP_F64)):
+        mantissa, exponent = frexp_f64(d)
+        results.extend((frexp_mant_f32(x), frexp_exp_i32_f32(x), ldexp_f32(x, n), frexp_mant_f32(x ^ 0x80000000),
+                        mantissa & 0xFFFFFFFF, mantissa >> 32, exponent,
+                        ldexp_f32(x & 0x7FFFFFFF, n) if thread % 2 == 0 else FREXP_LDEXP_KEPT))
+        inputs.extend((x, n, d & 0xFFFFFFFF, d >> 32))
+    return [0xEEEEEEEE] * len(results) + inputs, results + inputs
+
+
+def frexp_ldexp_test(tools, spirv, env=None):
+    """Verify the five frexp and ldexp ops on 64 memory-fed records, including the untouched input records."""
+    initial, expected = frexp_ldexp_words()
+    with tempfile.TemporaryDirectory(prefix="leonida-frexp-ldexp-") as tmp:
+        path = Path(tmp) / "input.bin"
+        path.write_bytes(struct.pack(f"<{len(initial)}I", *initial))
+        child = dict(os.environ if env is None else env, VKC_HEAP_INIT=str(path))
+        child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_frexp_ldexp") or 32))
+        return dump_test(tools, spirv, "cs_w32_frexp_ldexp", expected, len(expected), child)
+
+
 # cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
@@ -2082,6 +2192,7 @@ def main():
     results.append(("cs_w32_shift64", shift64_test(tools, spirv)))
     results.append(("cs_w32_cmp_f64", cmp_f64_test(tools, spirv)))
     results.append(("cs_w32_round_f64", round_f64_test(tools, spirv)))
+    results.append(("cs_w32_frexp_ldexp", frexp_ldexp_test(tools, spirv)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
