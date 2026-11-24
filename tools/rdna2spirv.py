@@ -7605,8 +7605,15 @@ class Gen:
             d, x = a[0], a[1]
             wide_src = op == "s_quadmask_b64"
             wide_dst = op != "s_quadmask_b32"
+            mask_words = None
             if self.is_mask_op(x):
-                raise Unsupported(op + " on a lane mask")
+                # s_bitreplicate_b64_b32 of a 32-bit lane mask into plain scalar data (6 pipeline-library programs of
+                # 1.0.2.1): the wave's mask word as data, then replicated as any scalar (wave_mask, as s_ff1 reads it).
+                if op != "s_bitreplicate_b64_b32" or (d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc"))):
+                    raise Unsupported(op + " on a lane mask")
+                lo, hi = self.wave_mask(x)
+                half = self.mask_half(x) if self.wave64 else None
+                mask_words = [hi if half == "hi" else lo]
             if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
                 if op != "s_bitreplicate_b64_b32" or d["t"] not in ("exec", "vcc"):
                     raise Unsupported(op + " on a lane mask")
@@ -7624,9 +7631,18 @@ class Gen:
                 self.emit(f"{shift} = OpShiftRightLogical %uint {lane} {self.cu(1)}")
                 self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {shift}")
                 self.emit(f"{bit} = OpBitwiseAnd %uint {shifted} {self.cu(1)}")
-                self.set_exec(bit)
+                # As a lane mask (0 or ~0): set_exec takes this lane's bit of the value it is given (lane_bit_on),
+                # which a mask answers for every lane and a plain 0/1 only for lanes 0 and 32.
+                mask = self.tmp()
+                self.emit(f"{mask} = OpISub %uint {self.cu(0)} {bit}")
+                if d["t"] == "vcc":
+                    self.emit(f"OpStore %vcc {mask}")
+                else:
+                    self.set_exec(mask)
                 return
-            if wide_src:
+            if mask_words is not None:
+                words = mask_words
+            elif wide_src:
                 lo, hi = self.src64_data(x, op)
                 words = [lo, hi]
             else:
