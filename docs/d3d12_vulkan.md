@@ -3000,6 +3000,14 @@ queue they came on (one `VkQueue` behind all of them).
   keeps the app's sync interval.
   `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render;
   `PercentScanned` only for a frame shown at once by `ImmediateThresholdPercent`, else 0); `S_FALSE` with count 0 for what it does not have.
+  *Pacing drift reporting (BL-6):* `FramePacer` keeps fixed-capacity ring buffers (`frame_pacing_window = 1024`) of
+  present-to-present frame intervals and origin-to-present latencies (clearing the last-present anchor across
+  `SuspendX`/`ResumeX` so suspended pauses are excluded), computing nearest-rank `p50`/`p95`/`p99` and the mean drift
+  against the active target interval (`FramePacer::pacing_summary()`). On teardown after at least one present,
+  `XboxPresentation` logs a single `[rt] present: pacing summary ...` line on stderr, which `tools/boot_trace.py`
+  surfaces beside the D3D12 call counts. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
+  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode) and by
+  `tests/test_boot_trace.py`.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
   (bilinear, so the rectangle's outer texels blend with their neighbours). The blit converts between formats; an sRGB
