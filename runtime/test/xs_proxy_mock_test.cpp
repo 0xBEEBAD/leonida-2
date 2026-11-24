@@ -1239,6 +1239,96 @@ int check_console_command_list() {
     return 0;
 }
 
+// ---- 11. Presentation handler wiring (device slots 78–81 + queue PresentX/SuspendX/ResumeX) ----
+
+struct MockPresenter {
+    int interval_calls = 0;
+    UINT last_interval = 0;
+    int schedule_calls = 0;
+    UINT last_event = 0;
+    int wait_calls = 0;
+    UINT last_flags = 0;
+    int stats_calls = 0;
+    int present_calls = 0;
+    UINT last_planes = 0;
+    int suspend_calls = 0;
+    int resume_calls = 0;
+};
+
+int check_presentation_wiring() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 11, true);
+    EXPECT(device != nullptr);
+    void* queue = make_queue(device);
+    EXPECT(queue != nullptr);
+
+    MockPresenter p{};
+    xs::PresentationHandler h{};
+    h.context = &p;
+    h.set_frame_interval = [](void* ctx, IUnknown*, UINT us, UINT, UINT) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->interval_calls;
+        m->last_interval = us;
+        return S_OK;
+    };
+    h.schedule_frame_event = [](void* ctx, UINT ev, UINT, UINT) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->schedule_calls;
+        m->last_event = ev;
+        return S_OK;
+    };
+    h.wait_frame_event = [](void* ctx, UINT, DWORD, UINT flags, std::uint64_t* tok) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->wait_calls;
+        m->last_flags = flags;
+        if (tok) *tok = 77;
+        return S_FALSE;
+    };
+    h.get_frame_statistics = [](void* ctx, std::uint64_t, UINT, UINT* count, void*) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->stats_calls;
+        if (count) *count = 0;
+        return S_FALSE;
+    };
+    h.present_x = [](void* ctx, UINT plane_count, const void*, const void*) -> HRESULT {
+        auto* m = static_cast<MockPresenter*>(ctx);
+        ++m->present_calls;
+        m->last_planes = plane_count;
+        return S_OK;
+    };
+    h.suspend_x = [](void* ctx, UINT) -> HRESULT {
+        ++static_cast<MockPresenter*>(ctx)->suspend_calls;
+        return S_OK;
+    };
+    h.resume_x = [](void* ctx) -> HRESULT {
+        ++static_cast<MockPresenter*>(ctx)->resume_calls;
+        return S_OK;
+    };
+
+    EXPECT(xs::set_presentation_handler(device, &h));
+    EXPECT(hr_of(raw(device, 78, 0, 33333, 2, 0)) == S_OK && p.interval_calls == 1 && p.last_interval == 33333);
+    EXPECT(hr_of(raw(device, 79, 2, 0, 0, 0)) == S_OK && p.schedule_calls == 1 && p.last_event == 2);
+    std::uint64_t tok = 0;
+    EXPECT(hr_of(raw(device, 80, 0, 0, 0, 2, word(&tok))) == S_FALSE && tok == 77 && p.wait_calls == 1 &&
+           p.last_flags == 2);
+    UINT count = 3;
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&count), 0)) == S_FALSE && count == 0 && p.stats_calls == 1);
+
+    // Queue slots 30/31/32 route to PresentX / SuspendX / ResumeX while attached.
+    EXPECT(hr_of(raw(queue, 30, 1, 0x1000, 0x2000)) == S_OK && p.present_calls == 1 && p.last_planes == 1);
+    EXPECT(hr_of(raw(queue, 31, 0)) == S_OK && p.suspend_calls == 1);
+    EXPECT(hr_of(raw(queue, 32)) == S_OK && p.resume_calls == 1);
+
+    // Detaching restores default E_NOTIMPL refusal on beyond-PC queue slots.
+    EXPECT(xs::set_presentation_handler(device, nullptr));
+    EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) == E_NOTIMPL && p.present_calls == 1);
+
+    EXPECT(release(queue) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: presentation handler wiring (slots 78-81 and queue 30-32) passed\n", g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1249,7 +1339,8 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
+        check_presentation_wiring())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

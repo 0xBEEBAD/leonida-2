@@ -199,5 +199,13 @@ private:
 };
 
 inline constexpr UINT xbox_frame_event_origin = leonida::frame_event_origin;
+inline constexpr UINT xbox_frame_event_vblank = leonida::frame_event_vblank;
+inline constexpr UINT xbox_frame_event_flip = leonida::frame_event_flip;
+inline constexpr UINT xbox_frame_wait_token_on_timeout = leonida::frame_wait_flag_token_on_timeout;
+
+// Wires an XboxPresentation into a d3d12_xs device proxy's frame-event slots (78–81) and queue PresentX/SuspendX/
+// ResumeX slots (default 30/31/32, configurable via LEONIDA_XS_*_SLOT). Passing nullptr detaches the presentation.
+bool attach_xbox_presentation(void* device_proxy, XboxPresentation* presentation);
+bool detach_xbox_presentation(void* device_proxy);
 
 }  // namespace rt::d3d12
