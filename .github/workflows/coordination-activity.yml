@@ -6,7 +6,7 @@ on:
   issues:
     types: [edited]
   pull_request_target:
-    types: [closed]
+    types: [opened, reopened, synchronize, edited, ready_for_review, closed]
   workflow_run:
     workflows: ["Coordination claim"]
     types: [completed]
@@ -332,15 +332,14 @@ jobs:
                       return pulls
                   return []
               if event_name == "pull_request_target":
-                  closed_pull = event.get("pull_request") or {}
-                  if ((closed_pull.get("base") or {}).get("ref")) != "main":
+                  changed_pull = event.get("pull_request") or {}
+                  action = event.get("action")
+                  base_ref = ((changed_pull.get("base") or {}).get("ref"))
+                  if base_ref != "main" and action != "edited":
                       return []
-                  closed_sha = ((closed_pull.get("head") or {}).get("sha") or "")
-                  return [
-                      pull for pull in pulls
-                      if ((pull.get("base") or {}).get("ref")) == "main"
-                      and ((pull.get("head") or {}).get("sha") or "") == closed_sha
-                  ]
+                  # Recompute every open main-targeting head so shared-SHA statuses
+                  # recover when a PR opens, changes commits, changes base, or closes.
+                  return [pull for pull in pulls if ((pull.get("base") or {}).get("ref")) == "main"]
               if event_name == "workflow_run":
                   run = event.get("workflow_run") or {}
                   associated = run.get("pull_requests") or []
