@@ -7,8 +7,10 @@
 //   - an old RADV: sizes 32..64, COMPUTE only.
 // No game data.
 #include "../src/subgroup_size.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 
 #define CHECK(condition) do {                                    \
@@ -129,13 +131,52 @@ int main() {
             const auto r = decide_subgroup_size(entry(stage, false), caps);
             CHECK(r.outcome == SubgroupOutcome::device_fixed && r.size == 0 && r.flags == 0);
         }
-        // Wave64 cannot be had (64 > max): native wave64 is reported in every stage, emulated is fine.
+        // Without a graphics tier, a native wave64 shader is reported in every stage.
         for (const char* stage : {"cs", "ps", "vs", "gs", "ms"}) {
             const auto r = decide_subgroup_size(entry(stage, true), caps);
             CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0 && r.wanted == 64);
         }
         const auto emulated = decide_subgroup_size(entry("cs", true, {64, 1, 1}, true), caps);
         CHECK(emulated.outcome == SubgroupOutcome::emulated && emulated.size == 0);
+    }
+
+    // Read the translator's graphics tier through the same index lookup used at pipeline creation.
+    {
+        const testfiles::ScratchDir scratch("leonida_subgroup_graphics");
+        std::ofstream(scratch.path() / "index.json") << R"({
+            "a": {"stage":"vs","wave64":true,"subgroup_size":64,"fssm_sha256":"a","wave64_graphics":"A"},
+            "b": {"stage":"ps","wave64":true,"subgroup_size":64,"fssm_sha256":"b","wave64_graphics":"B"},
+            "c": {"stage":"gs","wave64":true,"subgroup_size":64,"fssm_sha256":"c","wave64_graphics":"C"},
+            "unknown": {"stage":"ps","wave64":true,"fssm_sha256":"unknown","wave64_graphics":"D"},
+            "bad": {"stage":"ps","wave64":true,"fssm_sha256":"bad","wave64_graphics":1}
+        })";
+        ShaderLibrary library;
+        CHECK(library.load(scratch.path()));
+        const auto* a = library.find("vs", "a");
+        const auto* b = library.find("ps", "b");
+        CHECK(a && b);
+        for (const auto* shader : {a, b}) {
+            const auto r = decide_subgroup_size(*shader, nvidia());
+            CHECK(r.outcome == SubgroupOutcome::graphics_halves && r.wanted == 64 && r.size == 0 && r.flags == 0);
+        }
+        for (const auto* shader : {library.find("gs", "c"), library.find("ps", "unknown"), library.find("ps", "bad")}) {
+            CHECK(shader && decide_subgroup_size(*shader, nvidia()).outcome == SubgroupOutcome::unavailable);
+        }
+        const auto native = decide_subgroup_size(*b, amd());
+        CHECK(native.outcome == SubgroupOutcome::required && native.size == 64);
+        auto narrow = nvidia();
+        narrow.min_size = narrow.max_size = narrow.default_size = 16;
+        CHECK(decide_subgroup_size(*b, narrow).outcome == SubgroupOutcome::unavailable);
+        auto shader = *a;
+        shader.stage = "gs";
+        CHECK(decide_subgroup_size(shader, nvidia()).outcome == SubgroupOutcome::graphics_halves);
+        auto variable = old_radv();
+        variable.default_size = 32;
+        CHECK(decide_subgroup_size(shader, variable).outcome == SubgroupOutcome::unavailable);
+        for (const char* stage : {"cs", "ms"}) {
+            shader.stage = stage;
+            CHECK(decide_subgroup_size(shader, nvidia()).outcome == SubgroupOutcome::unavailable);
+        }
     }
 
     // --- An old RADV: COMPUTE only ----------------------------------------------------------------------------------

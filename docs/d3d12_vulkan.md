@@ -984,7 +984,8 @@ the game's present entry point (`PresentX`; the DXGI factory/swapchain and the p
   shader on a 64-wide default reads the other half's lanes (AnyPS5 #487 on RDNA4). `runtime/src/subgroup_size.h`
   decides, per stage, from the shader's index entry and what the device offers; the PSO chains the result.
   - **Index fields:** `wave64`, `subgroup_size` (64 for wave64, 32 otherwise, `null` when emulated) and
-    `wave64_exchange` (present: translated with `--wave64-emulate`, exact on any size).
+    `wave64_exchange` (present: translated with `--wave64-emulate`, exact on any size). For wave64 VS/PS/GS,
+    `wave64_graphics` records the translator's partition-invariance tier (SHADER-10 in `docs/design.md`).
   - **Device:** `subgroupSizeControl` and `computeFullSubgroups` are enabled where supported;
     `minSubgroupSize`, `maxSubgroupSize`, `maxComputeWorkgroupSubgroups`, `requiredSubgroupSizeStages` (from
     `VkPhysicalDeviceSubgroupSizeControlProperties`) and the default `subgroupSize` are kept in
@@ -999,7 +1000,8 @@ the game's present entry point (`PresentX`; the DXGI factory/swapchain and the p
     -flags-08988 for the stage, -pNext-02757 for X). Wave32 shaders ask for 32 the same way. A device whose only size is the wanted one (NVIDIA,
     wave32) needs no chain. Where the size cannot be required (stage not listed, feature off) but the device default is
     the wanted one, the shader works as it is (`device_default`; nothing guarantees the default, so it is not logged
-    as inexact); any other size is `unavailable` and logged.
+    as inexact). On a fixed 32-wide device, a wave64 VS/PS/GS with tier A or B runs as two 32-lane halves
+    (`graphics_halves`), without a size request or width warning. Other size mismatches are `unavailable` and logged.
   - **Which stages can be required:** it is the driver's list, not a fixed rule, and AMD's Windows driver gives
     different lists for different GPUs, on the same 26.11.2 release too:
     - Radeon 880M (RDNA3.5, gfx1150), 26.11.2: FRAGMENT | COMPUTE | TASK | MESH, sizes 32..64, so wave64 and wave32
@@ -1036,8 +1038,9 @@ the game's present entry point (`PresentX`; the DXGI factory/swapchain and the p
   - **A size the device cannot give** is logged once per stage with the first shader's name (and again at 10, 100,
     1000 shaders of that stage): `[rt] d3d12: <name> (<stage>) is a 64-wide shader but this device cannot require that
     subgroup size ...`. For compute and mesh the fix is the build, `--wave64-emulate` (`make_game.py
-    --wave64-emulate auto` picks it for this GPU); a wave64 vertex, geometry or pixel shader has no emulation yet
-    (the ~10,000 wave64 pixel shaders are the open case on NVIDIA, SHADER-10).
+    --wave64-emulate auto` picks it for this GPU). For graphics, tier C can depend on the other half of the wave.
+    It still triggers the warning on fixed-32 devices, as does a missing or unrecognized tier. The pipeline is
+    submitted in each case.
   - **Test:** `subgroup_size_test` (CPU) checks the decision against AMD-like, NVIDIA-like and old-RADV
     properties and the resulting create-info chain; `d3d12_subgroup_test` (GPU) runs `cs_w64x_readlane` natively
     and with `--wave64-emulate`, and `cs_wqm_w32`, through D3D12 PSOs and compares the read-back words.
