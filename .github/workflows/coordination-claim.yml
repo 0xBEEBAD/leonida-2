@@ -4,12 +4,18 @@ on:
   pull_request:
     branches: [main]
     types: [opened, reopened, edited, synchronize, ready_for_review, converted_to_draft, closed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Current PR number to validate
+        required: true
+        type: number
 
 permissions: {}
 
 jobs:
   validate-claim:
-    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    if: (github.event_name == 'pull_request' && github.event.action != 'closed') || github.event_name == 'workflow_dispatch'
     name: coordination-claim
     runs-on: ubuntu-latest
     timeout-minutes: 3
@@ -34,9 +40,9 @@ jobs:
           OWNER, REPOSITORY = os.environ["GITHUB_REPOSITORY"].split("/", 1)
           TOKEN = os.environ["GITHUB_TOKEN"]
           ISSUE_NUMBER = 14
-          ID_PATTERN = r"[A-Z0-9]+(?:-[A-Z0-9]+)+"
+          ID_PATTERN = r"(?<![A-Za-z0-9-])[A-Z0-9]+(?:-[A-Z0-9]+)+(?![A-Za-z0-9-])"
           WORK_ID_RE = re.compile(ID_PATTERN)
-          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)")
+          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)(?![A-Za-z0-9-])")
           CLAIM_FIELD_RE = re.compile(
               r"(?im)^\s*>?\s*Claimed in the coordination issue as:\s*(.*?)\s*$"
           )
@@ -147,31 +153,43 @@ jobs:
                   return None
           
           
-          def pull_claim_ids(pull, allowed_ids, comments_by_id):
-              found = ids_from_text(pull.get("title") or "") & allowed_ids
+          def pull_claim_ids(pull, comments_by_id):
+              found = ids_from_text(pull.get("title") or "")
+              unresolved_links = []
               body = re.sub(r"<!--[\s\S]*?-->", "", pull.get("body") or "")
               for field in CLAIM_FIELD_RE.finditer(body):
                   value = field.group(1)
-                  found.update(ids_from_text(value) & allowed_ids)
+                  found.update(ids_from_text(value))
                   for comment_id in re.findall(r"#issuecomment-(\d+)", value):
                       linked = comments_by_id.get(comment_id)
-                      if linked:
-                          found.update(
-                              ids_from_claim_comment(linked.get("body") or "") & allowed_ids
-                          )
-              return found
-          
-          
+                      if not linked:
+                          unresolved_links.append(comment_id)
+                          continue
+                      linked_ids = ids_from_claim_comment(linked.get("body") or "")
+                      if not linked_ids:
+                          unresolved_links.append(comment_id)
+                      found.update(linked_ids)
+              return found, unresolved_links
+          event_name = os.environ.get("GITHUB_EVENT_NAME")
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
               event = json.load(event_file)
-          event_pull = event.get("pull_request") or {}
-          pull_number = event_pull.get("number") or event.get("number")
-          event_head_sha = ((event_pull.get("head") or {}).get("sha") or "")
-          if not pull_number or not event_head_sha:
-              fail("Cannot determine the PR number or event head SHA.")
+          if event_name == "workflow_dispatch":
+              try:
+                  pull_number = int((event.get("inputs") or {}).get("pr_number") or 0)
+              except (TypeError, ValueError):
+                  pull_number = 0
+              event_head_sha = ""
+          else:
+              event_pull = event.get("pull_request") or {}
+              pull_number = event_pull.get("number") or event.get("number")
+              event_head_sha = ((event_pull.get("head") or {}).get("sha") or "")
+          if not pull_number:
+              fail("Cannot determine the PR number.")
           pull = request_json(f"/repos/{OWNER}/{REPOSITORY}/pulls/{pull_number}")
           live_head_sha = ((pull.get("head") or {}).get("sha") or "")
-          if live_head_sha != event_head_sha:
+          if not live_head_sha:
+              fail("Cannot determine the current PR head.")
+          if event_head_sha and live_head_sha != event_head_sha:
               fail("The PR head changed after this run was queued; check the current PR head.")
           author = ((pull.get("user") or {}).get("login") or "").casefold()
           opened_at = parse_time(pull.get("created_at"))
@@ -188,13 +206,20 @@ jobs:
                   claims_by_id.setdefault(item_id, []).append(comment)
           
           allowed_ids = open_work_ids(issue.get("body") or "") | set(claims_by_id)
-          candidates = pull_claim_ids(pull, allowed_ids, comments_by_id)
+          candidates, unresolved_links = pull_claim_ids(pull, comments_by_id)
+          if unresolved_links:
+              fail("The PR references a missing or non-claim issue comment.")
           if not candidates:
               fail(
                   "Put one or more work-item IDs from issue #14 in the PR title or "
                   "the 'Claimed in the coordination issue as' field."
               )
-          
+          unknown_ids = candidates - allowed_ids
+          if unknown_ids:
+              fail(
+                  "Unknown work-item IDs: " + ", ".join(sorted(unknown_ids)) +
+                  ". Add them to the Open work table first."
+              )
           owners = set()
           for item_id in sorted(candidates):
               prior_claims = []
@@ -217,6 +242,6 @@ jobs:
           
           if owners != {author}:
               fail("Every declared claim must have one owner, and that owner must match the PR author.")
-          print("Coordination claim verified for " + ", ".join(sorted(candidates)) + ".")
+          print(f"Coordination claim verified for PR #{pull_number} at head {live_head_sha}: " + ", ".join(sorted(candidates)) + ".")
           
           PY
