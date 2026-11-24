@@ -628,6 +628,27 @@ Each refused server is logged once (`[rt] winhttp: offline, refused <host>:<port
 tried to reach. `runtime/test/winhttp_offline_test.cpp` (ctest `winhttp_offline`) covers the synchronous and
 asynchronous paths with `.invalid` names; it opens no connection.
 
+## Winsock2 (`ws2_32.dll`) offline
+
+`runtime/shims/ws2_offline.cpp` intercepts outbound Winsock2 entry points — both by name and by standard Windows
+`ws2_32.dll` ordinal (`bind`/`#2`, `connect`/`#4`, `sendto`/`#20`, `gethostbyaddr`/`#51`, `gethostbyname`/`#52`,
+`WSAAsyncGetHostByAddr`/`#102`, `WSAAsyncGetHostByName`/`#103`, `getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExA/W`,
+`getnameinfo`, `GetNameInfoW`, `WSAConnect`, `WSAConnectByNameA/W`, `WSAConnectByList`, `WSASendTo`, `WSASendMsg`, and
+`WSAIoctl` for `WSAID_CONNECTEX` and `WSAID_WSASENDMSG`) — while keeping `ws2_32.dll` partially overridden so local
+socket bookkeeping (`WSAStartup`, `socket`, `closesocket`, `select`, `recv`, `send`, byte-order helpers) still works
+for loopback traffic:
+
+- `connect`, `WSAConnect`, `ConnectEx`, `sendto`, `WSASendTo`, `WSASendMsg`, `WSAConnectByNameA/W` and
+  `WSAConnectByList` allow only IPv4 loopback (`127.0.0.0/8`), IPv6 loopback (`::1`) and IPv4-mapped loopback
+  (`::ffff:127.0.0.0/104`); everything else fails with `WSAENETUNREACH`.
+- `bind` narrows wildcard binds (`0.0.0.0`, `::`) to loopback (`127.0.0.1`, `::1`) and refuses other non-loopback
+  addresses with `WSAEADDRNOTAVAIL`.
+- Forward lookups refuse external names with `WSAHOST_NOT_FOUND` without sending DNS traffic; `getnameinfo` /
+  `GetNameInfoW` force `NI_NUMERICHOST` (or return `WSAHOST_NOT_FOUND` under `NI_NAMEREQD`) for non-loopback addresses.
+
+`runtime/test/ws2_offline_test.cpp` (ctest `ws2_offline`) verifies name and ordinal bindings, external refusals using
+RFC 5737 / RFC 3849 / `.invalid` targets, wildcard-bind narrowing, and a local loopback UDP round-trip.
+
 ## What this proves and what it does not
 
 - It proves the loader parses real Xbox Series PE files, maps their sections, applies no unnecessary relocation,
