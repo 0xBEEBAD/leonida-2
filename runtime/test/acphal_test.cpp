@@ -11,11 +11,27 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <thread>
 #include <vector>
 
 #include "shims.h"
+
+// Fail only the calling test thread's designated allocation.
+static thread_local int allocations_before_failure = -1;
+void* operator new(std::size_t size) {
+    if (allocations_before_failure == 0) {
+        allocations_before_failure = -1;
+        throw std::bad_alloc();
+    }
+    if (allocations_before_failure > 0) --allocations_before_failure;
+    if (void* memory = std::malloc(size ? size : 1)) return memory;
+    throw std::bad_alloc();
+}
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace {
 
@@ -78,9 +94,42 @@ struct XmaWords {
     }
 };
 
+// Synthetic mono XMA2 with a single positive spectral coefficient in each frame.
+void write_xma_packet(uint8_t* packet, uint32_t frames, uint8_t packet_skip) {
+    constexpr uint32_t frame_bits = 82;
+    std::memset(packet, 0xFF, 2048);
+    std::size_t at = 0;
+    auto put = [&](uint32_t value, std::size_t width) {
+        for (std::size_t i = 0; i < width; ++i, ++at) {
+            const auto mask = static_cast<uint8_t>(0x80u >> (at % 8));
+            packet[at / 8] &= static_cast<uint8_t>(~mask);
+            if ((value >> (width - 1 - i)) & 1u) packet[at / 8] |= mask;
+        }
+    };
+    put((frames << 26) | (1u << 8) | packet_skip, 32);
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+        put(frame_bits, 15);
+        put(0b10u, 2);                    // Fixed layout, one 512-sample subframe.
+        put(0, 11);                       // Gain, trim, fill and subframe error flag.
+        put(1, 1);                        // Coefficients are present.
+        put(1, 1);                        // Explicit vector coefficient count.
+        put(0, 8);                        // Use only run/level coding.
+        put(0, 6);                        // Quantizer adjustment.
+        put(0, 2);                        // Scale factor step.
+        put((1u << 23) - 1, 23);          // One zero delta per 48 kHz scale band.
+        put(0, 1);                        // Run/level table 0.
+        put(0b00u, 2);                    // Run 0, level 1.
+        put(1, 1);                        // Positive sign.
+        put(0b0101011u, 7);               // End of coefficients.
+        put(0, 1);                        // Frame padding bit.
+        put(frame + 1 < frames ? 1 : 0, 1);
+    }
+}
+
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("acphal_test: registered acphal.dll shim verification\n");
 
     const auto create = reinterpret_cast<AcpHalCreateFn>(
@@ -264,6 +313,21 @@ int main() {
     check(ctx_all.xmaContextArray != nullptr, "xmaContextArray is allocated");
     check(ctx_all.pcmContextArray != nullptr, "pcmContextArray is allocated");
 
+    TestShapeContexts retry_ctx{};
+    retry_ctx.numXmaContexts = 2;
+    allocations_before_failure = 1;  // The tracked allocation can grow, then voice slot allocation fails.
+    HRESULT allocation_result = E_UNEXPECTED;
+    try {
+        allocation_result = alloc_ctx(&retry_ctx);
+    } catch (const std::bad_alloc&) {
+        // An exception across the AcpHal boundary is a regression.
+    }
+    allocations_before_failure = -1;
+    check(allocation_result == E_OUTOFMEMORY && retry_ctx.xmaContextArray == nullptr,
+          "A failed XMA slot allocation returns E_OUTOFMEMORY without publishing a context");
+    check(alloc_ctx(&retry_ctx) == S_OK && retry_ctx.xmaContextArray != nullptr,
+          "SHAPE allocation can be retried after memory pressure");
+
     // Release shape contexts
     check(release_ctx(&ctx_all) == S_OK, "AcpHalReleaseShapeContexts succeeds");
     check(ctx_all.xmaContextArray == nullptr, "xmaContextArray is reset to null");
@@ -359,44 +423,6 @@ int main() {
     {
         // Two synthetic XMA2 packets with three mono frames each. Each frame
         // transmits one positive spectral coefficient so decoded PCM differs from fallback silence.
-        std::vector<uint8_t> stream(2 * 2048, 0xFFu);
-        auto put_bits = [&](size_t at, uint32_t value, size_t width) {
-            for (size_t i = 0; i < width; ++i) {
-                const size_t p = at + i;
-                const uint32_t bit = (value >> (width - 1 - i)) & 1u;
-                stream[p / 8] = static_cast<uint8_t>(
-                    (stream[p / 8] & ~(0x80u >> (p % 8))) |
-                    (bit << (7 - (p % 8))));
-            }
-        };
-        for (size_t packet = 0; packet < 2; ++packet) {
-            const size_t base = packet * 2048 * 8;
-            put_bits(base, (3u << 26) | (1u << 8), 32);
-            constexpr size_t frame_bits = 82;
-            for (size_t f = 0; f < 3; ++f) {
-                size_t at = base + 32 + f * frame_bits;
-                auto put = [&](uint32_t value, size_t width) {
-                    put_bits(at, value, width);
-                    at += width;
-                };
-                put(frame_bits, 15);
-                put(0b10u, 2);               // Fixed layout, one 512-sample subframe.
-                put(0, 11);                  // Gain, trim, fill and subframe error flag.
-                put(1, 1);                   // Coefficients are present.
-                put(1, 1);                   // Explicit vector coefficient count.
-                put(0, 8);                   // Use only run/level coding.
-                put(0, 6);                   // Quantizer adjustment.
-                put(0, 2);                   // Scale factor step.
-                put((1u << 23) - 1, 23);     // One zero delta per 48 kHz scale band.
-                put(0, 1);                   // Run/level table 0.
-                put(0b00u, 2);               // Run 0, level 1.
-                put(1, 1);                   // Positive sign.
-                put(0b0101011u, 7);          // End of coefficients.
-                put(0, 1);                   // Frame padding bit.
-                put(f < 2 ? 1u : 0u, 1);    // Another frame follows in this packet.
-            }
-        }
-
         TestShapeContexts xma_ctx{};
         xma_ctx.numXmaContexts = 4;
         check(alloc_ctx(&xma_ctx) == S_OK && xma_ctx.xmaContextArray != nullptr,
@@ -406,7 +432,9 @@ int main() {
         uint32_t in_apu = 0;
         check(alloc(&in_va, &in_apu, 0x1000, 0x800, 1) == S_OK && in_va != nullptr,
               "ApuAlloc 2-packet XMA2 input buffer");
-        std::memcpy(in_va, stream.data(), stream.size());
+        auto* packets = static_cast<uint8_t*>(in_va);
+        write_xma_packet(packets, 3, 0);
+        write_xma_packet(packets + 2048, 3, 0);
 
         void* out_va = nullptr;
         uint32_t out_apu = 0;
@@ -499,27 +527,6 @@ int main() {
     // 8b. Loops are rounded to whole packets: the loop end packet plays in full and the read
     //     restarts at the packet holding the loop start. One 1-frame packet = 512 samples = 4 blocks.
     {
-        // Three packets with one silent mono frame each. Packet 0 skips packet 1,
-        // which belongs to another stream.
-        std::vector<uint8_t> stream(3 * 2048, 0xFFu);
-        auto put_bits = [&](size_t at, uint32_t value, size_t width) {
-            for (size_t i = 0; i < width; ++i) {
-                const size_t p = at + i;
-                const uint32_t bit = (value >> (width - 1 - i)) & 1u;
-                stream[p / 8] = static_cast<uint8_t>(
-                    (stream[p / 8] & ~(0x80u >> (p % 8))) |
-                    (bit << (7 - (p % 8))));
-            }
-        };
-        for (size_t packet = 0; packet < 3; ++packet) {
-            const size_t base = packet * 2048 * 8;
-            put_bits(base, (1u << 26) | (packet == 0 ? 1u : 0u), 32);
-            const size_t at = base + 32;
-            put_bits(at, 31, 15);          // frame length
-            put_bits(at + 15, 0b10u, 2);   // fixed layout, one 512-sample subframe
-            put_bits(at + 17, 0, 14);      // gain(8) + trim(1) + subframe_skip/empty(5)
-        }
-
         TestShapeContexts xma_ctx{};
         xma_ctx.numXmaContexts = 4;
         check(alloc_ctx(&xma_ctx) == S_OK && xma_ctx.xmaContextArray != nullptr,
@@ -527,9 +534,12 @@ int main() {
 
         void* in_va = nullptr;
         uint32_t in_apu = 0;
-        check(alloc(&in_va, &in_apu, 0x1800, 0x800, 1) == S_OK && in_va != nullptr,
-              "ApuAlloc 3-packet loop input buffer");
-        std::memcpy(in_va, stream.data(), stream.size());
+        check(alloc(&in_va, &in_apu, 0x2000, 0x800, 1) == S_OK && in_va != nullptr,
+              "ApuAlloc 4-packet loop and refill input buffer");
+        auto* packets = static_cast<uint8_t*>(in_va);
+        write_xma_packet(packets, 1, 1);  // Packet 1 belongs to another stream.
+        write_xma_packet(packets + 0x800, 2, 0);
+        write_xma_packet(packets + 0x1000, 1, 0);
 
         void* out_va = nullptr;
         uint32_t out_apu = 0;
@@ -569,8 +579,10 @@ int main() {
 
         const uint32_t voice_index = 2u;
         // Returns the number of blocks written before input exhaustion, or -1 on timeout.
-        auto run_blocks = [&](uint32_t loops, uint32_t input_0_packets = 3) -> int {
+        auto run_blocks = [&](uint32_t loops, uint32_t input_0_packets = 3,
+                              uint32_t initial_skip = 0, uint32_t loop_skip = 0) -> int {
             configure_voice(loops, input_0_packets, 16, 0, 0);
+            words[1].fetch_or((initial_skip << 24) | (loop_skip << 17));
             check(fn_submit(x_acp, 5, 0xf3, 0xffffffffu, &voice_index, 0) == S_OK,
                   "ENABLE_XMA voice 2 succeeds");
             int wait = 0;
@@ -588,10 +600,26 @@ int main() {
         check(run_blocks(0) == 8, "Packets 0 and 2 write 8 blocks, skipping packet 1");
         check(run_blocks(1) == 12, "One loop of packet 0 writes 12 blocks (packets 0, 0, 2)");
         check(((words[0] >> 12) & 0xFFu) == 0u, "Loop count is consumed by the single loop");
+        const auto* ring_bytes = static_cast<const uint8_t*>(out_va);
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+        auto has_signal = [](const uint8_t* start) {
+            return std::any_of(start, start + 0x400, [](uint8_t b) { return b != 0 && b != 0x55; });
+        };
+        check(has_signal(ring_bytes) && has_signal(ring_bytes + 0x400) && has_signal(ring_bytes + 0x800),
+              "Rust produces signal before and after rewinding the loop");
+        check(std::memcmp(ring_bytes, ring_bytes + 0x400, 0x400) == 0,
+              "Rewind decodes the first packet from fresh decoder state");
+#endif
+        check(run_blocks(1, 3, 2, 1) == 9 && ((words[1] >> 24) & 7u) == 0,
+              "Initial and loop subframe skips consume 3 blocks and clear the initial skip");
         check(run_blocks(0, 2) == 8 && (words[4] >> 31) == 1u,
               "A skip to the end of input 0 continues at input 1");
         check(run_blocks(0, 1) == 8 && (words[4] >> 31) == 1u,
               "An overshooting skip starts at packet 1 of input 1");
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+        check(has_signal(ring_bytes) && has_signal(ring_bytes + 0x400),
+              "Rust produces signal on both sides of the buffer switch");
+#endif
 
         configure_voice(255, 3, 4, 7, 9);
         check(fn_submit(x_acp, 5, 0xf3, 0xffffffffu, &voice_index, 0) == S_OK,
@@ -602,7 +630,6 @@ int main() {
         check(fn_submit(x_acp, 7, 0xf4, 0xffffffffu, &voice_index, 0) == S_OK,
               "Disable infinite loop after filling bounded ring");
         check(((words[0] >> 12) & 0xFFu) == 255u, "Infinite loop does not consume its loop count");
-        const auto* ring_bytes = static_cast<const uint8_t*>(out_va);
         check(std::all_of(ring_bytes + 0x400, ring_bytes + 0x1000,
                           [](uint8_t b) { return b == 0x55; }),
               "Output never writes beyond the configured four-block ring");
@@ -613,6 +640,48 @@ int main() {
         check(fn_submit(x_acp, 18, 0xf5, 0xffffffffu, advance_args, 0) == S_OK && words[9] == 2u,
               "ADVANCE_XMA_READ wraps at the ring size without overflowing");
 
+        auto wait_for_ring = [&]() {
+            for (int wait = 0; wait < 1000 && (words[1] >> 31) != 0u; ++wait) Sleep(1);
+            return (words[1] >> 31) == 0u;
+        };
+        const uint32_t refill_read_args[2] = {voice_index, 4};
+
+        configure_voice(0, 3, 4, 0, 0);
+        words[0] = 1u | (1u << 20) | (4u << 22);
+        write_xma_packet(packets, 3, 0);
+        check(fn_submit(x_acp, 5, 0xf6, 0xffffffffu, &voice_index, 0) == S_OK && wait_for_ring(),
+              "First packet fills the ring and leaves queued PCM");
+        words[0].fetch_or(1u << 20);
+        check(fn_submit(x_acp, 5, 0xf7, 0xffffffffu, &voice_index, 0) == S_OK,
+              "Re-enable while refilling the current input");
+        int refills = 0;
+        for (int i = 0; i < 5; ++i) {
+            if (fn_submit(x_acp, 18, 0xf8, 0xffffffffu, refill_read_args, 0) != S_OK || !wait_for_ring()) break;
+            ++refills;
+        }
+        check(refills == 5 && (words[2] >> 31) == 0u && ((words[0] >> 20) & 3u) == 0u,
+              "Refill and repeated enable preserve all six frames and consume the reused input");
+        check(fn_submit(x_acp, 7, 0xf9, 0xffffffffu, &voice_index, 0) == S_OK,
+              "Disable the single-buffer refill voice");
+
+        // The next same-stream packet is in the first input's refill, after a short second input.
+        write_xma_packet(packets, 1, 2);
+        write_xma_packet(packets + 0x1000, 2, 0);
+        write_xma_packet(packets + 0x1800, 1, 0);
+        configure_voice(0, 1, 4, 0, 0);
+        words[1] = (words[1] & ~0xFFFu) | 1u;
+        check(fn_submit(x_acp, 5, 0xfa, 0xffffffffu, &voice_index, 0) == S_OK && wait_for_ring(),
+              "Voice fills the ring before the skip crosses two buffers");
+        words[5] = in_apu + 0x1000u;
+        words[0] = (words[0] & ~0xFFFu) | 2u | (1u << 20);
+        check(fn_submit(x_acp, 18, 0xfb, 0xffffffffu, refill_read_args, 0) == S_OK && wait_for_ring(),
+              "The same-stream packet fills the ring after two buffer crossings");
+        check(((words[0] >> 20) & 3u) == 0u && (words[4] >> 31) == 0u,
+              "A skip across both buffers lands on the last packet of the reloaded input");
+        check(fn_submit(x_acp, 7, 0xfc, 0xffffffffu, &voice_index, 0) == S_OK,
+              "Disable the two-buffer refill voice");
+
+        check(release_ctx(x_acp) == S_OK, "Release SHAPE contexts through the opaque AcpHal handle");
         check(fn_release(x_acp) == S_OK, "Release packet loop AcpHal succeeds");
         free_mem(in_va);
         free_mem(out_va);

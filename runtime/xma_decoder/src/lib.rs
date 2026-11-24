@@ -109,7 +109,8 @@ unsafe fn create_with<E>(
 /// Decodes a buffer containing one or more complete 2048-byte XMA2 packets.
 ///
 /// # Safety
-/// `decoder` must be a live handle returned by `leonida_xma2_decoder_create`.
+/// `decoder` must be a live handle returned by `leonida_xma2_decoder_create`
+/// or `leonida_xma2_decoder_create_hardware`.
 /// `input` must reference `input_len` readable bytes and `out_block` must be writable.
 /// Do not destroy a decoder concurrently with this call. The returned PCM block remains valid
 /// until `leonida_xma2_pcm_destroy` is called.
@@ -182,8 +183,8 @@ pub unsafe extern "C" fn leonida_xma2_decode_buffer(
 /// Destroys a decoder. Passing null is a no-op.
 ///
 /// # Safety
-/// A non-null pointer must be a live handle returned by `leonida_xma2_decoder_create`,
-/// and no calls may be using it concurrently.
+/// A non-null pointer must be a live handle returned by `leonida_xma2_decoder_create`
+/// or `leonida_xma2_decoder_create_hardware`. No calls may be using it concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn leonida_xma2_decoder_destroy(decoder: *mut LeonidaXma2Decoder) {
     if !decoder.is_null() {

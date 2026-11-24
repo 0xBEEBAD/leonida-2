@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <set>
 #include <shared_mutex>
@@ -286,8 +287,17 @@ ApuRegion g_cached_heap;
 ApuRegion g_noncached_heap;
 
 // Tracked SHAPE context arrays
+struct ShapeArrayFree {
+    void operator()(void* array) const noexcept { std::free(array); }
+};
+
+struct ShapeAllocation {
+    SHAPE_CONTEXTS* caller;
+    std::array<std::unique_ptr<void, ShapeArrayFree>, 6> arrays;
+};
+
 std::mutex g_shape_mutex;
-std::vector<void*> g_active_shape_arrays;
+std::vector<ShapeAllocation> g_shape_allocations;
 
 // Resolves a contiguous [apu, apu + len) byte range inside the APU heap.
 uint8_t* apu_span(uint32_t apu, std::size_t len) {
@@ -391,8 +401,8 @@ struct XmaVoice {
     std::unique_ptr<LeonidaXma2Decoder, Xma2DecoderFree> decoder;
 #endif
     std::deque<int16_t> pcm;
-    std::size_t skip = 0;  // samples per channel to drop (start/loop subframe skip)
-    std::optional<std::size_t> next_input_packet;
+    std::size_t loop_skip = 0;  // samples per channel to drop after a rewind
+    std::optional<uint32_t> exhausted_input;
     bool ended = false;
 };
 
@@ -406,14 +416,14 @@ public:
     ~XmaEngine() { unbind(); }
 
     void bind(SHAPE_XMA_CONTEXT* array, uint32_t count) {
+        // Construct with a size so MSVC's Debug iterator allocations can also fail
+        // through this call instead of the noexcept default constructor.
+        std::vector<std::unique_ptr<XmaVoiceSlot>> slots(count);
+        for (auto& slot : slots) slot = std::make_unique<XmaVoiceSlot>();
         unbind();
         std::unique_lock lock(table_mutex_);
         array_ = array;
-        voices_.clear();
-        voices_.reserve(count);
-        for (uint32_t i = 0; i < count; ++i) {
-            voices_.push_back(std::make_unique<XmaVoiceSlot>());
-        }
+        voices_.swap(slots);
     }
 
     void unbind() {
@@ -476,16 +486,15 @@ public:
 
         {
             std::lock_guard slot_lock(voices_[index]->mutex);
-            const bool was_active = voices_[index]->voice.has_value();
+            auto& voice = voices_[index]->voice;
             // Clear error_status (26..30) and error flag (31).
             ctx.set_field(2, 26, 6, 0);
 
-            XmaVoice voice;
-            voice.skip = static_cast<std::size_t>(ctx.field(1, 24, 3)) * kXmaSubframeSamples;
-            voices_[index]->voice.emplace(std::move(voice));
-            if (!was_active) {
+            if (!voice) {
+                voice.emplace();
                 active_count_.fetch_add(1, std::memory_order_relaxed);
             }
+            voice->ended = false;
         }
         ensure_worker_and_wake();
     }
@@ -566,19 +575,17 @@ private:
         uint32_t current = ctx.field(4, 31, 1);
         const uint32_t valid = ctx.field(0, 20, 2);
 
-        if (voice.next_input_packet || (valid & (1u << current)) == 0) {
-            const uint32_t other = 1u - current;
-            if ((valid & (1u << other)) == 0) {
-                voice.ended = true;
-                ctx.set_field(2, 26, 5, kXmaErrorInputInvalid);
-                ctx.set_field(2, 31, 1, 1);
-                return !voice.pcm.empty();
-            }
+        if (valid == 0) {
+            voice.ended = true;
+            ctx.set_field(2, 26, 6, kXmaErrorInputInvalid | 32u);
+            return !voice.pcm.empty();
+        }
+        const uint32_t other = 1u - current;
+        const bool current_valid = (valid & (1u << current)) != 0;
+        const bool other_valid = (valid & (1u << other)) != 0;
+        if (!current_valid || (voice.exhausted_input == current && other_valid)) {
             current = other;
             ctx.set_field(4, 31, 1, current);
-            const auto next_bit = voice.next_input_packet.value_or(0) * kXmaPacketBits;
-            ctx.set_field(2, 0, 26, static_cast<uint32_t>(next_bit));
-            voice.next_input_packet.reset();
         }
 
         const uint32_t address = (current == 0) ? ctx.get(5) : ctx.get(6);
@@ -586,18 +593,25 @@ private:
         const std::size_t packet = ctx.field(2, 0, 26) / kXmaPacketBits;
         const uint8_t* data = apu_span(address & ~0x7FFu, packets * kXmaPacketBytes);
         if (!data || packet >= packets) {
-            ctx.set_field(0, 20 + current, 1, 0);
-            voice.next_input_packet = 0;
-            ctx.set_field(2, 0, 26, 0);
+            finish_input(ctx, voice, current, packet >= packets ? packet - packets : 0);
             return true;
         }
+        voice.exhausted_input.reset();
 
         const uint8_t* packet_data = data + packet * kXmaPacketBytes;
         const uint8_t packet_skip = packet_data[3];
         std::vector<int16_t> pcm;
         decode_packet(ctx, voice, packet_data, pcm);
-        const std::size_t skip_samples = std::min(voice.skip * channels, pcm.size());
-        voice.skip -= skip_samples / channels;
+        const std::size_t subframe_samples = kXmaSubframeSamples * channels;
+        const std::size_t initial_skip = ctx.field(1, 24, 3);
+        const std::size_t skipped_subframes = std::min(initial_skip, pcm.size() / subframe_samples);
+        if (skipped_subframes != 0) {
+            ctx.set_field(1, 24, 3, static_cast<uint32_t>(initial_skip - skipped_subframes));
+        }
+        const std::size_t initial_samples = skipped_subframes * subframe_samples;
+        const std::size_t loop_samples = std::min(voice.loop_skip * channels, pcm.size() - initial_samples);
+        voice.loop_skip -= loop_samples / channels;
+        const std::size_t skip_samples = initial_samples + loop_samples;
         voice.pcm.insert(voice.pcm.end(), pcm.begin() + static_cast<std::ptrdiff_t>(skip_samples), pcm.end());
 
         // XMA2 packet headers link packets from the same stream; 0xff ends the chain.
@@ -606,7 +620,7 @@ private:
         const std::size_t loop_end = ctx.field(4, 0, 26);
         if (loops > 0 && loop_end != 0 && packet == loop_end / kXmaPacketBits) {
             next = ctx.field(3, 0, 26) / kXmaPacketBits;
-            voice.skip = static_cast<std::size_t>(ctx.field(1, 17, 3)) * kXmaSubframeSamples;
+            voice.loop_skip = static_cast<std::size_t>(ctx.field(1, 17, 3)) * kXmaSubframeSamples;
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
             // A frame spilling out of the loop-end packet does not continue in the loop-start packet:
             // start a fresh decoder there rather than decode the spliced bits.
@@ -615,16 +629,24 @@ private:
             if (loops != 255u) ctx.set_field(0, 12, 8, loops - 1u);
         }
         if (next >= packets) {
-            ctx.set_field(0, 20 + current, 1, 0);
-            voice.next_input_packet = next - packets;
-            next = 0;
+            finish_input(ctx, voice, current, next - packets);
+        } else {
+            ctx.set_field(2, 0, 26, static_cast<uint32_t>(next * kXmaPacketBits));
         }
-        ctx.set_field(2, 0, 26, static_cast<uint32_t>(next * kXmaPacketBits));
         return true;
+    }
+
+    static void finish_input(XmaContextView ctx, XmaVoice& voice, uint32_t current,
+                             std::size_t skip_packets) {
+        voice.exhausted_input = current;
+        // Publish the next offset before telling the title it can refill this input.
+        ctx.set_field(2, 0, 26, static_cast<uint32_t>(skip_packets * kXmaPacketBits));
+        ctx.set_field(0, 20 + current, 1, 0);
     }
 
     static void pump_voice(XmaContextView ctx, XmaVoice& voice) {
         const uint32_t size = ctx.field(0, 22, 5);
+        if (size == 0 || ctx.field(1, 31, 1) == 0) return;
         auto* ring = apu_span(ctx.get(7), size * kXmaBlockBytes);
         if (!ring) return;
 
@@ -918,58 +940,80 @@ HRESULT __stdcall AcpHalAllocateShapeContexts(SHAPE_CONTEXTS* ctx) {
 
     std::lock_guard lock(g_shape_mutex);
 
-    auto alloc_array = [](uint32_t count, size_t elem_size) -> void* {
+    ShapeAllocation pending{ctx, {}};
+    std::size_t array_index = 0;
+    auto alloc_array = [&](uint32_t count, size_t elem_size) -> void* {
         if (count == 0) return nullptr;
         void* ptr = std::calloc(count, elem_size);
-        if (ptr) g_active_shape_arrays.push_back(ptr);
+        if (!ptr) throw std::bad_alloc();
+        pending.arrays[array_index++].reset(ptr);
         return ptr;
     };
 
-    ctx->srcContextArray = static_cast<SHAPE_SRC_CONTEXT*>(
-        alloc_array(ctx->numSrcContexts, sizeof(SHAPE_SRC_CONTEXT)));
-    ctx->eqCompContextArray = static_cast<SHAPE_EQCOMP_CONTEXT*>(
-        alloc_array(ctx->numEqCompContexts, sizeof(SHAPE_EQCOMP_CONTEXT)));
-    ctx->filtVolContextArray = static_cast<SHAPE_FILTVOL_CONTEXT*>(
-        alloc_array(ctx->numFiltVolContexts, sizeof(SHAPE_FILTVOL_CONTEXT)));
-    ctx->dmaContextArray = static_cast<SHAPE_DMA_CONTEXT*>(
-        alloc_array(ctx->numDmaContexts, sizeof(SHAPE_DMA_CONTEXT)));
-    ctx->xmaContextArray = static_cast<SHAPE_XMA_CONTEXT*>(
-        alloc_array(ctx->numXmaContexts, sizeof(SHAPE_XMA_CONTEXT)));
-    ctx->pcmContextArray = static_cast<SHAPE_PCM_CONTEXT*>(
-        alloc_array(ctx->numPcmContexts, sizeof(SHAPE_PCM_CONTEXT)));
+    SHAPE_CONTEXTS result{};
+    result.numSrcContexts = ctx->numSrcContexts;
+    result.numEqCompContexts = ctx->numEqCompContexts;
+    result.numFiltVolContexts = ctx->numFiltVolContexts;
+    result.numDmaContexts = ctx->numDmaContexts;
+    result.numXmaContexts = ctx->numXmaContexts;
+    result.numPcmContexts = ctx->numPcmContexts;
+    try {
+        result.srcContextArray = static_cast<SHAPE_SRC_CONTEXT*>(
+            alloc_array(result.numSrcContexts, sizeof(SHAPE_SRC_CONTEXT)));
+        result.eqCompContextArray = static_cast<SHAPE_EQCOMP_CONTEXT*>(
+            alloc_array(result.numEqCompContexts, sizeof(SHAPE_EQCOMP_CONTEXT)));
+        result.filtVolContextArray = static_cast<SHAPE_FILTVOL_CONTEXT*>(
+            alloc_array(result.numFiltVolContexts, sizeof(SHAPE_FILTVOL_CONTEXT)));
+        result.dmaContextArray = static_cast<SHAPE_DMA_CONTEXT*>(
+            alloc_array(result.numDmaContexts, sizeof(SHAPE_DMA_CONTEXT)));
+        result.xmaContextArray = static_cast<SHAPE_XMA_CONTEXT*>(
+            alloc_array(result.numXmaContexts, sizeof(SHAPE_XMA_CONTEXT)));
+        result.pcmContextArray = static_cast<SHAPE_PCM_CONTEXT*>(
+            alloc_array(result.numPcmContexts, sizeof(SHAPE_PCM_CONTEXT)));
 
-    // On PC there is no physical APU address translation for host context arrays;
-    // assign unique synthetic addresses from the APU base.
-    ctx->apuSrcContextArray = {ctx->srcContextArray ? kApuBaseAddress : 0};
-    ctx->apuEqCompContextArray = {ctx->eqCompContextArray ? kApuBaseAddress + 0x1000 : 0};
-    ctx->apuFiltVolContextArray = {ctx->filtVolContextArray ? kApuBaseAddress + 0x2000 : 0};
-    ctx->apuDmaContextArray = {ctx->dmaContextArray ? kApuBaseAddress + 0x3000 : 0};
-    ctx->apuXmaContextArray = {ctx->xmaContextArray ? kApuBaseAddress + 0x4000 : 0};
-    ctx->apuPcmContextArray = {ctx->pcmContextArray ? kApuBaseAddress + 0x5000 : 0};
+        // Assign synthetic APU addresses to the host-side context arrays.
+        result.apuSrcContextArray = {result.srcContextArray ? kApuBaseAddress : 0};
+        result.apuEqCompContextArray = {result.eqCompContextArray ? kApuBaseAddress + 0x1000 : 0};
+        result.apuFiltVolContextArray = {result.filtVolContextArray ? kApuBaseAddress + 0x2000 : 0};
+        result.apuDmaContextArray = {result.dmaContextArray ? kApuBaseAddress + 0x3000 : 0};
+        result.apuXmaContextArray = {result.xmaContextArray ? kApuBaseAddress + 0x4000 : 0};
+        result.apuPcmContextArray = {result.pcmContextArray ? kApuBaseAddress + 0x5000 : 0};
 
-    g_xma_engine.bind(ctx->xmaContextArray, ctx->numXmaContexts);
+        g_shape_allocations.reserve(g_shape_allocations.size() + 1);
+        g_xma_engine.bind(result.xmaContextArray, result.numXmaContexts);
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    }
 
-    trace_call("AcpHalAllocateShapeContexts",
-               ",\"src\":" + std::to_string(ctx->numSrcContexts) +
-               ",\"xma\":" + std::to_string(ctx->numXmaContexts) +
-               ",\"pcm\":" + std::to_string(ctx->numPcmContexts));
+    // Both the backing arrays and the engine's slots are now fully allocated.
+    g_shape_allocations.push_back(std::move(pending));
+    *ctx = result;
+    if (rt::startup_trace::enabled()) {
+        try {
+            trace_call("AcpHalAllocateShapeContexts",
+                       ",\"src\":" + std::to_string(result.numSrcContexts) +
+                       ",\"xma\":" + std::to_string(result.numXmaContexts) +
+                       ",\"pcm\":" + std::to_string(result.numPcmContexts));
+        } catch (const std::bad_alloc&) {
+            // The allocation succeeded. A missing diagnostic does not invalidate it.
+        }
+    }
     return S_OK;
 }
 
 // ---- AcpHalReleaseShapeContexts ----
 
-HRESULT __stdcall AcpHalReleaseShapeContexts(SHAPE_CONTEXTS* ctx = nullptr) {
+HRESULT __stdcall AcpHalReleaseShapeContexts(void* argument = nullptr) {
     std::lock_guard lock(g_shape_mutex);
     // Stop and detach the XMA worker before freeing backing arrays.
     g_xma_engine.unbind();
 
-    // Free all recorded context allocations
-    for (void* p : g_active_shape_arrays) {
-        if (p) std::free(p);
-    }
-    g_active_shape_arrays.clear();
-
-    if (ctx) {
+    // Retail passes its IAcpHal handle. Only a pointer previously supplied to
+    // AllocateShapeContexts can safely be treated as a SHAPE_CONTEXTS output.
+    const auto allocation = std::find_if(g_shape_allocations.begin(), g_shape_allocations.end(),
+        [argument](const ShapeAllocation& entry) { return entry.caller == argument; });
+    if (allocation != g_shape_allocations.end()) {
+        auto* ctx = allocation->caller;
         ctx->srcContextArray = nullptr;
         ctx->eqCompContextArray = nullptr;
         ctx->filtVolContextArray = nullptr;
@@ -977,6 +1021,7 @@ HRESULT __stdcall AcpHalReleaseShapeContexts(SHAPE_CONTEXTS* ctx = nullptr) {
         ctx->xmaContextArray = nullptr;
         ctx->pcmContextArray = nullptr;
     }
+    g_shape_allocations.clear();
 
     trace_call("AcpHalReleaseShapeContexts", "");
     return S_OK;

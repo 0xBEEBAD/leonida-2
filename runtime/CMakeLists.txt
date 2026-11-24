@@ -108,6 +108,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   # Rust XMA2 decoder (runtime/xma_decoder), built at configure time when cargo is on PATH.
   # Without it (or if that build fails) the runtime still builds and XMA voices output silence.
+  option(LEONIDA_REQUIRE_XMA2_DECODER "Fail configure if the Rust XMA2 decoder is unavailable" OFF)
   find_program(LEONIDA_CARGO cargo)
   if(LEONIDA_CARGO)
     # Cargo's host (or configured default target) can differ from the runtime's MSVC ABI.
@@ -138,6 +139,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     endif()
   else()
     message(STATUS "cargo not found: runtime/xma_decoder not built, XMA voices will be silent")
+  endif()
+  if(LEONIDA_REQUIRE_XMA2_DECODER AND NOT TARGET leonida_xma2_decoder)
+    message(FATAL_ERROR "LEONIDA_REQUIRE_XMA2_DECODER is enabled, but the Rust XMA2 decoder is unavailable")
   endif()
 
   add_executable(gta6rt
