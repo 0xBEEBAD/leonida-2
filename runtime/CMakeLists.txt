@@ -106,6 +106,44 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
   )
 
+  # Rust XMA2 decoder (runtime/xma_decoder), built at configure time when cargo is on PATH.
+  # Without it (or if that build fails) the runtime still builds and XMA voices output silence.
+  option(LEONIDA_REQUIRE_XMA2_DECODER "Fail configure if the Rust XMA2 decoder is unavailable" OFF)
+  find_program(LEONIDA_CARGO cargo)
+  if(LEONIDA_CARGO)
+    # Cargo's host (or configured default target) can differ from the runtime's MSVC ABI.
+    set(_xma_target x86_64-pc-windows-msvc)
+    set(_xma_target_dir ${CMAKE_BINARY_DIR}/xma_decoder)
+    set(_xma_lib ${_xma_target_dir}/${_xma_target}/release/leonida_xma2_decoder.lib)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.lock
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/src/lib.rs)
+    execute_process(
+      COMMAND ${LEONIDA_CARGO} build --release --locked --target ${_xma_target}
+              --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+              --target-dir ${_xma_target_dir}
+      TIMEOUT 120
+      RESULT_VARIABLE _xma_result)
+    if(_xma_result STREQUAL "0" AND EXISTS ${_xma_lib})
+      add_library(leonida_xma2_decoder STATIC IMPORTED)
+      # Link Rust's Windows SDK dependencies. CMake's C++ target selects its own CRT
+      # (/MD or /MDd); the C ABI keeps allocation and deallocation on the same side.
+      set_target_properties(leonida_xma2_decoder PROPERTIES
+        IMPORTED_LOCATION ${_xma_lib}
+        INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder
+        INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
+        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp")
+    else()
+      message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
+    endif()
+  else()
+    message(STATUS "cargo not found: runtime/xma_decoder not built, XMA voices will be silent")
+  endif()
+  if(LEONIDA_REQUIRE_XMA2_DECODER AND NOT TARGET leonida_xma2_decoder)
+    message(FATAL_ERROR "LEONIDA_REQUIRE_XMA2_DECODER is enabled, but the Rust XMA2 decoder is unavailable")
+  endif()
+
   add_executable(gta6rt
     src/main.cpp
     src/host_cpu.cpp
@@ -250,6 +288,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
+
+  if(TARGET leonida_xma2_decoder)
+    target_link_libraries(gta6rt PRIVATE leonida_xma2_decoder)
+    target_link_libraries(acphal_test PRIVATE leonida_xma2_decoder)
+  endif()
 
   # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
   # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
@@ -1179,6 +1222,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
+    add_test(NAME acphal_noncached_only COMMAND acphal_test --noncached-only)
   endif()
   if(WIN32 AND TARGET cpu_emulation_test)
     add_test(NAME cpu_emulation COMMAND cpu_emulation_test)
