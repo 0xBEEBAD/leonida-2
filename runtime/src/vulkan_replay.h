@@ -3069,8 +3069,8 @@ inline void plan_statistics_segments(PreparedList& out) {
 }
 
 // Overlapping pipeline-statistics queries (D3D-252): the same physical-segment layout the occlusion planner
-// builds, in the statistics pool. Each Begin and End of a statistics query â€” and every non-timestamp resolve
-// while one runs, because its helper dispatch would be counted â€” closes the one open physical query and opens
+// builds, in the statistics pool. Each Begin and End of a statistics query — and every non-timestamp resolve
+// while one runs, because its helper dispatch would be counted — closes the one open physical query and opens
 // a new one, so each logical query keeps a contiguous slot range and its result is the sum of that range
 // (statistics_sum.comp). A Begin or End of another query kind leaves the segments alone.
 inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
