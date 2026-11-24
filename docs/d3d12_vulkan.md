@@ -146,7 +146,8 @@ The design is therefore an **IR per command list**:
 - `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle's recorded commands and calls are replayed at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
 - Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves, `SetPredication`, `DiscardResource`, the atomic copies, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets` and `ClearState`; `WriteBufferImmediate` is allowed in a bundle); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. `d3d12_bundle_forbidden_test` measured the last four on the PC runtime without the debug layer: the bundle's `Close` fails (`E_FAIL`, where this layer gives `E_INVALIDARG`) on the default adapter and on WARP, and executing a bundle whose `Close` failed crashes the runtime, so the layer refuses it in `ExecuteBundle` instead. A bundle has no render targets, viewport or root signature of its own, so its state calls (pipeline state, root signature and arguments, vertex and index buffers, topology, blend factor, stencil references) and its draws and dispatches are kept as they were called, and `ExecuteBundle` plays them on the parent through the same members the application would have called. A draw then snapshots the parent's state plus what the bundle set, and what the bundle set stays on the parent afterwards. Commands that need no state (markers, immediate writes) are copied between them in order. `d3d12_bundle_test` measured the rule on the PC runtime, where the default adapter (an RTX 4060 Ti) and WARP drew the same picture in every case it ran. A bundle's draws see the parent's render targets, viewport and scissor, root signature and arguments (also when the bundle sets the same root signature first, so those arguments stay), and vertex and index buffers. A bundle starts with the pipeline state it was created or reset with, not the parent's. After `ExecuteBundle` the parent has that pipeline state and whatever else the bundle set: topology, root arguments, vertex and index buffers, and a different root signature with the bundle's arguments in place of the parent's. Topology: the default adapter takes the parent's when the bundle sets none. That is more lenient than Microsoft's stated rule (topology is undefined when a bundle begins), and WARP follows the rule by removing the device when a bundle draws or hands back without one, so a bundle should set it; the layer follows the default adapter. A bundle that sets a root argument before any root signature crashes the NVIDIA driver (the layer applies it to the parent's signature). The deferred calls are checked when they play, against the parent's root signature, so a bad one makes the parent's `Close` fail, not the bundle's. A per-list state setter must go through the deferred path (`defer()` in `d3d12_com.cpp`, replaying through a private member that does not trace) to work in a bundle. Not deferred yet: `ExecuteIndirect` in a bundle, and bundle `Dispatch` has no GPU test.
 - What `Close` returns after one recorded call is compared with the PC runtime over WARP (no debug layer) by
-  `d3d12_close_parity_test`, 113 cases on fresh lists, nothing executed. 82 agree; the other 31 are listed in the
+  `d3d12_close_parity_test`, 116 cases on fresh lists, nothing executed. 85 agree (three of them enhanced texture
+  barriers, two into `LAYOUT_UNDEFINED`: section 4.3); the other 31 are listed in the
   test as known differences. In 16 the layer fails a list WARP closes: draws and dispatches with no pipeline,
   root arguments before a root signature, a `CopyTextureRegion` box that is empty or inverted, footprint to
   footprint or at an unaligned footprint offset or pitch, `CopyResource` of a resource onto itself,
@@ -2736,6 +2737,23 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   `ResolveQueryData`'s never-written queries as `vkCmdFillBuffer`, which synchronization2 runs in the `CLEAR` stage
   (D3D-838; `vk_command_replay_test` part K is a read-after-write hazard under synchronization validation without
   it).
+- `LayoutAfter = UNDEFINED` from a defined layout (D3D-BARRIER-INTO-UNDEFINED) releases the subresources: their
+  contents are no longer needed, as before their memory is aliased. Vulkan has no transition into `UNDEFINED`
+  (VUID-VkImageMemoryBarrier2-newLayout-01198), so each piece gets a barrier with `oldLayout = newLayout`, the
+  layout the tracker has for it: the accesses are ordered and nothing in the image changes. The tracker keeps those
+  layouts. A piece never used yet gets no barrier and is not zero-filled for it. The next barrier on these
+  subresources has to start from `UNDEFINED`, which discards from whatever layout they are in, as before. The list
+  closes, as it does on WARP (measured on Windows 11 26340 in #984). #984 also reports that the retail title ends a
+  depth buffer's use this way and takes a failed `Close` as fatal; the layer failed such a list's `Close` until
+  this change. `UNDEFINED` to `UNDEFINED` is a separate case (#600).
+  - **Tests:** `command_list_test` and `replay_texture_barrier_test` (CPU: the barriers recorded, the kept layouts,
+    an unused image, the barrier that follows); three rows of `d3d12_close_parity_test`; `vk_command_replay_test`
+    part L (a colour target, a depth buffer whose planes are in two layouts and an unused image released, the target
+    used again and read back); and `d3d12_com_test`, where a depth buffer is cleared, released, taken from
+    `UNDEFINED` again, cleared and read back through the D3D12 list and queue (16 depth and 16 stencil texels
+    exact). Run on an RTX 4070 Ti (NVIDIA 620.70.06, Linux): part L natively with the validation layer 1.4.363 and
+    no error, where the same barriers with `newLayout = UNDEFINED` give VUID-VkImageMemoryBarrier2-newLayout-01198
+    four times; the D3D12 tests under Wine.
 - `DiscardResource` (D3D-26): each discarded image subresource gets a barrier from `oldLayout = UNDEFINED` to the
   layout the tracker already has for it, so the driver may drop the contents while later commands see no layout
   change. The other cases are no-ops, which "contents undefined" allows: buffers, discards with rectangles (only
