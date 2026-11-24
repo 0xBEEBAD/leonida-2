@@ -1,4 +1,5 @@
 #pragma once
+#include "vulkan_gpu_labels.h"
 
 // The execution side of the D3D12 layer, without COM: the per-device Vulkan context (resources, layout tracker,
 // image views), queues that execute command lists, and timeline-semaphore fences. The COM objects in
@@ -85,7 +86,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdClearAttachments) X(vkDeviceWaitIdle) X(vkCreateImage) X(vkDestroyImage)                         \
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
-    X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
+    X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage) X(vkCmdBlitImage)  \
     X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)        \
     X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)               \
     X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp)    \
@@ -104,7 +105,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
-    X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) X(vkMergePipelineCaches)   \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
@@ -941,6 +942,7 @@ public:
         replay_.copy_buffer_to_image = vk.vkCmdCopyBufferToImage;
         replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
         replay_.copy_image = vk.vkCmdCopyImage;
+        replay_.blit_image = vk.vkCmdBlitImage;
         replay_.resolve_image = vk.vkCmdResolveImage;
         replay_.fill_buffer = vk.vkCmdFillBuffer;
         replay_.update_buffer = vk.vkCmdUpdateBuffer;
@@ -1142,6 +1144,12 @@ public:
         std::unique_lock lock(resource_mutex_);
         set_resource_locked(id, binding);
     }
+    // Whether `va` is in a buffer this context knows by VA (the index buffer_at searches).
+    bool knows_buffer_va(std::uint64_t va) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        return buffer_vas_.find(va, hit);
+    }
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::unique_lock rlock(resource_mutex_);
         set_resource_locked(id, binding);
@@ -1203,6 +1211,7 @@ public:
         }
         {
             std::lock_guard lock(storage_mutex_);  // a buffer destroyed before any submission is not filled
+            storage_pending_.erase(id);
             std::erase_if(zero_pending_, [id](const PendingZero& zero) { return zero.id == id; });
         }
         if (img) {
@@ -1275,6 +1284,24 @@ public:
         replay_.zero_size = size;
     }
 
+    struct GeometryUpload {
+        std::uint64_t source{}, size{};
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
+        std::shared_ptr<void> owner;
+    };
+    using GeometryProvider = std::function<bool(std::uint64_t,std::uint64_t,GeometryUpload&)>;
+    void set_geometry_provider(GeometryProvider provider) {
+        std::unique_lock lock(resource_mutex_);
+        geometry_provider_=std::move(provider);
+    }
+
+    // LOCAL: the copy-in fallback for vertex and index views in title memory (ReplayFunctions::title_memory).
+    void set_title_memory(std::function<bool(std::uint64_t, std::uint64_t, VkBuffer&, VkDeviceSize&)> copy) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.title_memory = std::move(copy);
+    }
+
     // Pre-expanded 32-bit triangle indices for non-indexed quad lists (ReplayFunctions::quad_indices).
     void set_quad_indices(VkBuffer buffer, VkDeviceSize offset, std::uint32_t count) {
         std::unique_lock lock(resource_mutex_);
@@ -1321,6 +1348,23 @@ public:
     bool has_resource(ResourceId id) {
         std::shared_lock lock(resource_mutex_);
         return resources_.find(id) != resources_.end();
+    }
+
+    // The registered buffer whose VA range holds `va`, preferring one that holds [va, va + bytes) as buffer_at does: its
+    // ID, first VA and size in bytes. False when none does, or when `acquire(id)` returns false. `acquire` runs with
+    // the registry locked, so the resource cannot finish being removed under it: it takes the caller's reference
+    // (Resource's destructor removes its entry first, which waits for this lock). Used where a console call names a
+    // buffer by VA only (Xbox device slot 70).
+    template<class Acquire>
+    bool buffer_resource_at(std::uint64_t va, std::uint64_t bytes, ResourceId& id, std::uint64_t& start,
+                            std::uint64_t& size, Acquire&& acquire) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        if (!buffer_vas_.find(va, hit, bytes) || !acquire(hit.id)) return false;
+        id = hit.id;
+        start = hit.start;
+        size = hit.size;
+        return true;
     }
 
     bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
@@ -1397,6 +1441,28 @@ public:
     // written: the device brings the bindless set 0 of the translated shaders up to date there (vulkan_bindless.h)
     // and records what the set needs first. When it fails, nothing of that call is executed.
     void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
+    void set_graphics_family(std::uint32_t family) { graphics_family_ = family; }
+    void set_compute_copy_aspects(std::function<VkImageAspectFlags(VkFormat)> check) {
+        replay_.compute_copy_aspects = std::move(check);
+    }
+
+    // `before` is called at the start of every submission of command lists (a held batch: when it is released),
+    // before any lock here is taken: the device re-copies its slot-133 shadow buffers from the title's pages there.
+    // Set once, before the first queue exists.
+    void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
+
+    // Table VAs are offsets in this device's arena. Install its scanner before creating any queues.
+    using TableScanner = std::function<void(std::uint64_t, std::uint32_t)>;
+    void set_table_scanner(TableScanner scan) { table_scanner_ = std::move(scan); }
+    void set_cpu_texture_publisher(std::function<bool()> f) { cpu_texture_publisher_ = std::move(f); }
+    bool publish_cpu_textures() const { return !cpu_texture_publisher_ || cpu_texture_publisher_(); }
+    void set_sample_table_resolver(std::function<bool(std::uint64_t,std::uint32_t)> f) { sample_table_resolver_ = std::move(f); }
+    bool prepare_sample_table(std::uint64_t address, std::uint32_t count) const {
+        return !sample_table_resolver_ || sample_table_resolver_(address,count);
+    }
+    void scan_table(std::uint64_t va, std::uint32_t descriptors) const {
+        if (table_scanner_) table_scanner_(va, descriptors);
+    }
 
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
         std::unique_lock lock(resource_mutex_);
@@ -1423,9 +1489,9 @@ public:
     // `allocate`. Without this such a copy is refused as unsupported. `extra_usage` is added to the chunks' transfer
     // usage, for configure_quad_indices.
     void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate,
-                             VkBufferUsageFlags extra_usage = 0) {
+                             VkBufferUsageFlags extra_usage = 0, std::vector<std::uint32_t> families = {}) {
         std::unique_lock lock(resource_mutex_);
-        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), extra_usage);
+        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate), extra_usage, std::move(families));
         if (!scratch_->loaded()) scratch_.reset();
     }
 
@@ -1586,7 +1652,11 @@ private:
 
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
-        return it == resources_.end() ? nullptr : &it->second;
+        if (it == resources_.end()) return nullptr;
+        const auto& binding = it->second;
+        // The caller holds resource_mutex_, so the registered owner's lifetime includes this bind.
+        if (binding.ensure_residency && !binding.ensure_residency(binding.residency_owner)) return nullptr;
+        return &binding;
     }
 
     // Called from prepare; protected by views_mutex_ so concurrent shared_lock readers are safe.
@@ -1713,6 +1783,11 @@ private:
     std::map<std::tuple<VkFormat, std::uint32_t, VkImageLayout, VkImageLayout, VkResolveModeFlagBits>, VkRenderPass>
         resolve_passes_;
     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
+    std::function<void()> before_execute_;
+    TableScanner table_scanner_;
+    GeometryProvider geometry_provider_;
+    std::function<bool(std::uint64_t,std::uint32_t)> sample_table_resolver_;
+    std::function<bool()> cpu_texture_publisher_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::function<VkDescriptorSet()> bindless_current_;
     bool bindless_upload_pending_ = false;  // tracker_mutex_
@@ -1735,6 +1810,7 @@ private:
     std::unique_ptr<QuadIndexExpander> quad_indices_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
+    std::uint32_t graphics_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
 };
 #ifdef _MSC_VER
@@ -2268,6 +2344,7 @@ private:
 
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
+        if (context_.before_execute_) context_.before_execute_();
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())
@@ -2319,6 +2396,23 @@ private:
         // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
         if (prepared.size() < lists.size()) prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
+        std::vector<VulkanContext::GeometryUpload> geometry;
+        if (context_.geometry_provider_) {
+            replay.title_memory = [&](std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+                if (!va || !bytes || bytes>UINT64_MAX-va) return false;
+                for (const auto& upload : geometry) {
+                    if (va < upload.source || va-upload.source > upload.size || bytes > upload.size-(va-upload.source)) continue;
+                    buffer=upload.buffer; offset=upload.offset+(va-upload.source);
+                    return true;
+                }
+                VulkanContext::GeometryUpload upload;
+                if (!context_.geometry_provider_(va,bytes,upload)) return false;
+                buffer=upload.buffer;offset=upload.offset;
+                geometry.push_back(std::move(upload));
+                return true;
+            };
+        }
+        replay.graphics_family = family_ == context_.graphics_family_;
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                             : 0;
@@ -2542,6 +2636,7 @@ private:
         };
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        label::completions().begin_record(command_buffer);
         if (context_.vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
             discard();
             return ReplayResult::unsupported;
@@ -2585,8 +2680,7 @@ private:
                 storage_init_seen_ = context_.storage_init_version_;
             }
             // The set this submission binds may be a new generation whose table another queue's submission uploads:
-            // wait for that one, as for the storage images (the table's buffers are used by one queue family only:
-            // every D3D12 queue of the device is made in info.queue_family).
+            // wait for that one, as for the storage images. The table and fallback images share the device's families.
             if (context_.bindless_upload_semaphore_ && context_.bindless_upload_semaphore_ != progress_ &&
                 context_.bindless_upload_version_ != bindless_upload_seen_) {
                 waits_.push_back(context_.bindless_upload_semaphore_);
@@ -2693,6 +2787,7 @@ private:
             slot->counted_dispatch = std::move(counted_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
+            slot->geometry = std::move(geometry);
         } else {
             discard();
         }
@@ -2927,6 +3022,7 @@ private:
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
         std::vector<KhrAsQueryPool> khr_as_queries;   // KHR postbuild COMPACTED_SIZE query pools, same lifetime
+        std::vector<VulkanContext::GeometryUpload> geometry;
     };
 
     struct PendingBindings {
@@ -2949,6 +3045,7 @@ private:
         auto& vk = context_.vk;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        label::completions().begin_record(command_buffer);
         if (vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
             slot->ticket = 0;
             return false;
@@ -3087,6 +3184,7 @@ private:
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
             slot.segments.clear();
+            slot.geometry.clear();
             recycle_khr_stages(slot.khr_instances);
             recycle_khr_as_queries(slot.khr_as_queries);
             for (VkEvent event : slot.events)
@@ -3223,7 +3321,9 @@ private:
             submit.pCommandBuffers = &command_buffer;
             submit.signalSemaphoreCount = signal_count;
             submit.pSignalSemaphores = signals;
-            res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
+            const auto label_fence=label::completions().submit_fence(command_buffer);
+            res = context_.vk.vkQueueSubmit(queue_, 1, &submit, label_fence);
+            label::completions().submitted(command_buffer,res==VK_SUCCESS);
             if (res == VK_SUCCESS) {
                 context_.record_submit_locked(progress_, ticket);
                 if (signals_fence) context_.holds().signaled(fence, value);

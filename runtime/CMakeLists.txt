@@ -117,12 +117,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xg_xs.cpp
     shims/acphal.cpp
     shims/d3d12_xs.cpp
-    shims/d3d12_xs_device.cpp
+    shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
     shims/xgameruntime.cpp
     shims/xgameruntime_user.cpp
     shims/xgameruntime_gamesave.cpp
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
+    shims/xbox_bvh_builder.cpp
     shims/library_loader.cpp
     shims/process.cpp
     shims/com_shim.cpp
@@ -170,7 +171,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       test/root_sig_test.cpp
       shims/registry.cpp
       shims/d3d12_xs.cpp
-      shims/d3d12_xs_device.cpp
+      shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
     )
     target_link_libraries(root_sig_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY})
     target_compile_definitions(root_sig_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -194,7 +195,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
         test/device_proxy_test.cpp
         shims/registry.cpp
         shims/d3d12_xs.cpp
-        shims/d3d12_xs_device.cpp
+        shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
       )
       target_link_libraries(device_proxy_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY})
       target_compile_definitions(device_proxy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -207,7 +208,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     # patches its own import table to inject failures, so the proxy source is compiled into it alone.
     add_executable(xs_proxy_mock_test
       test/xs_proxy_mock_test.cpp
-      shims/d3d12_xs_device.cpp
+      shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
     )
     target_compile_definitions(xs_proxy_mock_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(xs_proxy_mock_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
@@ -257,19 +258,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
 
-  # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
-  # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
-  add_executable(dstorage_test
-    test/dstorage_test.cpp
-    shims/dstorage.cpp
-    shims/file_system.cpp
-    shims/registry.cpp
-  )
-  target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
-  target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(dstorage_test PRIVATE /OPT:NOREF)
-
   # xapu.dll and chad.dll, the APU and audio DSP command queues, resolved through the registry like xmem_test.
   add_executable(xapu_chad_test
     test/xapu_chad_test.cpp
@@ -314,6 +302,19 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(int3_skip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
+
+  # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
+  # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
+  add_executable(dstorage_test
+    test/dstorage_test.cpp
+    shims/dstorage.cpp
+    shims/file_system.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(dstorage_test PRIVATE /OPT:NOREF)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
@@ -530,8 +531,24 @@ if(BUILD_TESTING)
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 
+  # The title's own window, where PresentX shows its frames (shims/title_window.h): user32 only, no device.
+  if(WIN32)
+    add_executable(title_window_test test/title_window_test.cpp)
+    target_include_directories(title_window_test PRIVATE shims)
+    target_compile_definitions(title_window_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(title_window_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    target_link_libraries(title_window_test PRIVATE user32)
+    add_test(NAME title_window COMMAND title_window_test)
+  endif()
+
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+
+  # D3D-704's session-cache limit and header check: pure stdlib, no Vulkan headers.
+  add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
+  add_test(NAME pipeline_cache_store COMMAND pipeline_cache_store_test)
 
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
@@ -652,7 +669,7 @@ if(BUILD_TESTING)
       shims/registry.cpp
       shims/xmem.cpp
       shims/d3d12_xs.cpp
-      shims/d3d12_xs_device.cpp
+      shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
     )
     target_include_directories(pe_loader_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -793,7 +810,7 @@ if(BUILD_TESTING)
       shims/registry.cpp
       shims/xmem.cpp
       shims/d3d12_xs.cpp
-      shims/d3d12_xs_device.cpp
+      shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
     )
     target_include_directories(test_pe_loader_bounds PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -817,7 +834,7 @@ if(BUILD_TESTING)
       shims/registry.cpp
       shims/xmem.cpp
       shims/d3d12_xs.cpp
-      shims/d3d12_xs_device.cpp
+      shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
     )
     target_include_directories(pe_loader_fuzz PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -902,6 +919,61 @@ if(BUILD_TESTING)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
+
+    # Module TLS index 0 fixture: an EXE built /GA, so its thread_local reads go straight to
+    # ThreadLocalStoragePointer[0] as a game executable's can. The loader must give a mapped executable index 0;
+    # loader_tls_index0_test maps it next to tiny_tls.dll and run_tiny_tls_ga runs it under gta6rt. Ordinary test
+    # code, no game data. The test checks the /GA code shape only where the compiler is MSVC, which implements /GA.
+    add_executable(tiny_tls_ga test/fixtures/tiny_tls_ga.cpp)
+    target_compile_options(tiny_tls_ga PRIVATE /W4 /permissive- /utf-8 /EHsc /GA)
+    set_target_properties(tiny_tls_ga PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    add_executable(loader_tls_index0_test
+      test/loader_tls_index0_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(loader_tls_index0_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_compile_definitions(loader_tls_index0_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+      $<$<CXX_COMPILER_ID:MSVC>:LEONIDA_GA_FIXTURE_IS_GA=1>)
+    target_compile_options(loader_tls_index0_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    # Loaded by the threads scenario before the TLS helper: its DllMain(DLL_THREAD_ATTACH) runs test code first.
+    add_library(tiny_thread_hook SHARED test/fixtures/tiny_thread_hook.cpp)
+    target_compile_definitions(tiny_thread_hook PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_thread_hook PRIVATE /W4 /permissive- /utf-8 /GS-)
+    set_target_properties(tiny_thread_hook PROPERTIES
+      OUTPUT_NAME tiny_thread_hook
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    add_dependencies(loader_tls_index0_test tiny_tls_ga tiny_tls tiny_thread_hook gta6rt_tls_host)
+    # Imports tiny_tls.dll and tiny_tls_cb_only.dll, so gta6rt needs a helper clone for one of them
+    # (check_tls_clone_cleanup.cmake).
+    add_executable(tiny_tls_clones test/fixtures/tiny_tls_clones.cpp)
+    target_link_libraries(tiny_tls_clones PRIVATE tiny_tls tiny_tls_cb_only)
+    target_compile_options(tiny_tls_clones PRIVATE /W4 /permissive- /utf-8)
+    set_target_properties(tiny_tls_clones PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+    # One process per scenario: the reservation is once per process. loader_tls_index0 (runs) reserves at start,
+    # loader_tls_index0_threads reserves while threads are being created, loader_tls_index0_noreserve never does.
+    foreach(scenario runs threads noreserve)
+      if(scenario STREQUAL "runs")
+        set(name loader_tls_index0)
+      else()
+        set(name loader_tls_index0_${scenario})
+      endif()
+      add_test(NAME ${name}
+        COMMAND loader_tls_index0_test ${scenario} "$<TARGET_FILE:tiny_tls_ga>" "$<TARGET_FILE:tiny_tls>"
+                "$<TARGET_FILE:tiny_thread_hook>"
+      )
+    endforeach()
 
     # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so
     # DllMain's only work is that one call. No game files.
@@ -1015,6 +1087,10 @@ if(BUILD_TESTING)
 
   if(TARGET device_proxy_test)
     add_test(NAME device_proxy COMMAND device_proxy_test)
+    add_executable(pso_stream_test test/pso_stream_test.cpp shims/d3d12_xs_pso_stream.cpp)
+    target_include_directories(pso_stream_test PRIVATE shims)
+    add_test(NAME pso_stream_records COMMAND pso_stream_test)
+
     set_tests_properties(device_proxy PROPERTIES SKIP_RETURN_CODE 77)  # no WARP adapter (Wine)
     # With --trace-d3d12 the 24 D3D12XboxCreateDevice parameter words still print (docs/boot.md, question 1),
     # and the line with run-specific pointers does not.
@@ -1032,6 +1108,7 @@ if(BUILD_TESTING)
     # The routes are read once per process, so each override case is its own test.
     add_test(NAME xs_proxy_mock_env_slots COMMAND xs_proxy_mock_test --env-slots)
     add_test(NAME xs_proxy_mock_env_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)
+    add_test(NAME xs_proxy_mock_env_slots_70 COMMAND xs_proxy_mock_test --env-slots-70)
     add_test(NAME xs_proxy_mock_env_slots_74 COMMAND xs_proxy_mock_test --env-slots-74)
   endif()
   if(TARGET root_sig_test)
@@ -1118,7 +1195,7 @@ if(BUILD_TESTING)
         shims/registry.cpp
         shims/xmem.cpp
         shims/d3d12_xs.cpp
-        shims/d3d12_xs_device.cpp
+        shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
       )
       target_compile_definitions(fsr_dispatch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
       target_compile_options(fsr_dispatch_test PRIVATE /W4 /permissive- /EHsc /utf-8)
@@ -1135,7 +1212,7 @@ if(BUILD_TESTING)
         shims/registry.cpp
         shims/xmem.cpp
         shims/d3d12_xs.cpp
-        shims/d3d12_xs_device.cpp
+        shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
       )
       target_compile_definitions(bvh_builder_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
       target_compile_options(bvh_builder_test PRIVATE /W4 /permissive- /EHsc /utf-8)
@@ -1162,6 +1239,9 @@ if(BUILD_TESTING)
     add_test(NAME bink_audio COMMAND bink_audio_test)
     set_tests_properties(bink_audio PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  if(WIN32 AND TARGET cpu_emulation_test)
+    add_test(NAME cpu_emulation COMMAND cpu_emulation_test)
+  endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
   endif()
@@ -1170,9 +1250,6 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
-  endif()
-  if(WIN32 AND TARGET cpu_emulation_test)
-    add_test(NAME cpu_emulation COMMAND cpu_emulation_test)
   endif()
   if(WIN32 AND TARGET xapu_chad_test)
     add_test(NAME xapu_chad COMMAND xapu_chad_test)
@@ -1332,6 +1409,15 @@ if(BUILD_TESTING)
              "-DTOOL=$<TARGET_FILE:gta6rt>" "-DWANT=${GTA6RT_STACK}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
     add_test(NAME run_tiny_game_stack COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 stack)
+    # A /GA executable under --run and --init reads its TLS from slot 0, and the trace names gta6rt.exe as the image
+    # whose index 0 moved.
+    add_test(NAME run_tiny_tls_ga COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_tls_ga>" "-DTRACE_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tls_index0.cmake")
+    # Clone files are deleted when gta6rt exits normally; only the home clone outlives the run, until the next one.
+    add_test(NAME run_tiny_tls_clone_cleanup COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_tls_clones>" "-DTRACE_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tls_clone_cleanup.cmake")
     # GAME: is the game folder, absolute, when gta6rt is given a bare image name or `--game-dir .`.
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
@@ -1356,7 +1442,7 @@ if(LEONIDA_D3D12_SHIM_TESTS)
     test/d3d12_xs_root_signature_test.cpp
     shims/d3d12_xs.cpp
     shims/registry.cpp
-    shims/d3d12_xs_device.cpp
+    shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
   )
   target_include_directories(d3d12_xs_root_signature_test PRIVATE shims)
   target_compile_definitions(d3d12_xs_root_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1638,6 +1724,15 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME vk_presenter_sync COMMAND vk_presenter_sync_test)
     set_tests_properties(vk_presenter_sync PROPERTIES SKIP_RETURN_CODE 77)
+    set(conformance_src ${CMAKE_CURRENT_SOURCE_DIR}/../tools/conformance/native/src)
+    add_executable(vk_present_dump_test test/vk_present_dump_test.cpp
+                   ${conformance_src}/png_io.cpp ${conformance_src}/diagnostics.cpp)
+    target_link_libraries(vk_present_dump_test PRIVATE Vulkan::Headers user32 windowscodecs ole32)
+    target_compile_definitions(vk_present_dump_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME vk_present_dump COMMAND vk_present_dump_test)
+    add_test(NAME vk_present_dump_default COMMAND vk_present_dump_test --default)
+    add_test(NAME vk_present_dump_invalid COMMAND vk_present_dump_test --invalid)
+    set_tests_properties(vk_present_dump vk_present_dump_default vk_present_dump_invalid PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
@@ -1692,7 +1787,7 @@ if(TARGET Vulkan::Headers)
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py ${LEONIDA_D3D12_HEADER}
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
-    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/xbox_present.cpp
+    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp shims/xbox_present.cpp
                 shims/dxgi_com.cpp ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature)
@@ -1817,6 +1912,24 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_xdxr_rt_check COMMAND "${Python3_EXECUTABLE}" -I
                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_D3D12_XDXR_OUT}" --rays 1000)
       set_tests_properties(d3d12_xdxr_rt_check PROPERTIES FIXTURES_REQUIRED d3d12_xdxr_cases SKIP_RETURN_CODE 77)
+    endif()
+
+    # XboxBvhBuilder.dll served by the layer's builder (RT-5, boot stop 18): the seven exports the executable imports,
+    # through the shim registry as the title binds them; the structures are checked like d3d12_xdxr_rt's.
+    set(LEONIDA_XBOX_BVH_BUILDER_OUT "${CMAKE_CURRENT_BINARY_DIR}/xbox_bvh_builder_cases")
+    add_executable(xbox_bvh_builder_test test/xbox_bvh_builder_test.cpp shims/xbox_bvh_builder.cpp shims/registry.cpp)
+    target_link_libraries(xbox_bvh_builder_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(xbox_bvh_builder_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xbox_bvh_builder_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(xbox_bvh_builder_test PRIVATE /OPT:NOREF)
+    add_test(NAME xbox_bvh_builder COMMAND xbox_bvh_builder_test "${LEONIDA_XBOX_BVH_BUILDER_OUT}")
+    set_tests_properties(xbox_bvh_builder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 FIXTURES_SETUP xbox_bvh_builder_cases)
+    add_test(NAME xbox_bvh_builder_console COMMAND xbox_bvh_builder_test --console)
+    set_tests_properties(xbox_bvh_builder_console PROPERTIES ENVIRONMENT "LEONIDA_BVH_BUILDER=console")
+    if(Python3_FOUND)
+      add_test(NAME xbox_bvh_builder_check COMMAND "${Python3_EXECUTABLE}" -I
+               "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_XBOX_BVH_BUILDER_OUT}" --rays 1000)
+      set_tests_properties(xbox_bvh_builder_check PROPERTIES FIXTURES_REQUIRED xbox_bvh_builder_cases SKIP_RETURN_CODE 77)
     endif()
 
     # GCL8's QueryInterface and its one method need an allocator and a list, not a Vulkan device.
@@ -1999,6 +2112,10 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_xmem_placed_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(d3d12_xmem_placed_test PRIVATE /OPT:NOREF)
     add_test(NAME d3d12_xmem_placed COMMAND d3d12_xmem_placed_test)
+    add_test(NAME xbox_linear_texture_map COMMAND d3d12_xmem_placed_test --linear-map)
+    add_test(NAME xbox_linear_gpu_staging COMMAND d3d12_xmem_placed_test --linear-staging)
+    set_tests_properties(xbox_linear_gpu_staging PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(xbox_linear_texture_map PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     set_tests_properties(d3d12_xmem_placed PROPERTIES SKIP_RETURN_CODE 77)
 
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
@@ -2132,16 +2249,40 @@ if(TARGET Vulkan::Headers)
           -o ${_indirect_count_spv} ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
         COMMENT "Compiling the counted indirect dispatch test shader" VERBATIM)
-      add_executable(d3d12_indirect_dispatch_count_test test/d3d12_indirect_dispatch_count_test.cpp
-        ${_indirect_count_spv})
+      add_custom_target(gta6rt_indirect_count_shader DEPENDS ${_indirect_count_spv})
+      add_executable(d3d12_indirect_dispatch_count_test test/d3d12_indirect_dispatch_count_test.cpp)
+      add_dependencies(d3d12_indirect_dispatch_count_test gta6rt_indirect_count_shader)
       target_link_libraries(d3d12_indirect_dispatch_count_test PRIVATE gta6rt_d3d12_com d3d12 dxgi version)
       target_compile_definitions(d3d12_indirect_dispatch_count_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         LEONIDA_TEST_INDIRECT_COUNT_SPV="${_indirect_count_spv}")
       target_compile_options(d3d12_indirect_dispatch_count_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_indirect_dispatch_count COMMAND d3d12_indirect_dispatch_count_test)
       set_tests_properties(d3d12_indirect_dispatch_count PROPERTIES SKIP_RETURN_CODE 77)
+      # The cache vk_pipeline_check saves has to hit on the runtime's device (docs/pipeline_check.md): the checker
+      # compiles that shader, then the test creates the same pipeline on the runtime's device from the cache.
+      add_executable(pipeline_cache_seed_test test/pipeline_cache_seed_test.cpp)
+      add_dependencies(pipeline_cache_seed_test vk_pipeline_check gta6rt_indirect_count_shader)
+      target_link_libraries(pipeline_cache_seed_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(pipeline_cache_seed_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(pipeline_cache_seed_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME pipeline_cache_seed COMMAND "${CMAKE_COMMAND}"
+               "-DCHECKER=$<TARGET_FILE:vk_pipeline_check>"
+               "-DTEST=$<TARGET_FILE:pipeline_cache_seed_test>"
+               "-DSHADER=${_indirect_count_spv}"
+               "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/pipeline_cache_seed"
+               "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+               -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_pipeline_cache_seed.cmake")
+      set_tests_properties(pipeline_cache_seed PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP: ")
     endif()
 
+    # Test descriptor creation and clears in CTest without shader tools. The GPU runner passes the translated
+    # cs_texture_uav.spv to also exercise dispatches through set 0 and compare texels with Windows WARP.
+    add_executable(d3d12_texture_uav_test test/d3d12_texture_uav_test.cpp)
+    target_link_libraries(d3d12_texture_uav_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_texture_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_texture_uav_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_texture_uav COMMAND d3d12_texture_uav_test --descriptors-only)
+    set_tests_properties(d3d12_texture_uav PROPERTIES SKIP_RETURN_CODE 77)
     # What Close returns after one recorded call, against WARP; today's differences are listed in the test.
     add_executable(d3d12_close_parity_test test/d3d12_close_parity_test.cpp)
     target_link_libraries(d3d12_close_parity_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
@@ -2345,6 +2486,28 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_pipeline_library_host PROPERTIES SKIP_RETURN_CODE 77)
 
     # Milestone M0: a window, 60 cleared frames presented through the proxy on Vulkan.
+    add_executable(xbox_cbv_vector_test test/xbox_cbv_vector_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp)
+    target_link_libraries(xbox_cbv_vector_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(xbox_cbv_vector_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
+    add_test(NAME xbox_cbv_vectors COMMAND xbox_cbv_vector_test)
+    set_tests_properties(xbox_cbv_vectors PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    add_executable(xbox_depth_storage_test test/xbox_depth_storage_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp)
+    target_link_libraries(xbox_depth_storage_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(xbox_depth_storage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
+    add_test(NAME xbox_depth_storage COMMAND xbox_depth_storage_test)
+    add_test(NAME xbox_d16s8_storage COMMAND xbox_depth_storage_test)
+    set_tests_properties(xbox_d16s8_storage PROPERTIES ENVIRONMENT "LEONIDA_TEST_D16S8_UAV=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(xbox_depth_storage PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_executable(xbox_d16s8_surface_test test/xbox_d16s8_surface_test.cpp)
+    target_link_libraries(xbox_d16s8_surface_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(xbox_d16s8_surface_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME xbox_d16s8_surface COMMAND xbox_d16s8_surface_test)
+    set_tests_properties(xbox_d16s8_surface PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    add_executable(xbox_gpu_label_test test/xbox_gpu_label_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp)
+    target_link_libraries(xbox_gpu_label_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(xbox_gpu_label_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
+    add_test(NAME xbox_gpu_label_completion COMMAND xbox_gpu_label_test)
+    set_tests_properties(xbox_gpu_label_completion PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
     add_executable(d3d12_present_test test/d3d12_present_test.cpp)
     target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32 dxgi)
     target_compile_definitions(d3d12_present_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -2353,7 +2516,7 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_present PROPERTIES SKIP_RETURN_CODE 77)
 
     # Per-pipeline --f16-interp-fallback linking (SHADER-378): 16-param VS + colliding PS rendered on Vulkan.
-    add_executable(d3d12_f16_halves_test test/d3d12_f16_halves_test.cpp shims/d3d12_xs_device.cpp)
+    add_executable(d3d12_f16_halves_test test/d3d12_f16_halves_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp)
     target_link_libraries(d3d12_f16_halves_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_f16_halves_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_f16_halves_test PRIVATE /W4 /permissive- /utf-8)
@@ -2389,7 +2552,7 @@ if(TARGET Vulkan::Headers)
 
     # First light through D3D12 (docs/first_light.md): the real model and translated VS/PS that tools/first_light.py
     # wrote to LEONIDA_FIRST_LIGHT_DIR, drawn through the device proxy. Skips (77) unless that variable is set.
-    add_executable(d3d12_first_light_test test/d3d12_first_light_test.cpp shims/d3d12_xs_device.cpp)
+    add_executable(d3d12_first_light_test test/d3d12_first_light_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp)
     target_link_libraries(d3d12_first_light_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_first_light_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
     target_compile_options(d3d12_first_light_test PRIVATE /W4 /permissive- /utf-8)
@@ -2427,17 +2590,21 @@ if(TARGET Vulkan::Headers)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m15.asm
         COMMENT "Translating vs_m15 and ps_m15 for the translated draw test"
         VERBATIM)
-      add_executable(d3d12_translated_draw_test test/d3d12_translated_draw_test.cpp shims/d3d12_xs_device.cpp
+      add_executable(d3d12_translated_draw_test test/d3d12_translated_draw_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_M15_FILES})
       target_link_libraries(d3d12_translated_draw_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_translated_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M15_DIR="${LEONIDA_M15_DIR}")
       target_compile_options(d3d12_translated_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_translated_draw COMMAND d3d12_translated_draw_test)
+      add_test(NAME xbox_native_base_draw COMMAND d3d12_translated_draw_test --native-pso)
+      add_test(NAME xbox_derived_mask_zero COMMAND d3d12_translated_draw_test --derived-zero)
+      add_test(NAME xbox_derived_mask_restore COMMAND d3d12_translated_draw_test --derived-restore)
+
       set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
 
       # The console's rectangle and quad lists (src/rect_list_geometry.h), through the same translated vs_m15 / ps_m15.
-      add_executable(d3d12_rect_list_test test/d3d12_rect_list_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M15_FILES})
+      add_executable(d3d12_rect_list_test test/d3d12_rect_list_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_M15_FILES})
       target_link_libraries(d3d12_rect_list_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_rect_list_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M15_DIR="${LEONIDA_M15_DIR}")
@@ -2515,13 +2682,31 @@ if(TARGET Vulkan::Headers)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_literal.asm
         COMMENT "Translating vs_m2 and ps_m2 for the textured draw test"
         VERBATIM)
-      add_executable(d3d12_m2_textured_test test/d3d12_m2_textured_test.cpp shims/d3d12_xs_device.cpp
+      add_executable(d3d12_m2_textured_test test/d3d12_m2_textured_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_M2_FILES})
       target_link_libraries(d3d12_m2_textured_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_m2_textured_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M2_DIR="${LEONIDA_M2_DIR}")
       target_compile_options(d3d12_m2_textured_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m2_textured COMMAND d3d12_m2_textured_test)
+      add_test(NAME xbox_visible_texture_views COMMAND d3d12_m2_textured_test)
+      set_tests_properties(xbox_visible_texture_views PROPERTIES ENVIRONMENT "LEONIDA_TEST_VISIBLE_VIEWS=1" SKIP_RETURN_CODE 77 TIMEOUT 25)
+      add_test(NAME xbox_staged_texture_views COMMAND d3d12_m2_textured_test)
+      set_tests_properties(xbox_staged_texture_views PROPERTIES ENVIRONMENT "LEONIDA_TEST_STAGED_VIEWS=1" SKIP_RETURN_CODE 77 TIMEOUT 25)
+      add_test(NAME xbox_placed_texture_first_use COMMAND d3d12_m2_textured_test)
+      set_tests_properties(xbox_placed_texture_first_use PROPERTIES ENVIRONMENT "LEONIDA_TEST_PLACED_FIRST_USE=1" SKIP_RETURN_CODE 77 TIMEOUT 25)
+      add_test(NAME xbox_raw_2d_stripes COMMAND d3d12_m2_textured_test)
+      set_tests_properties(xbox_raw_2d_stripes PROPERTIES ENVIRONMENT "LEONIDA_TEST_LARGE_RAW_TEXTURE=1" SKIP_RETURN_CODE 77 TIMEOUT 35)
+      add_test(NAME xbox_raw_2d_surface COMMAND d3d12_m2_textured_test)
+      set_tests_properties(xbox_raw_2d_surface PROPERTIES ENVIRONMENT "LEONIDA_TEST_RAW_TEXTURE=1" SKIP_RETURN_CODE 77 TIMEOUT 25)
+      add_test(NAME xbox_packed4444_clear_sample COMMAND d3d12_m2_textured_test)
+      set_tests_properties(xbox_packed4444_clear_sample PROPERTIES ENVIRONMENT "LEONIDA_TEST_FIXED4=1" SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_m2_sampler_refresh COMMAND d3d12_m2_textured_test --refresh-samplers)
+      add_test(NAME d3d12_m2_unbounded_sampler_refresh COMMAND d3d12_m2_textured_test --refresh-unbounded-samplers)
+      set_tests_properties(d3d12_m2_sampler_refresh d3d12_m2_unbounded_sampler_refresh PROPERTIES
+                           SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
+      add_test(NAME d3d12_m2_sampler_refresh_off COMMAND d3d12_m2_textured_test --refresh-samplers-off)
+      set_tests_properties(d3d12_m2_sampler_refresh_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=0")
       set_tests_properties(d3d12_m2_textured PROPERTIES SKIP_RETURN_CODE 77)
 
       # M2, formats: BC1 and BC7 textures with mip chains and an R8G8B8A8 2D array through the same descriptor path.
@@ -2541,7 +2726,7 @@ if(TARGET Vulkan::Headers)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_array.asm
         COMMENT "Translating vs_m2, ps_m2 and ps_m2_array for the M2 formats test"
         VERBATIM)
-      add_executable(d3d12_m2_formats_test test/d3d12_m2_formats_test.cpp shims/d3d12_xs_device.cpp
+      add_executable(d3d12_m2_formats_test test/d3d12_m2_formats_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_M2F_FILES})
       target_link_libraries(d3d12_m2_formats_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_m2_formats_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
@@ -2571,7 +2756,7 @@ if(TARGET Vulkan::Headers)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_query.asm
         COMMENT "Translating M3 frame and single-output occlusion-probe shaders"
         VERBATIM)
-      add_executable(d3d12_m3_frame_test test/d3d12_m3_frame_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M3_FILES})
+      add_executable(d3d12_m3_frame_test test/d3d12_m3_frame_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_M3_FILES})
       target_link_libraries(d3d12_m3_frame_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_m3_frame_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M3_DIR="${LEONIDA_M3_DIR}")
@@ -2602,7 +2787,7 @@ if(TARGET Vulkan::Headers)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_indirect.asm
         COMMENT "Translating cs_m4_fill and cs_m4_indirect for the compute test"
         VERBATIM)
-      add_executable(d3d12_m4_compute_test test/d3d12_m4_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M4_FILES})
+      add_executable(d3d12_m4_compute_test test/d3d12_m4_compute_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_M4_FILES})
       target_link_libraries(d3d12_m4_compute_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_m4_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M4_DIR="${LEONIDA_M4_DIR}")
@@ -2630,7 +2815,7 @@ if(TARGET Vulkan::Headers)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_buf_counter.asm
         COMMENT "Translating cs_buf_typed and cs_buf_counter for the buffer UAV test"
         VERBATIM)
-      add_executable(d3d12_buffer_uav_test test/d3d12_buffer_uav_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_BUFFER_UAV_FILES})
+      add_executable(d3d12_buffer_uav_test test/d3d12_buffer_uav_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_BUFFER_UAV_FILES})
       target_link_libraries(d3d12_buffer_uav_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_buffer_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_BUFFER_UAV_DIR="${LEONIDA_BUFFER_UAV_DIR}")
@@ -2651,7 +2836,7 @@ if(TARGET Vulkan::Headers)
     # Console Xbox CreateDescriptorHeap extended ABI (issue #313 comment 7107265058): the title passes address/size
     # after the PC desc and expects GetCPU/GPUDescriptorHandleForHeapStart() == address. Synthetic test; no title-memory
     # aliasing / §3.3 backing coverage.
-    add_executable(d3d12_console_descriptor_heap_test test/d3d12_console_descriptor_heap_test.cpp shims/d3d12_xs_device.cpp)
+    add_executable(d3d12_console_descriptor_heap_test test/d3d12_console_descriptor_heap_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp)
     target_link_libraries(d3d12_console_descriptor_heap_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_console_descriptor_heap_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_console_descriptor_heap_test PRIVATE /W4 /permissive- /utf-8)
@@ -2785,15 +2970,33 @@ if(TARGET Vulkan::Headers)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_user_data.comp
         COMMENT "Compiling the compute test shader"
         VERBATIM)
-      add_executable(d3d12_compute_test test/d3d12_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_CS})
+      add_executable(d3d12_compute_test test/d3d12_compute_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_compute_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
       target_compile_options(d3d12_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compute COMMAND d3d12_compute_test)
       set_tests_properties(d3d12_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # A buffer at the title's own VA (device slot 133) read by the same shader through a root view and a V#.
+      add_executable(d3d12_title_va_test test/d3d12_title_va_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_CS})
+      target_link_libraries(d3d12_title_va_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_title_va_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+      target_compile_options(d3d12_title_va_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_title_va COMMAND d3d12_title_va_test)
+      set_tests_properties(d3d12_title_va PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_api_descriptor_copy COMMAND d3d12_title_va_test --api-descriptor-copy)
+      set_tests_properties(d3d12_api_descriptor_copy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
+      add_test(NAME d3d12_api_descriptor_copy_off COMMAND d3d12_title_va_test --api-descriptor-copy-off)
+      set_tests_properties(d3d12_api_descriptor_copy_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=0")
+      add_test(NAME d3d12_rebound_tables COMMAND d3d12_title_va_test --rebound-tables)
+      set_tests_properties(d3d12_rebound_tables PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
+      add_test(NAME d3d12_rebound_tables_off COMMAND d3d12_title_va_test --rebound-tables-off)
+      set_tests_properties(d3d12_rebound_tables_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=0")
+      add_test(NAME d3d12_rebound_second_device COMMAND d3d12_title_va_test --rebound-second-device)
+      set_tests_properties(d3d12_rebound_second_device PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
       # Compute PSOs from FSPX programs (docs/fspx.md): an ACCC container at slot 62 and a bare kind-6 program.
-      add_executable(d3d12_fspx_compute_test test/d3d12_fspx_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_CS})
+      add_executable(d3d12_fspx_compute_test test/d3d12_fspx_compute_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_fspx_compute_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_fspx_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
@@ -2820,7 +3023,7 @@ if(TARGET Vulkan::Headers)
           COMMENT "Compiling the draw test shader ${source}"
           VERBATIM)
       endforeach()
-      add_executable(d3d12_draw_test test/d3d12_draw_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_VS}
+      add_executable(d3d12_draw_test test/d3d12_draw_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_VS}
                      ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_VS_INT})
       target_link_libraries(d3d12_draw_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
@@ -2830,6 +3033,8 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_VS_INT_SPV="${LEONIDA_TEST_VS_INT}")
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_draw COMMAND d3d12_draw_test)
+      add_test(NAME xbox_geometry_upload_batch COMMAND d3d12_draw_test)
+      set_tests_properties(xbox_geometry_upload_batch PROPERTIES ENVIRONMENT "LEONIDA_TEST_GEOMETRY_BATCH=1" SKIP_RETURN_CODE 77 TIMEOUT 40)
       set_tests_properties(d3d12_draw PROPERTIES SKIP_RETURN_CODE 77)
       # Graphics & compute PSO descriptor validation parity against live Windows D3D12 (WARP and HW).
       add_executable(d3d12_pso_validation_test test/d3d12_pso_validation_test.cpp ${LEONIDA_TEST_VS}
@@ -2900,7 +3105,7 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_conservative_tier3 COMMAND d3d12_conservative_tier3_test)
       set_tests_properties(d3d12_inner_coverage_guards d3d12_inner_coverage_native d3d12_conservative_tier3
         PROPERTIES SKIP_RETURN_CODE 77)
-      add_executable(d3d12_msaa_draw_test test/d3d12_msaa_draw_test.cpp shims/d3d12_xs_device.cpp
+      add_executable(d3d12_msaa_draw_test test/d3d12_msaa_draw_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_msaa_draw_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_msaa_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
@@ -2909,7 +3114,7 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_msaa_draw COMMAND d3d12_msaa_draw_test)
       set_tests_properties(d3d12_msaa_draw PROPERTIES SKIP_RETURN_CODE 77)
       # Geometry shaders: a VS+GS+PS pipeline whose GS emits each triangle twice.
-      add_executable(d3d12_geometry_test test/d3d12_geometry_test.cpp shims/d3d12_xs_device.cpp
+      add_executable(d3d12_geometry_test test/d3d12_geometry_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_TEST_VS} ${LEONIDA_TEST_GS_DOUBLE} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_geometry_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_geometry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
@@ -2936,7 +3141,7 @@ if(TARGET Vulkan::Headers)
           COMMENT "Compiling the D24 draw test shader ${source}"
           VERBATIM)
       endforeach()
-      add_executable(d3d12_depth24_draw_test test/d3d12_depth24_draw_test.cpp shims/d3d12_xs_device.cpp
+      add_executable(d3d12_depth24_draw_test test/d3d12_depth24_draw_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_TEST_VS_DEPTH} ${LEONIDA_TEST_PS_DEPTH_EMPTY} ${LEONIDA_TEST_PS_DEPTH_WRITE}
                      ${LEONIDA_TEST_GS_DEPTH})
       target_link_libraries(d3d12_depth24_draw_test PRIVATE gta6rt_d3d12_com)
@@ -2958,7 +3163,7 @@ if(TARGET Vulkan::Headers)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_set0_sample.comp
         COMMENT "Compiling the set-0 compute test shader"
         VERBATIM)
-      add_executable(d3d12_set0_compute_test test/d3d12_set0_compute_test.cpp shims/d3d12_xs_device.cpp
+      add_executable(d3d12_set0_compute_test test/d3d12_set0_compute_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_TEST_CS_SET0_SAMPLE})
       target_link_libraries(d3d12_set0_compute_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_set0_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
@@ -2966,9 +3171,28 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      set(depth_uav_shader ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_depth_stencil_uav.comp)
+      foreach(variant IN ITEMS DEPTH_STENCIL_2D DEPTH_STENCIL_ARRAY DEPTH16_2D DEPTH16_ARRAY)
+        set(spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_depth_uav_${variant}.spv)
+        add_custom_command(OUTPUT ${spv}
+          COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -D${variant}=1
+                  -o ${spv} ${depth_uav_shader}
+          DEPENDS ${depth_uav_shader} VERBATIM)
+        list(APPEND depth_uav_shaders ${spv})
+        list(APPEND depth_uav_definitions LEONIDA_${variant}_SPV="${spv}")
+      endforeach()
+      add_executable(d3d12_depth_stencil_uav_test test/d3d12_depth_stencil_uav_test.cpp
+                     shims/d3d12_xs_device.cpp ${depth_uav_shaders})
+      target_link_libraries(d3d12_depth_stencil_uav_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_depth_stencil_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 ${depth_uav_definitions})
+      target_compile_options(d3d12_depth_stencil_uav_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_depth_stencil_uav COMMAND d3d12_depth_stencil_uav_test)
+      set_tests_properties(d3d12_depth_stencil_uav PROPERTIES SKIP_RETURN_CODE 77)
       # Bindless table churn on a direct and a compute queue: the table grows and live keys move without a
       # device-idle wait (D3D-314); the same shader, run twice (deferred retirement, and the old wait for timing).
-      add_executable(d3d12_bindless_churn_test test/d3d12_bindless_churn_test.cpp shims/d3d12_xs_device.cpp
+      add_executable(d3d12_bindless_churn_test test/d3d12_bindless_churn_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_TEST_CS_SET0_SAMPLE})
       target_link_libraries(d3d12_bindless_churn_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_bindless_churn_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
@@ -2996,6 +3220,10 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_bundle_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bundle COMMAND d3d12_bundle_test)
       set_tests_properties(d3d12_bundle PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_root_layout_compact COMMAND d3d12_bundle_test --compact)
+      add_test(NAME d3d12_root_layout_legacy COMMAND d3d12_bundle_test --legacy)
+      set_tests_properties(d3d12_root_layout_compact PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_GRAPHICS_STAGE_LAYOUT=1")
+      set_tests_properties(d3d12_root_layout_legacy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_GRAPHICS_STAGE_LAYOUT=0")
       # Calls a bundle may not make, Close of the bundle and of its parent, against the host runtime and WARP.
       add_executable(d3d12_bundle_forbidden_test test/d3d12_bundle_forbidden_test.cpp)
       target_link_libraries(d3d12_bundle_forbidden_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
@@ -3034,7 +3262,7 @@ if(TARGET Vulkan::Headers)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
         COMMENT "Compiling the mesh test shader ms_draw.mesh"
         VERBATIM)
-      add_executable(d3d12_mesh_test test/d3d12_mesh_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_MS}
+      add_executable(d3d12_mesh_test test/d3d12_mesh_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_MS}
                      ${LEONIDA_TEST_PS} ${LEONIDA_TEST_VS_FULLSCREEN})
       target_link_libraries(d3d12_mesh_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
@@ -3100,7 +3328,7 @@ if(TARGET Vulkan::Headers)
           VERBATIM)
         list(APPEND LEONIDA_SG_INDEXES ${output})
       endforeach()
-      add_executable(d3d12_subgroup_test test/d3d12_subgroup_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_SG_INDEXES})
+      add_executable(d3d12_subgroup_test test/d3d12_subgroup_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_SG_INDEXES})
       target_link_libraries(d3d12_subgroup_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_subgroup_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_SUBGROUP_SHADERS="${LEONIDA_SG_DIR}")
@@ -3119,6 +3347,13 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_clear_formats COMMAND d3d12_clear_formats_test)
     set_tests_properties(d3d12_clear_formats PROPERTIES SKIP_RETURN_CODE 77)
 
+    add_executable(d3d12_a8_dimensions_test test/d3d12_a8_dimensions_test.cpp)
+    target_link_libraries(d3d12_a8_dimensions_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_a8_dimensions_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_a8_dimensions_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_a8_dimensions COMMAND d3d12_a8_dimensions_test)
+    set_tests_properties(d3d12_a8_dimensions PROPERTIES SKIP_RETURN_CODE 77)
+
     # SetDescriptorHeaps validation, Reset/ClearState/bundle parity, lifetime pinning, direct-index flags.
     add_executable(d3d12_set_descriptor_heaps_test test/d3d12_set_descriptor_heaps_test.cpp)
     target_link_libraries(d3d12_set_descriptor_heaps_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
@@ -3130,7 +3365,7 @@ if(TARGET Vulkan::Headers)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
-      target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
+      target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com user32)  # user32: the PresentX window
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
 
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the
@@ -3396,6 +3631,9 @@ if(TARGET Vulkan::Headers)
     add_executable(arena_size_test test/arena_size_test.cpp)
     target_link_libraries(arena_size_test PRIVATE Vulkan::Headers)
     add_test(NAME arena_size COMMAND arena_size_test)
+    # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
+    add_executable(title_va_alias_test test/title_va_alias_test.cpp)
+    add_test(NAME title_va_alias COMMAND title_va_alias_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     add_executable(vk_queue_constructor_oom_test test/vk_queue_constructor_oom_test.cpp)
     target_link_libraries(vk_queue_constructor_oom_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})

@@ -14,6 +14,8 @@
 // locally at a title's call sites (each function says which). The page functions are built on the Windows placeholder
 // APIs (VirtualAlloc2, MapViewOfFile3), whose flags the title's own XMemVirtualAlloc calls already use.
 #include <windows.h>
+#include <winioctl.h>
+#include <filesystem>
 #include <intrin.h>
 #include <malloc.h>
 #include <psapi.h>
@@ -36,6 +38,8 @@
 #include "shims.h"
 #include "startup_trace.h"
 #include "xmem.h"
+#include "../src/gpu_label_memory.h"
+#include "../src/title_va_alias.h"
 
 namespace {
 
@@ -67,14 +71,35 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
 
 void* allocate_block(size_t size) { return _aligned_malloc(size ? size : 1, kAlign); }
 
+// Every block and range the title gets here is recorded as the title's memory (src/title_va_alias.h): a shader
+// address into it can be given a GPU copy, and an address anywhere else cannot.
+void track_label_data(void* p,std::size_t bytes,bool heap) {
+    if(!p)return; MEMORY_BASIC_INFORMATION info{};
+    if(VirtualQuery(p,&info,sizeof(info)) && info.Type==MEM_PRIVATE)
+        leonida::label::memory().track(reinterpret_cast<std::uintptr_t>(p),bytes,reinterpret_cast<std::uintptr_t>(info.AllocationBase),heap);
+}
+
+void* title_block(size_t size) {
+    void* p = allocate_block(size);
+    leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(p), size ? size : 1);
+    track_label_data(p,size?size:1,true);
+    return p;
+}
+
+void free_title_block(void* p) {
+    if(p)leonida::label::memory().release_heap(reinterpret_cast<std::uintptr_t>(p));
+    if (p) leonida::title_va_aliases().remove_title_memory(reinterpret_cast<uintptr_t>(p));
+    _aligned_free(p);
+}
+
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
-    return allocate_block(size);
+    return title_block(size);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
     note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
-    _aligned_free(p);
+    free_title_block(p);
 }
 
 // XMemAllocDefault / XMemFreeDefault: the GDK's own allocator behind XMemAlloc and XMemFree, which a title that hooks
@@ -83,12 +108,12 @@ void __stdcall XMemFree(void* p, uint64_t attributes) {
 // released by either free.
 void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
     note_attributes("XMemAllocDefault", attributes, size, _ReturnAddress());
-    return allocate_block(size);
+    return title_block(size);
 }
 
 void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
     note_attributes("XMemFreeDefault", attributes, kNoSize, _ReturnAddress());
-    _aligned_free(p);
+    free_title_block(p);
 }
 
 // BOOL XMemIsToolsMemAvailable(void). The measured title calls it from one helper, which six out-of-memory paths reach
@@ -237,10 +262,39 @@ struct Window {
     DWORD protect;
 };
 
+// A sparse temporary file gives large physical pools real shared pages without reserving their
+// total size against the process's pagefile commitment. Views retain the section until the last alias dies.
+HANDLE file_backed_section(std::uint64_t bytes) {
+    wchar_t dir[32768]{};
+    const auto len = GetEnvironmentVariableW(L"LEONIDA_XMEM_BACKING_DIR", dir, DWORD(std::size(dir)));
+    if (!len || len >= std::size(dir)) return nullptr;
+    const std::filesystem::path parent(dir);
+    if (!parent.is_absolute()) return nullptr;
+    static std::atomic<unsigned> sequence{};
+    const auto name = L"physical-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                      std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(++sequence) + L".tmp";
+    const HANDLE file = CreateFileW((parent / name).c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
+                                   FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    DWORD ignored{};
+    LARGE_INTEGER size{};
+    size.QuadPart = static_cast<LONGLONG>(bytes);
+    HANDLE section = nullptr;
+    if (DeviceIoControl(file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &ignored, nullptr) &&
+        SetFilePointerEx(file, size, nullptr, FILE_BEGIN) && SetEndOfFile(file))
+        section = CreateFileMappingW(file, nullptr, PAGE_READWRITE, size.HighPart, size.LowPart, nullptr);
+    CloseHandle(file);
+    return section;
+}
+
 struct Section {
     HANDLE handle;
     void* scratch;
-    explicit Section(HANDLE h) : handle(h), scratch(MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0)) {}
+    bool file_backed;
+    Section(HANDLE h, bool use_file) : handle(h), scratch(MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0)), file_backed(use_file) {}
     Section(const Section&) = delete;
     Section& operator=(const Section&) = delete;
     ~Section() {
@@ -346,8 +400,19 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
+void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect);
+
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+    void* result = xmem_virtual_alloc(address, size, allocation_type, attributes, protect);
+    // The title's memory (src/title_va_alias.h). Never forgotten: a released range is no longer committed, which
+    // the copy also checks.
+    if (result) leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(result), size);
+    if(result)track_label_data(result,size,false);
+    return result;
+}
+
+void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -611,13 +676,15 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         return FALSE;
     }
     const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
-    const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
+    HANDLE handle = file_backed_section(bytes);
+    const bool use_file = handle != nullptr;
+    if (!handle) handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                              static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
     if (!handle) {
         *page_count = 0;
         return FALSE;
     }
-    const auto section = std::make_shared<Section>(handle);
+    const auto section = std::make_shared<Section>(handle, use_file);
     if (!section->scratch) {
         *page_count = 0;
         return FALSE;
@@ -796,8 +863,27 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
 constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
+BOOL WINAPI TitleVirtualFree(LPVOID address,SIZE_T size,DWORD flags) {
+    DWORD saved=0;
+    const bool ok=leonida::label::memory().release_pages(reinterpret_cast<std::uintptr_t>(address),size,(flags&MEM_RELEASE)!=0,[&]{
+        const BOOL r=::VirtualFree(address,size,flags);saved=GetLastError();return !!r;
+    });
+    SetLastError(saved);return ok?TRUE:FALSE;
+}
+BOOL WINAPI TitleVirtualFreeEx(HANDLE process,LPVOID address,SIZE_T size,DWORD flags) {
+    if(GetProcessId(process)!=GetCurrentProcessId())return ::VirtualFreeEx(process,address,size,flags);
+    DWORD saved=0;
+    const bool ok=leonida::label::memory().release_pages(reinterpret_cast<std::uintptr_t>(address),size,(flags&MEM_RELEASE)!=0,[&]{
+        const BOOL r=::VirtualFreeEx(process,address,size,flags);saved=GetLastError();return !!r;
+    });
+    SetLastError(saved);return ok?TRUE:FALSE;
+}
+
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    LPVOID result = VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    if (result) leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(result), size);
+    if(result)track_label_data(result,size,false);
+    return result;
 }
 
 }  // namespace
@@ -821,6 +907,33 @@ bool commit_physical_range(const void* address, size_t size) {
         if (commit_mapped_page(page, page, protect) == PageCommit::failed) return false;
     }
     return true;
+}
+
+std::shared_ptr<std::uint8_t> pin_mapped_data(const void* address, std::size_t size) {
+    const auto start = reinterpret_cast<std::uintptr_t>(address);
+    if (!size || !start || size > UINTPTR_MAX - start) return {};
+    const auto end = start + size;
+    const auto first = start & ~std::uintptr_t(kPhysicalPageSize - 1);
+    const FaultLockShared lock;
+    const auto base = g_mapped.find(first);
+    if (base == g_mapped.end() || !base->second.section || !base->second.section->scratch) return {};
+    const auto section = base->second.section;
+    const auto offset = base->second.offset;
+    for (auto page=first; page<end; page+=kPhysicalPageSize) {
+        const auto it = g_mapped.find(page);
+        if (it==g_mapped.end() || it->second.section != section || it->second.offset != offset+page-first) return {};
+        DWORD previous{};
+        const auto ready = commit_mapped_page(page, std::max(page,start), previous);
+        if (ready!=PageCommit::committed_before && ready!=PageCommit::committed_now) return {};
+    }
+    for (auto at=start; at<end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) ||
+            info.Type!=MEM_MAPPED || info.State!=MEM_COMMIT || (info.Protect & (PAGE_NOACCESS|PAGE_GUARD)) ||
+            ((info.Protect & 255)!=PAGE_READWRITE && (info.Protect & 255)!=PAGE_WRITECOPY)) return {};
+        at=reinterpret_cast<std::uintptr_t>(info.BaseAddress)+info.RegionSize;
+    }
+    return {section,static_cast<std::uint8_t*>(section->scratch)+offset+(start-first)};
 }
 
 bool commit_physical_pages(const uint64_t* page_array, size_t count) {
@@ -847,7 +960,7 @@ bool commit_physical_pages(const uint64_t* page_array, size_t count) {
             ++last;
         }
         void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
-        if (!VirtualAlloc(backing, (last - first) * kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
+        if (!it->second.section->file_backed && !VirtualAlloc(backing, (last - first) * kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
         first = last;
     }
     return true;
@@ -855,7 +968,7 @@ bool commit_physical_pages(const uint64_t* page_array, size_t count) {
 
 }
 
-#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
+#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}, {dll,"VirtualFree",reinterpret_cast<void*>(&TitleVirtualFree)}, {dll,"VirtualFreeEx",reinterpret_cast<void*>(&TitleVirtualFreeEx)}
 
 // The classic libraries and the memory api sets a title's imports name.
 SHIM_TABLE(title_memory,

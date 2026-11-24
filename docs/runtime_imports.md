@@ -190,6 +190,20 @@ The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so
 again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
 unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
 
+The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`,
+`XApuEnqueueCommand`, `XApuGetResultCount`) and `chad.dll` (`XDspActivate`, `XDspConnectWithMaximumStreamLimit`,
+`XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) are served by `runtime/shims/xapu_chad.cpp`. The shapes were
+read statically from the executable's call sites: one each, four for `XApuEnqueueCommand`. Both connects succeed with
+a handle; the APU connect also returns a zeroed shared buffer the title writes stream input to and reads output from.
+Commands are accepted and not processed, so the audio stays silent. A stream open (type 1) and a stream close
+(type 2) each queue one result of the same type and slot, because the title frees a stream id only when the close
+result arrives. `XDspActivate` writes its two outputs as pointers to zeroed memory, which the title reads as "command
+done" after each `XDspSubmitCommand`. `XApuConnect` leaves its first argument, a global of the title, untouched. The
+buffer size (128 stream slots), the two results and the zeroed DSP status are hypotheses, explained in the file.
+`xapu_chad_test` calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
+`audio_queue` event.
+The table above was measured before this shim and still lists these ten as unimplemented; they are served now. The call shapes agree with `docs/audio_hal_exe_calls.md`, which was measured with `tools/import_call_sites.py`.
+
 What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
 that name exists), and an unimplemented import stops the run only if the title calls it
@@ -197,6 +211,19 @@ that name exists), and an unimplemented import stops the run only if the title c
 functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
 host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
 which opens none.
+
+## Audio hardware (`AcpHal.dll`)
+
+The game executable imports nine functions from `AcpHal.dll`, the console's audio hardware layer.
+`runtime/shims/acphal.cpp` serves them; the argument shapes come from a static read of the executable's call sites
+(one thunk per import, 16 call sites in all), and the names of the parameters and object slots are hypotheses.
+`ApuCreateHeap` reserves one block of ordinary memory for both sizes it is given, `ApuAlloc` and `ApuFree` manage it
+first fit, and an APU address is a fixed 32-bit base plus the offset in it, so `ApuMapVirtualAddress` and
+`ApuMapApuAddress` are arithmetic and `ApuIsVirtualAddressValid` checks a live block and the alignment.
+`AcpHalAllocateShapeContexts` fills zeroed 64-byte contexts per count, and `AcpHalCreate` returns an object whose
+calls succeed and do nothing: there is no audio processor, so the game gets no sound from this path. Its boot checks
+fail hard, which is why every call succeeds. `acphal_test` covers the call shapes.
+The table under [The retail executable](#the-retail-executable-rt-5) was measured before this shim and still lists these nine as unimplemented; they are served now.
 
 ## Console paths and the write overlay
 
@@ -298,19 +325,30 @@ measurement in `d3d12_vulkan.md`, because its page could not be found.
 Not every console module is reached through an import table. `libHttpClient.GDK.dll` and `XCurl.dll` both use the
 GDK runtime, but `dumpbin /imports` shows **no import of `xgameruntime.dll`** in either. Both carry the wide string
 `xgameruntime.dll` and the ASCII names `InitializeApiImpl`, `InitializeApiImplEx`, `InitializeApiImplEx2`,
-`QueryApiImpl` and `UninitializeApiImpl`, next to a statically linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s
-thunks `LoadLibraryW` the runtime and `GetProcAddress` those five names at run time. xodus-gaming/xgameruntime-docs
+`QueryApiImpl`, `UninitializeApiImpl` and `XErrorReport` (one block of strings in each DLL), next to a statically
+linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s thunks `LoadLibraryW` the runtime and `GetProcAddress` those
+six names at run time. A runtime without `XErrorReport` is refused before any initializer is called: with only the
+five entry points served, the package's own libHttpClient `HCInitialize` returned `0x89240101`
+(`E_GAMERUNTIME_DLL_NOT_FOUND`) and XCurl's `curl_global_init` returned `CURLE_FAILED_INIT`, both called through
+`gta6rt --run` by a stand-in program that loads the two DLLs from the package. xodus-gaming/xgameruntime-docs
 (GPL-3.0) documents the same mechanism for PC GDK titles: `InitializeApiImplEx2` is what
 `XGameRuntimeInitialize[WithOptions]` calls, and `QueryApiImpl` hands out the runtime's COM classes, whose methods
 mostly correspond one to one to the `xgameruntime.lib` functions. The executable is very likely linked the same way.
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, and the DirectStorage
+modules `dstorage_xs.dll`, `xcrdapi.dll` and `dstorage.dll`, [directstorage.md](directstorage.md)) with a
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, `acphal.dll`) with a
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, `xapu.dll`, `chad.dll`) with a
+pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `xg_xs.dll`, `gameinput.dll`)
 with a pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
-`runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
+`runtime/shims/xgameruntime.cpp` serves the five entry points and `XErrorReport(HRESULT, const char*)`, the same
+function as `IXErrorImpl` slot 3 (below), so a report reaches the callback `XErrorSetCallback` set either way. The
+initializers succeed offline and log the GDK
 version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
 `XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
 (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
@@ -325,7 +363,8 @@ the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` s
 pointers to 64-bit locals (the result is not read), compares the pair with the one it saw last and keeps it. On the
 host that load would find a PC's Gaming Services runtime, which bypasses the offline classes, or nothing, in which
 case XCurl returns `0x87E00196`. The shims own `gameplatformservices.dll` too: its `QueryApiImpl` is the offline
-one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time.
+one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time. `curl_global_init` also
+asks that module for `InitializeApiImpl`, which is not served; the call succeeds without it.
 
 ### Class layouts, measured
 

@@ -62,6 +62,8 @@ std::atomic<int> g_runtime_refs{0};
 // (no caller in the shipped DLLs to measure), and the classes of the other xgameruntime_*.cpp files through their
 // query functions; for any other class QueryApiImpl logs the class and interface id and refuses it, so the first boot
 // with the executable lists the interfaces to implement next.
+//
+// The thunks look up a sixth name, XErrorReport (served below GetApiVersionImpl), and refuse the runtime without it.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -650,6 +652,7 @@ HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
     if (second) *second = kOfflineApiVersion;
     return S_OK;
 }
+
 
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
 HRESULT __stdcall XGameRuntimeInitialize() {
@@ -1365,7 +1368,7 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
-    XGR(XErrorReport),
+    XGR(XErrorReport),  // looked up with the five above; without it the thunks refuse the runtime
     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},

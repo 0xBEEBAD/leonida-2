@@ -103,6 +103,8 @@ int main() {
     std::vector<Pixel> rect_pixels(target_extent * target_extent), quad_pixels(target_extent * target_extent),
         second_pixels(target_extent * target_extent), third_pixels(target_extent * target_extent),
         skew_pixels(target_extent * target_extent);
+    std::vector<Pixel> dynamic_pixels(rect_pixels.size()), triangle_pixels(rect_pixels.size()),
+        repeated_pixels(rect_pixels.size());
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -281,6 +283,9 @@ int main() {
         EXPECT(render_frame(3, rect_pso.p, rect_list, 2, 3, second_pixels) == 0);
         EXPECT(render_frame(4, rect_pso.p, rect_list, 3, 3, third_pixels) == 0);
         EXPECT(render_frame(5, rect_pso.p, rect_list, 4, 3, skew_pixels) == 0);
+        EXPECT(render_frame(6, quad_pso.p, rect_list, 0, 3, dynamic_pixels) == 0);
+        EXPECT(render_frame(7, quad_pso.p, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 0, 3, triangle_pixels) == 0);
+        EXPECT(render_frame(8, quad_pso.p, rect_list, 0, 3, repeated_pixels) == 0);
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         rect_pso.reset();
         quad_pso.reset();
@@ -329,6 +334,20 @@ int main() {
         }
     }
     EXPECT(covered == target_extent * target_extent);
+    // The same triangle-family PSO can select either primitive at draw time. Compare both rectangle draws
+    // to the verified type-19 reference; exclude only the shared diagonal from the triangle coverage check.
+    const Pixel clear_value = {0.5f, 0.125f, 0.25f, 0.5f};
+    for (UINT y = 0; y < target_extent; ++y) {
+        for (UINT x = 0; x < target_extent; ++x) {
+            const auto i = y * target_extent + x;
+            EXPECT(std::memcmp(&dynamic_pixels[i], &rect_pixels[i], sizeof(Pixel)) == 0);
+            EXPECT(std::memcmp(&repeated_pixels[i], &rect_pixels[i], sizeof(Pixel)) == 0);
+            if (x + y + 1 < target_extent)
+                EXPECT(std::memcmp(&triangle_pixels[i], &rect_pixels[i], sizeof(Pixel)) == 0);
+            if (x + y + 1 > target_extent)
+                EXPECT(std::memcmp(&triangle_pixels[i], &clear_value, sizeof(Pixel)) == 0);
+        }
+    }
 
     // Right angle at the second and at the third vertex: the plane through the three drawn corners, everywhere.
     const std::vector<Pixel>* const corner_pixels[2] = {&second_pixels, &third_pixels};

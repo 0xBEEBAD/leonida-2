@@ -1,3 +1,4 @@
+#include <atomic>
 #include "xbox_present.h"
 
 #include "d3d12_trace.h"

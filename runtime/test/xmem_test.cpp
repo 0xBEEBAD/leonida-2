@@ -900,7 +900,7 @@ void print_result() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::printf("xmem_test: registered xmem.dll shim ABI\n");
 
     const auto alloc = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAlloc"));
@@ -968,6 +968,11 @@ int main() {
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
+        if (argc == 2 && std::strcmp(argv[1], "--file-pools") == 0) {
+            test_placeholders(physical);
+            print_result();
+            return g_failures ? 1 : 0;
+        }
         test_physical_pages_commit_on_touch(physical);
         test_commit_physical_pages(physical);
         test_first_touch_during_remap(physical);

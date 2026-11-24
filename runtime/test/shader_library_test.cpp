@@ -571,6 +571,16 @@ int main() {
     CHECK(!zlib_inflate(broken, out));
     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
     CHECK(!zlib_inflate(bytes("not zlib"), out));
+    // The reason a caller can ask for (dstorage.cpp reports each with its own HRESULT).
+    ZlibError why = ZlibError::limit;
+    CHECK(zlib_inflate(dynamic, out, 600, &why) && why == ZlibError::none);
+    CHECK(!zlib_inflate(dynamic, out, 599, &why) && why == ZlibError::limit);
+    CHECK(!zlib_inflate(bytes("not zlib"), out, 1 << 20, &why) && why == ZlibError::header);
+    broken = dynamic;
+    broken.back() ^= 1;
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::checksum);
+    broken.resize(100);
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
 
     Json json;
     // "s" holds an escaped quote and a \u escape for U+00E9, which the reader must turn into UTF-8.
@@ -760,65 +770,63 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
-    // Pipeline-library entries: the compute programs of the library in shaders.rpf, translated by make_game.py into
-    // <dir>/library/index.json (named "library/<name>"), are found by the same two keys as the DLL's FSPX programs,
-    // next to <dir>/fspx/. The executable's slot-67 description carries kind 0 (the record's state blob) and kind 6.
+    // Executable embedded shaders (<dir>/exe/index.json): graphics (vs/ps) FSSM programs indexed alongside the game's
+    // own shaders, counted apart via exe_size(), and optional when missing or malformed.
     {
+        const auto vs_container = container({{fixed, 25}});
+        const auto ps_container = container({{stored, 40}});
+        const std::string vs_hash = sha256_hex(fssm_program(vs_container));
+        const std::string ps_hash = sha256_hex(fssm_program(ps_container));
         const auto code = fspx_code(0x5000);
-        const auto shared_code = fspx_code(0x7000);
-        std::vector<std::uint8_t> state(28, 0), other_state(28, 0);
-        state[12] = 64;  // word 3: NumThreadsX
-        other_state[12] = 32;
-        const auto n = std::uint32_t(code.size());
-        const auto payload = [&](const std::vector<std::uint8_t>& kind0) {
-            std::vector<std::uint8_t> body = kind0;
-            body.insert(body.end(), code.begin(), code.end());
-            return fspx_payload({{0, 48, 28}, {6, 48 + 28, n}}, body);
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        const auto write = [&](const std::filesystem::path& file, const std::string& text) {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out << text;
         };
+        const std::string game = "\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}";
+        const std::string vs_entry = "{\"stage\": \"vs\", \"fssm_sha256\": \"" + vs_hash +
+                                     "\", \"input_signature\": [{\"semantic\": \"POSITION\", \"semantic_index\": 0, "
+                                     "\"register\": 0, \"system_value\": 0, \"component_type\": \"float\"}]}";
+        const std::string ps_entry = "{\"stage\": \"ps\", \"fssm_sha256\": \"" + ps_hash + "\"}";
         std::filesystem::create_directories(dir / "fspx");
-        std::filesystem::create_directories(dir / "library");
+        std::filesystem::create_directories(dir / "bvh");
+        std::filesystem::create_directories(dir / "exe");
+        write(dir / "index.json", "{" + game + "}");
+        write(dir / "fspx" / "index.json",
+              "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
+        write(dir / "bvh" / "index.json",
+              "{\"BuilderProgram\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}}");
+        write(dir / "exe" / "index.json",
+              "{\"container_00\": " + vs_entry + ",\n \"container_01\": " + ps_entry +
+                  ",\n \"NoKey\": {\"error\": \"ValueError: synthetic\"}}");
         {
-            std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);
-            index << "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash << "\"}}";
-            std::ofstream dll(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
-            dll << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(fspx_code(0x6000))
-                << "\"}, \"shared_dll\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(shared_code)
-                << "\"}}";
-            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
-            lib << "{\"lib_cs_00007\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(code)
-                << "\", \"fspx_state_sha256\": \"" << sha256_hex(state)
-                << "\", \"bindings\": [], \"local_size\": [64, 1, 1]}, "
-                << "\"lib_cs_shared\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(shared_code)
-                << "\"}}";
-            std::ofstream spv(dir / "library" / "lib_cs_00007.spv", std::ios::binary);
-            const std::uint32_t words[5] = {0x07230203, 0x00010500, 7, 1, 0};
+            std::ofstream spv(dir / "exe" / "container_00.spv", std::ios::binary);
             spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+            std::ofstream spv_ps(dir / "exe" / "container_01.spv", std::ios::binary);
+            spv_ps.write(reinterpret_cast<const char*>(words), sizeof(words));
         }
-        ShaderLibrary library;
-        CHECK(library.load(dir.string(), &error) && library.size() == 5 && library.fspx_size() == 4);
-        const auto found = library.fspx_candidates("cs", sha256_hex(code));
-        CHECK(found.size() == 1 && found[0]->name == "library/lib_cs_00007" && found[0]->local_size[0] == 64 &&
-              found[0]->fssm_sha256.empty());
-        CHECK(library.spirv(*found[0]).size() == 5);  // <dir>/library/lib_cs_00007.spv
-        // fspx/ loads before library/, so shared code keys preserve fspx/ entries ahead of library/ entries.
-        const auto shared = library.fspx_candidates("cs", sha256_hex(shared_code));
-        CHECK(shared.size() == 2 && shared[0]->name == "fspx/shared_dll" && shared[1]->name == "library/lib_cs_shared");
-        // As slot 67 passes it: kind 0 and kind 6 in one payload. The record's state finds it; another state doesn't.
-        bool ambiguous = true;
-        CHECK(library.program_candidates("cs", compute_program(payload(state)), &ambiguous) == found && !ambiguous);
-        CHECK(library.program_candidates("cs", compute_program(payload(other_state)), &ambiguous).empty());
-        // The DLL's entries are still there, and the game's own by FSSM hash.
-        CHECK(library.fspx_candidates("cs", sha256_hex(fspx_code(0x6000))).at(0)->name == "fspx/upscaler_00");
-        CHECK(library.find("cs", hash) && library.find("cs", hash)->name == "cs_game");
-        // A broken library index leaves the others loaded; a missing one is not an error either.
-        {
-            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
-            lib << "{broken";
-        }
-        CHECK(library.load(dir.string(), &error) && library.size() == 3 && library.fspx_size() == 2 &&
-              library.fspx_candidates("cs", sha256_hex(code)).empty());
-        std::filesystem::remove(dir / "library" / "index.json");
-        CHECK(library.load(dir.string(), &error) && library.size() == 3 && library.fspx_size() == 2);
+        ShaderLibrary exe;
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 5 && exe.fspx_size() == 1 && exe.bvh_size() == 1 &&
+              exe.exe_size() == 2);
+        const ShaderEntry* vs = exe.find("vs", vs_hash);
+        const ShaderEntry* ps = exe.find("ps", ps_hash);
+        CHECK(vs && vs->name == "exe/container_00" && vs->input_signature.size() == 1 &&
+              vs->input_signature[0].semantic == "POSITION" && exe.spirv(*vs).size() == 5);
+        CHECK(ps && ps->name == "exe/container_01" && exe.spirv(*ps).size() == 5);
+        CHECK(exe.candidates("ps", vs_hash).empty() && exe.candidates("vs", ps_hash).empty() &&
+              exe.fspx_candidates("vs", vs_hash).empty());
+        // Same program in main index and exe/: main comes first (index order).
+        write(dir / "index.json", "{" + game + ",\n \"vs_same\": " + vs_entry + "}");
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 6 && exe.exe_size() == 2);
+        const auto both = exe.candidates("vs", vs_hash);
+        CHECK(both.size() == 2 && both[0]->name == "vs_same" && both[1]->name == "exe/container_00");
+        write(dir / "index.json", "{" + game + "}");
+        // Broken or missing exe/index.json leaves main, fspx, and bvh loaded and resets exe_size() to 0.
+        write(dir / "exe" / "index.json", "{broken");
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 3 && exe.exe_size() == 0 && exe.bvh_size() == 1 &&
+              exe.fspx_size() == 1 && !exe.find("vs", vs_hash));
+        std::filesystem::remove(dir / "exe" / "index.json");
+        CHECK(exe.load(dir.string(), &error) && exe.size() == 3 && exe.exe_size() == 0 && exe.find("cs", hash));
         std::filesystem::remove_all(dir);
     }
 
@@ -886,6 +894,61 @@ int main() {
         write(dir / "fspx" / "index.json", "{broken");
         CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 1 && bvh.fspx_size() == 0 &&
               bvh.program_candidates("cs", program).size() == 1);
+        std::filesystem::remove_all(dir);
+    }
+
+    // Pipeline-library entries: the compute programs of the library in shaders.rpf, translated by make_game.py into
+    // <dir>/library/index.json (named "library/<name>"), are found by the same two keys as the DLL's FSPX programs,
+    // next to <dir>/fspx/. The executable's slot-67 description carries kind 0 (the record's state blob) and kind 6.
+    {
+        const auto code = fspx_code(0x5000);
+        std::vector<std::uint8_t> state(28, 0), other_state(28, 0);
+        state[12] = 64;  // word 3: NumThreadsX
+        other_state[12] = 32;
+        const auto n = std::uint32_t(code.size());
+        const auto payload = [&](const std::vector<std::uint8_t>& kind0) {
+            std::vector<std::uint8_t> body = kind0;
+            body.insert(body.end(), code.begin(), code.end());
+            return fspx_payload({{0, 48, 28}, {6, 48 + 28, n}}, body);
+        };
+        std::filesystem::create_directories(dir / "fspx");
+        std::filesystem::create_directories(dir / "library");
+        {
+            std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);
+            index << "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash << "\"}}";
+            std::ofstream dll(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
+            dll << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(fspx_code(0x6000))
+                << "\"}}";
+            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
+            lib << "{\"lib_cs_00007\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(code)
+                << "\", \"fspx_state_sha256\": \"" << sha256_hex(state)
+                << "\", \"bindings\": [], \"local_size\": [64, 1, 1]}}";
+            std::ofstream spv(dir / "library" / "lib_cs_00007.spv", std::ios::binary);
+            const std::uint32_t words[5] = {0x07230203, 0x00010500, 7, 1, 0};
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        ShaderLibrary library;
+        CHECK(library.load(dir.string(), &error) && library.size() == 3 && library.fspx_size() == 2);
+        const auto found = library.fspx_candidates("cs", sha256_hex(code));
+        CHECK(found.size() == 1 && found[0]->name == "library/lib_cs_00007" && found[0]->local_size[0] == 64 &&
+              found[0]->fssm_sha256.empty());
+        CHECK(library.spirv(*found[0]).size() == 5);  // <dir>/library/lib_cs_00007.spv
+        // As slot 67 passes it: kind 0 and kind 6 in one payload. The record's state finds it; another state doesn't.
+        bool ambiguous = true;
+        CHECK(library.program_candidates("cs", compute_program(payload(state)), &ambiguous) == found && !ambiguous);
+        CHECK(library.program_candidates("cs", compute_program(payload(other_state)), &ambiguous).empty());
+        // The DLL's entries are still there, and the game's own by FSSM hash.
+        CHECK(library.fspx_candidates("cs", sha256_hex(fspx_code(0x6000))).at(0)->name == "fspx/upscaler_00");
+        CHECK(library.find("cs", hash) && library.find("cs", hash)->name == "cs_game");
+        // A broken library index leaves the others loaded; a missing one is not an error either.
+        {
+            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
+            lib << "{broken";
+        }
+        CHECK(library.load(dir.string(), &error) && library.size() == 2 && library.fspx_size() == 1 &&
+              library.fspx_candidates("cs", sha256_hex(code)).empty());
+        std::filesystem::remove(dir / "library" / "index.json");
+        CHECK(library.load(dir.string(), &error) && library.size() == 2 && library.fspx_size() == 1);
         std::filesystem::remove_all(dir);
     }
 
