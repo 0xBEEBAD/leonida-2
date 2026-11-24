@@ -3,6 +3,10 @@ name: Coordination activity
 on:
   issue_comment:
     types: [created, edited, deleted]
+  issues:
+    types: [edited]
+  pull_request_target:
+    types: [closed]
   workflow_run:
     workflows: ["Coordination claim"]
     types: [completed]
@@ -22,11 +26,14 @@ jobs:
   reconcile-claims:
     concurrency:
       group: coordination-claim-status
+      queue: max
       cancel-in-progress: false
     if: >-
       (github.event_name != 'issue_comment' ||
       (github.event.issue.number == 14 &&
       github.event.comment.user.login != 'github-actions[bot]')) &&
+      (github.event_name != 'issues' ||
+      github.event.issue.number == 14) &&
       (github.event_name != 'schedule' ||
       github.event.schedule == '17 * * * *')
     name: publish-coordination-claim-status
@@ -320,14 +327,34 @@ jobs:
                       pull for pull in pulls
                       if comment_change_targets_pull(pull, changed_ids, comment_id, comments_by_id)
                   ]
+              if event_name == "issues":
+                  if str((event.get("issue") or {}).get("number")) == str(ISSUE_NUMBER):
+                      return pulls
+                  return []
+              if event_name == "pull_request_target":
+                  closed_pull = event.get("pull_request") or {}
+                  if ((closed_pull.get("base") or {}).get("ref")) != "main":
+                      return []
+                  closed_sha = ((closed_pull.get("head") or {}).get("sha") or "")
+                  return [
+                      pull for pull in pulls
+                      if ((pull.get("base") or {}).get("ref")) == "main"
+                      and ((pull.get("head") or {}).get("sha") or "") == closed_sha
+                  ]
               if event_name == "workflow_run":
                   run = event.get("workflow_run") or {}
                   associated = run.get("pull_requests") or []
                   if associated:
-                      numbers = {str(item.get("number")) for item in associated}
+                      associated_shas = {
+                          ((item.get("head") or {}).get("sha") or "")
+                          for item in associated
+                          if (item.get("head") or {}).get("sha")
+                      }
+                      if run.get("head_sha"):
+                          associated_shas.add(run.get("head_sha"))
                       return [
                           pull for pull in pulls
-                          if str(pull.get("number")) in numbers and workflow_run_matches_pull(run, pull)
+                          if ((pull.get("head") or {}).get("sha") or "") in associated_shas
                       ]
                   return [pull for pull in pulls if workflow_run_matches_pull(run, pull)]
               if event_name == "workflow_dispatch":
@@ -538,9 +565,11 @@ jobs:
       group: coordination-activity-comment
       cancel-in-progress: false
     if: >-
-      github.event_name != 'issue_comment' ||
+      (github.event_name != 'issue_comment' ||
       (github.event.issue.number == 14 &&
-      github.event.comment.user.login != 'github-actions[bot]')
+      github.event.comment.user.login != 'github-actions[bot]')) &&
+      (github.event_name != 'issues' ||
+      github.event.issue.number == 14)
     name: sync-issue-activity
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -831,14 +860,34 @@ jobs:
                       pull for pull in pulls
                       if comment_change_targets_pull(pull, changed_ids, comment_id, comments_by_id)
                   ]
+              if event_name == "issues":
+                  if str((event.get("issue") or {}).get("number")) == str(ISSUE_NUMBER):
+                      return pulls
+                  return []
+              if event_name == "pull_request_target":
+                  closed_pull = event.get("pull_request") or {}
+                  if ((closed_pull.get("base") or {}).get("ref")) != "main":
+                      return []
+                  closed_sha = ((closed_pull.get("head") or {}).get("sha") or "")
+                  return [
+                      pull for pull in pulls
+                      if ((pull.get("base") or {}).get("ref")) == "main"
+                      and ((pull.get("head") or {}).get("sha") or "") == closed_sha
+                  ]
               if event_name == "workflow_run":
                   run = event.get("workflow_run") or {}
                   associated = run.get("pull_requests") or []
                   if associated:
-                      numbers = {str(item.get("number")) for item in associated}
+                      associated_shas = {
+                          ((item.get("head") or {}).get("sha") or "")
+                          for item in associated
+                          if (item.get("head") or {}).get("sha")
+                      }
+                      if run.get("head_sha"):
+                          associated_shas.add(run.get("head_sha"))
                       return [
                           pull for pull in pulls
-                          if str(pull.get("number")) in numbers and workflow_run_matches_pull(run, pull)
+                          if ((pull.get("head") or {}).get("sha") or "") in associated_shas
                       ]
                   return [pull for pull in pulls if workflow_run_matches_pull(run, pull)]
               if event_name == "workflow_dispatch":
