@@ -118,7 +118,7 @@ the GPU.
 If you cannot install distribution packages (no `sudo`), you can install `llvm-tools` and `spirv-tools` into a
 user-owned folder with [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html)
 (x86-64 glibc; for ARM64 use `linux-aarch64` from the micromamba guide; musl/Alpine is not natively supported) and let
-CMake fetch its pinned, hash-checked Vulkan headers:
+CMake fetch its pinned, hash-checked Vulkan headers if the system does not provide them:
 
 ```bash
 LEO=$HOME/leonida-tools
