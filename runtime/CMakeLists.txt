@@ -2233,6 +2233,17 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_indirect_dispatch_count PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
+    # The cache vk_pipeline_check saves has to hit on the runtime's device (docs/pipeline_check.md): the test
+    # compiles an embedded synthetic compute shader through a same-named copy of the checker, then creates the
+    # same pipeline on the runtime's device from the saved cache.
+    add_executable(pipeline_cache_seed_test test/pipeline_cache_seed_test.cpp)
+    add_dependencies(pipeline_cache_seed_test vk_pipeline_check)
+    target_link_libraries(pipeline_cache_seed_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(pipeline_cache_seed_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pipeline_cache_seed_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME pipeline_cache_seed COMMAND pipeline_cache_seed_test $<TARGET_FILE:vk_pipeline_check>)
+    set_tests_properties(pipeline_cache_seed PROPERTIES SKIP_RETURN_CODE 77)
+
     # What Close returns after one recorded call, against WARP; today's differences are listed in the test.
     add_executable(d3d12_close_parity_test test/d3d12_close_parity_test.cpp)
     target_link_libraries(d3d12_close_parity_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
