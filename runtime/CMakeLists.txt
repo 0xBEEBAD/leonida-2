@@ -168,6 +168,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/process.cpp
     shims/com_shim.cpp
     shims/bcrypt_rng.cpp
+    shims/xapu.cpp
     shims/xapu_chad.cpp
     shims/dstorage.cpp
   )
@@ -316,9 +317,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(dstorage_test PRIVATE /OPT:NOREF)
 
-  # xapu.dll and chad.dll, the APU and audio DSP command queues, resolved through the registry like xmem_test.
+  # xapu.dll and chad.dll, the APU and audio DSP command queues, resolved through the registry like xmem_test; Opus
+  # frame counts from hand-made packets.
   add_executable(xapu_chad_test
     test/xapu_chad_test.cpp
+    shims/xapu.cpp
     shims/xapu_chad.cpp
     shims/registry.cpp
   )
