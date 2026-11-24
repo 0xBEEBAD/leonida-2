@@ -4,19 +4,13 @@ on:
   pull_request:
     branches: [main]
     types: [opened, reopened, edited, synchronize, ready_for_review, converted_to_draft, closed]
-  workflow_dispatch:
-    inputs:
-      pr_number:
-        description: Current PR number to validate
-        required: true
-        type: number
 
 permissions: {}
 
 jobs:
   validate-claim:
-    if: (github.event_name == 'pull_request' && github.event.action != 'closed') || github.event_name == 'workflow_dispatch'
-    name: coordination-claim
+    if: github.event.action != 'closed'
+    name: coordination-claim-validator
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions:
@@ -89,6 +83,13 @@ jobs:
               return {value.upper() for value in WORK_ID_RE.findall(text or "")}
           
           
+          def work_id_list(text):
+              listed = ID_LIST_RE.match(text)
+              if listed and re.match(r"^\s*,", text[listed.end():]):
+                  return None
+              return listed
+          
+          
           def ids_from_claim_comment(body):
               lines = (body or "").splitlines()
               found = set()
@@ -97,7 +98,7 @@ jobs:
                   if not match:
                       continue
                   tail = match.group(1).strip()
-                  listed = ID_LIST_RE.match(tail)
+                  listed = work_id_list(tail)
                   if listed:
                       found.update(ids_from_text(listed.group(1)))
                       continue
@@ -115,7 +116,7 @@ jobs:
                       bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
                       if not bullet:
                           break
-                      first_ids = ID_LIST_RE.match(
+                      first_ids = work_id_list(
                           bullet.group(1).strip().strip(BACKTICK)
                       )
                       if not first_ids:
@@ -170,19 +171,11 @@ jobs:
                           unresolved_links.append(comment_id)
                       found.update(linked_ids)
               return found, unresolved_links
-          event_name = os.environ.get("GITHUB_EVENT_NAME")
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
               event = json.load(event_file)
-          if event_name == "workflow_dispatch":
-              try:
-                  pull_number = int((event.get("inputs") or {}).get("pr_number") or 0)
-              except (TypeError, ValueError):
-                  pull_number = 0
-              event_head_sha = ""
-          else:
-              event_pull = event.get("pull_request") or {}
-              pull_number = event_pull.get("number") or event.get("number")
-              event_head_sha = ((event_pull.get("head") or {}).get("sha") or "")
+          event_pull = event.get("pull_request") or {}
+          pull_number = event_pull.get("number") or event.get("number")
+          event_head_sha = ((event_pull.get("head") or {}).get("sha") or "")
           if not pull_number:
               fail("Cannot determine the PR number.")
           pull = request_json(f"/repos/{OWNER}/{REPOSITORY}/pulls/{pull_number}")
@@ -205,7 +198,7 @@ jobs:
               for item_id in ids_from_claim_comment(comment.get("body") or ""):
                   claims_by_id.setdefault(item_id, []).append(comment)
           
-          allowed_ids = open_work_ids(issue.get("body") or "") | set(claims_by_id)
+          allowed_ids = open_work_ids(issue.get("body") or "")
           candidates, unresolved_links = pull_claim_ids(pull, comments_by_id)
           if unresolved_links:
               fail("The PR references a missing or non-claim issue comment.")
