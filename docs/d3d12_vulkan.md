@@ -1879,6 +1879,17 @@ UINT border colour or non-normalized coordinates) with a log line, since 1.1 can
 once with an empty 1.2 description. `root_sig_test` checks the rewrite field by field and through the host
 deserializer.
 
+**Heap-directly-indexed flags on older runtimes.** The same in-box `d3d12.dll` refuses
+`D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and `..._SAMPLER_HEAP_DIRECTLY_INDEXED` in the
+serializer at every descriptor version, with `E_INVALIDARG` and "Unsupported bit-flag set (root signature flags c00)"
+(measured on 10.0.19041.4355; 1.0 and 1.1 both fail). Its *deserializer* and its devices take a blob that carries
+them: a blob serialized without the bits, patched back in and re-hashed deserializes with `Flags = 0xc00` and creates
+a WARP root signature. So the `d3d12_xs` serializer, when the host refuses and the description sets either bit,
+serializes again with the bits cleared and puts them back into the produced `RTS0` chunk, recomputing the container
+hash. A host that takes them (Windows 11) gets one call and its own blob back. `d3d12_xs_root_signature_test` covers
+both descriptor versions and checks the flags through the host deserializer and a device; the test-side
+`d3d12test::serialize_root_signature` helper does the same retry for tests that serialize directly.
+
 Things that can invalidate this simple model, all **Open**:
 
 - **Shader visibility.** The layer starts with one global block in root-parameter order and treats visibility as
