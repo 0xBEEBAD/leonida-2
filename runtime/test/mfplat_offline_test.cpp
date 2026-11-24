@@ -201,10 +201,48 @@ int main() {
           "file://localhost/GAME:/ prefers overlay copy");
     check(rt::mf::resolve_media_url(L"file:///C:/Windows/a.wav", out) == S_OK && out == L"C:\\Windows\\a.wav",
           "file:///C:/ normalizes to local drive path");
-    check(rt::mf::resolve_media_url(L"clip.mp4", out) == S_OK && out == L"clip.mp4",
-          "relative local path passes through unchanged");
     check(FAILED(rt::mf::resolve_media_url(L"GAME:\\..\\outside.mp4", out)),
           "console path traversal outside GAME: is refused");
+
+    // 4b. Default deny: anything but a console path, an absolute drive path, or a file URL naming one is refused.
+    check(rt::mf::resolve_media_url(L"clip.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme &&
+              scheme == "relative",
+          "relative local path refused");
+    check(rt::mf::resolve_media_url(L"relative\\movie.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme &&
+              scheme == "relative",
+          "relative backslash path refused");
+    check(rt::mf::resolve_media_url(L"C:relative.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme &&
+              scheme == "relative",
+          "drive-relative C:relative.mp4 refused");
+    check(rt::mf::resolve_media_url(L"\\movies\\a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme,
+          "rooted single-backslash path refused");
+    check(rt::mf::resolve_media_url(L"/movies/a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme,
+          "rooted single-slash path refused");
+    check(rt::mf::resolve_media_url(L" http://example.com/a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme,
+          "leading space before http scheme refused");
+    check(rt::mf::resolve_media_url(L"\thttp://x/a", out, &scheme, &host) == rt::mf::kUnsupportedScheme,
+          "leading tab before http scheme refused");
+    check(rt::mf::resolve_media_url(L"\\??\\C:\\movies\\a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme &&
+              scheme == "unc",
+          "NT \\??\\ prefix refused");
+    check(rt::mf::resolve_media_url(L"\\\\.\\C:\\movies\\a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme &&
+              scheme == "unc",
+          "device \\\\.\\ prefix refused");
+    check(rt::mf::resolve_media_url(L"\\\\?\\C:movies\\a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme,
+          "extended-prefix drive-relative path refused");
+    check(rt::mf::resolve_media_url(L"file:///movies/a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme &&
+              scheme == "file",
+          "driveless file:/// URL refused");
+    check(rt::mf::resolve_media_url(L"file:\\\\host\\share\\a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme,
+          "file:\\\\host backslash UNC refused");
+    check(rt::mf::resolve_media_url(L"file:////host/share/a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme,
+          "file:////host forward-slash UNC refused");
+    check(rt::mf::resolve_media_url(L"file:///%5C%5Chost/share/a.mp4", out, &scheme, &host) ==
+                  rt::mf::kUnsupportedScheme,
+          "file:/// percent-encoded UNC refused");
+    check(rt::mf::resolve_media_url(L"file:///\\\\host\\share\\a.mp4", out, &scheme, &host) ==
+                  rt::mf::kUnsupportedScheme,
+          "file:/// with backslash UNC refused");
 
     // 5. COM proxy isolation and forwarding against mock IMFSourceResolver.
     MockResolver mock{};

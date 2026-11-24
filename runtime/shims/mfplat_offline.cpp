@@ -7,10 +7,14 @@
 // that:
 //   - refuses non-local URL schemes, UNC shares, and non-local file:// hosts with MF_E_UNSUPPORTED_SCHEME, logging
 //     each (scheme, host) pair once;
-//   - accepts local drive paths, relative paths, and local file:/// or file://localhost/ URLs (percent-decoded);
+//   - default-denies everything else: only GAME: paths, absolute drive paths (X:\ or X:/), and file:/// or
+//     file://localhost/ URLs whose percent-decoded path is one of those pass. Relative, drive-relative, and UNC
+//     forms are refused, and so is a host drive path on a network drive;
 //   - rewrites console paths (GAME:, G:, T:) through rt::fs::resolve_read_path so movies in the package or overlay
 //     open through Media Foundation without touching the original package on write;
 //   - answers QueryInterface only for IUnknown and IMFSourceResolver so the unguarded host resolver cannot escape.
+// Only the IMFSourceResolver URL methods are gated. Byte-stream methods and MFCreateSourceReaderFromURL
+// (mfreadwrite.dll) are not.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -43,8 +47,10 @@ constexpr GUID kIidIUnknown = {0x00000000u, 0x0000u, 0x0000u, {0xC0u, 0x00u, 0x0
 
 bool is_ascii_alpha(wchar_t c) { return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z'); }
 
+// "X:" followed by a separator. Drive-relative "X:name" is not a drive path.
 bool is_drive_prefix(const std::wstring& s, size_t pos = 0) {
-    return pos + 2 <= s.size() && is_ascii_alpha(s[pos]) && s[pos + 1] == L':';
+    return pos + 3 <= s.size() && is_ascii_alpha(s[pos]) && s[pos + 1] == L':' &&
+           (s[pos + 2] == L'\\' || s[pos + 2] == L'/');
 }
 
 bool is_game_prefix(const std::wstring& s, size_t pos = 0) {
@@ -275,7 +281,11 @@ HRESULT resolve_media_url(const wchar_t* url, std::wstring& out, std::string* re
         return kUnsupportedScheme;
     };
 
+    // Default deny: only GAME: paths, absolute drive paths, and local file URLs that name one of those get through.
     std::wstring candidate;
+    if (text.starts_with(L"\\??\\") || text.starts_with(L"\\\\.\\")) {
+        return refuse("unc", "");
+    }
     if (text.starts_with(L"\\\\?\\")) {
         if (!is_drive_prefix(text, 4)) {
             std::wstring rest = text.substr(4);
@@ -328,21 +338,29 @@ HRESULT resolve_media_url(const wchar_t* url, std::wstring& out, std::string* re
                 if (ch == L'/') ch = L'\\';
             }
             if (!is_game_prefix(decoded) && !is_drive_prefix(decoded)) {
-                // Local file URL without an explicit drive: forward original URL.
-                out = text;
-                return S_OK;
+                // File URL without a console or drive path (no drive, or a relative path): refused.
+                return refuse("file", "");
             }
             candidate = std::move(decoded);
         } else {
-            // Relative local path: pass through unchanged.
-            out = text;
-            return S_OK;
+            // No scheme: relative path, drive-relative path ("C:name"), or rooted path. Refused.
+            return refuse("relative", "");
         }
     }
 
     std::uint32_t win32_err = 0;
     if (!rt::fs::resolve_read_path(candidate, out, &win32_err)) {
         return win32_err ? HRESULT_FROM_WIN32(win32_err) : E_ACCESSDENIED;
+    }
+    // A host drive the title names itself (resolve_read_path returns it unchanged) that is mapped to a network share is
+    // a remote host, so it is refused. Console paths resolve under the configured game/overlay folders, which every
+    // other file shim reads from wherever they live.
+    const std::wstring host_path = out.starts_with(L"\\\\?\\") ? out.substr(4) : out;
+    if (out == candidate && is_drive_prefix(host_path)) {
+        const std::wstring root = host_path.substr(0, 2) + L"\\";
+        if (GetDriveTypeW(root.c_str()) == DRIVE_REMOTE) {
+            return refuse("remote-drive", narrow_ascii_lower(root));
+        }
     }
     return S_OK;
 }
@@ -362,14 +380,25 @@ HRESULT wrap_source_resolver(IUnknown* host_resolver, void** out) {
 namespace {
 
 HRESULT STDAPICALLTYPE mf_create_source_resolver_shim(void** out) {
-    // Forward into the internal implementation inside rt::mf.
+    // Creates the host resolver from System32 mfplat.dll and wraps it in the offline proxy.
     if (!out) return E_POINTER;
     *out = nullptr;
-    HMODULE mod = LoadLibraryExW(L"mfplat.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!mod) return rt::mf::kUnsupportedScheme;
     using CreateFn = HRESULT(STDAPICALLTYPE*)(IUnknown**);
-    const auto real_create = reinterpret_cast<CreateFn>(GetProcAddress(mod, "MFCreateSourceResolver"));
-    if (!real_create) return rt::mf::kUnsupportedScheme;
+    // Loaded once and never freed, so calls do not leak LoadLibraryExW references. A failure is remembered with its
+    // error code, so later calls report the same one.
+    static DWORD failure = 0;
+    static const HMODULE mod = [] {
+        HMODULE m = LoadLibraryExW(L"mfplat.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!m) failure = GetLastError();
+        return m;
+    }();
+    static const CreateFn real_create = [] {
+        if (!mod) return static_cast<CreateFn>(nullptr);
+        CreateFn fn = reinterpret_cast<CreateFn>(GetProcAddress(mod, "MFCreateSourceResolver"));
+        if (!fn) failure = GetLastError();
+        return fn;
+    }();
+    if (!real_create) return failure ? HRESULT_FROM_WIN32(failure) : E_FAIL;
     IUnknown* host = nullptr;
     const HRESULT hr = real_create(&host);
     if (FAILED(hr) || !host) return FAILED(hr) ? hr : E_FAIL;
