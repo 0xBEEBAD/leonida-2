@@ -535,7 +535,16 @@ int check_rebound_tables(Context& c, ID3D12RootSignature* narrow, bool mirror, b
     for (UINT pass = 0; pass < 2; ++pass) {
         const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{source->GetGPUVirtualAddress() + kBytes * pass, kBytes};
         const D3D12_CPU_DESCRIPTOR_HANDLE src{staging_cpu.ptr + pass * step};
-        c.inner->CreateConstantBufferView(&cbv, src);
+        // The reference uses the producer of the slot under test. Xbox CreateCBV
+        // addresses 16-byte rows. A PC descriptor copied through the API retains its byte layout.
+        const bool xbox_cbv = api_copy && pass == 0;
+        (xbox_cbv ? c.device : c.inner)->CreateConstantBufferView(&cbv, src);
+        leonida::gfx10::BufferWords words{};
+        std::memcpy(words.data(), reinterpret_cast<const void*>(src.ptr), sizeof(words));
+        leonida::gfx10::Buffer reference_cbv{};
+        EXPECT(leonida::gfx10::decode(words, reference_cbv));
+        EXPECT(reference_cbv.stride == (xbox_cbv ? 16u : 0u));
+        EXPECT(reference_cbv.num_records == (xbox_cbv ? kBytes / 16u : kBytes));
         const void* copy_from = reinterpret_cast<const void*>(src.ptr);
         if (api_copy) {
             // Write to a shader-visible slot outside the bound table. The game copies from its CPU backing.

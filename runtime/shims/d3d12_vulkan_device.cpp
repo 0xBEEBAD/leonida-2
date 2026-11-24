@@ -2723,15 +2723,30 @@ public:
         const auto* pages = static_cast<const std::uint8_t*>(address);
         const auto base = reinterpret_cast<std::uintptr_t>(address);
         if (desc_.Width > UINTPTR_MAX - base) return E_INVALIDARG;
-        // A CPU-data shadow represents committed contents. With demand-paged XMem the placement
-        // provider commits its own registered pages before entering the backend.
+        // A single reservation can contain both committed data and holes. Copy the readable
+        // part on submission and zero the holes. A wholly reserved XMem window still needs
+        // the physical mapping provider to establish its backing.
+        const void* allocation = nullptr;
+        bool has_data = false;
         for (std::uintptr_t cursor = base; cursor < base + desc_.Width;) {
             MEMORY_BASIC_INFORMATION region{};
             if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) ||
-                region.State != MEM_COMMIT || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
-                !(region.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY))) return E_NOTIMPL;
-            cursor = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+                !region.AllocationBase || (allocation && allocation != region.AllocationBase))
+                return E_NOTIMPL;
+            allocation = region.AllocationBase;
+            if (region.State == MEM_COMMIT) {
+                if ((region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+                    !(region.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY)))
+                    return E_NOTIMPL;
+                has_data = true;
+            } else if (region.State != MEM_RESERVE) {
+                return E_NOTIMPL;
+            }
+            const auto start = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+            if (region.RegionSize > UINTPTR_MAX - start || start + region.RegionSize <= cursor) return E_NOTIMPL;
+            cursor = start + region.RegionSize;
         }
+        if (!has_data) return E_NOTIMPL;
         // The shadow is a range of the GPU address arena when it fits there (docs/d3d12_vulkan.md section 3.3).
         // The title's VA is a user-mode Windows address far above 4 GiB, past the arena, so a shader's heap_base + VA would miss
         // any buffer of the layer's; the root views and V#s the layer writes for that VA name the arena offset

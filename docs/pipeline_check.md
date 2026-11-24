@@ -445,9 +445,9 @@ The runtime seeds its `VkPipelineCache` from the cache this tool saves, so a pip
 driver gives it the same cache key in both programs. Measured on Windows with an RX 9070 XT (driver
 32.0.32029.2010) and one synthetic compute shader, reading the application-cache-hit bit:
 
-- `robustBufferAccess`, `scalarBlockLayout` and `robustImageAccess` are each part of the key. The runtime's
-  device enables none of them, so the checker's does not either. Nothing else that differs between the two
-  devices changed the key: the checker's other features, the runtime's extensions, the application name.
+- The three device features `robustBufferAccess`, `scalarBlockLayout` and `robustImageAccess` each affect the key.
+  The first two are disabled on both devices. This integration enables supported core image robustness for storage
+  views on both the runtime device and the checker. The seed test compares the two using one synthetic pipeline.
 - The executable's file name is part of the key; its folder is not. A copy of the checker under another name
   misses the cache the original wrote, and the runtime's device hits the checker's cache only from a program
   with the checker's file name. So on this driver a cache written by `vk_pipeline_check.exe` does not hit in

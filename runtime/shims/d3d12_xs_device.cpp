@@ -75,6 +75,7 @@
 namespace rt::d3d12_xs {
 namespace {
 std::atomic<ConsoleCaller> g_console_caller{nullptr};
+std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
 thread_local bool g_console_feature_query = false;
 
 bool is_console_caller(const void* address) {
@@ -2864,6 +2865,15 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<Slot>(self, r1, r2, r3, r4, a5)));
 }
 
+static bool console_heap_range_plausible(const D3D12_DESCRIPTOR_HEAP_DESC* desc, std::uint64_t address,
+                                         std::uint64_t size) {
+    constexpr std::uint64_t kConsoleDescriptorSize = 32;
+    if (address == 0 || size == 0) return false;
+    if (desc->NumDescriptors == 0 || desc->NumDescriptors > (0xFFFFFFFFull / kConsoleDescriptorSize)) return false;
+    if (size != static_cast<std::uint64_t>(desc->NumDescriptors) * kConsoleDescriptorSize) return false;
+    return true;
+}
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -2872,15 +2882,6 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
-    void* created = nullptr;
-    HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
-    if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
-
-    ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
-    SIZE_T custom_cpu_start = 0;
-    SIZE_T custom_byte_size = 0;
-    SIZE_T real_cpu_start = 0;
-    SIZE_T stride = 0;
     DescriptorHeapBackingAlloc alloc_fn = nullptr;
     DescriptorHeapBackingFree free_fn = nullptr;
     {
@@ -2888,6 +2889,31 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
         alloc_fn = g_heap_alloc;
         free_fn = g_heap_free;
     }
+    // Title allocation hooks supply live CPU slots. Without hooks, an explicit GPU
+    // address can be served by the backend after validating the extended descriptor.
+    void* created = nullptr;
+    const auto handler = g_console_descriptor_heap.load(std::memory_order_acquire);
+    bool extended = false;
+    HRESULT hr = E_INVALIDARG;
+    if (!alloc_fn && handler && desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
+        !(desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) {
+        const auto* tail = reinterpret_cast<const std::uint8_t*>(desc) + sizeof(*desc);
+        std::uint64_t range[2]{};
+        if (readable_range(tail, sizeof(range))) {
+            std::memcpy(range, tail, sizeof(range));
+            if (console_heap_range_plausible(desc, range[0], range[1])) {
+                extended = true;
+                hr = handler(self->real, desc, range[0], range[1], __uuidof(ID3D12DescriptorHeap), &created);
+            }
+        }
+    }
+    if (!extended) hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+    if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
+    ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
+    SIZE_T custom_cpu_start = 0;
+    SIZE_T custom_byte_size = 0;
+    SIZE_T real_cpu_start = 0;
+    SIZE_T stride = 0;
     if (alloc_fn && desc && desc->NumDescriptors > 0) {
         const UINT inc = self->real->GetDescriptorHandleIncrementSize(desc->Type);
         if (inc > 0 && desc->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc) {
@@ -3766,7 +3792,6 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
 std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
 std::atomic<PlacedAtVaPagesHook> g_placed_at_va_pages{nullptr};
 std::atomic<PinnedTexturePages> g_pin_texture_pages{nullptr};
-std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
 
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
                                        std::uint32_t layout, const D3D12_CLEAR_VALUE* clear, const IID* riid, void** out) {
