@@ -64,8 +64,11 @@ def listing_and_blob(program, variant="invalid"):
         if text is not None:
             lines.append(f"\t{text:<40}{encoding(raw)}")
             continue
-        second = bytes.fromhex(raw)[4:8]
+        raw_bytes = bytes.fromhex(raw)
         lines.append(INVALID)
+        if len(raw_bytes) == 4:
+            continue
+        second = raw_bytes[4:8]
         if variant == "invalid":
             lines.append(INVALID)
         elif variant == "junk":         # the second word decodes as an instruction of its own, bytes as stored
@@ -161,6 +164,34 @@ class VccTupleFallbackTest(unittest.TestCase):
                 self.assertEqual([mem.get(OUT + 4 * i) for i in range(4)],
                                  [0x11110000, 0x11110007, 0x1000, 0x12345678])
 
+    def test_swallowed_compare_in_wave64_writes_a_pair(self):
+        # The junk exp covers the tuple's second word and the compare's first; the compare's second prints on its own.
+        program = SET_SGPR_V + [
+            ("s_mov_b32 s12, 0", "80 03 8c be"), ("s_mov_b32 s13, 0", "80 03 8d be"),
+            (None, LOAD_X8_VCC),
+            ("v_cmp_gt_u32_e64 s[12:13], 40, v0", "0c 00 c4 d4 a8 00 02 00"),
+            WAIT,
+            ("s_bcnt1_i32_b64 s10, s[12:13]", "0c 10 8a be"),
+            ("v_mov_b32_e32 v10, s10", "0a 02 14 7e"),
+            ("v_lshlrev_b32_e32 v6, 2, v0", "82 00 0c 34"),
+            ("v_add_nc_u32_e32 v6, 0x3000, v6", "ff 0c 0c 4a 00 30 00 00"),
+            ("global_store_dword v6, v10, s[0:1]", "00 80 70 dc 06 0a 00 00"),
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        data, blob = listing_and_blob(program)
+        blob = bytearray(blob)
+        struct.pack_into("<4I", blob, 0x138, 0x88, 64, 1, 1)
+        struct.pack_into("<I", blob, fssm_header.WAVE_FLAGS_OFFSET, 0)       # wave64
+        lines = data.decode().splitlines()
+        first = lines.index(INVALID)
+        lines[first:first + 3] = [INVALID, "\texp mrt0 v0, v0, v0, v0 done vm " + encoding("0f 18 00 f8 00 00 00 00"),
+                                  f"\ts_nop 0{'':<33}" + encoding("a8 00 02 00")]
+        spv = translate_listing(NAME, ("\n".join(lines) + "\n").encode(), fssm=bytes(blob))
+        mem = {BASE + 4 * i: 0 for i in range(8)}
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {
+            "%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i}, push_constants=[0] * 36, memory=mem)
+        self.assertEqual([mem.get(OUT + 4 * i) for i in range(64)], [0x28] * 64)
+
     def test_rejected_word_after_a_tuple_is_still_refused(self):
         # inside no printed instruction: llvm-mc rejected the word itself, so it is not taken for swallowed code
         program = SET_SGPR_V + [(None, LOAD_X8_VCC), (None, "04 03 8a be 04 03 8a be"), WAIT] + STORE_X4
@@ -182,6 +213,66 @@ class VccTupleFallbackTest(unittest.TestCase):
         restored = rdna2spirv.restore_vcc_tuples([], mimg_nsa1, 0, 12)
         self.assertEqual(len(restored), 1)
         self.assertEqual((restored[0]["pc"], len(restored[0]["enc"]) // 2), (0, 12))
+
+    def test_skipped_data_word_before_branch_target_is_not_restored(self):
+        # An unreachable data word skipped by s_branch whose bytes equal the first dword of a vcc-tuple load must
+        # not be restored across the branch target instruction that immediately follows it.
+        program = SET_SGPR_V + [
+            ("s_branch 1", "01 00 82 bf"),
+            (None, "02 19 2c f4"),
+            ("v_mov_b32_e32 v10, 7", "87 02 14 7e"),
+            ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
+            ("global_store_dword v6, v10, s[0:1]", "00 80 70 dc 06 0a 00 00"),
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        mem = run(translate(program), {})
+        self.assertEqual(mem.get(OUT), 7)
+
+    def test_skipped_data_word_before_branch_target_vcc_load(self):
+        # Same skipped data word right before a real vcc-tuple load at the branch target: the data word is skipped
+        # and the real vcc-tuple load at the target is restored cleanly across all three listing variants.
+        program = SET_SGPR_V + [
+            ("s_branch 1", "01 00 82 bf"),
+            (None, "02 19 2c f4"),
+            (None, LOAD_X8_VCC), WAIT,
+            ("v_mov_b32_e32 v10, s100", "64 02 14 7e"), ("v_mov_b32_e32 v11, s105", "69 02 16 7e"),
+            ("v_mov_b32_e32 v12, vcc_lo", "6a 02 18 7e"), ("v_mov_b32_e32 v13, vcc_hi", "6b 02 1a 7e"),
+        ] + STORE_X4
+        words = [0x22220000 + i for i in range(8)]
+        for variant in PROGRAM_VARIANTS:
+            with self.subTest(printed_as=variant):
+                mem = run(translate(program, variant), {BASE + 4 * i: w for i, w in enumerate(words)})
+                self.assertEqual([mem.get(OUT + 4 * i) for i in range(4)], [words[0], words[5], words[6], words[7]])
+
+    def test_data_word_after_endpgm_before_branch_target_is_not_restored(self):
+        # An unreachable data word after s_endpgm right before a branch target is likewise ignored.
+        program = SET_SGPR_V + [
+            ("s_cmp_eq_i32 s4, s4", "04 04 00 bf"),
+            ("s_cbranch_scc1 2", "02 00 85 bf"),
+            ("s_endpgm", "00 00 81 bf"),
+            (None, "02 19 2c f4"),
+            ("v_mov_b32_e32 v10, 7", "87 02 14 7e"),
+            ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
+            ("global_store_dword v6, v10, s[0:1]", "00 80 70 dc 06 0a 00 00"),
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        mem = run(translate(program), {})
+        self.assertEqual(mem.get(OUT), 7)
+
+    def test_fallthrough_into_data_word_before_branch_target_refused(self):
+        # When fall-through reaches a data word equal to the first dword of a vcc-tuple load right before a branch
+        # target, restore_vcc_tuples must not swallow the branch target; reachable_code refuses the fall-through.
+        program = SET_SGPR_V + [
+            ("s_cmp_eq_i32 s4, s4", "04 04 00 bf"),
+            ("s_cbranch_scc1 1", "01 00 85 bf"),
+            (None, "02 19 2c f4"),
+            ("v_mov_b32_e32 v10, 7", "87 02 14 7e"),
+            ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
+            ("global_store_dword v6, v10, s[0:1]", "00 80 70 dc 06 0a 00 00"),
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "fall-through into undecodable words"):
+            translate(program)
 
 
 class ResyncTest(unittest.TestCase):
@@ -215,6 +306,48 @@ class ResyncTest(unittest.TestCase):
         # instruction because the junk before it ended there. So a resync may not stop at every printed start.
         words = [LOAD_X8_VCC, self.MOV, self.LITERAL, self.END]
         self.assertEqual(self.restore(words, [(4, 12), (16, 4), (20, 4)]), [(0, 8), (8, 4), (12, 8), (20, 4)])
+
+    def test_wave_size_reaches_the_decoder(self):
+        blob = bytes.fromhex(LOAD_X8_VCC + "0c 00 c4 d4 a8 00 02 00" + self.END)   # v_cmp_gt_u32_e64 s12 / s[12:13]
+        for wave32, n in ((True, 1), (False, 2)):
+            with self.subTest(wave32=wave32):
+                insns = [{"pc": 4, "enc": blob[4:16].hex(), "op": "x", "args": []},
+                         {"pc": 16, "enc": self.END.replace(" ", ""), "op": "s_endpgm", "args": []}]
+                out = rdna2spirv.restore_vcc_tuples(insns, blob, 0, len(blob), wave32=wave32)
+                self.assertEqual((out[1]["pc"], out[1]["args"][0].get("n", 1)), (8, n))
+
+    def branch(self, op, dwords):
+        return {"s_branch": "%02x %02x 82 bf", "s_cbranch_scc1": "%02x %02x 85 bf"}[op] % (dwords & 255, dwords >> 8 & 255)
+
+    def restore_ops(self, words, printed):
+        blob = bytes.fromhex("".join(words))
+        insns = [{"pc": pc, "enc": blob[pc:pc + n].hex(), "op": op, "args": args} for pc, n, op, args in printed]
+        return [i["pc"] for i in rdna2spirv.restore_vcc_tuples(insns, blob, 0, len(blob))]
+
+    def test_a_swallowed_branch_is_followed(self):
+        # the s_branch at 8, in the first tuple's junk, is the only way to the second tuple at 16
+        words = [LOAD_X8_VCC, self.branch("s_branch", 1), self.BAD, LOAD_X8_VCC, self.END]
+        self.assertEqual(self.restore_ops(words, [(4, 8, "x", []), (24, 4, "s_endpgm", [])]), [0, 8, 16, 24])
+
+    def test_a_branch_to_a_swallowed_instruction_does_not_hide_it(self):
+        # 0: scc1 -> 16 (swallowed), then the jump to 24, from where the tuple at 8 is reached last
+        imm = [{"k": "imm", "v": 3}]
+        words = [self.branch("s_cbranch_scc1", 3), self.branch("s_branch", 4), LOAD_X8_VCC, self.MOV, self.END,
+                 self.branch("s_cbranch_scc1", -6), self.END]
+        printed = [(0, 4, "s_cbranch_scc1", imm), (4, 4, "s_branch", [{"k": "imm", "v": 4}]),
+                   (12, 8, "x", []), (20, 4, "s_endpgm", []),
+                   (24, 4, "s_cbranch_scc1", [{"k": "imm", "v": -5}]), (28, 4, "s_endpgm", [])]
+        self.assertEqual(self.restore_ops(words, printed), [0, 4, 8, 16, 20, 24, 28])
+        # the same with the branches to the two taken in the other order
+        printed[0], printed[4] = (0, 4, "s_cbranch_scc1", [{"k": "imm", "v": 1}]), (24, 4, "s_cbranch_scc1",
+                                                                                   [{"k": "imm", "v": -3}])
+        self.assertEqual(self.restore_ops(words, printed), [0, 4, 8, 16, 20, 24, 28])
+
+    def test_what_follows_a_branched_into_tuple_is_dropped_with_it(self):
+        # a branch lands on the tuple's second word, so neither the tuple nor the words after it are taken for code
+        words = [self.branch("s_cbranch_scc1", 1), LOAD_X8_VCC, self.MOV, self.END]
+        printed = [(0, 4, "s_cbranch_scc1", [{"k": "imm", "v": 1}]), (8, 8, "x", []), (16, 4, "s_endpgm", [])]
+        self.assertEqual(self.restore_ops(words, printed), [0, 8, 16])
 
     def test_drops_out_when_a_decode_fails(self):
         # a word no decoder takes inside the junk: the s_mov_b32 after it is not picked up again

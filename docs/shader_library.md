@@ -171,7 +171,8 @@ What stops the rest, by the translator's message:
   `tests/semantic/test_vcc_tuple_fallback.py`. The junk llvm-mc prints at such a word's second dword is often longer
   than that dword (an 8-byte `exp`, say) and swallows the instruction after the tuple too, so the words after a restored
   instruction are decoded from the blob until the stream is back at one llvm-mc printed. A word llvm-mc itself rejected
-  is not taken for swallowed code and stays refused. The table above was measured before both changes. Measured since,
+  is not taken for swallowed code and stays refused. They are decoded for the program's own wave size: in wave64 a
+  swallowed VOP3 compare writes an SGPR pair. The table above was measured before both changes. Measured since,
   over the 2,684 compute programs (llvm-mc 21.1.8): 1,816 translate with the tuples alone and 2,567 with the swallowed
   instructions, all of which pass `spirv-val`; the modules of the 1,816 are byte-identical.
 * **443: an instruction llvm-mc prints with another encoding than the blob's** (`v_fma_mix*`, `v_interp_p2_f16`):
