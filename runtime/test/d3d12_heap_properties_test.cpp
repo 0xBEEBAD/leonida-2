@@ -235,9 +235,10 @@ void run(ID3D12Device* device, Record& out) {
 // committed and placed resources, with either output optional, and not for reserved ones. So for every committed or
 // placed resource the layer created: the call succeeds with both outputs, with the properties alone and with the
 // flags alone; Type is the heap type it was created with and, for a custom heap, so are the CPU page property and the
-// memory pool; and a call asking for one output reports what the call asking for both does, and writes it. For a
-// reserved resource the call fails. The values D3D12 derives itself (the flags a committed resource reports, the node
-// masks) are the host comparison's. Returns the number of wrong answers; `checked` counts the resources looked at.
+// memory pool; and a call asking for one output reports what the call asking for both does, and every output asked
+// for is written. For a reserved resource the call fails. The values D3D12 derives itself (the flags a committed
+// resource reports, the node masks) are the host comparison's. Returns the number of wrong answers; `checked` counts
+// the resources looked at.
 int layer_wrong(const Record& ours, int* checked) {
     int wrong = 0;
     const auto find = [&](const std::string& name, std::uint64_t* value) {
@@ -259,11 +260,19 @@ int layer_wrong(const Record& ours, int* checked) {
             std::printf("heap properties %s: missing from the layer's record (%s)\n", name.c_str(), why);
         ++wrong;
     };
-    const auto same = [&](const std::string& one, const std::string& both, bool written) {
+    // A value from a call asking for one output: it has to be what the call asking for both gave, and the call has
+    // to have written it (the outputs start as the sentinel), which holds the other call to having written it too.
+    const auto same = [&](const std::string& one, const std::string& both) {
         std::uint64_t a = 0, b = 0;
-        if (find(one, &a) && find(both, &b) && a == b && (!written || std::uint32_t(a) != kSentinel)) return;
-        std::printf("heap properties %s: the layer answers 0x%llx where the call with both outputs gave 0x%llx\n",
-                    one.c_str(), static_cast<unsigned long long>(a), static_cast<unsigned long long>(b));
+        const bool found = find(one, &a) && find(both, &b);
+        if (found && a == b && std::uint32_t(a) != kSentinel) return;
+        if (found && a == b)
+            std::printf("heap properties %s: the layer did not write it, with both outputs asked for either\n",
+                        one.c_str());
+        else
+            std::printf("heap properties %s: the layer answers 0x%llx where the call with both outputs gave "
+                        "0x%llx\n", one.c_str(), static_cast<unsigned long long>(a),
+                        static_cast<unsigned long long>(b));
         ++wrong;
     };
     static const char* const kPropertyFields[] = {"Type", "CPUPageProperty", "MemoryPoolPreference",
@@ -294,8 +303,8 @@ int layer_wrong(const Record& ours, int* checked) {
                    "the custom heap's memory pool");
         }
         for (const char* field : kPropertyFields)
-            same(name + ", properties only: " + field, name + ": " + field, false);
-        same(name + ", flags only: flags", name + ": flags", true);
+            same(name + ", properties only: " + field, name + ": " + field);
+        same(name + ", flags only: flags", name + ": flags");
     }
     return wrong;
 }
