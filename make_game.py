@@ -887,6 +887,10 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
                 missing.append(pipeline_check_prerequisite(runtime_building))
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
+    if os.name == "nt" and "runtime" in stages and not runtime_build and not os.environ.get("VULKAN_SDK"):
+        log("warning: VULKAN_SDK is not set, so the runtime may be built without the Vulkan D3D12 device and "
+            "LEONIDA_D3D12=vulkan would then be ignored. Install the Vulkan SDK (https://vulkan.lunarg.com/), "
+            "reopen the terminal and run the build again to get it.")
     if "pipelines" in stages and "shaders" not in stages:
         require_translated_shaders(work)
     need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
