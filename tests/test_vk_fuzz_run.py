@@ -106,6 +106,10 @@ class ProgramText(unittest.TestCase):
             lanes = R.read_dump(str(dump), 1, 32)
             self.assertEqual(lanes, [[0x100 + lane] for lane in range(32)])
             self.assertNotIn([sentinel], lanes)
+            # wave64, words=1 from a two-group dump (128 words): the buffer is longer than the request the other way
+            # round, and only the first 64 words are the wave's.
+            dump.write_bytes(struct.pack("<128I", *([0x200 + lane for lane in range(64)] + [sentinel] * 64)))
+            self.assertEqual(R.read_dump(str(dump), 1, 64), [[0x200 + lane] for lane in range(64)])
             # An exact-size dump still reads as before.
             dump.write_bytes(struct.pack("<128I", *range(128)))
             lanes = R.read_dump(str(dump), 4, 32)
