@@ -26,6 +26,7 @@ jobs:
           import sys
           import urllib.error
           import urllib.request
+from datetime import datetime
 
           API = "https://api.github.com"
           OWNER, REPOSITORY = os.environ["GITHUB_REPOSITORY"].split("/", 1)
@@ -134,14 +135,36 @@ jobs:
                   "(or link the claim comment) before requesting review."
               )
 
+          def parse_time(value):
+              if not value:
+                  return None
+              try:
+                  return datetime.fromisoformat(value.replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+
+          pull_opened = parse_time(pull.get("created_at"))
+          if pull_opened is None:
+              fail("Cannot determine when this PR was opened.")
+
           item_id = next(iter(candidate_ids))
           matching_claims = []
+          later_claim_exists = False
           for comment in comments:
               for match in CLAIM_RE.finditer(comment.get("body") or ""):
-                  if match.group(1).upper() == item_id:
+                  if match.group(1).upper() != item_id:
+                      continue
+                  claim_time = parse_time(comment.get("created_at"))
+                  if claim_time is None:
+                      continue
+                  if claim_time < pull_opened:
                       matching_claims.append(comment)
+                  else:
+                      later_claim_exists = True
 
           if not matching_claims:
+              if later_claim_exists:
+                  fail(f"Claim {item_id} must be posted before the PR is opened.")
               fail(f"No claiming comment was found for work item {item_id} on issue #14.")
           owners = {
               ((comment.get("user") or {}).get("login") or "").casefold()
