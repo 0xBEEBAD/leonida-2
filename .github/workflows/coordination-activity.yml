@@ -822,6 +822,7 @@ jobs:
                       stop(f"GitHub GraphQL request failed (HTTP {error.code}): {detail}")
                   except (urllib.error.URLError, TimeoutError) as error:
                       stop(f"Cannot reach GitHub GraphQL API: {error}")
+              stop("GitHub GraphQL retry loop ended unexpectedly.")
 
           def attach_comment_edit_metadata(comments, retry=True):
               claim_comments = [
@@ -830,6 +831,16 @@ jobs:
               ]
               if not claim_comments:
                   return comments
+
+              def refresh_comments():
+                  if not retry:
+                      stop("Could not verify claim metadata after one fresh issue-comment read.")
+                  refreshed = get_collection(
+                      f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments",
+                      "issue #14 comments",
+                  )
+                  return attach_comment_edit_metadata(refreshed, retry=False)
+
               query = (
                   "query($ids: [ID!]!) { nodes(ids: $ids) { "
                   "... on IssueComment { fullDatabaseId lastEditedAt } } }"
@@ -845,6 +856,26 @@ jobs:
                   )
                   errors = result.get("errors") or []
                   if errors:
+                      node_error = any(
+                          isinstance(error, dict)
+                          and (
+                              (
+                                  isinstance(error.get("path"), list)
+                                  and error["path"]
+                                  and error["path"][0] == "nodes"
+                              )
+                              or (
+                                  "node" in (error.get("message") or "").casefold()
+                                  and (
+                                      "resolve" in (error.get("message") or "").casefold()
+                                      or "not found" in (error.get("message") or "").casefold()
+                                  )
+                              )
+                          )
+                          for error in errors
+                      )
+                      if node_error:
+                          return refresh_comments()
                       details = "; ".join(
                           str(error.get("message") or "GraphQL error")
                           for error in errors[:3]
@@ -865,13 +896,7 @@ jobs:
                   if str(comment.get("id") or "") not in edited_at_by_id
               ]
               if missing:
-                  if retry:
-                      refreshed = get_collection(
-                          f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments",
-                          "issue #14 comments",
-                      )
-                      return attach_comment_edit_metadata(refreshed, retry=False)
-                  stop("Could not verify claim comment metadata after one fresh read.")
+                  return refresh_comments()
               for comment in claim_comments:
                   comment["_last_edited_at"] = edited_at_by_id[str(comment["id"])]
               return comments
@@ -889,13 +914,13 @@ jobs:
           
           def unwrap_work_id_code(text):
               text = (text or "").strip()
-              quote = re.escape(BACKTICK)
-              inline_code = re.match("^" + quote + "([^" + BACKTICK + "]*)" + quote + "(.*)$", text)
-              if inline_code:
-                  code_text = inline_code.group(1).strip()
+              pattern = re.escape(BACKTICK) + "([^" + BACKTICK + "]*)" + re.escape(BACKTICK)
+              def replace_code_span(match):
+                  code_text = match.group(1).strip()
                   if ID_LIST_RE.fullmatch(code_text):
-                      return code_text + inline_code.group(2)
-              return text
+                      return code_text
+                  return match.group(0)
+              return re.sub(pattern, replace_code_span, text)
 
           def ids_from_claim_comment(body):
               lines = (body or "").splitlines()
