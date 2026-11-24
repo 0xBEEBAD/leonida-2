@@ -26,6 +26,7 @@ jobs:
           import os
           import re
           import sys
+          import time
           import urllib.error
           import urllib.request
           from datetime import datetime
@@ -80,51 +81,104 @@ jobs:
           
           
           def graphql_json(payload):
-              request = urllib.request.Request(
-                  API + "/graphql",
-                  data=json.dumps(payload).encode("utf-8"),
-                  method="POST",
-                  headers={
-                      "Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {TOKEN}",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                      "Content-Type": "application/json",
-                  },
-              )
-              try:
-                  with urllib.request.urlopen(request, timeout=20) as response:
-                      return json.load(response)
-              except urllib.error.HTTPError as error:
-                  fail(f"Cannot verify issue comment edit history (HTTP {error.code}).")
-              except (urllib.error.URLError, TimeoutError):
-                  fail("Cannot reach GitHub to verify issue comment edit history.")
+              for attempt in range(2):
+                  request = urllib.request.Request(
+                      API + "/graphql",
+                      data=json.dumps(payload).encode("utf-8"),
+                      method="POST",
+                      headers={
+                          "Accept": "application/vnd.github+json",
+                          "Authorization": f"Bearer {TOKEN}",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                          "Content-Type": "application/json",
+                      },
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=20) as response:
+                          result = json.load(response)
+                          errors = result.get("errors") or []
+                          limited = any(
+                              isinstance(error, dict)
+                              and (
+                                  error.get("type") == "RATE_LIMITED"
+                                  or "rate limit" in (error.get("message") or "").casefold()
+                              )
+                              for error in errors
+                          )
+                          retry_after = response.headers.get("Retry-After")
+                          try:
+                              delay = float(retry_after) if retry_after is not None else None
+                          except (TypeError, ValueError):
+                              delay = None
+                          if limited and attempt == 0 and delay is not None and 0 <= delay <= 20:
+                              time.sleep(delay)
+                              continue
+                          return result
+                  except urllib.error.HTTPError as error:
+                      detail = error.read().decode("utf-8", "replace")[:300]
+                      retry_after = error.headers.get("Retry-After")
+                      try:
+                          delay = float(retry_after) if retry_after is not None else None
+                      except (TypeError, ValueError):
+                          delay = None
+                      if error.code in (403, 429) and attempt == 0 and delay is not None and 0 <= delay <= 20:
+                          time.sleep(delay)
+                          continue
+                      fail(f"GitHub GraphQL request failed (HTTP {error.code}): {detail}")
+                  except (urllib.error.URLError, TimeoutError) as error:
+                      fail(f"Cannot reach GitHub GraphQL API: {error}")
 
-          def attach_comment_edit_metadata(comments):
+          def attach_comment_edit_metadata(comments, retry=True):
+              claim_comments = [
+                  comment for comment in comments
+                  if ids_from_claim_comment(comment.get("body") or "")
+              ]
+              if not claim_comments:
+                  return comments
               query = (
                   "query($ids: [ID!]!) { nodes(ids: $ids) { "
                   "... on IssueComment { fullDatabaseId lastEditedAt } } }"
               )
-              for offset in range(0, len(comments), 100):
-                  batch = comments[offset : offset + 100]
+              edited_at_by_id = {}
+              for offset in range(0, len(claim_comments), 100):
+                  batch = claim_comments[offset : offset + 100]
                   node_ids = [comment.get("node_id") for comment in batch]
                   if any(not node_id for node_id in node_ids):
-                      fail("Cannot verify issue comment edit history.")
-                  result = graphql_json({"query": query, "variables": {"ids": node_ids}})
-                  if result.get("errors"):
-                      fail("Cannot verify issue comment edit history.")
+                      fail("Cannot verify issue comment edit history: missing GraphQL node ID.")
+                  result = graphql_json(
+                      {"query": query, "variables": {"ids": node_ids}}
+                  )
+                  errors = result.get("errors") or []
+                  if errors:
+                      details = "; ".join(
+                          str(error.get("message") or "GraphQL error")
+                          for error in errors[:3]
+                          if isinstance(error, dict)
+                      )
+                      fail("Cannot verify issue comment edit history: " + details)
                   nodes = ((result.get("data") or {}).get("nodes"))
                   if not isinstance(nodes, list) or len(nodes) != len(batch):
                       fail("GitHub returned invalid issue comment edit metadata.")
-                  edited_at_by_id = {}
                   for node in nodes:
                       if not isinstance(node, dict) or node.get("fullDatabaseId") is None:
-                          fail("GitHub returned invalid issue comment edit metadata.")
-                      edited_at_by_id[str(node["fullDatabaseId"])] = node.get("lastEditedAt")
-                  for comment in batch:
-                      comment_id = str(comment.get("id") or "")
-                      if comment_id not in edited_at_by_id:
-                          fail("Could not match issue comment edit metadata.")
-                      comment["_last_edited_at"] = edited_at_by_id[comment_id]
+                          continue
+                      if "lastEditedAt" not in node:
+                          fail("GitHub omitted lastEditedAt from issue comment metadata.")
+                      edited_at_by_id[str(node["fullDatabaseId"])] = node["lastEditedAt"]
+              missing = [
+                  comment for comment in claim_comments
+                  if str(comment.get("id") or "") not in edited_at_by_id
+              ]
+              if missing:
+                  if retry:
+                      refreshed = get_collection(
+                          f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments"
+                      )
+                      return attach_comment_edit_metadata(refreshed, retry=False)
+                  fail("Could not verify claim comment metadata after one fresh read.")
+              for comment in claim_comments:
+                  comment["_last_edited_at"] = edited_at_by_id[str(comment["id"])]
+              return comments
 
           def ids_from_text(text):
               return {value.upper() for value in WORK_ID_RE.findall(text or "")}
@@ -137,6 +191,16 @@ jobs:
               return listed
           
           
+          def unwrap_work_id_code(text):
+              text = (text or "").strip()
+              quote = re.escape(BACKTICK)
+              inline_code = re.match("^" + quote + "([^" + BACKTICK + "]*)" + quote + "(.*)$", text)
+              if inline_code:
+                  code_text = inline_code.group(1).strip()
+                  if ID_LIST_RE.fullmatch(code_text):
+                      return code_text + inline_code.group(2)
+              return text
+
           def ids_from_claim_comment(body):
               lines = (body or "").splitlines()
               found = set()
@@ -165,7 +229,7 @@ jobs:
                       bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
                       if not bullet:
                           break
-                      bullet_text = bullet.group(1).replace(BACKTICK, "").strip()
+                      bullet_text = unwrap_work_id_code(bullet.group(1))
                       first_ids = work_id_list(bullet_text)
                       if not first_ids:
                           leading_id = re.match(rf"^{ID_PATTERN}", bullet_text)
@@ -246,7 +310,7 @@ jobs:
           comments = get_collection(
               f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments"
           )
-          attach_comment_edit_metadata(comments)
+          comments = attach_comment_edit_metadata(comments)
           comments_by_id = {str(comment.get("id")): comment for comment in comments}
           claims_by_id = {}
           for comment in comments:
