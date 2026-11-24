@@ -21,6 +21,10 @@ PASS = "import unittest\nimport helper\nclass T(unittest.TestCase):\n    def tes
 FAIL = "import unittest\nclass T(unittest.TestCase):\n    def test_a(self): self.assertEqual(1, 2, 'boom-msg')\n"
 BROKEN = "import no_such_module_anywhere\n"
 HANG = "import time\nprint('before-sleep-marker', flush=True)\ntime.sleep(60)\n"
+RAN0 = ("import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+        "        print('Ran 0 tests in 0.000s', flush=True)\n")
+RAN0_AT_EXIT = ("import atexit\nimport unittest\natexit.register(lambda: print('Ran 0 tests in 0.000s'))\n"
+                "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
 
 
 def suite(tmp, files):
@@ -56,6 +60,18 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("TIMED OUT after 1 s: test_hang", result.stdout)
             self.assertIn("3 files, 4 tests, 1 files failed", result.stdout)
             self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_the_count_comes_from_unittest_not_from_a_test_line(self):
+        # A test may print a line of the same shape as unittest's own summary. unittest writes its summary to stderr
+        # and a test's own output to stdout, so the count comes from stderr: in the merged output it was whichever
+        # line came first, which depended on stdout buffering.
+        for source in (RAN0, RAN0_AT_EXIT):
+            with self.subTest(source=source.split(chr(10))[0]), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"test_counts.py": source})
+                result = cli(tmp, "-j", "2")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
+                self.assertNotIn("no tests ran", result.stdout)
 
     def test_serial_timeout_keeps_discover_output_and_names_the_suite(self):
         with tempfile.TemporaryDirectory() as tmp:

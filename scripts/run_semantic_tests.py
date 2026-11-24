@@ -81,20 +81,26 @@ def run_module(directory, module, verbose, timeout=None):
     target = module[:-len(".__init__")] if module.endswith(".__init__") else module
     cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), target]
     try:
-        p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                            errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        out = exc.stdout or ""
-        if isinstance(out, bytes):  # TimeoutExpired retains bytes even when text=True.
-            out = out.decode(locale.getpreferredencoding(False), errors="replace")
+        # TimeoutExpired retains bytes even when text=True.
+        parts = [chunk.decode(locale.getpreferredencoding(False), errors="replace") if isinstance(chunk, bytes)
+                 else chunk for chunk in (exc.stdout, exc.stderr) if chunk]
+        out = "".join(parts)
         return 1, 0, out + f"\nTIMED OUT after {timeout:g} s: {module}\n"
-    ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
+    # unittest writes its own summary ("Ran N tests in X s") and its "NO TESTS RAN" to stderr; a test's own output
+    # goes to stdout and can hold a line of the same shape. The count therefore comes from stderr alone. Reading the
+    # merged output took whichever line came first, which is the test's own when it flushes and unittest's when it does
+    # not, so the count depended on stdout buffering.
+    ran = re.search(r"^Ran (\d+) tests? in", p.stderr, re.M)
     count = int(ran.group(1)) if ran else 0
+    out = p.stdout + p.stderr
     # Discover imports every package initializer, but an empty one has no tests to run. It is included in the
     # module list so parallel runs see TestCase classes when there are any; without them, it is not a failure.
-    if p.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in p.stdout:
-        return 0, 0, p.stdout
-    return p.returncode, count, p.stdout
+    if p.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in p.stderr:
+        return 0, 0, out
+    return p.returncode, count, out
 
 
 def main(argv=None):
