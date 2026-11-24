@@ -467,8 +467,9 @@ int main() {
     // 8b. Loops are rounded to whole packets: the loop end packet plays in full and the read
     //     restarts at the packet holding the loop start. One 1-frame packet = 512 samples = 4 blocks.
     {
-        // Two packets with one silent mono frame each.
-        std::vector<uint8_t> stream(2 * 2048, 0xFFu);
+        // Three packets with one silent mono frame each. Packet 0 skips packet 1,
+        // which belongs to another stream.
+        std::vector<uint8_t> stream(3 * 2048, 0xFFu);
         auto put_bits = [&](size_t at, uint32_t value, size_t width) {
             for (size_t i = 0; i < width; ++i) {
                 const size_t p = at + i;
@@ -478,9 +479,9 @@ int main() {
                     (bit << (7 - (p % 8))));
             }
         };
-        for (size_t packet = 0; packet < 2; ++packet) {
+        for (size_t packet = 0; packet < 3; ++packet) {
             const size_t base = packet * 2048 * 8;
-            put_bits(base, 1u << 26, 32);  // 1 frame, first_frame_bit = 0
+            put_bits(base, (1u << 26) | (packet == 0 ? 1u : 0u), 32);
             const size_t at = base + 32;
             put_bits(at, 31, 15);          // frame length
             put_bits(at + 15, 0b10u, 2);   // fixed layout, one 512-sample subframe
@@ -494,8 +495,8 @@ int main() {
 
         void* in_va = nullptr;
         uint32_t in_apu = 0;
-        check(alloc(&in_va, &in_apu, 0x1000, 0x800, 1) == S_OK && in_va != nullptr,
-              "ApuAlloc 2-packet loop input buffer");
+        check(alloc(&in_va, &in_apu, 0x1800, 0x800, 1) == S_OK && in_va != nullptr,
+              "ApuAlloc 3-packet loop input buffer");
         std::memcpy(in_va, stream.data(), stream.size());
 
         void* out_va = nullptr;
@@ -520,14 +521,16 @@ int main() {
 
         // Decodes the stream once on voice 2 with the given loop count and returns the number of
         // blocks written when the error flag rose, or -1 on timeout.
-        auto run_blocks = [&](uint32_t loops) -> int {
+        auto run_blocks = [&](uint32_t loops, bool split_inputs = false) -> int {
             std::memset(out_va, 0x55, 0x1000);
-            words[0] = 2u | (loops << 12) | (1u << 20) | (16u << 22);
-            words[1] = (1u << 31) | (3u << 27);  // 48 kHz, mono, writable
+            words[0] = (split_inputs ? 2u : 3u) | (loops << 12) |
+                       ((split_inputs ? 3u : 1u) << 20) | (16u << 22);
+            words[1] = (1u << 31) | (3u << 27) | (split_inputs ? 1u : 0u);
             words[2] = 32u;                       // read at packet 0
             words[3] = 32u;                       // loop start: packet 0
             words[4] = 100u;                      // loop end: packet 0
             words[5] = in_apu;
+            words[6] = in_apu + 0x1000u;
             words[7] = out_apu;
             words[9] = 0u;
 
@@ -547,9 +550,17 @@ int main() {
             return blocks;
         };
 
-        check(run_blocks(0) == 8, "Two 1-frame packets without a loop write 8 blocks (1024 samples)");
-        check(run_blocks(1) == 12, "One loop of packet 0 writes 12 blocks (packets 0, 0, 1)");
+        check(run_blocks(0) == 8, "Packets 0 and 2 write 8 blocks, skipping packet 1");
+        check(run_blocks(1) == 12, "One loop of packet 0 writes 12 blocks (packets 0, 0, 2)");
         check(((words[0] >> 12) & 0xFFu) == 0u, "Loop count is consumed by the single loop");
+        check(run_blocks(0, true) == 8 && (words[4] >> 31) == 1u,
+              "A skip to the end of input 0 continues at input 1");
+
+        words[0] = 3u << 22;  // three ring blocks
+        words[9] = 2u;
+        const uint32_t advance_args[2] = {2u, UINT32_MAX};
+        check(fn_submit(x_acp, 18, 0xf5, 0xffffffffu, advance_args, 0) == S_OK && words[9] == 2u,
+              "ADVANCE_XMA_READ wraps at the ring size without overflowing");
 
         check(fn_release(x_acp) == S_OK, "Release packet loop AcpHal succeeds");
         free_mem(in_va);
@@ -557,8 +568,7 @@ int main() {
         check(release_ctx(&xma_ctx) == S_OK, "Release packet loop SHAPE contexts");
     }
 
-    // 9. ENABLE_XMA (starts/wakes the decoder worker) racing bind/release (stops it).
-    //    Every release must return; a lost stop would hang this block.
+    // 9. ENABLE_XMA racing SHAPE allocation and release, including concurrent releases.
     {
         using RaceConnectFn = HRESULT(__stdcall*)(void*, uint32_t, uint32_t);
         using RaceSubmitFn = HRESULT(__stdcall*)(void*, uint32_t, uint64_t, uint32_t, const void*, uint32_t);
@@ -581,6 +591,11 @@ int main() {
                             &enable_arg, 0);
             }
         });
+        std::thread releaser([&]() {
+            for (int i = 0; i < kRaceIterations; ++i) {
+                if (release_ctx(nullptr) != S_OK) ++bind_failures;
+            }
+        });
         for (int i = 0; i < kRaceIterations; ++i) {
             TestShapeContexts race_ctx{};
             race_ctx.numXmaContexts = 4;
@@ -588,7 +603,8 @@ int main() {
             if (release_ctx(&race_ctx) != S_OK) ++bind_failures;
         }
         enabler.join();
-        check(bind_failures == 0, "20000 bind/release cycles race ENABLE_XMA without hanging");
+        releaser.join();
+        check(bind_failures == 0, "20000 bind/release cycles race ENABLE_XMA and independent releases");
         check(race_release(race_acp) == S_OK, "Release race AcpHal succeeds");
     }
 

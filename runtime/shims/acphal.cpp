@@ -303,6 +303,7 @@ ApuRegion g_cached_heap;
 ApuRegion g_noncached_heap;
 
 // Tracked SHAPE context arrays
+std::mutex g_shape_mutex;
 std::vector<void*> g_active_shape_arrays;
 
 // Resolves a contiguous [apu, apu + len) byte range inside the APU heap.
@@ -419,7 +420,7 @@ public:
     ~XmaEngine() { unbind(); }
 
     void bind(SHAPE_XMA_CONTEXT* array, uint32_t count) {
-        stop_worker();
+        unbind();
         std::unique_lock lock(table_mutex_);
         array_ = reinterpret_cast<volatile uint32_t*>(array);
         voices_.clear();
@@ -427,15 +428,17 @@ public:
         for (uint32_t i = 0; i < count; ++i) {
             voices_.push_back(std::make_unique<XmaVoiceSlot>());
         }
-        active_count_.store(0, std::memory_order_relaxed);
     }
 
     void unbind() {
+        {
+            std::unique_lock lock(table_mutex_);
+            array_ = nullptr;
+            voices_.clear();
+            active_count_.store(0, std::memory_order_relaxed);
+        }
+        // Once detached, commands cannot start a worker for this table.
         stop_worker();
-        std::unique_lock lock(table_mutex_);
-        array_ = nullptr;
-        voices_.clear();
-        active_count_.store(0, std::memory_order_relaxed);
     }
 
     bool handle_command(uint32_t command, const void* config) {
@@ -481,11 +484,11 @@ public:
     }
 
     void enable(uint32_t index) {
-        {
-            std::shared_lock table_lock(table_mutex_);
-            XmaContextView ctx = context_locked(index);
-            if (!ctx.words) return;
+        std::shared_lock table_lock(table_mutex_);
+        XmaContextView ctx = context_locked(index);
+        if (!ctx.words) return;
 
+        {
             std::lock_guard slot_lock(voices_[index]->mutex);
             const bool was_active = voices_[index]->voice.has_value();
             // Clear error_status (26..30) and error flag (31).
@@ -512,16 +515,16 @@ public:
     }
 
     void advance_read(uint32_t index, uint32_t blocks) {
+        std::shared_lock table_lock(table_mutex_);
+        XmaContextView ctx = context_locked(index);
+        if (!ctx.words) return;
+
         bool wake = false;
         {
-            std::shared_lock table_lock(table_mutex_);
-            XmaContextView ctx = context_locked(index);
-            if (!ctx.words) return;
-
             std::lock_guard slot_lock(voices_[index]->mutex);
             const uint32_t raw_size = ctx.field(0, 22, 5);
             const uint32_t size = raw_size ? raw_size : 1u;
-            const uint32_t read = (ctx.field(9, 0, 5) + blocks) % size;
+            const uint32_t read = (ctx.field(9, 0, 5) + blocks % size) % size;
             ctx.set_field(9, 0, 5, read);
             if (blocks > 0) {
                 ctx.set_field(1, 31, 1, 1);
@@ -559,6 +562,7 @@ private:
                 pcm.assign(samples, samples + count);
                 return;
             }
+            voice.decoder.reset();  // Resume with a clean state after replacing a packet with silence.
         }
 #else
         (void)voice;
@@ -599,13 +603,16 @@ private:
             return true;
         }
 
+        const uint8_t* packet_data = data + packet * kXmaPacketBytes;
+        const uint8_t packet_skip = packet_data[3];
         std::vector<int16_t> pcm;
-        decode_packet(ctx, voice, data + packet * kXmaPacketBytes, pcm);
+        decode_packet(ctx, voice, packet_data, pcm);
         const std::size_t skip_samples = std::min(voice.skip * channels, pcm.size());
         voice.skip -= skip_samples / channels;
         voice.pcm.insert(voice.pcm.end(), pcm.begin() + static_cast<std::ptrdiff_t>(skip_samples), pcm.end());
 
-        std::size_t next = packet + 1;
+        // XMA2 packet headers link packets from the same stream; 0xff ends the chain.
+        std::size_t next = packet_skip == 0xFFu ? packets : packet + 1 + packet_skip;
         const uint32_t loops = ctx.field(0, 12, 8);
         const std::size_t loop_end = ctx.field(4, 0, 26);
         if (loops > 0 && loop_end != 0 && packet == loop_end / kXmaPacketBits) {
@@ -921,45 +928,38 @@ HRESULT __stdcall AcpHalCreate(void** ppAcpHal) {
 HRESULT __stdcall AcpHalAllocateShapeContexts(SHAPE_CONTEXTS* ctx) {
     if (!ctx) return E_POINTER;
 
-    SHAPE_XMA_CONTEXT* xma_array = nullptr;
-    uint32_t xma_count = 0;
-    {
-        std::lock_guard lock(g_apu_mutex);
+    std::lock_guard lock(g_shape_mutex);
 
-        auto alloc_array = [](uint32_t count, size_t elem_size) -> void* {
-            if (count == 0) return nullptr;
-            void* ptr = std::calloc(count, elem_size);
-            if (ptr) g_active_shape_arrays.push_back(ptr);
-            return ptr;
-        };
+    auto alloc_array = [](uint32_t count, size_t elem_size) -> void* {
+        if (count == 0) return nullptr;
+        void* ptr = std::calloc(count, elem_size);
+        if (ptr) g_active_shape_arrays.push_back(ptr);
+        return ptr;
+    };
 
-        ctx->srcContextArray = static_cast<SHAPE_SRC_CONTEXT*>(
-            alloc_array(ctx->numSrcContexts, sizeof(SHAPE_SRC_CONTEXT)));
-        ctx->eqCompContextArray = static_cast<SHAPE_EQCOMP_CONTEXT*>(
-            alloc_array(ctx->numEqCompContexts, sizeof(SHAPE_EQCOMP_CONTEXT)));
-        ctx->filtVolContextArray = static_cast<SHAPE_FILTVOL_CONTEXT*>(
-            alloc_array(ctx->numFiltVolContexts, sizeof(SHAPE_FILTVOL_CONTEXT)));
-        ctx->dmaContextArray = static_cast<SHAPE_DMA_CONTEXT*>(
-            alloc_array(ctx->numDmaContexts, sizeof(SHAPE_DMA_CONTEXT)));
-        ctx->xmaContextArray = static_cast<SHAPE_XMA_CONTEXT*>(
-            alloc_array(ctx->numXmaContexts, sizeof(SHAPE_XMA_CONTEXT)));
-        ctx->pcmContextArray = static_cast<SHAPE_PCM_CONTEXT*>(
-            alloc_array(ctx->numPcmContexts, sizeof(SHAPE_PCM_CONTEXT)));
+    ctx->srcContextArray = static_cast<SHAPE_SRC_CONTEXT*>(
+        alloc_array(ctx->numSrcContexts, sizeof(SHAPE_SRC_CONTEXT)));
+    ctx->eqCompContextArray = static_cast<SHAPE_EQCOMP_CONTEXT*>(
+        alloc_array(ctx->numEqCompContexts, sizeof(SHAPE_EQCOMP_CONTEXT)));
+    ctx->filtVolContextArray = static_cast<SHAPE_FILTVOL_CONTEXT*>(
+        alloc_array(ctx->numFiltVolContexts, sizeof(SHAPE_FILTVOL_CONTEXT)));
+    ctx->dmaContextArray = static_cast<SHAPE_DMA_CONTEXT*>(
+        alloc_array(ctx->numDmaContexts, sizeof(SHAPE_DMA_CONTEXT)));
+    ctx->xmaContextArray = static_cast<SHAPE_XMA_CONTEXT*>(
+        alloc_array(ctx->numXmaContexts, sizeof(SHAPE_XMA_CONTEXT)));
+    ctx->pcmContextArray = static_cast<SHAPE_PCM_CONTEXT*>(
+        alloc_array(ctx->numPcmContexts, sizeof(SHAPE_PCM_CONTEXT)));
 
-        // On PC there is no physical APU address translation for host context arrays;
-        // assign unique synthetic addresses from the APU base.
-        ctx->apuSrcContextArray = {ctx->srcContextArray ? kApuBaseAddress : 0};
-        ctx->apuEqCompContextArray = {ctx->eqCompContextArray ? kApuBaseAddress + 0x1000 : 0};
-        ctx->apuFiltVolContextArray = {ctx->filtVolContextArray ? kApuBaseAddress + 0x2000 : 0};
-        ctx->apuDmaContextArray = {ctx->dmaContextArray ? kApuBaseAddress + 0x3000 : 0};
-        ctx->apuXmaContextArray = {ctx->xmaContextArray ? kApuBaseAddress + 0x4000 : 0};
-        ctx->apuPcmContextArray = {ctx->pcmContextArray ? kApuBaseAddress + 0x5000 : 0};
+    // On PC there is no physical APU address translation for host context arrays;
+    // assign unique synthetic addresses from the APU base.
+    ctx->apuSrcContextArray = {ctx->srcContextArray ? kApuBaseAddress : 0};
+    ctx->apuEqCompContextArray = {ctx->eqCompContextArray ? kApuBaseAddress + 0x1000 : 0};
+    ctx->apuFiltVolContextArray = {ctx->filtVolContextArray ? kApuBaseAddress + 0x2000 : 0};
+    ctx->apuDmaContextArray = {ctx->dmaContextArray ? kApuBaseAddress + 0x3000 : 0};
+    ctx->apuXmaContextArray = {ctx->xmaContextArray ? kApuBaseAddress + 0x4000 : 0};
+    ctx->apuPcmContextArray = {ctx->pcmContextArray ? kApuBaseAddress + 0x5000 : 0};
 
-        xma_array = ctx->xmaContextArray;
-        xma_count = ctx->numXmaContexts;
-    }
-
-    g_xma_engine.bind(xma_array, xma_count);
+    g_xma_engine.bind(ctx->xmaContextArray, ctx->numXmaContexts);
 
     trace_call("AcpHalAllocateShapeContexts",
                ",\"src\":" + std::to_string(ctx->numSrcContexts) +
@@ -971,10 +971,9 @@ HRESULT __stdcall AcpHalAllocateShapeContexts(SHAPE_CONTEXTS* ctx) {
 // ---- AcpHalReleaseShapeContexts ----
 
 HRESULT __stdcall AcpHalReleaseShapeContexts(SHAPE_CONTEXTS* ctx = nullptr) {
+    std::lock_guard lock(g_shape_mutex);
     // Stop and detach the XMA worker before freeing backing arrays.
     g_xma_engine.unbind();
-
-    std::lock_guard lock(g_apu_mutex);
 
     // Free all recorded context allocations
     for (void* p : g_active_shape_arrays) {
