@@ -2102,17 +2102,12 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
-    if (!pipeline) return ReplayResult::unresolved_resource;
-    // A pipeline created lazily (LEONIDA_LAZY_PSO) has no base pipeline until its first draw builds it as variant 0.
-    const VkPipeline base = pipeline->pipeline ? pipeline->pipeline
-                                               : (pipeline->variant ? pipeline->variant(0) : VK_NULL_HANDLE);
-    if (!base) return ReplayResult::unresolved_resource;
+    if (!pipeline || (!pipeline->pipeline && !pipeline->variant)) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
-    p.pipeline = base;
     p.area = {UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
     const auto shrink = [&](const ResourceBinding& b, const TargetView& view, const VkImageSubresourceRange& range) {
@@ -2169,10 +2164,6 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
-    if (unbound) {
-        p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
-        if (!p.pipeline) return ReplayResult::unsupported;
-    }
 
     // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
     // step rate 0 also take stride 0, so every instance reads element 0.
@@ -2212,6 +2203,15 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
                 return ReplayResult::unresolved_resource;
         }
+    }
+
+    // Build only the selected variant after the draw passes validation. A lazy pipeline uses variant zero for a
+    // complete attachment set.
+    if (unbound || !pipeline->pipeline) {
+        p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
+        if (!p.pipeline) return unbound ? ReplayResult::unsupported : ReplayResult::unresolved_resource;
+    } else {
+        p.pipeline = pipeline->pipeline;
     }
     return ReplayResult::success;
 }

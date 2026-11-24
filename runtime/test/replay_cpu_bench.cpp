@@ -23,6 +23,7 @@
 #include "../src/vulkan_replay.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -499,6 +500,68 @@ const char* result_name(ReplayResult r) {
     return "?";
 }
 
+int check_draw_pipeline_selection() {
+    Scene scene;
+    const auto base = scene.pipeline.pipeline;
+    const auto depthless = fake_handle<VkPipeline>(0x6002);
+    const auto unbound_depth = GraphicsPipeline::unbound_depth;
+    struct Case {
+        const char* name;
+        VkPipeline ready;
+        VkPipeline base_variant;
+        bool has_depth;
+        bool mesh;
+        ReplayResult result;
+        VkPipeline selected;
+        std::vector<std::uint32_t> variants;
+    };
+    const std::array cases{
+        Case{"lazy draw without depth", VK_NULL_HANDLE, base, false, false, ReplayResult::success,
+             depthless, {unbound_depth}},
+        Case{"lazy draw without depth and with a refused base", VK_NULL_HANDLE, VK_NULL_HANDLE, false, false,
+             ReplayResult::success, depthless, {unbound_depth}},
+        Case{"lazy draw with depth", VK_NULL_HANDLE, base, true, false, ReplayResult::success, base, {0}},
+        Case{"lazy draw with depth and with a refused base", VK_NULL_HANDLE, VK_NULL_HANDLE, true, false,
+             ReplayResult::unresolved_resource, VK_NULL_HANDLE, {0}},
+        Case{"invalid lazy mesh draw", VK_NULL_HANDLE, base, false, true, ReplayResult::invalid_draw,
+             VK_NULL_HANDLE, {}},
+        Case{"eager draw without depth", base, base, false, false, ReplayResult::success, depthless, {unbound_depth}},
+        Case{"eager draw with depth", base, base, true, false, ReplayResult::success, base, {}},
+    };
+
+    Draw draw{};
+    draw.pipeline = Scene::pipeline_id;
+    auto views = std::make_shared<DrawViews>();
+    views->render_targets = {color_view};
+    draw.views = std::move(views);
+    const auto resolve = [&scene](ResourceId id) { return scene.resolve(id); };
+    std::vector<std::uint32_t> variants;
+    int failures = 0;
+    for (const auto& test : cases) {
+        variants.clear();
+        scene.pipeline.pipeline = test.ready;
+        scene.pipeline.variant = [&](std::uint32_t mask) {
+            variants.push_back(mask);
+            return mask == unbound_depth ? depthless : test.base_variant;
+        };
+        draw.depth = test.has_depth ? depth_view : TargetView{};
+        draw.mesh = test.mesh;
+        detail::PreparedDraw prepared{};
+        const auto result = detail::prepare_draw(draw, resolve, scene.vk, prepared);
+        const bool selected = result != ReplayResult::success || prepared.pipeline == test.selected;
+        if (result != test.result || !selected || variants != test.variants) {
+            std::fprintf(stderr, "FAIL %s: result %s (expected %s), variant masks:", test.name,
+                         result_name(result), result_name(test.result));
+            for (auto mask : variants) std::fprintf(stderr, " %u", mask);
+            std::fprintf(stderr, "; expected:");
+            for (auto mask : test.variants) std::fprintf(stderr, " %u", mask);
+            std::fprintf(stderr, "%s\n", selected ? "" : "; wrong pipeline selected");
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 void print_header(bool csv) {
     if (csv)
         std::printf("case,commands,record_ns,prepare_ns,emit_ns,total_ns,record_allocs,prepare_allocs,emit_allocs,"
@@ -595,6 +658,7 @@ int main(int argc, char** argv) {
     const Result f = run(scene, lists, frame, reps, warmup);
     check("frame", f);
     if (self_test) {
+        failures += check_draw_pipeline_selection();
         // A PreparedList keeps its draws' storage from one execution to the next. A draw prepared in an entry an
         // indexed draw with depth used before must not keep that draw's depth attachment or index buffer.
         CommandList earlier, later;
