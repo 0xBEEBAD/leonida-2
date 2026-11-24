@@ -117,11 +117,23 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
+void* xmem_descriptor_heap_alloc(std::size_t byte_size, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    return (hooks && hooks->alloc) ? hooks->alloc(byte_size, attributes) : nullptr;
+}
+
+void xmem_descriptor_heap_free(void* ptr, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    if (hooks && hooks->free) hooks->free(ptr, attributes);
+}
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
-// (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
-// least restrictive floor; higher feature levels are still exposed by the created device.
+// (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 11_0, the lowest it
+// accepts, is the floor; the created device still exposes the adapter's highest level. Wine's d3d12 (vkd3d) reports
+// at most 11_1, so a 12_0 floor makes the host device fail there with E_INVALIDARG even on a 12_x GPU.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
+    rt::d3d12_xs::set_default_descriptor_heap_allocator(&xmem_descriptor_heap_alloc, &xmem_descriptor_heap_free);
     constexpr auto method = "D3D12XboxCreateDevice";
     using rt::d3d12_trace::result;
     if (!out) return result(method, E_POINTER);
@@ -157,6 +169,14 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
     }
 
+    // A console title gets the console-shaped list the Xbox ABI calls. A guest compiled against the PC
+    // headers (the tiny fixtures, which call the list through PC vtable indices) asks for PC-shaped lists
+    // with LEONIDA_D3D12_LISTS=pc — the device, queue and friends stay console-shaped either way.
+    char lists_mode[8] = {};
+    size_t lists_length = 0;
+    const bool pc_lists = getenv_s(&lists_length, lists_mode, "LEONIDA_D3D12_LISTS") == 0 &&
+                          std::strcmp(lists_mode, "pc") == 0;
+
 #ifdef LEONIDA_VULKAN_DEVICE
     // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
     // behind the same proxy instead of the host's D3D12 device.
@@ -171,7 +191,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<unsigned long>(vhr));
             return result(method, vhr);
         }
-        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
+        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out, /*console_lists=*/!pc_lists);
         if (FAILED(vhr)) {
             vulkan->Release();
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
@@ -190,7 +210,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     if (!create) return result(method, E_NOTIMPL);
 
     ID3D12Device* real = nullptr;
-    HRESULT hr = create(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
+    HRESULT hr = create(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                         reinterpret_cast<void**>(&real));
     if (FAILED(hr) || !real) {
         if (real) real->Release();
@@ -199,7 +219,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         return result(method, FAILED(hr) ? hr : E_FAIL);
     }
 
-    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
+    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out, /*console_lists=*/!pc_lists);
     if (FAILED(hr)) {
         // create_device_proxy keeps the caller's reference on failure.
         real->Release();

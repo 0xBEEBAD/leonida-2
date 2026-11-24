@@ -293,22 +293,41 @@ int main() {
     check(at<EnumVoices>(acc, 8)(acc, reinterpret_cast<void*>(&on_state), nullptr) == S_OK &&
               at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
           "XSpeechSynthesizerEnumerateInstalledVoices: no voices, S_OK (a callback is required)");
+    // Speech synthesis is silent rather than missing (5733d01c3, after VIctory's speech.rs): Create hands out a
+    // synthesizer, every stream is a valid 44-byte WAVE file with no samples (16 kHz mono 16-bit PCM), so a title
+    // that narrates plays silence and goes on instead of stalling on its first-boot accessibility step. Closing and
+    // voice selection succeed; only a missing argument fails.
     void* synth = reinterpret_cast<void*>(1);
-    check(at<SpeechCreate>(acc, 9)(acc, &synth) == E_FAIL && synth == nullptr,
-          "XSpeechSynthesizerCreate fails offline and nulls the handle");
-    void* stream = reinterpret_cast<void*>(1);
-    size_t size = 5, got = 5;
-    check(at<SpeechClose>(acc, 10)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 11)(acc, nullptr) == E_INVALIDARG &&
-              at<SpeechClose>(acc, 12)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 14)(acc, nullptr) == E_INVALIDARG,
-          "close and set-voice calls on a null handle: E_INVALIDARG");
-    check(at<SpeechStream>(acc, 13)(acc, nullptr, "hi", &stream) == E_INVALIDARG && stream == nullptr,
-          "CreateStreamFromText on a null synthesizer: E_INVALIDARG, no stream");
-    stream = reinterpret_cast<void*>(1);
-    check(at<SpeechStream>(acc, 21)(acc, nullptr, "<speak/>", &stream) == E_INVALIDARG && stream == nullptr,
-          "CreateStreamFromSsml on a null synthesizer: E_INVALIDARG, no stream");
-    check(at<StreamSize>(acc, 15)(acc, nullptr, &size) == E_INVALIDARG && size == 0 &&
-              at<StreamData>(acc, 16)(acc, nullptr, 8, nullptr, &got) == E_INVALIDARG && got == 0,
-          "stream size and data on a null stream: E_INVALIDARG, zero written");
+    check(at<SpeechCreate>(acc, 9)(acc, &synth) == S_OK && synth != nullptr,
+          "XSpeechSynthesizerCreate answers a synthesizer offline");
+    check(at<SpeechCreate>(acc, 9)(acc, nullptr) == E_POINTER,
+          "XSpeechSynthesizerCreate with no output handle: E_POINTER");
+    check(at<SpeechClose>(acc, 10)(acc, synth) == S_OK && at<SpeechClose>(acc, 11)(acc, synth) == S_OK &&
+              at<SpeechClose>(acc, 12)(acc, synth) == S_OK && at<SpeechClose>(acc, 14)(acc, synth) == S_OK,
+          "close, set-default-voice and set-custom-voice: S_OK, nothing to play");
+    void* stream = nullptr;
+    check(at<SpeechStream>(acc, 13)(acc, synth, "hi", &stream) == S_OK && stream != nullptr &&
+              at<SpeechStream>(acc, 21)(acc, synth, "<speak/>", &stream) == S_OK && stream != nullptr,
+          "CreateStreamFromText and CreateStreamFromSsml answer a stream offline");
+    check(at<SpeechStream>(acc, 13)(acc, synth, "hi", nullptr) == E_POINTER,
+          "a stream call with no output handle: E_POINTER");
+    size_t size = 0;
+    check(at<StreamSize>(acc, 15)(acc, stream, &size) == S_OK && size == 44,
+          "an offline stream is a 44-byte WAVE file");
+    check(at<StreamSize>(acc, 15)(acc, stream, nullptr) == E_POINTER,
+          "the stream size with no output: E_POINTER");
+    unsigned char wave[44] = {};
+    size_t got = 0;
+    check(at<StreamData>(acc, 16)(acc, stream, sizeof(wave), wave, &got) == S_OK && got == sizeof(wave) &&
+              std::memcmp(wave, "RIFF", 4) == 0 && std::memcmp(wave + 8, "WAVEfmt ", 8) == 0 &&
+              std::memcmp(wave + 36, "data", 4) == 0 && wave[40] == 0 && wave[41] == 0 && wave[42] == 0 &&
+              wave[43] == 0,
+          "the stream is valid WAVE (RIFF, WAVE, fmt, an empty data chunk): no samples");
+    check(at<StreamData>(acc, 16)(acc, stream, sizeof(wave) - 1, wave, &got) ==
+                  HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
+              at<StreamData>(acc, 16)(acc, stream, sizeof(wave), nullptr, nullptr) ==
+                  HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "a buffer smaller than the stream, or none: E_NOT_SUFFICIENT_BUFFER");
     bool speech_to_text_fails = true;
     for (int slot : {6, 7, 17, 18, 19, 20}) speech_to_text_fails = speech_to_text_fails && FAILED(at<NoArgs>(acc, slot)(acc));
     check(speech_to_text_fails, "speech-to-text display calls fail offline");

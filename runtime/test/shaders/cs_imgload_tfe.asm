@@ -1,9 +1,9 @@
-; tfe status VGPR on image_load (SHADER-1266): cs_imgload with tfe on both loads. With tfe an MIMG read returns one
-; more dword after its data, the fetch status, at vdata[data_count] (RDNA2 ISA, MIMG TFE/LWE). Every texel here is
-; resident, so the status is 0. Each status VGPR is seeded with 1000 before its load and added into the result, so a
-; status that keeps its old value moves every texel by 1000 or 2000. vk_store_test fills the r32 uint image with
-; 100 + 8y + x and the r32 sint image with -2 (8y + x) before the dispatch; the rgba8 image is stored as in
-; cs_imgstore. Run: vk_store_test cs_imgload_tfe.spv load -> sint = 100 - (8y + x), uint unchanged.
+; tfe status VGPR on image_load (SHADER-1266): the status follows the data VGPRs and is written on a texel fault
+; (RDNA2 ISA, MIMG TFE). The images here are fully resident, so each status VGPR keeps its seed. XOR each status
+; with its own seed, OR the differences, and add that word to the texel sum so either overwrite fails the check.
+; vk_store_test fills the r32 uint image with 100 + 8y + x and the r32 sint image with -2 (8y + x) before dispatch.
+; The RGBA8 image is stored as in cs_imgstore. Run: vk_store_test cs_imgload_tfe.spv load ->
+; sint = 100 - (8y + x), uint unchanged.
 v_and_b32_e32 v1, 7, v0
 v_lshrrev_b32_e32 v2, 3, v0
 v_cvt_f32_u32_e32 v3, v1
@@ -39,12 +39,14 @@ s_mov_b32 s28, 0x33
 s_mov_b32 s29, 0x33
 s_mov_b32 s30, 0x33
 s_mov_b32 s31, 0x33
-v_mov_b32_e32 v12, 0x3e8
+v_mov_b32_e32 v12, 0x7d0
 image_load v[11:12], v[1:2], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm tfe
 s_waitcnt vmcnt(0)
 v_add_nc_u32_e32 v11, v7, v11
+v_xor_b32_e32 v8, 0x3e8, v8
+v_xor_b32_e32 v12, 0x7d0, v12
+v_or_b32_e32 v8, v8, v12
 v_add_nc_u32_e32 v11, v8, v11
-v_add_nc_u32_e32 v11, v12, v11
 v_mov_b32_e32 v12, 0
 v_mov_b32_e32 v13, 0
 v_mov_b32_e32 v14, 0

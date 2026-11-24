@@ -91,9 +91,12 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
-    text = " ".join(f"0x{b:02x}" for b in code)
+    # llvm-mc echoes the entire input line for each bad word. Newlines are whitespace, even inside
+    # a multiword instruction. Bound each diagnostic to one dword instead of the whole shader.
+    text = "\n".join(" ".join(f"0x{b:02x}" for b in code[i:i + 4]) for i in range(0, len(code), 4))
     try:
-        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
+        wave_flags = [] if wave32 else ["-mattr=-wavefrontsize32,+wavefrontsize64"]
+        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", *wave_flags, "-show-encoding"],
                            input=text, capture_output=True, text=True, errors="replace",
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:

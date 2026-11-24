@@ -147,6 +147,16 @@ basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, 
 module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
 compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
 
+The game's code is built for the console's AMD Zen 2 and uses a few of its instructions without asking CPUID: SSE4a
+`insertq`/`extrq`, `clzero` and `monitorx`/`mwaitx` (no Intel CPU has them) and `clwb` (Intel since Ice Lake)
+([docs/cpu_features.md](../docs/cpu_features.md)). A host without one raises `#UD` there, so `gta6rt` installs a
+vectored handler before any image code runs (`src/cpu_emulation.h`): it recognises those encodings at the faulting
+address, does the same work on the thread's context and continues after the instruction. It prints one `[rt] cpu:`
+line at startup naming what the host lacks, and one the first time each instruction is emulated. On a host that has
+them the CPU runs them and the handler never sees them. Each emulated instruction costs an exception round trip, so a
+hot loop of them is slow; patching such a site in place is a later step. `cpu_emulation_test` runs every form for
+real: natively on a Zen host, through the handler on an Intel one.
+
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
 reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
@@ -170,8 +180,28 @@ clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
 directory (or with an all-zero one) load normally.
 
-A `/GA` executable's code reaches its static TLS directly at index 0 (`mov r64, gs:[58h]`), but the
-loader can only get that image an index from the OS, and it need not be 0. Before the image's sections
+An executable (an image without `IMAGE_FILE_DLL`, the game's EXE under `--run`, `--init` and `--dry-run`) gets
+module TLS index 0 instead, as Windows gives the process EXE. MSVC code built with `/GA` relies on that: it reads
+`ThreadLocalStoragePointer[0]` directly and never loads `_tls_index`. A `thread_local int v = 42;` EXE built
+`/O2 /GA /MD` printed `tls_index=0 value=42` natively but `tls_index=6 value=0` under `gta6rt --run` when it got a
+helper's index. Index 0 belongs to `gta6rt.exe` itself (measured: Windows gives it to the process EXE, the trace event
+below names it, and `gta6rt.exe` has a 1398-byte TLS template when measured and no TLS callbacks), and all of its own
+TLS reads go through `_tls_index`. So `gta6rt.exe` moves off index 0 once, at start (`rt::reserve_tls_index0()`,
+called from a CRT initializer that runs before any of gta6rt's own static initializers): it writes one more clone of the
+helper, `leonida_tls_host_<pid>_home.dll`, whose TLS directory covers a copy of `gta6rt.exe`'s template (the
+helper carries a 16 KiB array for it), swaps slots 0 and that clone's index on the calling thread and writes the
+clone's index into `gta6rt.exe`'s `_tls_index`. Every thread the OS starts from then on has a fresh copy of
+`gta6rt.exe`'s TLS at that index from its first instruction, so nothing has to run on a new thread first, including
+code that runs in an earlier DLL's `DLL_THREAD_ATTACH`. Slot 0 then holds a block nothing reads, which the executable's
+template copy replaces on the loading thread, on threads started later, and through `install_tls_for_thread()` on
+older ones, exactly as a DLL's copy replaces a helper's; the OS frees both slots at thread exit. The move cannot be made
+later: MSVC keeps the address of a TLS slot in a frame across calls (`zlib_inflate` in `shader_library.h` does), so
+a thread that already runs gta6rt's code cannot be moved wherever it is stopped. The startup trace records the move at
+the first executable (`tls_index0`). DLLs keep the helper indices and work next to the executable as before.
+
+When the executable does not get index 0 (the reservation failed, or another executable holds it), its `/GA` code
+still reaches its static TLS directly at index 0 (`mov r64, gs:[58h]`), but the loader can only get that image an
+index from the OS, and it need not be 0. Before the image's sections
 are protected and before any of its code runs, TLS callbacks included, the loader rewrites each such
 slot-0 read in an executable section to the same instruction reading `TEB->TlsSlots[slot]` instead
 (`patch_ga_tls_reads`), with one `TlsAlloc` slot per image; the rewrite is the same length, so nothing
@@ -195,7 +225,19 @@ Current limits, by design:
   title's callback on, gets its copy from `load()` itself, the way Windows gives one to running threads for a DLL it
   loads: a block, no `DLL_THREAD_ATTACH`, `DLL_THREAD_DETACH` when it ends, and `~Loader` takes the block back.
   `install_tls_for_thread()` and `uninstall_tls_for_thread()` are no-ops on such a thread. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
-  called `load()`.
+  called `load()`. As on Windows, a new thread gets every module's copy before any TLS callback runs, and the
+  executable's callbacks come after the DLLs' ones, for attach and for detach.
+- One executable holds index 0 at a time, and only after `reserve_tls_index0()` has run at process start. An
+  executable mapped without it (the reservation failed, the `Loader` is used without it, or another executable
+  holds index 0) gets a helper index and a `[rt] loader: ... does not get module TLS index 0` line on stderr: its
+  `/GA` code would read and write the TLS in slot 0, which is `gta6rt.exe`'s own or the other executable's, so
+  `--run` and `--init` refuse it with an error and exit code 1, and a `Loader` user must not run its code.
+- Threads that ran gta6rt's code before the reservation keep nothing of their TLS: they find a fresh copy at the new
+  index. In gta6rt only the main thread has run its code by then, and its TLS moves with it.
+- The home clone stays loaded until the process ends (freeing it would free `gta6rt.exe`'s TLS blocks), and a mapped
+  image's file cannot be deleted, so its file stays in `%TEMP%` until the next run's clean-up of dead processes'
+  clones deletes it. The clones for mapped DLLs are deleted at exit as before. A `gta6rt.exe` whose TLS
+  outgrows the helper's 16 KiB array is refused the move.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 
@@ -226,7 +268,15 @@ Current limits, by design:
   Vulkan SDK and Python 3. The Vulkan device covers command submission, descriptor heaps, render-target and
   depth views, committed resources and copies (uploads, readbacks, BC textures), root signatures, graphics and
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
-  missing.
+  missing. `LEONIDA_DEVICE_FAULT=1` enables a stderr report with supported Vulkan fault information and queue
+  checkpoints on the first observed device loss.
+
+- `dstorage_xs.dll` / `xcrdapi.dll` / `dstorage.dll` — `DStorageGetFactory`: the console DirectStorage API
+  (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
+  overlay; each queue reads file or memory ranges into memory in order on its own worker thread, inflating zlib
+  requests (RFC 1950, `src/shader_library.h`'s inflater), and reports through status arrays, `ID3D12Fence` signals
+  and events. BCPack, swizzle and physical-page requests are not done yet.
+  See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
@@ -246,11 +296,12 @@ document names.
 
 | variable | default | what it changes |
 |---|---|---|
-| `LEONIDA_DEVICE_TYPE` | `7` | The `XSystemDeviceType` that `XSystemGetDeviceType` returns: `0` Unknown, `1` Pc, `2` XboxOne, `3` XboxOneS, `4` XboxOneX, `5` XboxOneXDevkit, `6` XboxScarlettLockhart (Series S), `7` XboxScarlettAnaconda (Series X), `8` XboxScarlettDevkit. A number outside 0..8 is ignored; text that is not a number counts as `0`. `6` also makes `XSystemGetAnalyticsInfo` report the form `Xbox Series S` instead of `Xbox Series X`. |
+| `LEONIDA_DEVICE_TYPE` | `7` | The `XSystemDeviceType` that `XSystemGetDeviceType` returns: `0` Unknown, `1` Pc, `2` XboxOne, `3` XboxOneS, `4` XboxOneX, `5` XboxOneXDevkit, `6` XboxScarlettLockhart (Series S), `7` XboxScarlettAnaconda (Series X), `8` XboxScarlettDevkit. A number outside 0..8 is ignored; text that is not a number counts as `0`. `6` also makes `XSystemGetAnalyticsInfo` report the form `Xbox Series S` instead of `Xbox Series X`. The title's registry read of `HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM` `ConsoleMode` is answered from the same setting (`6` → `0x60`, `7` → `0x64`, `8` → `0x68`; the other types have no value, so the host registry is asked), so no registry key has to be written into a Wine prefix or a Windows machine (`docs/runtime_imports.md`, "Console identity in the registry"). |
 | `LEONIDA_ANALYTICS_FORM` | unset | The `form` string of `XSystemGetAnalyticsInfo`, in place of the one the device type gives (up to 63 characters). |
 | `LEONIDA_PACKAGE_ID` | `LeonidaPackageIdentifier00000000` | The identifier `XPackageGetCurrentProcessPackageIdentifier` returns (up to 32 characters). It is also the one identifier `XPackageMount` refuses with `E_ACCESSDENIED`, as the game's own package. |
 | `LEONIDA_CONTENT_PACKAGES` | unset | The content packages `XPackageMount` can mount: `id1=path1;id2=path2` (up to 1,023 characters). The mount path of a listed identifier is its path, as written; any other identifier is `ERROR_NOT_FOUND`, and a path longer than 259 characters is `ERROR_INSUFFICIENT_BUFFER`. |
 | `LEONIDA_PACKAGED` | `1` | `0`, or text that is not a number, makes `XPackageIsPackagedProcess` return false. Any other number keeps it true. |
+| `LEONIDA_STACKS` | unset | Comma-separated whole seconds after the title's entry point is called (e.g. `90,180`). At each time `--run` suspends every other thread in turn just long enough to copy its context and stack, then unwinds the copy (title frames through the unwind tables the loader registers) and prints to stderr `[rt] stacks t=<s> thread <tid> (<thread description, or start address>):` and up to 40 `#i module+0xRVA` frames, innermost first; a chain identical to an earlier thread's prints `same as thread <tid>`. |
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
@@ -445,6 +496,7 @@ from the ANSI code page.
 | `kind` | When | Fields |
 |---|---|---|
 | `trace_open` | first line | `pid` |
+| `tls_index0` | the first executable is mapped with module TLS index 0, which gta6rt freed at start (once per process) | `owner` (the image that held index 0, `gta6rt.exe`), `moved_to` (the index its block moved to) |
 | `map` | a module is mapped, bound and protected | `module`, `base`, `size`, `relocated` |
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |

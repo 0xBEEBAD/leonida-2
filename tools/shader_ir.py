@@ -9,6 +9,7 @@ As a tool:  python -I shader_ir.py <disasm dir> [--limit N]   (parses everything
 Usage: `python -I tools/shader_ir.py --help` lists the options.
 """
 import argparse
+import itertools
 import os
 import re
 import sys
@@ -241,30 +242,27 @@ def parse_line(line):
 
 
 def parse_file(path):
-    with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
     info = {"name": os.path.splitext(os.path.basename(path))[0], "insns": [], "invalid": 0}
-    m = HDR.match(lines[0]) if lines else None
-    pc = int(m.group(2), 16) if m else 0
-    info["code_start"] = pc
-    # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
-    # between the last printed instruction and it
-    info["code_end"] = int(m.group(3), 16) if m else None
-    start = 1 if (lines and not lines[0].startswith("\t")) else 0
-    for ln in lines[start:]:
-        if ln.startswith("; ---"):
-            break
-        if not ln.startswith("\t") or ln.lstrip().startswith("."):
-            continue
-        ins = parse_line(ln)
-        if not ins:
-            continue
-        ins["pc"] = pc
-        if ins["enc"]:
-            pc += len(ins["enc"]) // 2
-        info["insns"].append(ins)
-    tail = "\n".join(lines)
-    info["invalid"] = tail.count("invalid instruction encoding")
+    with open(path, encoding="utf-8", errors="replace") as f:
+        first = f.readline()
+        header = HDR.match(first)
+        pc = int(header.group(2), 16) if header else 0
+        info["code_start"] = pc
+        info["code_end"] = int(header.group(3), 16) if header else None
+        body = True
+        # Older llvm-mc listings can have gigabytes of echoed source in their diagnostics.
+        for line in itertools.chain((first,), f):
+            info["invalid"] += line.count("invalid instruction encoding")
+            if line.startswith("; ---"):
+                body = False
+            if not body or not line.startswith("\t") or line.lstrip().startswith("."):
+                continue
+            ins = parse_line(line)
+            if ins:
+                ins["pc"] = pc
+                if ins["enc"]:
+                    pc += len(ins["enc"]) // 2
+                info["insns"].append(ins)
     return info
 
 

@@ -532,6 +532,25 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 return None, 4
             name, spec = entry
             mods = []
+            if is_dpp16 or is_dpp8:
+                # Some pipeline libraries encode f32 comparisons with the VOP2 DPP extension.
+                if not need(8) or not (name.startswith("v_cmp_") and name.endswith("_f32")) or name == "v_cmp_class_f32":
+                    return None, 4
+                ext = struct.unpack_from("<I", code, pc + 4)[0]
+                if is_dpp8:
+                    lanes = [(ext >> (8 + 3 * i)) & 7 for i in range(8)]
+                    mods = ["dpp8:[" + ",".join(map(str, lanes)) + "]"]
+                    if src0 == 234:
+                        mods.append("fi:1")
+                else:
+                    # Full write masks, bound_ctrl=1 and unmodified inputs.
+                    if ext & 0xfffe0000 != 0xff080000:
+                        return None, 4
+                    ctrl = _format_dpp16_ctrl((ext >> 8) & 0x1ff)
+                    if ctrl.startswith("dpp_ctrl:"):
+                        return None, 4
+                    mods = [ctrl, "row_mask:0xf", "bank_mask:0xf", "bound_ctrl:1"]
+                return finish(name + "_dpp", [_vcc_operand(wave32), _vreg(ext & 255, 1), _vreg(vsrc1, 1)], mods, 8)
             if is_sdwa:
                 if not need(8):
                     return None, 4
