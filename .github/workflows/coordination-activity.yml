@@ -252,7 +252,7 @@ jobs:
               rerun = 0
               for pull in pulls:
                   if pull_claim_ids(pull, allowed_ids | changed_ids, comments_by_id).isdisjoint(changed_ids):
-                      body = re.sub(r"<!--[\\s\\S]*?-->", "", pull.get("body") or "")
+                      body = re.sub(r"<!--[\s\S]*?-->", "", pull.get("body") or "")
                       linked_ids = {
                           comment_id
                           for field in CLAIM_FIELD_RE.finditer(body)
