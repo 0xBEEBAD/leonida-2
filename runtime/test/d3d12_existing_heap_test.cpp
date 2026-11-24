@@ -223,7 +223,7 @@ int check_import(ID3D12Device* device, bool supported) {
 // pagefile-backed section with EPERM (measured on an RX 9060 XT under Wine, found in review), while NVIDIA and
 // AMD's Windows driver import it. The fallback is checked to exist; the readback below needs the import. Since the shadow fallback
 // keeps the title's VA, a refused import still reads back through the shadow.
-int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size, bool may_refuse = false) {
+int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size, bool may_refuse = false, bool buffers_only = false) {
     const char* who = "vulkan slot-133 buffer";
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -304,6 +304,8 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     CloseHandle(done);
     EXPECT(waited == WAIT_OBJECT_0);
     EXPECT(std::memcmp(pages, reversed.data(), reversed.size()) == 0);
+
+    if (buffers_only) return 0;
 
     D3D12_RESOURCE_DESC texture = desc;
     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -513,6 +515,25 @@ int check_title_placed_shadow(ID3D12Device* device, const char* kind, void* page
     return 0;
 }
 
+// Independent of OpenExistingHeapFromAddress: only actual imported-buffer copies and surrounding-byte checks.
+int check_host_prefix_buffers(ID3D12Device* device) {
+    constexpr SIZE_T size = 4 * 0x10000;
+    auto* pages = static_cast<unsigned char*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!pages) return 1;
+    int failures = 0;
+    for (unsigned prefix : {0u, 16u, 32u, 64u}) {
+        std::memset(pages, 0xa5, size);
+        failures += check_title_placed(device, "host prefix buffer", pages + prefix, 0x1000 - prefix,
+                                      false, true);
+        for (unsigned i = 0; i < prefix; ++i) failures += pages[i] != 0xa5;
+        for (SIZE_T i = 0x1000; i < size; ++i) failures += pages[i] != 0xa5;
+    }
+    VirtualFree(pages, 0, MEM_RELEASE);
+    std::printf("host prefix buffers: 0/16/32/64-byte offsets, bidirectional copies and surrounding bytes: %s\n",
+                failures ? "FAIL" : "PASS");
+    return failures;
+}
+
 int check_title_placed_all(ID3D12Device* device) {
     constexpr SIZE_T size = 4 * 0x10000;
     int failures = 0;
@@ -523,13 +544,7 @@ int check_title_placed_all(ID3D12Device* device) {
     // Inside a page, as the title places small UAV buffers (64-byte aligned, found in review on an RTX 5090): the
     // import starts at the page and the buffer is bound at the offset.
     failures += check_title_placed(device, "64 bytes into a page", static_cast<char*>(pages) + 64, 0x1000 - 64);
-    for (unsigned prefix : {16u, 32u}) {
-        std::memset(pages, 0xa5, size);
-        failures += check_title_placed(device, "sub-page prefix", static_cast<char*>(pages) + prefix, 0x1000 - prefix);
-        auto* bytes = static_cast<const unsigned char*>(pages);
-        for (unsigned i = 0; i < prefix; ++i) failures += bytes[i] != 0xa5;
-        for (SIZE_T i = 0x1000; i < size; ++i) failures += bytes[i] != 0xa5;
-    }
+    failures += check_host_prefix_buffers(device);
     VirtualFree(pages, 0, MEM_RELEASE);
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
     void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
@@ -1909,7 +1924,9 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
+    if (argc != 1 && !prefix_only) return 2;
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
@@ -1932,6 +1949,11 @@ int main() {
         info.bindless_partially_bound = vk.partially_bound;
         info.robust_image_access = vk.robust_image_access;  // a Texture3D UAV is bound only with it
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        if (prefix_only) {
+            if (!vk.host_pointer_alignment) return 77;
+            const int result = check_host_prefix_buffers(ours.p);
+            return result || vk.validation_errors() ? 1 : 0;
+        }
         failures += check(ours.p, "vulkan");
         const std::vector<Case> vulkan_cases = open_cases(ours.p);
         print_cases(vulkan_cases, "vulkan");
