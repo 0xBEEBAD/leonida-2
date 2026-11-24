@@ -17,7 +17,7 @@ jobs:
       issues: read
       pull-requests: read
     steps:
-      - name: Validate claim against issue #14
+      - name: Validate every declared claim against issue #14
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -29,26 +29,26 @@ jobs:
           import urllib.error
           import urllib.request
           from datetime import datetime
-
+          
           API = "https://api.github.com"
           OWNER, REPOSITORY = os.environ["GITHUB_REPOSITORY"].split("/", 1)
           TOKEN = os.environ["GITHUB_TOKEN"]
           ISSUE_NUMBER = 14
-          WORK_ID_RE = re.compile(r"[A-Z0-9]+(?:-[A-Z0-9]+)+")
-          CLAIM_LIST_RE = re.compile(
-              r"^([A-Z0-9]+(?:-[A-Z0-9]+)+"
-              r"(?:\s*,\s*[A-Z0-9]+(?:-[A-Z0-9]+)+)*)"
-          )
+          ID_PATTERN = r"[A-Z0-9]+(?:-[A-Z0-9]+)+"
+          WORK_ID_RE = re.compile(ID_PATTERN)
+          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)", re.IGNORECASE)
           CLAIM_FIELD_RE = re.compile(
               r"(?im)^\s*>?\s*Claimed in the coordination issue as:\s*(.*?)\s*$"
           )
           BACKTICK = chr(96)
-
+          
+          
           def fail(message):
               safe = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
               print(f"::error title=Coordination claim::{safe}")
               sys.exit(1)
-
+          
+          
           def request_json(path):
               request = urllib.request.Request(
                   API + path,
@@ -65,19 +65,25 @@ jobs:
                   fail(f"Cannot verify the claim against issue #14 (HTTP {error.code}).")
               except (urllib.error.URLError, TimeoutError):
                   fail("Cannot reach GitHub to verify the claim against issue #14.")
-
+          
+          
           def get_collection(path):
               result = []
               for page in range(1, 101):
                   batch = request_json(f"{path}?per_page=100&page={page}")
                   if not isinstance(batch, list):
-                      fail("GitHub returned an invalid issue #14 response.")
+                      fail("GitHub returned an invalid issue #14 comments response.")
                   result.extend(batch)
                   if len(batch) < 100:
                       return result
               fail("Issue #14 has too many comments to verify safely.")
-
-          def claim_ids_from_comment(body):
+          
+          
+          def ids_from_text(text):
+              return {value.upper() for value in WORK_ID_RE.findall(text or "")}
+          
+          
+          def ids_from_claim_comment(body):
               lines = (body or "").splitlines()
               found = set()
               for index, line in enumerate(lines):
@@ -85,16 +91,34 @@ jobs:
                   if not match:
                       continue
                   tail = match.group(1).strip()
-                  listed = CLAIM_LIST_RE.match(tail)
+                  listed = ID_LIST_RE.match(tail)
                   if listed:
-                      found.update(part.strip().upper() for part in listed.group(1).split(","))
-                  elif re.match(r"^(the items below|a second batch)\b", tail, re.IGNORECASE):
-                      for bullet in lines[index + 1:]:
-                          if not re.match(r"^\s*[-*]\s+", bullet):
-                              continue
-                          found.update(re.findall(BACKTICK + r"([A-Z0-9]+(?:-[A-Z0-9]+)+)" + BACKTICK, bullet))
+                      found.update(ids_from_text(listed.group(1)))
+                      continue
+                  batch_intro = re.match(
+                      r"^(?:the items below|a second batch)\b",
+                      tail,
+                      re.IGNORECASE,
+                  )
+                  if tail and not batch_intro:
+                      continue
+                  cursor = index + 1
+                  while cursor < len(lines) and not lines[cursor].strip():
+                      cursor += 1
+                  bullets = []
+                  while cursor < len(lines):
+                      bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
+                      if not bullet:
+                          break
+                      bullets.append(bullet.group(1))
+                      cursor += 1
+                  for bullet in bullets:
+                      first_ids = ID_LIST_RE.match(bullet.strip().strip(BACKTICK))
+                      if first_ids:
+                          found.update(ids_from_text(first_ids.group(1)))
               return found
-
+          
+          
           def open_work_ids(body):
               in_open_work = False
               result = set()
@@ -114,19 +138,8 @@ jobs:
                   if item_id != "ID" and WORK_ID_RE.fullmatch(item_id) and status.startswith("open"):
                       result.add(item_id)
               return result
-
-          def find_ids(text, allowed):
-              text = text or ""
-              return {
-                  item_id
-                  for item_id in allowed
-                  if re.search(
-                      rf"(?<![A-Za-z0-9-]){re.escape(item_id)}(?![A-Za-z0-9-])",
-                      text,
-                      re.IGNORECASE,
-                  )
-              }
-
+          
+          
           def parse_time(value):
               if not value:
                   return None
@@ -134,7 +147,23 @@ jobs:
                   return datetime.fromisoformat(value.replace("Z", "+00:00"))
               except ValueError:
                   return None
-
+          
+          
+          def pull_claim_ids(pull, allowed_ids, comments_by_id):
+              found = ids_from_text(pull.get("title") or "") & allowed_ids
+              body = re.sub(r"<!--[\s\S]*?-->", "", pull.get("body") or "")
+              for field in CLAIM_FIELD_RE.finditer(body):
+                  value = field.group(1)
+                  found.update(ids_from_text(value) & allowed_ids)
+                  for comment_id in re.findall(r"#issuecomment-(\d+)", value):
+                      linked = comments_by_id.get(comment_id)
+                      if linked:
+                          found.update(
+                              ids_from_claim_comment(linked.get("body") or "") & allowed_ids
+                          )
+              return found
+          
+          
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
               event = json.load(event_file)
           pull = event.get("pull_request") or {}
@@ -142,41 +171,25 @@ jobs:
           opened_at = parse_time(pull.get("created_at"))
           if not author or opened_at is None:
               fail("Cannot determine the PR author or opening time.")
-
+          
           issue = request_json(f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}")
-          comments = get_collection(f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments")
+          comments = get_collection(
+              f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments"
+          )
           comments_by_id = {str(comment.get("id")): comment for comment in comments}
           claims_by_id = {}
           for comment in comments:
-              for item_id in claim_ids_from_comment(comment.get("body") or ""):
+              for item_id in ids_from_claim_comment(comment.get("body") or ""):
                   claims_by_id.setdefault(item_id, []).append(comment)
-
-          work_ids = open_work_ids(issue.get("body") or "")
-          allowed_ids = work_ids | set(claims_by_id)
-          title = pull.get("title") or ""
-          title_candidates = find_ids(title, allowed_ids)
-          candidates = set(title_candidates)
-          if not candidates:
-              body = re.sub(r"<!--[\s\S]*?-->", "", pull.get("body") or "")
-              field = CLAIM_FIELD_RE.search(body)
-              if field:
-                  value = field.group(1)
-                  linked = re.search(r"#issuecomment-(\d+)", value)
-                  if linked:
-                      linked_comment = comments_by_id.get(linked.group(1))
-                      if linked_comment:
-                          candidates.update(
-                              claim_ids_from_comment(linked_comment.get("body") or "") & allowed_ids
-                          )
-                  if not candidates:
-                      candidates.update(find_ids(value, allowed_ids))
-
+          
+          allowed_ids = open_work_ids(issue.get("body") or "") | set(claims_by_id)
+          candidates = pull_claim_ids(pull, allowed_ids, comments_by_id)
           if not candidates:
               fail(
-                  "Put one or more item IDs from issue #14 in the PR title or "
+                  "Put one or more work-item IDs from issue #14 in the PR title or "
                   "the 'Claimed in the coordination issue as' field."
               )
-
+          
           owners = set()
           for item_id in sorted(candidates):
               prior_claims = []
@@ -189,11 +202,16 @@ jobs:
                   for comment in prior_claims
               }
               if not prior_claims:
-                  fail(f"No claim for {item_id} was posted before the PR was opened.")
+                  fail(
+                      f"No unchanged claim for {item_id} predates this PR. "
+                      "Post the claim first and open a replacement PR."
+                  )
               if len(claim_owners) != 1:
                   fail(f"Claim {item_id} has multiple owners; resolve it in issue #14.")
               owners.update(claim_owners)
-
+          
           if owners != {author}:
-              fail("Every claim must have one owner, and that owner must match the PR author.")
+              fail("Every declared claim must have one owner, and that owner must match the PR author.")
           print("Coordination claim verified for " + ", ".join(sorted(candidates)) + ".")
+          
+          PY
