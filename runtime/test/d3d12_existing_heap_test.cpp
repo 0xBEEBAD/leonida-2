@@ -231,6 +231,8 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const std::vector<std::uint8_t> initial(static_cast<std::uint8_t*>(pages),
+                                             static_cast<std::uint8_t*>(pages) + size);
     Ref<ID3D12Resource> buffer;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
     if (may_refuse && buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages)) {
@@ -239,6 +241,7 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
         return 0;
     }
     EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+    EXPECT(std::memcmp(pages, initial.data(), initial.size()) == 0);
     auto* bytes = static_cast<std::uint8_t*>(pages);
     for (UINT64 i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(i * 131u + 7u);
 
@@ -271,6 +274,36 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     const bool same = std::memcmp(mapped, pages, static_cast<size_t>(size)) == 0;
     readback->Unmap(0, nullptr);
     EXPECT(same);
+
+    // Reverse the copy: a real import writes the caller's pages, including for sub-page allocations.
+    D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    Ref<ID3D12Resource> upload;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(&upload.p))));
+    std::vector<std::uint8_t> reversed(static_cast<size_t>(size));
+    for (size_t i = 0; i < reversed.size(); ++i) reversed[i] = static_cast<std::uint8_t>(i * 17u + 0x39u);
+    EXPECT(SUCCEEDED(upload->Map(0, nullptr, &mapped)));
+    std::memcpy(mapped, reversed.data(), reversed.size());
+    upload->Unmap(0, nullptr);
+    EXPECT(SUCCEEDED(allocator->Reset()));
+    EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {buffer.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(buffer.p, 0, upload.p, 0, size);
+    EXPECT(SUCCEEDED(list->Close()));
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)));
+    done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT(done != nullptr && SUCCEEDED(fence->SetEventOnCompletion(2, done)));
+    const DWORD waited = WaitForSingleObject(done, 10000);
+    CloseHandle(done);
+    EXPECT(waited == WAIT_OBJECT_0);
+    EXPECT(std::memcmp(pages, reversed.data(), reversed.size()) == 0);
 
     D3D12_RESOURCE_DESC texture = desc;
     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -490,6 +523,13 @@ int check_title_placed_all(ID3D12Device* device) {
     // Inside a page, as the title places small UAV buffers (64-byte aligned, found in review on an RTX 5090): the
     // import starts at the page and the buffer is bound at the offset.
     failures += check_title_placed(device, "64 bytes into a page", static_cast<char*>(pages) + 64, 0x1000 - 64);
+    for (unsigned prefix : {16u, 32u}) {
+        std::memset(pages, 0xa5, size);
+        failures += check_title_placed(device, "sub-page prefix", static_cast<char*>(pages) + prefix, 0x1000 - prefix);
+        auto* bytes = static_cast<const unsigned char*>(pages);
+        for (unsigned i = 0; i < prefix; ++i) failures += bytes[i] != 0xa5;
+        for (SIZE_T i = 0x1000; i < size; ++i) failures += bytes[i] != 0xa5;
+    }
     VirtualFree(pages, 0, MEM_RELEASE);
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
     void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
