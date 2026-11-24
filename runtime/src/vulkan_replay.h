@@ -2400,7 +2400,8 @@ inline bool has_helper_dispatch(const PreparedList& out, std::size_t i) {
     const auto& p = out.commands[i];
     if (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 || p.counted_dispatch.indirect)
         return true;
-    return std::holds_alternative<Draw>(out.list->commands()[i]) && out.draws[p.draw].quad_indices.buffer;
+    return std::holds_alternative<Draw>(out.list->commands()[i]) && p.draw < out.draws.size() &&
+           out.draws[p.draw].quad_indices.buffer;
 }
 
 // Helper dispatches must not contribute to the application's CSInvocations (D3D-162). Query resolves and
