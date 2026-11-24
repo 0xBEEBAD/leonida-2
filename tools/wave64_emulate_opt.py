@@ -1549,23 +1549,26 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
         eff_succ[b] = nxt
         eff_succ_compact.append([eff_idx[s] for s in nxt])
 
-    compact_tree = cfg_structure.structure(eff_succ_compact)
-    if compact_tree is None:
-        return None
-    tree = _map_tree_ids(compact_tree, eff_blocks)
-
     out_pcs = {}
     for b in eff_blocks:
         tail = chain_of[b][-1]
         s = set(eff_succ[b])
         if not s:
-            s.add(-1)
+            s.add(cfg_structure.END)
         elif tail not in folds and len(raw_edges[tail]) == 1:
             last = active_blocks[tail][-1] if active_blocks[tail] else None
             op = base_op(last["op"]) if last is not None else None
             if op in BRANCHES and op != "s_branch":
-                s.add(-1)
+                s.add(cfg_structure.END)
         out_pcs[b] = frozenset(s)
+    compact_out_pcs = {
+        eff_idx[b]: frozenset(eff_idx[p] if p != cfg_structure.END else cfg_structure.END for p in pcs)
+        for b, pcs in out_pcs.items()
+    }
+    compact_tree = cfg_structure.structure(eff_succ_compact, out_pcs=compact_out_pcs)
+    if compact_tree is None:
+        return None
+    tree = _map_tree_ids(compact_tree, eff_blocks)
     tree = _unwrap_known_pc_guards(tree, out_pcs, eff_blocks[0])
 
     # Precompute per-superblock instruction summaries (for dirty transfer, sync-free check, s_barrier, s_endpgm).

@@ -255,10 +255,11 @@ def test_deep_sequential_chains_stay_flat_and_iterative():
 
 
 def test_unwrap_known_pc_guards():
-    def unwrap(succ):
-        tree = S.structure(succ)
+    def unwrap(succ, out_pcs=None):
+        if out_pcs is None:
+            out_pcs = {b: (set(succ[b]) if succ[b] else {S.END}) for b in range(len(succ))}
+        tree = S.structure(succ, out_pcs=out_pcs)
         assert tree is not None
-        out_pcs = {b: (set(succ[b]) if succ[b] else {S.END}) for b in range(len(succ))}
         return S.unwrap_known_pc_guards(tree, out_pcs)
 
     # Single-arm if-then (ms_wave_info_s3 shape: 0 -> {2, 1}, 1 -> {2}, 2 -> []): join block 2 unwraps to top level.
@@ -270,6 +271,18 @@ def test_unwrap_known_pc_guards():
     assert unwrap([[0, 1], []]) == [("loop", 0, [("block", 0)]), ("block", 1)]
     # Early exit in arm 1 (0 -> {1, 2}, 1 -> [], 2 -> []): both arms MUST remain guarded (pc may be END).
     assert unwrap([[1, 2], [], []]) == [("block", 0), ("guard", 2, [("block", 2)]), ("guard", 1, [("block", 1)])]
+    # Conditional branch in the last block with no s_endpgm after it (fallthrough writes END):
+    # loop body block 2 has succ [0] but out_pcs {0, END}, so exiting loop 0 leaves pc in {1, END};
+    # guard 1 MUST stay so falling off the end does not execute block 1.
+    assert unwrap([[2, 1], [], [0]], out_pcs={0: {2, 1}, 1: {S.END}, 2: {0, S.END}}) == [
+        ("loop", 0, [("block", 0), ("guard", 2, [("block", 2)])]),
+        ("guard", 1, [("block", 1)]),
+    ]
+    # Non-loop conditional branch falling off the end whose single explicit target is immediately dominated by it:
+    # block 2 has succ [1] and out_pcs {1, END}, so structure() and unwrap MUST both keep guard 1.
+    assert unwrap([[2], [], [1]], out_pcs={0: {2}, 1: {S.END}, 2: {1, S.END}}) == [
+        ("block", 0), ("block", 2), ("guard", 1, [("block", 1)]),
+    ]
 
 
 if __name__ == "__main__":

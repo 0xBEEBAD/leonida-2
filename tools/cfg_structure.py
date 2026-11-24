@@ -80,7 +80,7 @@ def _dominators(rpo, preds):
     return idom, pos
 
 
-def structure(succ):
+def structure(succ, out_pcs=None):
     rpo, back, preds = _order(succ)
     idom, pos = _dominators(rpo, preds)
 
@@ -158,7 +158,8 @@ def structure(succ):
             out_list.append(("loop", x, lbody))
         else:
             out_list.append(("block", x))
-        if kind == "b" and len(below) == 1 and list(succ[x]) == [below[0][1]]:
+        if (kind == "b" and len(below) == 1 and list(succ[x]) == [below[0][1]]
+                and (out_pcs is None or set(out_pcs[x]) == {below[0][1]})):
             stack.append(("emit", out_list, parent_list, below[0], depth))
         else:
             hoist = (parent_list is not None and below
