@@ -110,24 +110,29 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Without it (or if that build fails) the runtime still builds and XMA voices output silence.
   find_program(LEONIDA_CARGO cargo)
   if(LEONIDA_CARGO)
+    # Cargo's host (or configured default target) can differ from the runtime's MSVC ABI.
+    set(_xma_target x86_64-pc-windows-msvc)
     set(_xma_target_dir ${CMAKE_BINARY_DIR}/xma_decoder)
-    set(_xma_lib ${_xma_target_dir}/release/leonida_xma2_decoder.lib)
+    set(_xma_lib ${_xma_target_dir}/${_xma_target}/release/leonida_xma2_decoder.lib)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
       ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
       ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.lock
       ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/src/lib.rs)
     execute_process(
-      COMMAND ${LEONIDA_CARGO} build --release --locked
+      COMMAND ${LEONIDA_CARGO} build --release --locked --target ${_xma_target}
               --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
               --target-dir ${_xma_target_dir}
+      TIMEOUT 120
       RESULT_VARIABLE _xma_result)
-    if(_xma_result EQUAL 0 AND EXISTS ${_xma_lib})
+    if(_xma_result STREQUAL "0" AND EXISTS ${_xma_lib})
       add_library(leonida_xma2_decoder STATIC IMPORTED)
+      # Link Rust's Windows SDK dependencies. CMake's C++ target selects its own CRT
+      # (/MD or /MDd); the C ABI keeps allocation and deallocation on the same side.
       set_target_properties(leonida_xma2_decoder PROPERTIES
         IMPORTED_LOCATION ${_xma_lib}
         INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder
         INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
-        INTERFACE_LINK_LIBRARIES "ws2_32;userenv;ntdll")
+        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp")
     else()
       message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
     endif()
