@@ -10,8 +10,11 @@ run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
             native:                 197/248 passed, 49 skipped, 2 failed
             LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
 Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike), both with
-            "r32 sint (sint view): 64 bad, texel(5,3) = 2071". The same two tests fail in
-            RTX4070Ti.txt, which attributes them to #31; not rerun here with any fix checked out.
+            "r32 sint (sint view): 64 bad, texel(5,3) = 2071": the resident read keeps the seeded
+            status VGPR, where the fixtures expect it cleared. Tracked in #31. The review on #98
+            reports native gfx1036 keeping the seed as well, and #98 was closed on that, so this
+            is read here as the fixtures' expectation, not as a translator fault. Not rerun with
+            any change checked out.
 Skipped:    native: 31 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
             device" and 1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
             emulated run covers), plus the 16 "run by d3d12_*_test / w64_graphics.py" cases.
