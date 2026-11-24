@@ -632,12 +632,14 @@ asynchronous paths with `.invalid` names; it opens no connection.
 ## Winsock2 (`ws2_32.dll`) offline
 
 `runtime/shims/ws2_offline.cpp` intercepts outbound Winsock2 entry points — both by name and by standard Windows
-`ws2_32.dll` ordinal (`bind`/`#2`, `connect`/`#4`, `sendto`/`#20`, `gethostbyaddr`/`#51`, `gethostbyname`/`#52`,
+`ws2_32.dll` ordinal (`bind`/`#2`, `connect`/`#4`, `sendto`/`#20`, `setsockopt`/`#21`, `gethostbyaddr`/`#51`,
+`gethostbyname`/`#52`,
 `WSAAsyncGetHostByAddr`/`#102`, `WSAAsyncGetHostByName`/`#103`, `getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExA/W`,
 `getnameinfo`, `GetNameInfoW`, `WSAConnect`, `WSAConnectByNameA/W`, `WSAConnectByList`, `WSASendTo`, `WSASendMsg`,
-`WSALookupServiceBeginA/W`, and `WSAIoctl` for `WSAID_CONNECTEX` and `WSAID_WSASENDMSG`). `wsock32.dll` maps its
+`WSALookupServiceBeginA/W`, `WSAJoinLeaf`, and `WSAIoctl` for `WSAID_CONNECTEX` and `WSAID_WSASENDMSG`). `wsock32.dll` maps its
 `bind`, `connect`, `sendto`, `gethostbyaddr`, `gethostbyname` and `WSAAsyncGetHostBy*` exports (and their ordinals) to
-the same wrappers, since its exports forward to `ws2_32.dll` natively; like `ws2_32.dll` it stays host-owned
+the same wrappers, since its exports forward to `ws2_32.dll` natively; its `setsockopt` (`#21`) is its own export,
+which takes the Winsock 1.1 option numbers, so it has its own wrapper. Like `ws2_32.dll` it stays host-owned
 (`owns_dll`), so `LoadLibrary` returns the real module. The shim keeps `ws2_32.dll` partially overridden
 so local socket bookkeeping (`WSAStartup`, `socket`, `closesocket`, `select`, `recv`, `send`, byte-order helpers) still
 works for loopback traffic:
@@ -651,6 +653,14 @@ works for loopback traffic:
   (each Winsock provider has its own), after the same loopback check.
 - `bind` narrows wildcard binds (`0.0.0.0`, `::`) to loopback (`127.0.0.1`, `::1`) and refuses other non-loopback
   addresses with `WSAEADDRNOTAVAIL`.
+- A send to a loopback address on an unbound socket (`sendto`, `WSASendTo`, `WSASendMsg`, `WSAJoinLeaf`) would bind it
+  to the wildcard address, as Microsoft's `sendto` remarks describe, and its port would then take datagrams from other
+  hosts. The shim first binds such a socket to `127.0.0.1`, `::1` or `::ffff:127.0.0.1` (matching the destination); if
+  it stays unbound the send fails with `WSAEADDRNOTAVAIL`.
+- Multicast group joins through `setsockopt` (`IP_ADD_MEMBERSHIP`, `IP_ADD_SOURCE_MEMBERSHIP`, `IPV6_ADD_MEMBERSHIP`,
+  `MCAST_JOIN_GROUP`, `MCAST_JOIN_SOURCE_GROUP`, and `wsock32.dll`'s Winsock 1.1 `IP_ADD_MEMBERSHIP` = 5) fail with
+  `WSAEADDRNOTAVAIL`; other options pass through. `WSAJoinLeaf` gets the same loopback check as `connect`, so a group
+  address is refused with `WSAENETUNREACH`.
 - Forward lookups refuse external names with `WSAHOST_NOT_FOUND` without sending DNS traffic. A dotted octet with a
   leading zero (`0127.0.0.1`) is refused too: Windows reads it as octal, so it is not the loopback address it looks
   like. `getnameinfo` / `GetNameInfoW` force `NI_NUMERICHOST` (or return `WSAHOST_NOT_FOUND` under `NI_NAMEREQD`) for
@@ -660,7 +670,8 @@ works for loopback traffic:
 `runtime/test/ws2_offline_test.cpp` (ctest `ws2_offline`) verifies name and ordinal bindings, the `wsock32.dll`
 aliases, external refusals using RFC 5737 / RFC 3849 / `.invalid` targets, the `0127.0.0.1` refusal, the
 `WSASERVICE_NOT_FOUND` refusal, wildcard-bind narrowing, a `ConnectEx` pointer from `WSAIoctl` connecting to a loopback
-listener, and a local loopback UDP round-trip.
+listener, a local loopback UDP round-trip, loopback binds for sends on unbound UDP sockets (with a control showing
+the host's own `sendto` binds to `0.0.0.0`), and the multicast and `WSAJoinLeaf` refusals.
 
 ## What this proves and what it does not
 
