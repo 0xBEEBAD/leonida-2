@@ -568,6 +568,8 @@ struct DeviceState {
         create.pQueueFamilyIndices = families.data();
     }
     std::unique_ptr<leonida::VulkanContext> context;
+    // The blocks textures share (allocate_image). Freed after the context, whose deferred queue holds ranges of them.
+    std::unique_ptr<leonida::ImageMemory> image_memory;
     VkPhysicalDeviceMemoryProperties memory{};
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
@@ -1412,6 +1414,23 @@ struct DeviceState {
         }
         return VK_NULL_HANDLE;
     }
+
+    // A range of a device-local block for a texture, or null: the texture is too large to share one, or device-local
+    // memory has no room for another block, and the caller makes its own allocation as it would without the blocks.
+    std::unique_ptr<leonida::ImageMemory::Range> allocate_image(const VkMemoryRequirements& requirements,
+                                                                VkMemoryPropertyFlags& chosen) {
+        for (const std::uint32_t i : leonida::memory_type_order(memory, requirements.memoryTypeBits,
+                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                                                requirements.size)) {
+            const VkDeviceSize block = leonida::image_block_bytes(memory.memoryHeaps[memory.memoryTypes[i].heapIndex].size);
+            if (requirements.size > block / 8) continue;
+            if (auto range = image_memory->allocate(i, requirements.size, requirements.alignment, block)) {
+                chosen = memory.memoryTypes[i].propertyFlags;
+                return range;
+            }
+        }
+        return nullptr;
+    }
 };
 
 // The Vulkan format for a texture this layer can create, with the D24 fallback; VK_FORMAT_UNDEFINED, after a log
@@ -1832,6 +1851,8 @@ public:
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
+        if (image_range_)
+            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_memory, image_range_.release());
     }
 
     leonida::ResourceId id() const { return resource_id(this); }
@@ -2260,6 +2281,10 @@ public:
         // (NVIDIA Pascal / 582.78: memoryTypeBits == 0), or fail to allocate one. Staging copies do not need
         // that usage, so recreate the image without it and continue on that path, as for a refused format above.
         VkMemoryRequirements requirements{};
+        // Render targets and depth buffers keep their own allocations: there are few of them, and a driver may give one
+        // a better place.
+        constexpr D3D12_RESOURCE_FLAGS attachment =
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         for (;;) {
             vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
             // NVIDIA's Pascal driver (582.78 on a GTX 1050 Ti) reports HOST_IMAGE_TRANSFER for the format and creates
@@ -2268,6 +2293,14 @@ public:
             // branch on any GPU with force_host_transfer_retry.
             bool retry = host_transfer_ &&
                          (requirements.memoryTypeBits == 0 || device_.info.force_host_transfer_retry);
+            if (!(desc_.Flags & attachment) && !host_transfer_)
+                image_range_ = device_.allocate_image(requirements, memory_flags_);
+            if (image_range_) {
+                if (vk.vkBindImageMemory(device_.info.device, image_, image_range_->memory(), image_range_->offset()) ==
+                    VK_SUCCESS)
+                    break;
+                return E_OUTOFMEMORY;
+            }
             if (!retry) {
                 memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
                 if (memory_ && vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) == VK_SUCCESS) break;
@@ -2332,6 +2365,8 @@ public:
         // Never used yet: the first command that touches a part zero-fills it and moves it to the layout of the
         // state that command expects (vulkan_replay.h, initialize), so no submission is needed here.
         device_.context->add_resource(id(), binding, VK_IMAGE_LAYOUT_UNDEFINED);
+        // A shader may read it before any command names it: D3D12 gives zeros, and a reused range holds an older texture.
+        if (image_range_ && image_range_->reused() && !binding.not_zeroed) device_.context->note_shader_image(id());
         return S_OK;
     }
 
@@ -2659,6 +2694,7 @@ private:
     VkImage image_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    std::unique_ptr<leonida::ImageMemory::Range> image_range_;  // a texture's, instead of memory_
     VkMemoryPropertyFlags memory_flags_ = 0;
     VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
@@ -5195,6 +5231,17 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.image_memory = std::make_unique<leonida::ImageMemory>(
+            [device = info.device, make = state_.context->vk.vkAllocateMemory](std::uint32_t type, std::uint64_t bytes) {
+                VkMemoryAllocateInfo block{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                block.allocationSize = bytes;
+                block.memoryTypeIndex = type;
+                VkDeviceMemory out = VK_NULL_HANDLE;
+                return make(device, &block, nullptr, &out) == VK_SUCCESS ? out : VkDeviceMemory(VK_NULL_HANDLE);
+            },
+            [device = info.device, free = state_.context->vk.vkFreeMemory](VkDeviceMemory block) {
+                free(device, block, nullptr);
+            });
         state_.context->mesh_queries = info.mesh_shader_queries;
         state_.context->set_depth_range_unrestricted(info.depth_range_unrestricted);
         if (info.physical && state_.format_properties) {
@@ -5569,6 +5616,7 @@ public:
         if (state_.pipeline_cache_handle)
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         state_.context.reset();
+        state_.image_memory.reset();  // the context's deferred queue gave its ranges back
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
     }
@@ -9115,6 +9163,16 @@ std::uint64_t device_arena_size(ID3D12Device* device) {
     if (!real) real = device;
     const Device* d = Device::from<Device>(real);
     return d ? d->state().arena.size : 0;
+}
+
+ImageMemoryStats image_memory_stats(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    if (!d || !d->state().image_memory) return {};
+    const auto stats = d->state().image_memory->stats();
+    return {stats.blocks, stats.block_bytes, stats.ranges};
 }
 
 namespace {

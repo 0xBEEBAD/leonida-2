@@ -11,6 +11,7 @@
 #endif
 #include "binary_occlusion_spirv.h"
 #include "buffer_va_index.h"
+#include "image_memory.h"
 #include "occlusion_sum_spirv.h"
 #include "queue_holds.h"
 #include "retire_tickets.h"
@@ -426,6 +427,7 @@ private:
 };
 
 struct SparseResource;
+using ImageMemory = ImageMemoryPool<VkDeviceMemory>;
 
 // Zero-allocation O(1) Ring Buffer deferred deletion queue tied to the device timeline semaphore.
 class DeferredDeletionQueue {
@@ -437,6 +439,7 @@ public:
         sparse_resource,
         buffer,
         device_memory,
+        image_memory,  // an ImageMemory::Range*, deleted: its bytes go back to their block
         acceleration_structure,
         framebuffer,
     };
@@ -521,6 +524,9 @@ public:
                 break;
             case Kind::device_memory:
                 vk.vkFreeMemory(device, reinterpret_cast<VkDeviceMemory>(item.handle), nullptr);
+                break;
+            case Kind::image_memory:
+                delete reinterpret_cast<ImageMemory::Range*>(item.handle);
                 break;
             case Kind::acceleration_structure:
                 if (vk.vkDestroyAccelerationStructureKHR)
