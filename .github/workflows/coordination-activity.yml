@@ -39,6 +39,7 @@ jobs:
           import os
           import re
           import sys
+          import time
           import urllib.error
           import urllib.parse
           import urllib.request
@@ -53,7 +54,7 @@ jobs:
           END = "<!-- END AUTO PR ACTIVITY -->"
           ID_PATTERN = r"[A-Z0-9]+(?:-[A-Z0-9]+)+"
           WORK_ID_RE = re.compile(ID_PATTERN)
-          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)", re.IGNORECASE)
+          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)")
           CLAIM_FIELD_RE = re.compile(
               r"(?im)^\s*>?\s*Claimed in the coordination issue as:\s*(.*?)\s*$"
           )
@@ -92,7 +93,8 @@ jobs:
           def get_collection(path, label):
               result = []
               for page in range(1, 101):
-                  batch = api_json(f"{path}?per_page=100&page={page}")
+                  separator = "&" if "?" in path else "?"
+                  batch = api_json(f"{path}{separator}per_page=100&page={page}")
                   if not isinstance(batch, list):
                       stop(f"GitHub returned an invalid {label} response.")
                   result.extend(batch)
@@ -127,20 +129,18 @@ jobs:
                   cursor = index + 1
                   while cursor < len(lines) and not lines[cursor].strip():
                       cursor += 1
-                  bullets = []
                   while cursor < len(lines):
                       bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
                       if not bullet:
                           break
-                      bullets.append(bullet.group(1))
+                      first_ids = ID_LIST_RE.match(
+                          bullet.group(1).strip().strip(BACKTICK)
+                      )
+                      if not first_ids:
+                          break
+                      found.update(ids_from_text(first_ids.group(1)))
                       cursor += 1
-                  for bullet in bullets:
-                      first_ids = ID_LIST_RE.match(bullet.strip().strip(BACKTICK))
-                      if first_ids:
-                          found.update(ids_from_text(first_ids.group(1)))
               return found
-          
-          
           def open_work_ids(body):
               in_open_work = False
               result = set()
@@ -245,64 +245,162 @@ jobs:
               return found, str(comment.get("id") or "")
           
           
-          def rerun_affected_checks(event, pulls, allowed_ids, comments_by_id):
-              changed_ids, changed_comment_id = changed_claim_ids(event)
-              if not changed_ids and not changed_comment_id:
-                  return 0
-              rerun = 0
-              for pull in pulls:
-                  if pull_claim_ids(pull, allowed_ids | changed_ids, comments_by_id).isdisjoint(changed_ids):
-                      body = re.sub(r"<!--[\s\S]*?-->", "", pull.get("body") or "")
-                      linked_ids = {
-                          comment_id
-                          for field in CLAIM_FIELD_RE.finditer(body)
-                          for comment_id in re.findall(r"#issuecomment-(\d+)", field.group(1))
-                      }
-                      if changed_comment_id not in linked_ids:
-                          continue
-                  head = pull.get("head") or {}
-                  sha = head.get("sha")
-                  if not sha:
-                      continue
-                  workflow = urllib.parse.quote("coordination-claim.yml", safe="")
-                  encoded_sha = urllib.parse.quote(sha, safe="")
-                  result = api_json(
+          def comment_change_targets_pull(pull, changed_ids, comment_id, allowed_ids, comments_by_id):
+              if not changed_ids and not comment_id:
+                  return False
+              candidates = pull_claim_ids(pull, allowed_ids | changed_ids, comments_by_id)
+              if candidates & changed_ids:
+                  return True
+              body = re.sub(r"<!--[\s\S]*?-->", "", pull.get("body") or "")
+              linked_ids = {
+                  linked_id
+                  for field in CLAIM_FIELD_RE.finditer(body)
+                  for linked_id in re.findall(r"#issuecomment-(\d+)", field.group(1))
+              }
+              return bool(comment_id and comment_id in linked_ids)
+          
+          
+          def list_claim_workflow_runs():
+              workflow = urllib.parse.quote("coordination-claim.yml", safe="")
+              result = []
+              for page in range(1, 101):
+                  response = api_json(
                       f"/repos/{OWNER}/{REPOSITORY}/actions/workflows/{workflow}/runs"
-                      f"?event=pull_request&head_sha={encoded_sha}&per_page=100"
+                      f"?event=pull_request&per_page=100&page={page}"
                   )
-                  runs = result.get("workflow_runs") or []
-                  selected = None
-                  for run in runs:
-                      if run.get("status") != "completed":
+                  batch = response.get("workflow_runs")
+                  if not isinstance(batch, list):
+                      stop("GitHub returned an invalid Coordination claim workflow-runs response.")
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      return result
+              stop("There are too many Coordination claim runs to reconcile safely.")
+          
+          
+          def run_matches_pull(run, pull):
+              head = pull.get("head") or {}
+              if run.get("event") != "pull_request" or run.get("head_sha") != head.get("sha"):
+                  return False
+              associated = run.get("pull_requests") or []
+              if associated:
+                  return any(
+                      str(item.get("number")) == str(pull.get("number"))
+                      for item in associated
+                  )
+              return run.get("head_branch") == head.get("ref")
+          
+          
+          def latest_runs_by_pull(pulls, runs):
+              latest = {}
+              for run in runs:
+                  for pull in pulls:
+                      if not run_matches_pull(run, pull):
                           continue
-                      associated = run.get("pull_requests") or []
-                      if associated:
-                          matches = any(
-                              item.get("number") == pull.get("number")
-                              for item in associated
-                          )
-                      else:
-                          matches = (
-                              run.get("head_sha") == sha
-                              and run.get("head_branch") == head.get("ref")
-                          )
-                      if matches:
-                          selected = run
-                          break
-                  if selected:
-                      try:
-                          api_json(
-                              f"/repos/{OWNER}/{REPOSITORY}/actions/runs/{selected['id']}/rerun",
-                              method="POST",
-                          )
-                          rerun += 1
-                      except SystemExit:
+                      key = str(pull.get("number"))
+                      sort_key = (
+                          run.get("created_at") or "",
+                          int(run.get("run_attempt") or 1),
+                          run.get("updated_at") or "",
+                      )
+                      old = latest.get(key)
+                      if old is None or sort_key > old[0]:
+                          latest[key] = (sort_key, run)
+              return {key: value[1] for key, value in latest.items()}
+          
+          
+          def latest_claim_update(candidates, claims_by_id):
+              timestamps = []
+              for item_id in candidates:
+                  for comment in claims_by_id.get(item_id, []):
+                      updated = parse_time(comment.get("updated_at") or comment.get("created_at"))
+                      if updated is not None:
+                          timestamps.append(updated)
+              return max(timestamps) if timestamps else None
+          
+          
+          def wait_for_run_completion(run):
+              if run.get("status") == "completed":
+                  return run
+              current = run
+              for _ in range(24):
+                  time.sleep(10)
+                  current = api_json(
+                      f"/repos/{OWNER}/{REPOSITORY}/actions/runs/{run.get('id')}"
+                  )
+                  if current.get("status") == "completed":
+                      return current
+              return current
+          
+          
+          def reconcile_claim_checks(
+              event_name,
+              event,
+              pulls,
+              activity_rows,
+              allowed_ids,
+              claims_by_id,
+              comments_by_id,
+          ):
+              runs = list_claim_workflow_runs()
+              latest = latest_runs_by_pull(pulls, runs)
+              changed_ids, changed_comment_id = changed_claim_ids(event)
+              rerun_count = 0
+              for pull, status, candidates, _owner, _links in activity_rows:
+                  run = latest.get(str(pull.get("number")))
+                  if run is None:
+                      continue
+                  force = (
+                      event_name == "issue_comment"
+                      and comment_change_targets_pull(
+                          pull,
+                          changed_ids,
+                          changed_comment_id,
+                          allowed_ids,
+                          comments_by_id,
+                      )
+                  )
+                  if run.get("status") != "completed":
+                      if not force:
+                          continue
+                      run = wait_for_run_completion(run)
+                      if run.get("status") != "completed":
                           print(
-                              f"::warning::Could not re-run claim check for PR #{pull.get('number')}."
+                              f"::warning::Claim check for PR #{pull.get('number')} is still running; a later sync will reconcile it."
                           )
-              return rerun
+                          continue
           
-          
+                  expected = "success" if status == "claimed" else "failure"
+                  if run.get("conclusion") == expected:
+                      continue
+                  attempt = int(run.get("run_attempt") or 1)
+                  run_started = parse_time(run.get("run_started_at") or run.get("created_at"))
+                  last_claim_change = latest_claim_update(candidates, claims_by_id)
+                  changed_after_run = (
+                      run_started is not None
+                      and last_claim_change is not None
+                      and last_claim_change > run_started
+                  )
+                  if not force and attempt >= 2 and not changed_after_run:
+                      print(
+                          f"::warning::Claim check for PR #{pull.get('number')} still differs from issue #14 after an automatic retry; inspect the run."
+                      )
+                      continue
+                  if attempt >= 50:
+                      print(
+                          f"::warning::Claim check for PR #{pull.get('number')} reached GitHub's rerun limit."
+                      )
+                      continue
+                  try:
+                      api_json(
+                          f"/repos/{OWNER}/{REPOSITORY}/actions/runs/{run.get('id')}/rerun",
+                          method="POST",
+                      )
+                      rerun_count += 1
+                  except SystemExit:
+                      print(
+                          f"::warning::Could not re-run claim check for PR #{pull.get('number')}."
+                      )
+              return rerun_count
           issue = api_json(f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}")
           comments = get_collection(
               f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments",
@@ -323,18 +421,25 @@ jobs:
           event_name = os.environ.get("GITHUB_EVENT_NAME")
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
               event = json.load(event_file)
-          rerun_count = 0
-          if event_name == "issue_comment":
-              rerun_count = rerun_affected_checks(event, pulls, allowed_ids, comments_by_id)
-          
+          activity_rows = []
           groups = defaultdict(list)
           for pull in pulls:
               status, item_ids, owner, links = evaluate_claim(
                   pull, allowed_ids, claims_by_id, comments_by_id
               )
+              activity_rows.append((pull, status, item_ids, owner, links))
               author = ((pull.get("user") or {}).get("login") or "unknown")
               groups[author].append((pull, status, item_ids, owner, links))
           
+          rerun_count = reconcile_claim_checks(
+              event_name,
+              event,
+              pulls,
+              activity_rows,
+              allowed_ids,
+              claims_by_id,
+              comments_by_id,
+          )
           updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
           section = [
               BEGIN,
@@ -403,8 +508,8 @@ jobs:
               end += len(END)
               new_body = current_body[:start] + managed_block + current_body[end:]
               normalize = lambda value: re.sub(
-                  r"(?m)^Updated: \*\*.*$",
-                  "Updated: *timestamp*",
+                  r"(?m)^(Updated: \*\*)[^*]+(\*\* — \*\*\d+ open PRs\*\* across \*\*\d+ submitters\*\*\.)$",
+                  r"\1timestamp\2",
                   value,
               )
               if len(new_body) > 65536:
