@@ -1401,7 +1401,7 @@ int check_xbox_slots() {
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
     // The real list is created as ID3D12GraphicsCommandList; the console IID the caller asked for is answered by
     // the proxy's QueryInterface instead.
-    EXPECT(mock->args[12][4] == word(&__uuidof(ID3D12GraphicsCommandList)));
+    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), __uuidof(ID3D12GraphicsCommandList)));
 
     // The measured console list IID (the 1.0.2.1 executable's only GUID of that form) maps to
     // ID3D12GraphicsCommandList6: slot 73 answers it, and a QueryInterface for it on the proxy returns the proxy.

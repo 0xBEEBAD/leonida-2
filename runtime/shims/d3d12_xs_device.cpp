@@ -139,6 +139,7 @@ struct DeviceProxy {
     // Optional presentation wiring attached via set_presentation_handler (guarded by presentation_lock).
     SRWLOCK presentation_lock = SRWLOCK_INIT;
     PresentationHandler presentation{};
+    bool external_presentation_mode = false;  // protected by presentation_lock, including after an explicit detach
 };
 
 // Freed in proxy_release; defined where the states are complete.
@@ -1649,7 +1650,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 HRESULT hr = S_OK;
                 bool external_queue = false;
                 if (call_presentation(self->device, [&](const PresentationHandler& p) {
-                        external_queue = p.present_x || p.suspend_x || p.resume_x;
+                        external_queue = self->device->external_presentation_mode;
                         if (Slot == qroutes.present_x && p.present_x) {
                             hr = p.present_x(p.context, static_cast<UINT>(a1), reinterpret_cast<const void*>(a2),
                                              reinterpret_cast<const void*>(a3));
@@ -1666,7 +1667,11 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                         return false;
                     }))
                     return hr_to_u64(hr);
-                if (external_queue && (Slot == 30 || Slot == 32)) return hr_to_u64(E_NOTIMPL);
+                // An explicitly managed queue has no fallback after detachment. An unmapped
+                // presentation slot cannot silently open a second window or acknowledge a suspend.
+                if (external_queue && ((Slot >= 30 && Slot <= 32) || Slot == qroutes.present_x ||
+                                       Slot == qroutes.suspend_x || Slot == qroutes.resume_x))
+                    return hr_to_u64(E_NOTIMPL);
             }
         }
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
@@ -2224,12 +2229,16 @@ HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
     if (!riid) return E_POINTER;
     // A console title asks for the console command-list IID (device slot 73 forwards it): it maps to a PC IID the
     // real list answers, and the caller gets this console-shaped object back.
-    const IID& pc_iid = command_list_iid_for_pc(*riid);
+    bool xbox_iid = false;
+    const IID& pc_iid = command_list_iid_for_pc(*riid, &xbox_iid);
     if (!is_list_iid(pc_iid)) {
         if (supports_iid(self->real, pc_iid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
     }
-    if (!supports_iid(self->real, pc_iid)) return E_NOINTERFACE;
+    // The console interface is implemented by the proxy. Its individual thunks check
+    // the wrapped list's available slots. Desktop interface queries still require that revision.
+    const IID& required = xbox_iid ? __uuidof(ID3D12GraphicsCommandList) : pc_iid;
+    if (!supports_iid(self->real, required)) return E_NOINTERFACE;
     *out = self;
     list_add_ref(self);
     return S_OK;
@@ -4556,6 +4565,7 @@ bool set_presentation_handler(void* device, const PresentationHandler* handler) 
     auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
     if (!proxy) return false;
     AcquireSRWLockExclusive(&proxy->presentation_lock);
+    proxy->external_presentation_mode = true;
     proxy->presentation = handler ? *handler : PresentationHandler{};
     ReleaseSRWLockExclusive(&proxy->presentation_lock);
     return true;
@@ -4759,6 +4769,10 @@ void reset_device_proxy_stats() {
     reset_child_stats<ChildKind::queue>();
     reset_child_stats<ChildKind::fence>();
     reset_child_stats<ChildKind::allocator>();
+    for (unsigned slot = 0; slot < kListSlots; ++slot) {
+        ListStats::hits[slot].store(0, std::memory_order_relaxed);
+        ListStats::first[slot].store(false, std::memory_order_relaxed);
+    }
 }
 
 }  // namespace rt::d3d12_xs
