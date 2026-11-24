@@ -3516,6 +3516,8 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
 // device behind the proxy registered (set_placed_at_va_handler), with the PC flags kept and the layout made
 // ROW_MAJOR, as slot 76 does.
 std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
+std::atomic<PlacedAtVaPagesHook> g_placed_at_va_pages{nullptr};
+std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
 
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
                                        std::uint32_t state, const IID* riid, void** out) {
@@ -3545,6 +3547,16 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                      "state=0x%x -> a buffer on the title's pages\n",
                      va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
                      xbox_flags, state);
+    }
+    // The buffer's pages are committed before the handler walks them (set_placed_at_va_pages_hook).
+    const PlacedAtVaPagesHook pages = g_placed_at_va_pages.load(std::memory_order_acquire);
+    if (pages && pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && pc_desc.Width &&
+        !pages(va, static_cast<std::size_t>(pc_desc.Width))) {
+        static std::atomic<bool> refused{false};
+        if (!refused.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 133: committing the pages of va=%p width=%llu failed (error %lu)\n",
+                         va, static_cast<unsigned long long>(pc_desc.Width), GetLastError());
+        }
     }
     return handler(self->real, va, pc_desc, state, *riid, out);
 }
@@ -3997,6 +4009,16 @@ unsigned device_proxy_slot_count(const void* device) {
 
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
+}
+
+void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
+    g_placed_at_va_pages.store(hook, std::memory_order_release);
+}
+
+// MERGE NOTE: main routes slot 14's console-extended heap to this handler; this stack still serves slot 14 with the
+// title-backed heaps of #7021 inside the proxy, so the handler is stored and not called yet.
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
+    g_console_descriptor_heap.store(handler, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {

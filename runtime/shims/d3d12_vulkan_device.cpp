@@ -22,6 +22,7 @@
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
+#include "../src/vulkan_mesh_limits.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
 #include "../src/pipeline_cache_file.h"
@@ -739,22 +740,9 @@ struct TextureCreateInfo {
     TextureCreateInfo& operator=(const TextureCreateInfo&) = delete;
 };
 
-std::filesystem::path configured_shader_directory() {
-    constexpr wchar_t env_name[] = L"LEONIDA_SHADERS";
-    if (const DWORD size = ::GetEnvironmentVariableW(env_name, nullptr, 0)) {
-        std::wstring value(size, L'\0');
-        const DWORD length = ::GetEnvironmentVariableW(env_name, value.data(), size);
-        if (length && length < size) {
-            value.resize(length);
-            return std::filesystem::path(value);
-        }
-    }
-
-    std::wstring exe(32768, L'\0');
-    const DWORD length = ::GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
-    if (!length || length >= exe.size()) return {};
-    exe.resize(length);
-    const auto config = std::filesystem::path(exe).parent_path() / L"shader_path.txt";
+// The folder make_game recorded in shader_path.txt at `config`, or empty without one. Throws when the path cannot be
+// converted: MSVC's STL reports a Windows path that is not UTF-8 as std::system_error, libstdc++ as filesystem_error.
+std::filesystem::path shader_directory_from_file(const std::filesystem::path& config) {
     std::ifstream file(config, std::ios::binary);
     if (!file) return {};
     const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
@@ -842,9 +830,14 @@ struct DeviceState {
     bool r9g9b9e5_uav_emulated = false;
     // The same for B5G5R5A1_UNORM: VK_FORMAT_A1R5G5B5_UNORM_PACK16 without STORAGE_IMAGE, backed by mutable R16_UINT.
     bool b5g5r5a1_uav_emulated = false;
+    // The same for the 8-bit sRGB formats: VK_FORMAT_R8G8B8A8_SRGB / B8G8R8A8_SRGB without STORAGE_IMAGE (as on most
+    // GPUs), backed by a mutable image of the UNORM format of the same order. The host runtime makes such textures.
+    bool rgba8_srgb_uav_emulated = false;
+    bool bgra8_srgb_uav_emulated = false;
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
+    std::uint32_t f16_half_top_location = 29;
     float max_sampler_lod_bias = 0;
     D3D12_CONSERVATIVE_RASTERIZATION_TIER conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
     bool conservative_post_depth_coverage = false;
@@ -1148,22 +1141,26 @@ struct DeviceState {
         std::lock_guard lock(library_mutex);
         if (!library_tried) {
             library_tried = true;
-            std::filesystem::path dir;
+            // Nothing may leave here into Create*PipelineState: a path the STL cannot convert throws std::system_error
+            // under MSVC, which is not a filesystem_error, so every std::exception gives the message.
             try {
-                dir = info.shader_dir.empty() ? configured_shader_directory() : std::filesystem::path(info.shader_dir);
-            } catch (const std::filesystem::filesystem_error& e) {
+                std::string error;
+                const std::filesystem::path dir = info.shader_dir.empty() ? configured_shader_directory(&error)
+                                                                          : std::filesystem::path(info.shader_dir);
+                if (!error.empty())
+                    std::fprintf(stderr, "[rt] d3d12: invalid translated shader path: %s\n", error.c_str());
+                else if (dir.empty())
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv\n");
+                else if (!shader_library.load(dir, &error))
+                    std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
+                else {
+                    const auto path = shader_library.directory().u8string();
+                    std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
+                                 shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
+                }
+            } catch (const std::exception& e) {
                 std::fprintf(stderr, "[rt] d3d12: invalid translated shader path: %s\n", e.what());
-                return nullptr;
-            }
-            std::string error;
-            if (dir.empty())
-                std::fprintf(stderr, "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv\n");
-            else if (!shader_library.load(dir, &error))
-                std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
-            else {
-                const auto path = dir.u8string();
-                std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
-                             shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
             }
         }
         return shader_library.loaded() ? &shader_library : nullptr;
@@ -1378,6 +1375,25 @@ struct DeviceState {
             Format backed{VK_FORMAT_R16_UINT, VK_IMAGE_ASPECT_COLOR_BIT};
             backed.uint_backed = VK_FORMAT_A1R5G5B5_UNORM_PACK16;
             return backed;
+        }
+        // An 8-bit sRGB UAV texture where the sRGB format has no storage support: the host runtime makes it (RTX 4090
+        // and WARP; a retail title sizes a 2048x2048 R8G8B8A8_UNORM_SRGB render target with unordered access), but no
+        // typed UAV is sRGB in D3D12, so shaders write the raw bytes. A mutable image of the UNORM format of the same
+        // channel order (Format::uint_backed): its storage view is UNORM, its SRVs and RTVs are sRGB, so sampling
+        // decodes and rendering encodes as on the host.
+        if ((desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
+            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            const bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            const VkFormat srgb = rgba ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_B8G8R8A8_SRGB;
+            if (!storage_usable(srgb)) {
+                if (!(rgba ? rgba8_srgb_uav_emulated : bgra8_srgb_uav_emulated) || desc.SampleDesc.Count > 1 ||
+                    ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && !color_attachment_usable(srgb)))
+                    return {};
+                log_once("8-bit sRGB UAV unavailable natively, using a mutable UNORM image; format", desc.Format);
+                Format backed{rgba ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT};
+                backed.uint_backed = srgb;
+                return backed;
+            }
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -2050,6 +2066,17 @@ const char* barrier_layout_refusal(const D3D12_RESOURCE_DESC& desc, D3D12_BARRIE
     }
 }
 
+// Console Xbox D3D12 CreateDescriptorHeap (device slot 14) passes the PC description followed by the heap address
+// and size, as measured in the retail boot (issue #313 comment 7107265058): a 16-byte PC D3D12_DESCRIPTOR_HEAP_DESC,
+// then address at +0x10 and size at +0x18. The title asserts GetCPUDescriptorHandleForHeapStart() == address.
+// Backing this range with title memory / section 3.3 aliasing is tracked separately; this path only satisfies the
+// observed ABI contract and must not be inferred from normal PC 16-byte CreateDescriptorHeap calls.
+struct ConsoleDescriptorHeapDesc {
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    std::uint64_t address = 0;
+    std::uint64_t size = 0;
+};
+
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12DescriptorHeap> {
@@ -2062,9 +2089,20 @@ public:
     // heaps (RTV, DSV, non-visible staging heaps) stay in host memory.
     // A shader-visible heap that the arena cannot hold is not created (ok() is false, E_OUTOFMEMORY), as a
     // default-heap buffer is not: in host memory its GPU handle would be 0, and every table would read VA 0.
-    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
-        const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
-        if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
+    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uint64_t console_address = 0,
+                   std::uint64_t console_size = 0)
+        : device_(device), desc_(desc), console_address_(console_address), console_size_(console_size),
+          console_addressed_(console_address != 0) {
+        const VkDeviceSize bytes = VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize;
+        if (console_addressed_) {
+            // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address. Report the requested title VA
+            // now; backing this range with title memory / §3.3 aliasing is tracked separately.
+            log_once("descriptor heap uses console address/size (not backed by title memory)", int(desc_.Type));
+            cpu_ = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
+            in_arena_ = false;
+            return;
+        }
+        if ((desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
             if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
                          int(std::min<VkDeviceSize>(bytes / 1024, INT_MAX)));
@@ -2105,12 +2143,16 @@ public:
     }
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
+        if (console_addressed_) return {static_cast<UINT64>(console_address_)};
         if (!in_arena_) log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
         return {in_arena_ ? UINT64(arena_offset_) : 0};
     }
 
     const D3D12_DESCRIPTOR_HEAP_DESC& raw_desc() const { return desc_; }
-    D3D12_GPU_VIRTUAL_ADDRESS gpu_base() const { return in_arena_ ? UINT64(arena_offset_) : 0; }
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_base() const {
+        if (console_addressed_) return static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(console_address_);
+        return in_arena_ ? UINT64(arena_offset_) : 0;
+    }
 
 private:
     DeviceState& device_;
@@ -2119,6 +2161,9 @@ private:
     std::uint8_t* cpu_ = nullptr;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    std::uint64_t console_address_ = 0;
+    std::uint64_t console_size_ = 0;
+    bool console_addressed_ = false;
 };
 
 class Resource final
@@ -2341,6 +2386,15 @@ public:
         void* const base_address = reinterpret_cast<void*>(base);
         const VkDeviceSize offset = start - base;
         const VkDeviceSize bytes = (offset + desc_.Width + alignment - 1) & ~(alignment - 1);
+        // An imported buffer's VA is its host address, and it joins the same BufferVaIndex as default-heap buffers,
+        // whose VAs are offsets in [0, arena size). A host range that reaches into that window (low host addresses,
+        // as under Wine) would shadow arena buffers in the index's nearest-start lookup, so it takes the fallback
+        // (found in review).
+        if (start < device_.arena.size) {
+            log_once("a title-placed buffer's host address overlaps the arena's VA window; not imported, size",
+                     int(desc_.Width > INT_MAX ? INT_MAX : desc_.Width));
+            return E_NOTIMPL;
+        }
         // The whole imported range must be committed, possibly across several allocations (the retail buffer spans
         // three mapped windows); a page not committed yet (xmem commits on first touch) or a write-combined one (on
         // an RTX 5090 such an import succeeded but GPU reads returned wrong bytes, found in review) is not imported,
@@ -2611,8 +2665,9 @@ public:
 
     // A placed buffer is a range of the heap's arena memory: it has no VkBuffer of its own and its console VA is
     // where it sits in the arena. The arena is host-visible, so an upload or readback place maps that same range.
-    HRESULT create_placed_buffer() {
+    HRESULT create_placed_buffer(std::shared_ptr<const leonida::TileHeapAllocation> heap_range) {
         if (!device_.arena.mapped) return E_OUTOFMEMORY;
+        heap_range_ = std::move(heap_range);
         if (cpu_visible()) mapped_ = device_.arena.mapped + va_;
         std::memset(device_.arena.mapped + va_, 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
         leonida::ResourceBinding binding{};
@@ -2752,10 +2807,15 @@ public:
 
     // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
     // runtime).
-    // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors). An acceleration
-    // structure reports its real device address (instance descriptors and builds hand it to the driver); other
-    // buffers report their console VA into the GPU address arena.
+    // Buffers report their console VA into the GPU address arena; an acceleration structure reports its real device
+    // address (instance descriptors and builds hand it to the driver). A texture the title placed at its own address
+    // through Xbox slot 133 reports that title address, as the console does: a title uses it as the CPU pointer it
+    // clears the texture through (docs/d3d12_vulkan.md 3.3). Any other texture answers 0, as on D3D12.
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+    // The title's own address for a texture Xbox slot 133 placed. The image is still the committed fallback, so its
+    // pixels do not alias the title's pages yet; the address is what GetGPUVirtualAddress answers (XCL PR #168's
+    // behavior, measured on a retail title).
+    void set_title_address(D3D12_GPU_VIRTUAL_ADDRESS address) { va_ = address; }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -3070,9 +3130,12 @@ private:
     bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
-    D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;  // a buffer's console VA, or a slot-133 texture's title address
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    // A placed buffer's heap range, held as a D3D12 placed resource holds its heap: the app may release the heap
+    // first, and the range must not go to another allocation while this buffer lives.
+    std::shared_ptr<const leonida::TileHeapAllocation> heap_range_;
 };
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
@@ -3274,6 +3337,7 @@ public:
     bool reserved() const { return bool(allocation_); }
     // An existing heap: the caller's memory, not an arena range, so offset() is not a place in the arena.
     const void* host_address() const { return host_address_; }
+    const std::shared_ptr<const leonida::TileHeapAllocation>& arena_range() const { return allocation_; }
     VkDeviceSize offset() const { return allocation_->offset; }
     UINT64 bytes() const { return desc_.SizeInBytes; }
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
@@ -4004,19 +4068,9 @@ public:
                 // The SPIR-V's output arrays are sized from PSV0 (the index's max_vertices / max_primitives); Vulkan
                 // has no per-pipeline limit to set, so a mesh shader beyond the device's is refused here
                 // (docs/d3d12_vulkan.md, "Pipelines").
-                const VkPhysicalDeviceMeshShaderPropertiesEXT& limits = device_.mesh_limits();
-                const auto& n = stage.entry->local_size;
-                if (stage.entry->max_vertices > limits.maxMeshOutputVertices ||
-                    stage.entry->max_primitives > limits.maxMeshOutputPrimitives ||
-                    n[0] > limits.maxMeshWorkGroupSize[0] || n[1] > limits.maxMeshWorkGroupSize[1] ||
-                    n[2] > limits.maxMeshWorkGroupSize[2] ||
-                    std::uint64_t(n[0]) * n[1] * n[2] > limits.maxMeshWorkGroupInvocations) {
-                    std::fprintf(stderr,
-                                 "[rt] d3d12: %s needs %u vertices, %u primitives, %ux%ux%u threads; the device "
-                                 "allows %u, %u, %u invocations\n",
-                                 stage.entry->name.c_str(), stage.entry->max_vertices, stage.entry->max_primitives,
-                                 n[0], n[1], n[2], limits.maxMeshOutputVertices, limits.maxMeshOutputPrimitives,
-                                 limits.maxMeshWorkGroupInvocations);
+                if (const std::string refusal = leonida::mesh_limit_refusal(*stage.entry, device_.mesh_limits());
+                    !refusal.empty()) {
+                    std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
                     return E_NOTIMPL;
                 }
             }
@@ -4049,10 +4103,11 @@ public:
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
-        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry && !ps_stage.entry->f16_halves.empty()) {
+        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
+            (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
             if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                          &link_error)) {
+                                          &link_error, device_.f16_half_top_location)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
@@ -5575,6 +5630,7 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        rt::d3d12_xs::set_console_descriptor_heap_handler(&rt::d3d12::create_console_descriptor_heap);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -5607,6 +5663,10 @@ public:
             state_.probe_uint_backed_uav(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_FORMAT_R32_UINT);
         state_.b5g5r5a1_uav_emulated =
             state_.probe_uint_backed_uav(VK_FORMAT_A1R5G5B5_UNORM_PACK16, VK_FORMAT_R16_UINT);
+        state_.rgba8_srgb_uav_emulated =
+            state_.probe_uint_backed_uav(VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM);
+        state_.bgra8_srgb_uav_emulated =
+            state_.probe_uint_backed_uav(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM);
         memory_properties(info.physical, &state_.memory);
         {
             char text[4] = {};
@@ -5646,6 +5706,8 @@ public:
                     VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
+                state_.f16_half_top_location = leonida::f16_half_top_location(
+                    props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
@@ -6166,6 +6228,19 @@ public:
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
     IUnknown* holder() { return identity(); }
+    // Console-extended CreateDescriptorHeap (Xbox slot 14): a heap at the title's console address. The proxy's
+    // handler (set_console_descriptor_heap_handler) calls this; a normal PC create never does.
+    HRESULT create_console_descriptor_heap(const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                           D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
+                                           REFIID riid, void** out) {
+        auto* heap = new DescriptorHeap(state_, *desc, console_address, console_size);
+        heap->attach_device(identity());
+        if (!heap->ok()) {
+            heap->Release();
+            return E_OUTOFMEMORY;
+        }
+        return hand_out(heap, riid, out);
+    }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
@@ -6236,7 +6311,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetEventOnMultipleFenceCompletion(ID3D12Fence* const* fences, const UINT64* values,
                                                                 UINT count, D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags,
                                                                 HANDLE event) override {
-        return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event);
+        return set_event_on_multiple_fence_completion(*state_.context, fences, values, count, flags, event, identity());
     }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
         if (removed_.load(std::memory_order_acquire)) return DXGI_ERROR_DEVICE_REMOVED;
@@ -6942,6 +7017,13 @@ public:
                     view = {};
                 else
                     view.format = static_cast<leonida::ColorViewFormat>(VK_FORMAT_A1R5G5B5_UNORM_PACK16);
+            } else if (r && (r->uint_backed() == VK_FORMAT_R8G8B8A8_SRGB || r->uint_backed() == VK_FORMAT_B8G8R8A8_SRGB)) {
+                // A UNORM-backed 8-bit sRGB UAV texture renders through an sRGB view (encoding as the host does), in its
+                // own format only.
+                if (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format)
+                    view = {};
+                else
+                    view.format = static_cast<leonida::ColorViewFormat>(r->uint_backed());
             } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
                        (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
@@ -7483,7 +7565,8 @@ public:
     // (docs/d3d12_vulkan.md section 3.5). So each gets a sampler in set 0 and a key in the hash table here, as
     // CreateSampler gives a heap slot's S#; without them the shader's lookup misses and it samples through the
     // fallback sampler. A static sampler is a D3D12_SAMPLER_DESC2 whose border colour is one of five named ones
-    // (D3D12_STATIC_BORDER_COLOR; the two UINT ones can be in a blob of any version, the flags only in 1.2).
+    // (D3D12_STATIC_BORDER_COLOR; the two UINT ones can be in a blob of any version, the flags only in 1.2), or
+    // transparent black with the UINT flag.
     void register_static_samplers(const rt::rootsig::RootSignature& signature) {
         for (const rt::rootsig::StaticSampler& s : signature.static_samplers) {
             D3D12_SAMPLER_DESC2 desc{};
@@ -7504,9 +7587,14 @@ public:
                 desc.Flags |= D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
                 desc.UintBorderColor[0] = desc.UintBorderColor[1] = desc.UintBorderColor[2] = white ? 1u : 0u;
                 desc.UintBorderColor[3] = 1;
+            } else if (s.border_color == D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK &&
+                       (desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) {
+                // The integer border the enum has no value for: the 1.2 flag on transparent black is UINT (0,0,0,0),
+                // which D3D12 serializes and creates. UintBorderColor is already zero.
             } else if (s.border_color > D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT ||
                        (desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) {
-                // A value past the enum, or the UINT flag with a float border: not a sampler D3D12 defines.
+                // A value past the enum, or the UINT flag with the float opaque black or white (D3D12 refuses to
+                // serialize that pair): not a sampler D3D12 defines.
                 log_once("static sampler not registered: border colour and flags do not go together; border colour",
                          int(s.border_color));
                 continue;
@@ -7816,18 +7904,31 @@ public:
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             // A texture is not placed on the title's pages yet: it gets an ordinary committed DEFAULT texture of the
             // same description, as slot 76 gives one, so the title has its resource instead of asserting (found in
-            // review). What the title writes at `address` does not reach it.
-            log_once("a title-placed texture (device slot 133) is an ordinary committed texture, not the title's pages; "
-                     "dimension",
+            // review). Its GPU VA is still the title's address: the console answers a placed texture's
+            // GetGPUVirtualAddress with the address the title placed it at, and a title turns that into the CPU
+            // pointer it clears the texture through (docs/d3d12_vulkan.md 3.3). What the title writes at `address`
+            // does not reach the image yet.
+            log_once("a title-placed texture (device slot 133) is a committed texture whose GPU VA is the title "
+                     "address; its pixels do not alias the title's pages yet; dimension",
                      int(desc.Dimension));
-            // The initial state follows the title's barrier layout (slot 133's third argument, measured by
-            // @dracbat); a state the description refuses (or UNDEFINED) gives COMMON, so the title still gets it.
+            // The title's barrier layout (slot 133's third argument, measured by @dracbat) is checked against the
+            // description as CreateCommittedResource checks a state; one it refuses (or UNDEFINED) gives COMMON, so
+            // the title still gets its texture. The image itself starts undefined either way: the first command that
+            // uses it moves it to that command's layout (vulkan_replay.h, initialize), as for every texture here.
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
             const D3D12_RESOURCE_STATES initial = state_for_barrier_layout(layout);
-            HRESULT hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, 0, nullptr, riid, out);
+            HRESULT hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, nullptr,
+                                                    0, nullptr, riid, out);
             if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
-                hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
-                                      riid, out);
+                hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc,
+                                                D3D12_RESOURCE_STATE_COMMON, nullptr, 0, nullptr, riid, out);
+            if (SUCCEEDED(hr) && out && *out) {
+                // The console answers the texture's GetGPUVirtualAddress with the title's address; without it a
+                // title that clears the texture through that pointer writes at address 0 (XCL measured this on a
+                // retail title). The image stays the committed fallback above, so only the address is folded in.
+                if (auto* texture = Resource::from<Resource>(static_cast<IUnknown*>(*out)))
+                    texture->set_title_address(reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address));
+            }
             return d3d12_trace::result(method, hr);
         }
         D3D12_HEAP_PROPERTIES heap{};
@@ -8060,7 +8161,7 @@ public:
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (buffer) {
-            hr = resource->create_placed_buffer();
+            hr = resource->create_placed_buffer(heap->arena_range());
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);
@@ -8143,7 +8244,10 @@ public:
         const UINT per_plane = mips * (volume ? 1 : desc->DepthOrArraySize);
         if (!format.format || UINT64(first) + count > UINT64(per_plane) * planes) return fail();
 
-        UINT64 offset = base, end = base;
+        // Subresources are aligned to D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT counting from BaseOffset, not from 0: the
+        // PC runtime moves the whole layout by BaseOffset, so an unaligned base (513) keeps the same relative offsets
+        // and the same total. Measured by compare_footprints in d3d12_vulkan_device_test.
+        UINT64 offset = 0, end = 0;
         for (UINT i = 0; i < count; ++i) {
             const UINT index = first + i, plane = index / per_plane, mip = index % mips;
             const VkImageAspectFlags aspect =
@@ -8168,14 +8272,15 @@ public:
             if (planes == 2) footprint_format = plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
             const UINT slices = std::max(1u, depth >> (mip & 31));
             if (layouts)
-                layouts[i] = {offset, {footprint_format, blocks_wide * block.block, blocks_high * block.block, slices, pitch}};
+                layouts[i] = {base + offset,
+                              {footprint_format, blocks_wide * block.block, blocks_high * block.block, slices, pitch}};
             if (rows) rows[i] = blocks_high;
             if (row_sizes) row_sizes[i] = row_size;
             const UINT64 total_rows = UINT64(blocks_high) * slices;
             end = offset + (total_rows - 1) * pitch + row_size;
             offset += total_rows * pitch;
         }
-        if (total) *total = end - base;
+        if (total) *total = end;
     }
 
     // How much heap memory resources need and how to align them, for applications that suballocate heaps (section
@@ -8538,6 +8643,32 @@ public:
                 fs->Support1 = D3D12_FORMAT_SUPPORT1_BUFFER;
                 return d3d12_trace::result(method, S_OK);
             }
+            // The plane formats a shader reads a depth-stencil texture through (CreateShaderResourceView takes them on
+            // R24G8/R32G8X24 and D24S8/D32S8 textures) have no image of their own, so the lookups below find nothing.
+            // The host reports them as sampled 2D and cube textures with mips, the depth plane also filtered and
+            // compared. Left out, as for the depth formats themselves: 1D, and multisample loads.
+            const bool depth_plane = fs->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                     fs->Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            if (depth_plane || fs->Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
+                fs->Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT) {
+                const bool d24 = fs->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                 fs->Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+                VkFormat family = vulkan_format(d24 ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                                                true).format;
+                if (family == VK_FORMAT_D24_UNORM_S8_UINT && !state_.depth_usable(family))
+                    family = VK_FORMAT_D32_SFLOAT_S8_UINT;
+                VkFormatProperties props{};
+                if (state_.format_properties) state_.format_properties(state_.info.physical, family, &props);
+                if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+                    return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
+                fs->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
+                               D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_MIP;
+                if (depth_plane && (props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+                    fs->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
+                                    D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON |
+                                    D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON;
+                return d3d12_trace::result(method, S_OK);
+            }
             const Format fmt = texture_storage_format(fs->Format, false);
             const Format depth_fmt = vulkan_format(fs->Format, true);
             VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
@@ -8675,6 +8806,11 @@ public:
                 const bool block_compressed = vk_fmt >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && vk_fmt <= VK_FORMAT_BC7_SRGB_BLOCK;
                 // Gathers read the sampled view like a sample does (OpImageGather); the host reports one with the other.
                 if (s1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) s1 |= D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
+                // Comparison sampling and gathers (SampleCmp, GatherCmp with a comparison sampler) are D3D12's for the
+                // depth-plane view formats only; R32_FLOAT and R16_UNORM are the views of D32 and D16 textures.
+                if ((s1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) &&
+                    (fs->Format == DXGI_FORMAT_R32_FLOAT || fs->Format == DXGI_FORMAT_R16_UNORM))
+                    s1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON | D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON;
                 // A mip chain where the image can have one (asked with its sampled or depth-stencil usage).
                 if (s1 & (D3D12_FORMAT_SUPPORT1_TEXTURE1D | D3D12_FORMAT_SUPPORT1_TEXTURE2D |
                           D3D12_FORMAT_SUPPORT1_TEXTURE3D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
@@ -10688,6 +10824,47 @@ bool has_global_realtime_privilege() {
 
 void set_global_realtime_privilege_override_for_test(int state) {
     g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
+}
+
+HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                       D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
+                                       REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !desc) return E_INVALIDARG;
+    // No output: a capability check, as CreateDescriptorHeap does.
+    if (!out) return S_FALSE;
+    if ((desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || desc->NodeMask > 1 ||
+        ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+         (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV))) {
+        return E_INVALIDARG;
+    }
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_INVALIDARG;
+    return d->create_console_descriptor_heap(desc, console_address, console_size, riid, out);
+}
+
+std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
+    try {
+        constexpr wchar_t env_name[] = L"LEONIDA_SHADERS";
+        if (const DWORD size = ::GetEnvironmentVariableW(env_name, nullptr, 0)) {
+            std::wstring value(size, L'\0');
+            const DWORD length = ::GetEnvironmentVariableW(env_name, value.data(), size);
+            if (length && length < size) {
+                value.resize(length);
+                return std::filesystem::path(value);
+            }
+        }
+        if (!config.empty()) return shader_directory_from_file(config);
+        std::wstring exe(32768, L'\0');
+        const DWORD length = ::GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+        if (!length || length >= exe.size()) return {};
+        exe.resize(length);
+        return shader_directory_from_file(std::filesystem::path(exe).parent_path() / L"shader_path.txt");
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return {};
+    }
 }
 
 }  // namespace rt::d3d12

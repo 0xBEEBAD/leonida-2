@@ -152,11 +152,11 @@ The design is therefore an **IR per command list**:
 - `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle's recorded commands and calls are replayed at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
 - Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves, `SetPredication`, `DiscardResource`, the atomic copies, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets` and `ClearState`; `WriteBufferImmediate` is allowed in a bundle); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. `d3d12_bundle_forbidden_test` measured the last four on the PC runtime without the debug layer: the bundle's `Close` fails (`E_FAIL`, where this layer gives `E_INVALIDARG`) on the default adapter and on WARP, and executing a bundle whose `Close` failed crashes the runtime, so the layer refuses it in `ExecuteBundle` instead. A bundle has no render targets, viewport or root signature of its own, so its state calls (pipeline state, root signature and arguments, vertex and index buffers, topology, blend factor, stencil references) and its draws and dispatches are kept as they were called, and `ExecuteBundle` plays them on the parent through the same members the application would have called. A draw then snapshots the parent's state plus what the bundle set, and what the bundle set stays on the parent afterwards. Commands that need no state (markers, immediate writes) are copied between them in order. `d3d12_bundle_test` measured the rule on the PC runtime, where the default adapter (an RTX 4060 Ti) and WARP drew the same picture in every case it ran. A bundle's draws see the parent's render targets, viewport and scissor, root signature and arguments (also when the bundle sets the same root signature first, so those arguments stay), and vertex and index buffers. A bundle starts with the pipeline state it was created or reset with, not the parent's. After `ExecuteBundle` the parent has that pipeline state and whatever else the bundle set: topology, root arguments, vertex and index buffers, and a different root signature with the bundle's arguments in place of the parent's. Topology: the default adapter takes the parent's when the bundle sets none. That is more lenient than Microsoft's stated rule (topology is undefined when a bundle begins), and WARP follows the rule by removing the device when a bundle draws or hands back without one, so a bundle should set it; the layer follows the default adapter. A bundle that sets a root argument before any root signature crashes the NVIDIA driver (the layer applies it to the parent's signature). The deferred calls are checked when they play, against the parent's root signature, so a bad one makes the parent's `Close` fail, not the bundle's. A per-list state setter must go through the deferred path (`defer()` in `d3d12_com.cpp`, replaying through a private member that does not trace) to work in a bundle. Not deferred yet: `ExecuteIndirect` in a bundle, and bundle `Dispatch` has no GPU test.
 - What `Close` returns after one recorded call is compared with the PC runtime over WARP (no debug layer) by
-  `d3d12_close_parity_test`, 100 cases on fresh lists, nothing executed. 62 agree; the other 38 are listed in the
-  test as known differences. In 23 the layer fails a list WARP closes: draws and dispatches with no pipeline,
+  `d3d12_close_parity_test`, 113 cases on fresh lists, nothing executed. 82 agree; the other 31 are listed in the
+  test as known differences. In 16 the layer fails a list WARP closes: draws and dispatches with no pipeline,
   root arguments before a root signature, a `CopyTextureRegion` box that is empty or inverted, footprint to
   footprint or at an unaligned footprint offset or pitch, `CopyResource` of a resource onto itself,
-  `ClearDepthStencilView` with no flag, an unknown flag or a depth outside 0..1, vertex-buffer slots past 31,
+  `ClearDepthStencilView` with an unknown flag, vertex-buffer slots past 31,
   17 viewports, an `OCCLUSION` query ended as `BINARY_OCCLUSION`, and `WriteBufferImmediate` at an address that
   is not 4-aligned. Since one failed list fails the whole `ExecuteCommandLists`, each of these drops a submission
   D3D12 would run. In 15 the layer closes a list WARP fails (redundant or out-of-range barriers, copies past a
@@ -204,7 +204,9 @@ What is implemented (all of it testable without the game):
   A `ClearDepthStencilView` flag for a plane the view's format doesn't have is ignored, as the PC runtime (WARP)
   does: `STENCIL` on a `D32_FLOAT` view clears nothing and `DEPTH | STENCIL` clears the depth plane. Until 2026-11-23
   `prepare` returned `invalid_clear` for it and the whole list was dropped (D3D-437); `d3d12_clear_test` compares three
-  such cases with WARP.
+  such cases with WARP. The depth value is kept as given: on a `D32_FLOAT` target WARP stores 1.5, -0.5 and NaN
+  unchanged, and a clear whose flags name no plane clears nothing, so neither fails the list any more
+  (`d3d12_clear_test` reads the texels back on WARP and here; `d3d12_close_parity_test` compares the `Close` verdicts).
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
   `vulkan_sync` / `vulkan_barrier_access` / `vulkan_layout` to `vkCmdPipelineBarrier2`. Whole-view clears are
@@ -419,6 +421,13 @@ What is implemented (all of it testable without the game):
     own T# format (`1_5_5_5_UNORM`, 134), so a shader store needs the translator to pack the 5-5-5-1 bits for that
     view; until it does, `CheckFeatureSupport` does not advertise the typed UAV. Multisampled UAV textures are still
     refused (`d3d12_b5g5r5a1_uav_test`);
+  - `R8G8B8A8_UNORM_SRGB` and `B8G8R8A8_UNORM_SRGB` with `ALLOW_UNORDERED_ACCESS`, which the host runtime sizes and
+    creates (RTX 4090 and WARP) and a retail title sizes as a 2048x2048, 12-mip render target, on a GPU whose sRGB
+    format lacks `STORAGE_IMAGE` (most): a mutable image of the UNORM format of the same order, with both formats in
+    its format list (`Format::uint_backed`). Its storage view is UNORM, as every D3D12 typed UAV of these textures
+    is, so shaders and `ClearUnorderedAccessViewFloat` write raw bytes; RTVs and SRVs are sRGB, so clears and
+    rendering encode and sampling decodes. BGRA8 needs `B8G8R8A8_UNORM` storage. Both clears match WARP byte for
+    byte; multisampled ones are still refused (`d3d12_srgb_uav_test`);
   - `B8G8R8X8_UNORM`, `_UNORM_SRGB` and `_TYPELESS` (D3D-87) are `B8G8R8A8` images: clears, copies and footprints
     keep all four bytes (WARP writes the clear's alpha into the X byte too), and shader views read alpha as 1. Its
     typeless family is its own, so views to or from `B8G8R8A8` are refused, unless the texture's castable-format
@@ -465,7 +474,11 @@ What is implemented (all of it testable without the game):
   - `GetCopyableFootprints` for buffers, 1D and 1D-array textures, 2D textures and volumes, including BC1–7 and the
     two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
-    depth-stencil rows are padded to 512 bytes, not 256.
+    depth-stencil rows are padded to 512 bytes, not 256, and that subresources are aligned to 512 bytes counting
+    from `BaseOffset`, not from 0: the PC runtime moves the whole layout by the base, so an unaligned base (513,
+    2^32 + 1) keeps the same relative offsets and the same total (measured on an AMD Radeon RX 7600, drivers 26.11.1
+    and 26.11.2, Windows 10 in-box runtime; aligning from 0 gives mismatching offsets and totals at both unaligned
+    bases and none at 0 and 1024, which is why it went unnoticed).
   - the `1`/`2`/`3` variants as wrappers over the methods above (D3D-28): `CreateCommittedResource1/2/3`,
     `CreateCommandQueue1` and `GetCopyableFootprints1`. `D3D12_RESOURCE_DESC1` drops to `D3D12_RESOURCE_DESC`,
     and the initial state or `D3D12_BARRIER_LAYOUT` is not used, because new textures start `UNDEFINED` and move
@@ -1479,10 +1492,19 @@ The layer therefore owns the console VAs. It returns them from `ID3D12Resource::
 | Address space | Two ranges. A **BDA arena** holds buffers, descriptor heaps and shader code; its device address is `heap_base`. A separate **image key range** supplies unique console VAs for images; those keys are never added to `heap_base`. The arena's `VkBuffer` is created with all buffer usages the game can bind (uniform, storage, vertex, index, indirect, transfer) plus `SHADER_DEVICE_ADDRESS`, and its memory with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`. |
 | Buffers | A buffer resource is a range in the arena's single `VkBuffer`: offset = its console VA, size = the resource size. Buffer commands bind the arena buffer with that offset, so its device address is exactly `arena_bda + offset`; no per-resource `VkBuffer` object is needed. |
 | Images | Each image gets a unique console VA key and lives in its own `VkDeviceMemory` (or a suballocated device-local image heap) with optimal tiling. Shader image access goes through the T#/hash table, so nothing dereferences the key. Keeping images out of the arena avoids forcing optimal-tiled images into the arena's memory type and keeps the arena sized by buffers, not textures. |
-| Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture (1D, 2D or 3D) gets its own `VkDeviceMemory` and a null VA, as in D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures (D3D-191) and multisampled 2D placed textures (D3D-222) share that backing, answer `GetResourceAllocationInfo` and `GetResourceTiling`, and check heap/offset alignments. Reserved buffers can use heap tile mappings (section 4.2). |
+| Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture (1D, 2D or 3D) gets its own `VkDeviceMemory`; one the title placed at its own address through the console's `CreatePlacedResourceX` (Xbox device slot 133) reports that title address from `GetGPUVirtualAddress`, as the console does — a title turns it into the CPU pointer it clears the texture through — while its pixels do not alias the title's pages yet. Any other texture answers a null VA, as on D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures (D3D-191) and multisampled 2D placed textures (D3D-222) share that backing, answer `GetResourceAllocationInfo` and `GetResourceTiling`, and check heap/offset alignments. Reserved buffers can use heap tile mappings (section 4.2). |
 | Descriptor heaps | Shader-visible CBV/SRV/UAV and sampler heaps are allocated in the low 4 GB of the arena. RTV/DSV heaps are host-side only. |
 | Shader code | Each FSSM blob is uploaded to the arena; its console VA is the code base. |
 | Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**ASSUMPTION**; **measured to fail for a V#**, see below). |
+
+**Measured (XCL, retail title, PR #168):** the console answers a placed texture's `GetGPUVirtualAddress` with the
+address the title placed it at; the title clears a 256×256 `R32_FLOAT` texture through that value as a CPU pointer.
+On the PC, where D3D12 answers 0 for a texture, that write went to address 0. XCL returns the title address when the
+PC answers 0 and leaves buffers and resources with a PC address unchanged
+([`real.rs`](https://github.com/ivall/xcl/blob/main/crates/xcl/src/hle/d3d12x/real.rs), PR
+[#168](https://github.com/ivall/xcl/pull/168)). Facts only: XCL is GPL-2.0-only and no code is copied. This layer
+sets a slot-133 fallback texture's `GetGPUVirtualAddress` to the title address; the image itself still does not
+alias the title's pages.
 
 Non-arena buffers (upload/readback) can still be addressed by the shader without putting them in the arena: pass
 `console_va = host_bda - heap_base` (mod 2^64) in root descriptors and vertex/index/indirect views, so the shader's
@@ -3044,6 +3066,12 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
   `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
+  `LEONIDA_PRESENT_UNCAP` (any non-empty value other than "0", read when the object is made) takes the frame-rate
+  cap off: a wait hands its token out at once (no vblank grid, no latency throttle) and `PresentX` presents
+  unsynced — MAILBOX or IMMEDIATE, not FIFO — so the frame rate is whatever the title renders; registration and
+  suspension errors are unchanged, and the statistics of an uncapped frame report its present time. This covers
+  the frame-event cap only: a cap inside the game's own code would still apply, and the DXGI swapchain fallback
+  keeps the app's sync interval.
   `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render;
   `PercentScanned` only for a frame shown at once by `ImmediateThresholdPercent`, else 0); `S_FALSE` with count 0 for what it does not have.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
@@ -3237,6 +3265,13 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   presents a loading screen with `Token = 0`, presents again with one token, or presents from a render thread out of
   order must not freeze. So those are presented anyway and logged once per kind; only a token that was never handed
   out gives `E_INVALIDARG` (nothing presented). Skipping a token is fine.
+- *Frame capture* (`LEONIDA_CAPTURE=<dir>`, `LEONIDA_CAPTURE_EVERY=<n>`, `LEONIDA_CAPTURE_LIMIT=<n>`): writes
+  every n-th presented frame (default 30, at most 24) to `<dir>/frame_NNNNN.ppm`, a binary P6 of the swapchain image
+  converted to 8-bit RGB, and appends one line per frame to `<dir>/index.txt` with the extent and the mean RGB. Off
+  unless the variable is set, and the folder is created. This is what a check reads when it has to know what the
+  layer actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
+  mean is enough to tell a real frame from a black one. `d3d12_present_test` turns it on and checks the files against
+  the colour it clears to.
 - *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
   with `ERROR_INVALID_STATE` and refuses presents (a `PresentX` waiting for a swapchain image polls the suspended
   state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until
