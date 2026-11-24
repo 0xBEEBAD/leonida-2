@@ -5,7 +5,7 @@ OS:         Windows 11 Home Single Language, build 26300
 Commit:     2d73c242fddfe26d57b52ee150704e6c3b23cff4 (main, 2026-11-24)
 Tools:      llvm-mc 21.1.8 (scripts\build_llvm_mc.ps1, AMDGPU target), SPIRV-Tools v2026.4 RC2,
             Vulkan SDK 1.4.363.0, CMake 4.4.4 + Ninja 1.13.2,
-            MSVC 14.44.35207 (VS Build Tools 2022 17.14), Python 3.14.10
+            MSVC 14.44.35207 (VS Build Tools 2022 17.14), Python 3.14.10 (MSYS2 UCRT64)
 CPU:        AMD Ryzen 7 7435HS
 RAM:        31.82 GiB reported
 
