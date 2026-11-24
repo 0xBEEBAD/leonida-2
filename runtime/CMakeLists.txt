@@ -838,6 +838,17 @@ if(BUILD_TESTING)
     set_target_properties(tiny_game_fixed PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # The same game built with /GA, as a title's executable is: its thread_local reads go to module TLS index 0
+    # without _tls_index, and under gta6rt index 0 is gta6rt.exe's own (docs/boot_leads.md, BL-1).
+    add_executable(tiny_game_ga test/fixtures/tiny_game.cpp)
+    target_link_libraries(tiny_game_ga PRIVATE xgameruntime_stub)
+    target_compile_definitions(tiny_game_ga PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(tiny_game_ga PRIVATE /W4 /permissive- /utf-8 /EHsc /GA)
+    # /GA can remove the _tls_index reference that pulls in the CRT TLS directory.
+    target_link_options(tiny_game_ga PRIVATE /INCLUDE:_tls_used)
+    set_target_properties(tiny_game_ga PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+    )
     add_executable(tiny_game_exit_code_test test/tiny_game_exit_code_test.cpp)
     target_compile_definitions(tiny_game_exit_code_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
@@ -1386,6 +1397,9 @@ if(BUILD_TESTING)
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
+    # The /GA build of the same game: thread_local on the entry thread and on a thread it starts, through index-0
+    # reads, while index 0 holds gta6rt.exe's own TLS.
+    add_test(NAME run_tiny_game_ga_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game_ga> -- hello 42 tls)
     # BUILD-1457: the stack a game thread gets. gta6rt_stack reads SizeOfStackReserve from the built loader (nothing
     # is run); run_tiny_game_stack asks Windows, on the entry thread and on a thread created with dwStackSize 0.
     add_test(NAME gta6rt_stack COMMAND "${CMAKE_COMMAND}"
