@@ -104,6 +104,8 @@ public:
     bool sampler_filter_minmax = false;
     bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
+    bool storage_image_extended_formats = false; // typed r8ui storage images
+    bool maintenance10 = false;  // depth/stencil transfers on non-graphics families, per format
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
     // VK_KHR_maintenance5 enabled, where VK_FORMAT_A8_UNORM_KHR can be sampled and blended as a colour attachment, as
@@ -111,11 +113,16 @@ public:
     bool a8_render_target = false;
     // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
     VkDeviceSize host_pointer_alignment = 0;
+    bool sliced_3d_uav = false;    // imageSlicedViewOf3D and robustImageAccess enabled
+    bool robust_image_access = false;
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
+    bool prepare_on_bind=false;
+    bool first_use_backend_pipelines=false;
+    bool cold_graphics_compile = false;
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
@@ -176,6 +183,17 @@ public:
     bool create(bool presentation = false) { return initialize(presentation) == DeviceStatus::ready; }
 
     DeviceStatus initialize(bool presentation = false) {
+        return initialize_device(presentation, false, true);
+    }
+
+    // Headless UAV tests can request sliced views and opt out of legacy formatless storage image features.
+    DeviceStatus initialize(bool enable_sliced_3d_uav, bool enable_legacy_formatless_features) {
+        return initialize_device(false, enable_sliced_3d_uav, enable_legacy_formatless_features);
+    }
+
+private:
+    DeviceStatus initialize_device(bool presentation, bool enable_sliced_3d_uav,
+                                   bool enable_legacy_formatless_features) {
         const auto failure = [](const char* call, VkResult result) {
             std::fprintf(stderr, "%s failed (VkResult %d)\n", call, static_cast<int>(result));
             return DeviceStatus::failed;
@@ -335,7 +353,9 @@ public:
         std::printf("device: %s%s%s\n", chosen.deviceName, v13_.core ? "" : " (Vulkan 1.2 + KHR extensions)",
                     validation ? " (validation on)" : "");
 
-        VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+        VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                                     v13_.core ? &features13 : nullptr};
         VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features11};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         features2_of(physical, &features);
@@ -375,8 +395,18 @@ public:
                     subgroup.subgroup_size_control ? "on" : "off", subgroup.compute_full_subgroups ? "on" : "off");
         // shaderDrawParameters, where available: translated vertex shaders will read BaseVertex and BaseInstance once PR 436
         // (zero-based VS ids) is in; harmless before.
+        const char* compile_mode = std::getenv("LEONIDA_PIPELINE_COMPILE");
+        const bool cache_only = compile_mode && std::strcmp(compile_mode, "cache-only") == 0;
+        v13_.enable_pipeline_cache_control = cache_only && v13_.core && v13_.pipeline_cache_control;
+        cold_graphics_compile = v13_.enable_pipeline_cache_control;
+        prepare_on_bind = compile_mode && std::strcmp(compile_mode, "on-demand") == 0;
+        first_use_backend_pipelines = prepare_on_bind || (compile_mode && std::strcmp(compile_mode, "first-use") == 0);
         VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                                   v13_.enable(conditional_rendering ? &enable_conditional : nullptr)};
+        if (v13_.core) {
+            robust_image_access = features13.robustImageAccess == VK_TRUE;
+            static_cast<VkPhysicalDeviceVulkan13Features*>(enable11.pNext)->robustImageAccess = robust_image_access;
+        }
         enable11.shaderDrawParameters = features11.shaderDrawParameters;
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
@@ -430,14 +460,19 @@ public:
             sharing_.push_back(f);
         }
         VkPhysicalDeviceFeatures enable{};
+        storage_image_extended_formats = features.features.shaderStorageImageExtendedFormats == VK_TRUE;
+        enable.shaderStorageImageExtendedFormats = storage_image_extended_formats;
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        enable.shaderStorageImageReadWithoutFormat =
+            enable_legacy_formatless_features && features.features.shaderStorageImageReadWithoutFormat;
+        enable.shaderStorageImageWriteWithoutFormat =
+            enable_legacy_formatless_features && features.features.shaderStorageImageWriteWithoutFormat;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
-        enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -536,6 +571,22 @@ public:
         }
 #endif
 
+        const char* sliced_name = VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME;
+        VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT sliced{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
+        if (enable_sliced_3d_uav && robust_image_access &&
+            std::any_of(extensions.begin(), extensions.end(), [&](const auto& e) {
+                return std::strcmp(e.extensionName, sliced_name) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &sliced};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            sliced_3d_uav = sliced.imageSlicedViewOf3D == VK_TRUE;
+            if (sliced_3d_uav) {
+                sliced.pNext = *v13_.next();
+                *v13_.next() = &sliced;
+            }
+        }
+
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         // VK_KHR_shader_fma where the device has it: translated shaders built with --fma khr use OpFmaKHR.
         VkPhysicalDeviceShaderFmaFeaturesKHR fma_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
@@ -605,6 +656,22 @@ public:
         if (a8_render_target) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
         if (host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        if (sliced_3d_uav) device_extensions.push_back(sliced_name);
+#ifdef VK_KHR_maintenance10
+        VkPhysicalDeviceMaintenance10FeaturesKHR maint10{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_FEATURES_KHR};
+        if (v13_.core && all_queue_types && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_MAINTENANCE_10_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maint10};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            maintenance10 = maint10.maintenance10 == VK_TRUE;
+            if (maintenance10) {
+                maint10.pNext = *v13_.next();
+                *v13_.next() = &maint10;
+                device_extensions.push_back(VK_KHR_MAINTENANCE_10_EXTENSION_NAME);
+            }
+        }
+#endif
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
 #if defined(VK_KHR_swapchain_maintenance1)
@@ -655,6 +722,7 @@ public:
         return result == VK_SUCCESS ? DeviceStatus::ready : failure("vkCreateCommandPool", result);
     }
 
+public:
     bool depth_format_usable(VkFormat format) const {
         VkFormatProperties properties{};
         instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(physical, format,

@@ -9,6 +9,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include "queue_families.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -23,8 +24,9 @@ public:
     // A device-local allocation for a chunk; null on failure.
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
-    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate)
-        : device_(device), allocate_(std::move(allocate)) {
+    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate,
+                   std::vector<std::uint32_t> families = {})
+        : device_(device), allocate_(std::move(allocate)), families_(std::move(families)) {
         loaded_ = vk_.load(get, device);
     }
 
@@ -149,6 +151,8 @@ private:
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        // A retired chunk can be reused by a submission on a different queue family.
+        share_across_queue_families(info, families_);
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);
@@ -172,6 +176,7 @@ private:
 
     VkDevice device_;
     Allocate allocate_;
+    std::vector<std::uint32_t> families_;
     Functions vk_;
     bool loaded_ = false;
     Batch current_;               // handed out, not yet submitted

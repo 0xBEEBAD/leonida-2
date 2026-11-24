@@ -14,11 +14,12 @@
 // locally at a title's call sites (each function says which). The page functions are built on the Windows placeholder
 // APIs (VirtualAlloc2, MapViewOfFile3), whose flags the title's own XMemVirtualAlloc calls already use.
 #include <windows.h>
+#include <winioctl.h>
+#include <filesystem>
 #include <intrin.h>
 #include <malloc.h>
 #include <psapi.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -36,8 +37,9 @@
 
 #include "shims.h"
 #include "startup_trace.h"
-#include "../src/title_va_alias.h"
 #include "xmem.h"
+#include "../src/gpu_label_memory.h"
+#include "../src/title_va_alias.h"
 
 namespace {
 
@@ -71,13 +73,21 @@ void* allocate_block(size_t size) { return _aligned_malloc(size ? size : 1, kAli
 
 // Every block and range the title gets here is recorded as the title's memory (src/title_va_alias.h): a shader
 // address into it can be given a GPU copy, and an address anywhere else cannot.
+void track_label_data(void* p,std::size_t bytes,bool heap) {
+    if(!p)return; MEMORY_BASIC_INFORMATION info{};
+    if(VirtualQuery(p,&info,sizeof(info)) && info.Type==MEM_PRIVATE)
+        leonida::label::memory().track(reinterpret_cast<std::uintptr_t>(p),bytes,reinterpret_cast<std::uintptr_t>(info.AllocationBase),heap);
+}
+
 void* title_block(size_t size) {
     void* p = allocate_block(size);
     leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(p), size ? size : 1);
+    track_label_data(p,size?size:1,true);
     return p;
 }
 
 void free_title_block(void* p) {
+    if(p)leonida::label::memory().release_heap(reinterpret_cast<std::uintptr_t>(p));
     if (p) leonida::title_va_aliases().remove_title_memory(reinterpret_cast<uintptr_t>(p));
     _aligned_free(p);
 }
@@ -252,12 +262,45 @@ struct Window {
     DWORD protect;
 };
 
+// A sparse temporary file gives large physical pools real shared pages without reserving their
+// total size against the process's pagefile commitment. Views retain the section until the last alias dies.
+HANDLE file_backed_section(std::uint64_t bytes) {
+    wchar_t dir[32768]{};
+    const auto len = GetEnvironmentVariableW(L"LEONIDA_XMEM_BACKING_DIR", dir, DWORD(std::size(dir)));
+    if (!len || len >= std::size(dir)) return nullptr;
+    const std::filesystem::path parent(dir);
+    if (!parent.is_absolute()) return nullptr;
+    static std::atomic<unsigned> sequence{};
+    const auto name = L"physical-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                      std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(++sequence) + L".tmp";
+    const HANDLE file = CreateFileW((parent / name).c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
+                                   FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    DWORD ignored{};
+    LARGE_INTEGER size{};
+    size.QuadPart = static_cast<LONGLONG>(bytes);
+    HANDLE section = nullptr;
+    if (DeviceIoControl(file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &ignored, nullptr) &&
+        SetFilePointerEx(file, size, nullptr, FILE_BEGIN) && SetEndOfFile(file))
+        section = CreateFileMappingW(file, nullptr, PAGE_READWRITE, size.HighPart, size.LowPart, nullptr);
+    CloseHandle(file);
+    return section;
+}
+
 struct Section {
     HANDLE handle;
-    explicit Section(HANDLE h) : handle(h) {}
+    void* scratch;
+    bool file_backed;
+    Section(HANDLE h, bool use_file) : handle(h), scratch(MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0)), file_backed(use_file) {}
     Section(const Section&) = delete;
     Section& operator=(const Section&) = delete;
-    ~Section() { CloseHandle(handle); }
+    ~Section() {
+        if (scratch) UnmapViewOfFile(scratch);
+        CloseHandle(handle);
+    }
 };
 
 struct PhysicalPage {
@@ -277,16 +320,28 @@ std::map<uintptr_t, Window> g_windows;              // base -> window
 std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
-// A mapped run: `count` pages of one section at consecutive offsets, mapped as one view at its base. One view per run
-// rather than per page: under Wine each view costs a placeholder split and a section map whose time grows with the
-// number of views, and the retail title maps about 100,000 pages in one call.
-struct View {
-    uint64_t count;
-    std::shared_ptr<Section> section;  // kept for remapping part of the run after its pages are freed
-    uint64_t offset;                   // section offset of the first page
-    DWORD protect;
+struct MappedPage {
+    uint64_t page;
+    std::shared_ptr<Section> section;
+    uint64_t offset;
 };
-std::map<uintptr_t, View> g_views;  // view base -> view
+
+std::unordered_map<uintptr_t, MappedPage> g_mapped;
+SRWLOCK g_fault_lock = SRWLOCK_INIT;
+
+struct FaultLockExclusive {
+    FaultLockExclusive() { AcquireSRWLockExclusive(&g_fault_lock); }
+    ~FaultLockExclusive() { ReleaseSRWLockExclusive(&g_fault_lock); }
+    FaultLockExclusive(const FaultLockExclusive&) = delete;
+    FaultLockExclusive& operator=(const FaultLockExclusive&) = delete;
+};
+
+struct FaultLockShared {
+    FaultLockShared() { AcquireSRWLockShared(&g_fault_lock); }
+    ~FaultLockShared() { ReleaseSRWLockShared(&g_fault_lock); }
+    FaultLockShared(const FaultLockShared&) = delete;
+    FaultLockShared& operator=(const FaultLockShared&) = delete;
+};
 
 // With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
 // kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
@@ -353,6 +408,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     // The title's memory (src/title_va_alias.h). Never forgotten: a released range is no longer committed, which
     // the copy also checks.
     if (result) leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(result), size);
+    if(result)track_label_data(result,size,false);
     return result;
 }
 
@@ -460,73 +516,18 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, ULON
     return VirtualAlloc(address, size, host_type, host_prot);
 }
 
-// With g_phys_mutex held. Maps `view` at the 64 KiB-aligned `address`, which holds no mapped page. MEM_REPLACE_PLACEHOLDER
-// needs the view to fill one placeholder exactly, and earlier partial unmaps can leave several host placeholders in one
-// run, so the run is mapped as one view per placeholder it spans. Views are capped at kMaxViewPages so that unmapping a
-// page inside a long run only remaps the rest of one capped view, not the whole run.
-constexpr uint64_t kMaxViewPages = 1024;  // 64 MiB
-
-bool map_view(uintptr_t address, const View& view) {
-    for (uint64_t mapped = 0; mapped < view.count;) {
-        const uintptr_t base = address + mapped * kPhysicalPageSize;
-        void* const target = reinterpret_cast<void*>(base);
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(target, &info, sizeof(info)) || info.State != MEM_RESERVE ||
-            info.RegionSize < kPhysicalPageSize) {
-            SetLastError(ERROR_INVALID_ADDRESS);
-            return false;
-        }
-        const uint64_t available = info.RegionSize / kPhysicalPageSize;
-        const uint64_t remaining = view.count - mapped;
-        const uint64_t count = (std::min)({available, remaining, kMaxViewPages});
-        const SIZE_T size = static_cast<SIZE_T>(count * kPhysicalPageSize);
-        const uint64_t offset = view.offset + mapped * kPhysicalPageSize;
-        if (!isolate_placeholder(target, size)) return false;
-        if (!placeholder_api().map_view3(view.section->handle, GetCurrentProcess(), target, offset, size,
-                                         MEM_REPLACE_PLACEHOLDER, view.protect, nullptr, 0)) {
-            return false;
-        }
-        g_views.emplace(base, View{count, view.section, offset, view.protect});
-        mapped += count;
+// With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
+bool unmap_page(uintptr_t address) {
+    const FaultLockExclusive lock;
+    const auto it = g_mapped.find(address);
+    if (it == g_mapped.end()) return true;
+    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
+                                       MEM_PRESERVE_PLACEHOLDER)) {
+        return false;
     }
+    g_mapped.erase(it);
     return true;
 }
-
-// With g_phys_mutex held. Unmaps every page in [start, end); the addresses become placeholders again. A view that
-// reaches outside the range is unmapped whole, and its pages outside the range are mapped again, so neighbours keep
-// their pages.
-bool unmap_range(uintptr_t start, uintptr_t end) {
-    auto it = g_views.upper_bound(start);
-    if (it != g_views.begin()) {
-        const auto prev = std::prev(it);
-        if (prev->first + prev->second.count * kPhysicalPageSize > start) it = prev;
-    }
-    while (it != g_views.end() && it->first < end) {
-        const uintptr_t base = it->first;
-        const View view = it->second;
-        const uintptr_t view_end = base + view.count * kPhysicalPageSize;
-        if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(base),
-                                           MEM_PRESERVE_PLACEHOLDER)) {
-            return false;
-        }
-        it = g_views.erase(it);
-        if (base < start) {
-            View left = view;
-            left.count = (start - base) / kPhysicalPageSize;
-            if (!map_view(base, left)) return false;
-        }
-        if (view_end > end) {
-            const uint64_t skipped = (end - base) / kPhysicalPageSize;
-            View right = view;
-            right.count = view.count - skipped;
-            right.offset += skipped * kPhysicalPageSize;
-            return map_view(end, right);  // the last view the range touches
-        }
-    }
-    return true;
-}
-
-bool unmap_page(uintptr_t address) { return unmap_range(address, address + kPhysicalPageSize); }
 
 // With g_phys_mutex held. Maps physical page `page` (0: unmap) at the 64 KiB-aligned `address`, replacing what was
 // mapped there. The caller has found the window.
@@ -538,7 +539,81 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
-    return map_view(address, View{1, it->second.section, it->second.offset, protect});
+    void* const target = reinterpret_cast<void*>(address);
+    if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
+    const FaultLockExclusive lock;
+    void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
+                                                   it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
+                                                   protect, nullptr, 0);
+    if (!view) return false;
+    g_mapped[address] = MappedPage{page, it->second.section, it->second.offset};
+    return true;
+}
+
+enum class PageCommit { not_ours, committed_before, committed_now, failed };
+
+PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& protect) {
+    const auto it = g_mapped.find(address);
+    if (it == g_mapped.end() || !it->second.section->scratch) return PageCommit::not_ours;
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<void*>(accessed), &info, sizeof(info)) || info.Type != MEM_MAPPED) {
+        return PageCommit::not_ours;
+    }
+    if (info.State == MEM_COMMIT) {
+        protect = info.Protect;
+        return PageCommit::committed_before;
+    }
+    void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
+    return VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE) ? PageCommit::committed_now
+                                                                                 : PageCommit::failed;
+}
+
+bool access_allowed(DWORD protect, ULONG_PTR access) {
+    if (protect & PAGE_GUARD) return false;
+    switch (protect & 0xff) {
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:
+        return access != 8;
+    case PAGE_EXECUTE_READ:
+        return access != 1;
+    case PAGE_READONLY:
+        return access == 0;
+    case PAGE_EXECUTE:
+        return access == 8;
+    default:
+        return false;
+    }
+}
+
+LONG CALLBACK physical_page_fault(EXCEPTION_POINTERS* info) {
+    thread_local bool busy = false;
+    const EXCEPTION_RECORD* record = info ? info->ExceptionRecord : nullptr;
+    if (busy || !record || record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    busy = true;
+    const uintptr_t accessed = static_cast<uintptr_t>(record->ExceptionInformation[1]);
+    const uintptr_t address = accessed & ~static_cast<uintptr_t>(kPhysicalPageSize - 1);
+    DWORD protect = 0;
+    PageCommit result;
+    {
+        const FaultLockShared lock;
+        result = commit_mapped_page(address, accessed, protect);
+    }
+    busy = false;
+    if (result == PageCommit::committed_now) return EXCEPTION_CONTINUE_EXECUTION;
+    if (result == PageCommit::committed_before && access_allowed(protect, record->ExceptionInformation[0])) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool install_physical_page_fault_handler() {
+    static const bool installed = AddVectoredExceptionHandler(1, &physical_page_fault) != nullptr;
+    return installed;
 }
 
 // Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
@@ -576,7 +651,7 @@ void note_physical_attributes(uint64_t attributes, uint64_t count, const void* c
 // a 32-bit BOOL. After success every caller compares the count with the one it asked for and frees the pages if they
 // differ, so the count is in/out.
 //
-// Each call is backed by one pagefile-backed section of count * 64 KiB: committed (charged) at once, given physical
+// Each call is backed by one pagefile-backed section of count * 64 KiB: committed (charged) on touch, given physical
 // memory as it is touched, zero-filled. Pages keep their contents while unmapped or mapped elsewhere, and one page can
 // be mapped at several addresses. ASSUMPTION: the attribute word (memory type, perhaps the page size) is not decoded;
 // every page is 64 KiB, which all four callers' arithmetic agrees with.
@@ -595,14 +670,25 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return FALSE;
     }
+    if (!install_physical_page_fault_handler()) {
+        *page_count = 0;
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
     const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
-    const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+    HANDLE handle = file_backed_section(bytes);
+    const bool use_file = handle != nullptr;
+    if (!handle) handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                              static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
     if (!handle) {
         *page_count = 0;
         return FALSE;
     }
-    const auto section = std::make_shared<Section>(handle);
+    const auto section = std::make_shared<Section>(handle, use_file);
+    if (!section->scratch) {
+        *page_count = 0;
+        return FALSE;
+    }
     for (uint64_t i = 0; i < count; ++i) {
         uint64_t slot;
         if (!g_free_slots.empty()) {
@@ -645,9 +731,8 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // or null to unmap that many (four calls at shutdown). Callers test the 64-bit result for zero, so it is the address on
 // success. A page number of 0 in the array unmaps that one page.
 //
-// Consecutive pages of one allocation are mapped as one view (MapViewOfFile3 into a placeholder of their size); a
-// page remapped or unmapped later splits its view, and its neighbours stay mapped. The range is unmapped first, so a
-// page number that is not a live page fails with the pages before it mapped and the rest of the range unmapped.
+// Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
+// without touching its neighbours. A failure part-way leaves the pages before it mapped.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
@@ -660,36 +745,20 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         return nullptr;
     }
     const std::lock_guard lock(g_phys_mutex);
-    const uintptr_t end = start + page_count * kPhysicalPageSize;
-    if (!page_array) return unmap_range(start, end) ? address : nullptr;
+    if (!page_array) {
+        for (uint64_t i = 0; i < page_count; ++i) {
+            if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
+        }
+        return address;
+    }
     const Window* const window = find_window(start, page_count * kPhysicalPageSize);
     if (!window) {
         SetLastError(ERROR_INVALID_ADDRESS);
         return nullptr;
     }
     const DWORD protect = view_protect(*window);
-    if (!unmap_range(start, end)) return nullptr;
-    for (uint64_t i = 0; i < page_count;) {
-        if (page_array[i] == 0) {
-            ++i;
-            continue;
-        }
-        const auto it = g_pages.find(page_array[i]);
-        if (it == g_pages.end()) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return nullptr;
-        }
-        View view{1, it->second.section, it->second.offset, protect};
-        while (i + view.count < page_count) {
-            const auto next = g_pages.find(page_array[i + view.count]);
-            if (next == g_pages.end() || next->second.section != view.section ||
-                next->second.offset != view.offset + view.count * kPhysicalPageSize) {
-                break;
-            }
-            ++view.count;
-        }
-        if (!map_view(start + i * kPhysicalPageSize, view)) return nullptr;
-        i += view.count;
+    for (uint64_t i = 0; i < page_count; ++i) {
+        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
     }
     return address;
 }
@@ -794,9 +863,26 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
 constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
+BOOL WINAPI TitleVirtualFree(LPVOID address,SIZE_T size,DWORD flags) {
+    DWORD saved=0;
+    const bool ok=leonida::label::memory().release_pages(reinterpret_cast<std::uintptr_t>(address),size,(flags&MEM_RELEASE)!=0,[&]{
+        const BOOL r=::VirtualFree(address,size,flags);saved=GetLastError();return !!r;
+    });
+    SetLastError(saved);return ok?TRUE:FALSE;
+}
+BOOL WINAPI TitleVirtualFreeEx(HANDLE process,LPVOID address,SIZE_T size,DWORD flags) {
+    if(GetProcessId(process)!=GetCurrentProcessId())return ::VirtualFreeEx(process,address,size,flags);
+    DWORD saved=0;
+    const bool ok=leonida::label::memory().release_pages(reinterpret_cast<std::uintptr_t>(address),size,(flags&MEM_RELEASE)!=0,[&]{
+        const BOOL r=::VirtualFreeEx(process,address,size,flags);saved=GetLastError();return !!r;
+    });
+    SetLastError(saved);return ok?TRUE:FALSE;
+}
+
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
     LPVOID result = VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
     if (result) leonida::title_va_aliases().add_title_memory(reinterpret_cast<uintptr_t>(result), size);
+    if(result)track_label_data(result,size,false);
     return result;
 }
 
@@ -804,35 +890,85 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
 
 namespace rt::xmem {
 
-// main's xmem commits physical pages on first touch and exposes these two for code that must see them committed
-// (slot 133's import, d3d12_xmem_placed_test). Here a physical page is committed when it is allocated, so there is
-// nothing to do: the range only has to be mapped, readable memory, and the page array non-null.
-bool commit_physical_range(const void* address, std::size_t size) {
+bool commit_physical_range(const void* address, size_t size) {
     if (size == 0) return true;
-    const auto* at = static_cast<const std::uint8_t*>(address);
-    const auto* const end = at + size;
-    while (at < end) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(at, &info, sizeof(info)) || info.State != MEM_COMMIT) {
-            SetLastError(ERROR_INVALID_ADDRESS);
-            return false;
-        }
-        at = static_cast<const std::uint8_t*>(info.BaseAddress) + info.RegionSize;
-    }
-    return true;
-}
-
-bool commit_physical_pages(const std::uint64_t* page_array, std::size_t count) {
-    if (count && !page_array) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    if (start > (std::numeric_limits<uintptr_t>::max)() - (size - 1)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
+    const uintptr_t mask = ~static_cast<uintptr_t>(kPhysicalPageSize - 1);
+    const uintptr_t first = start & mask;
+    const uintptr_t pages = (((start + (size - 1)) & mask) - first) / kPhysicalPageSize + 1;
+    const FaultLockShared lock;
+    for (uintptr_t i = 0; i < pages; ++i) {
+        DWORD protect = 0;
+        const uintptr_t page = first + i * kPhysicalPageSize;
+        if (commit_mapped_page(page, page, protect) == PageCommit::failed) return false;
+    }
     return true;
 }
 
-}  // namespace rt::xmem
+std::shared_ptr<std::uint8_t> pin_mapped_data(const void* address, std::size_t size) {
+    const auto start = reinterpret_cast<std::uintptr_t>(address);
+    if (!size || !start || size > UINTPTR_MAX - start) return {};
+    const auto end = start + size;
+    const auto first = start & ~std::uintptr_t(kPhysicalPageSize - 1);
+    const FaultLockShared lock;
+    const auto base = g_mapped.find(first);
+    if (base == g_mapped.end() || !base->second.section || !base->second.section->scratch) return {};
+    const auto section = base->second.section;
+    const auto offset = base->second.offset;
+    for (auto page=first; page<end; page+=kPhysicalPageSize) {
+        const auto it = g_mapped.find(page);
+        if (it==g_mapped.end() || it->second.section != section || it->second.offset != offset+page-first) return {};
+        DWORD previous{};
+        const auto ready = commit_mapped_page(page, std::max(page,start), previous);
+        if (ready!=PageCommit::committed_before && ready!=PageCommit::committed_now) return {};
+    }
+    for (auto at=start; at<end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) ||
+            info.Type!=MEM_MAPPED || info.State!=MEM_COMMIT || (info.Protect & (PAGE_NOACCESS|PAGE_GUARD)) ||
+            ((info.Protect & 255)!=PAGE_READWRITE && (info.Protect & 255)!=PAGE_WRITECOPY)) return {};
+        at=reinterpret_cast<std::uintptr_t>(info.BaseAddress)+info.RegionSize;
+    }
+    return {section,static_cast<std::uint8_t*>(section->scratch)+offset+(start-first)};
+}
 
-#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
+bool commit_physical_pages(const uint64_t* page_array, size_t count) {
+    if (count == 0) return true;
+    if (!page_array) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const std::lock_guard lock(g_phys_mutex);
+    size_t first = 0;
+    while (first < count) {
+        const auto it = g_pages.find(page_array[first]);
+        if (it == g_pages.end() || !it->second.section->scratch) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        size_t last = first + 1;
+        while (last < count) {
+            const auto next = g_pages.find(page_array[last]);
+            if (next == g_pages.end() || next->second.section != it->second.section ||
+                next->second.offset != it->second.offset + (last - first) * kPhysicalPageSize) {
+                break;
+            }
+            ++last;
+        }
+        void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
+        if (!it->second.section->file_backed && !VirtualAlloc(backing, (last - first) * kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
+        first = last;
+    }
+    return true;
+}
+
+}
+
+#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}, {dll,"VirtualFree",reinterpret_cast<void*>(&TitleVirtualFree)}, {dll,"VirtualFreeEx",reinterpret_cast<void*>(&TitleVirtualFreeEx)}
 
 // The classic libraries and the memory api sets a title's imports name.
 SHIM_TABLE(title_memory,

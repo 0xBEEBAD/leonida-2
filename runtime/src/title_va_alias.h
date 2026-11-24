@@ -12,10 +12,9 @@
 // submission), or its device address minus heap_base (mod 2^64) when it has its own memory (an imported slot-133
 // buffer). Addresses that are not in the title's memory are passed through unchanged.
 //
-// The table is process-wide, like the title's address space. The device behind it registers two hooks: a resolver
-// that makes a GPU copy for an address in the title's memory that has none yet, and a scanner that rewrites the
-// buffer V#s of a bound descriptor table before a submission. Without hooks the table only translates what was
-// added to it, so it is tested without a GPU (title_va_alias_test).
+// The table is process-wide, like the title's address space. A resolver makes a GPU copy for an address in the
+// title's memory that has none yet. Without it the table only translates previously added ranges.
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -37,7 +36,6 @@ public:
     // An address in the title's memory: true, with `shader_va` what a shader must be given (the address itself when
     // no copy could be made). False: not the title's memory (an arena VA, a buffer of the layer's).
     using Resolver = bool (*)(void* context, std::uint64_t va, std::uint64_t bytes, std::uint64_t& shader_va);
-    using TableScanner = void (*)(void* context, std::uint64_t table_va, std::uint32_t descriptors);
 
     // [title_va, title_va + bytes) is reached as [shader_va, shader_va + bytes). A range that overlaps a live one
     // replaces it (the title has placed a new buffer over pages it released). False for an empty or wrapping range.
@@ -109,19 +107,6 @@ public:
         if (va && shader_va(va) != va) untranslated_[kind].fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Before a submission: the device rewrites the buffer V#s of the `descriptors` slots the root signature declares
-    // for the table at `table_va` (a console VA in one of its shader-visible CBV/SRV/UAV heaps).
-    void scan_table(std::uint64_t table_va, std::uint32_t descriptors) {
-        TableScanner scanner;
-        void* context;
-        {
-            std::lock_guard lock(hook_mutex_);
-            scanner = scanner_;
-            context = hook_context_;
-        }
-        if (scanner) scanner(context, table_va, descriptors);
-    }
-
     // The scan's cost, per ExecuteCommandLists that had tables to scan.
     void note_scan(std::uint64_t nanoseconds) {
         scans_.fetch_add(1, std::memory_order_relaxed);
@@ -189,20 +174,18 @@ public:
     }
     std::uint64_t pulled() const { return pulled_.load(std::memory_order_relaxed); }
 
-    // The first device to register keeps the hooks until it clears them.
-    void set_hooks(void* context, Resolver resolver, TableScanner scanner) {
+    // The first device to register keeps the resolver until it clears it.
+    void set_resolver(void* context, Resolver resolver) {
         std::lock_guard lock(hook_mutex_);
         if (hook_context_) return;
         hook_context_ = context;
         resolver_ = resolver;
-        scanner_ = scanner;
     }
-    void clear_hooks(void* context) {
+    void clear_resolver(void* context) {
         std::lock_guard lock(hook_mutex_);
         if (hook_context_ != context) return;
         hook_context_ = nullptr;
         resolver_ = nullptr;
-        scanner_ = nullptr;
     }
 
     std::size_t size() const { return count_.load(std::memory_order_acquire); }
@@ -230,7 +213,6 @@ private:
     std::mutex hook_mutex_;
     void* hook_context_ = nullptr;
     Resolver resolver_ = nullptr;
-    TableScanner scanner_ = nullptr;
     void* source_context_ = nullptr;
     DescriptorSource source_ = nullptr;
     std::atomic<std::uint64_t> pulled_{0};

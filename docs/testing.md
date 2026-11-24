@@ -178,7 +178,29 @@ python -I runtime/test/shaders/build.py <out-dir> vs_ids ps_mullit
 python -I runtime/test/shaders/mullit_readback.py <out-dir> <harness-directory>
 ```
 
-For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
+For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with
+validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is
+installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal
+the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
+
+On Windows, `run_gpu_tests.py` assembles and translates the D3D-78 fixture and runs the UAV readback and WARP
+comparison from the same build folder. Use `--filter cs_texture_uav` to run only this case:
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = "1"
+python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_texture_uav
+```
+
+Use the actual configuration subfolder for the executables with a multi-config generator. The native Windows
+case reports SKIP without WARP or a sufficiently capable Vulkan device; failed translation, a missing test
+executable on Windows, and readback mismatches fail the runner. Devices without sliced 3D views still run the 1D,
+array and whole-mip cases and check that partial views are refused.
+
+CTest runs the same D3D-78 descriptor creation, copy, range/refusal and clear checks with `--descriptors-only`.
+That mode requires Vulkan, but not a translated shader or WARP. The GPU runner still exercises dispatch and readback.
+
+Use `--filter cs_imgload_mip` to check 2D `image_load_mip` on FLOAT (UNORM), UINT and SINT sampled views with
+both full-width and D16 loads; mip 0 contains decoy data and mip 1 holds the expected texels.
 
 `vk_compute_test`, `vk_bindless_test` and `vk_image_fuzz` read `LEONIDA_VK_VALIDATION` too (`vk_compute_test`
 through `runtime/test/vk_validation.h`): each validation message goes to stderr and a validation error makes the

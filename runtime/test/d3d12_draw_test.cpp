@@ -16,6 +16,7 @@
 //     or across B8G8R8X8 and B8G8R8A8: the bytes land in the view's order and encoding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "../src/title_va_alias.h"
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
 #include "vk_test_device.h"
@@ -43,6 +44,24 @@ using namespace d3d12test;
 using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: handle in RAX
 
 namespace {
+
+struct TitleGeometryPages {
+    static constexpr UINT bytes_per_view = 3 * 1024 * 1024;
+    static constexpr UINT count = 7;
+    std::byte* base = nullptr;
+    ~TitleGeometryPages() {
+        if (base) {
+            leonida::title_va_aliases().remove_title_memory(reinterpret_cast<UINT64>(base));
+            VirtualFree(base,0,MEM_RELEASE);
+        }
+    }
+    bool allocate() {
+        base = static_cast<std::byte*>(VirtualAlloc(nullptr,SIZE_T(bytes_per_view)*count,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+        if(!base) return false;
+        leonida::title_va_aliases().add_title_memory(reinterpret_cast<UINT64>(base),SIZE_T(bytes_per_view)*count);
+        return true;
+    }
+};
 
 struct Vertex {
     float x, y;
@@ -381,7 +400,15 @@ int main() {
         // State for the draws; the pipeline came with CreateCommandList.
         list->SetGraphicsRootSignature(root.p);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        const D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
+        const bool large_batch = std::getenv("LEONIDA_TEST_GEOMETRY_BATCH") != nullptr;
+        TitleGeometryPages title_vertices;
+        D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
+        if (large_batch) {
+            EXPECT(title_vertices.allocate());
+            std::memcpy(title_vertices.base,vertices,sizeof(vertices));
+            vbv.BufferLocation=reinterpret_cast<UINT64>(title_vertices.base);
+            vbv.SizeInBytes=TitleGeometryPages::bytes_per_view;
+        }
         list->IASetVertexBuffers(0, 1, &vbv);
         const D3D12_INDEX_BUFFER_VIEW ibv{upload_va + 256, sizeof(indices), DXGI_FORMAT_R16_UINT};
         list->IASetIndexBuffer(&ibv);
@@ -426,6 +453,18 @@ int main() {
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
+        if (large_batch) {
+            // More live bytes than the old 16 MiB ring. These zero-area triangles genuinely consume
+            // six separate CPU-backed views without changing the reference image of the five prior draws.
+            list->SetPipelineState(pso.p);
+            for (UINT i=1; i<TitleGeometryPages::count; ++i) {
+                const D3D12_VERTEX_BUFFER_VIEW extra{reinterpret_cast<UINT64>(title_vertices.base)+
+                    UINT64(i)*TitleGeometryPages::bytes_per_view,TitleGeometryPages::bytes_per_view,sizeof(Vertex)};
+                list->IASetVertexBuffers(0,1,&extra);
+                list->DrawInstanced(3,1,0,0);
+            }
+            list->IASetVertexBuffers(0,1,&vbv);
+        }
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &to_copy);

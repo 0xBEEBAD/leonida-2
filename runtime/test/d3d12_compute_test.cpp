@@ -308,6 +308,8 @@ int main() {
         srv_struct_b(elements), srv_typed(elements), srv_null(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
+        info.first_use_backend_pipelines=d.first_use_backend_pipelines;
+        info.prepare_on_bind=d.prepare_on_bind;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;
@@ -691,11 +693,11 @@ int main() {
                 leonida::gfx10::Buffer decoded{};
                 EXPECT(leonida::gfx10::decode(raw, decoded));
                 EXPECT(decoded.address == expected_va);
-                EXPECT(decoded.stride == 0);
-                EXPECT(decoded.num_records == 256);
+                EXPECT(decoded.stride == 16);
+                EXPECT(decoded.num_records == 16);
                 EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
                 EXPECT(decoded.swizzle == leonida::gfx10::identity_swizzle);
-                EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::raw);
+                EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::structured_with_offset);
                 EXPECT(std::memcmp(reinterpret_cast<const std::uint8_t*>(slot_cpu(slot_idx).ptr) + 16, zeros, 16) == 0);
             }
 
