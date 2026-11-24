@@ -8,7 +8,7 @@
 // list, which D3D12 orders on the queue and needs an explicit dependency for on Vulkan. Part H copies depth to colour
 // and back (D32_FLOAT <-> R32_FLOAT), which the replay stages through a scratch buffer. Part I resolves a depth
 // rectangle (MIN) and checks that the texels around it keep their values. Part J copies between disjoint regions
-// of one texture subresource. Part K releases textures with a barrier into LAYOUT_UNDEFINED and uses one again.
+// of one texture subresource. Part L releases textures with a barrier into LAYOUT_UNDEFINED and uses one again.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -1265,14 +1265,89 @@ int part_j(vktest::Device& d) {
     return 0;
 }
 
-// Part K: an enhanced barrier into LAYOUT_UNDEFINED releases a texture (D3D-BARRIER-INTO-UNDEFINED). Vulkan has no
+// Part K (D3D-838): an enhanced barrier with SYNC_COPY orders a WriteBufferImmediate before it. The write is recorded
+// as vkCmdUpdateBuffer, which synchronization2 runs in the CLEAR stage, not COPY, and a DEFAULT-mode write gets no
+// barrier of its own (replay leaves it to the application's). So: the write puts a word in src, a SYNC_COPY ->
+// SYNC_COPY buffer barrier (COPY_DEST -> COPY_SOURCE) follows, and CopyBufferRegion copies the word to dst. Under
+// LEONIDA_VK_VALIDATION=1 synchronization validation reports the read-after-write hazard when the barrier's source
+// stages leave CLEAR out; in every run the copied word is checked.
+int part_k(vktest::Device& d) {
+    constexpr VkDeviceSize bytes = 256;
+    constexpr std::uint64_t va_src = 0x50000;
+    constexpr std::uint32_t value = 0x5eed1234;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    void *src_mapped = nullptr, *dst_mapped = nullptr;
+    const VkBuffer src = d.buffer(bytes, usage, &src_mapped);
+    const VkBuffer dst = d.buffer(bytes, usage, &dst_mapped);
+    EXPECT(src && dst && src_mapped && dst_mapped);
+    std::memset(src_mapped, 0, bytes);
+    std::memset(dst_mapped, 0, bytes);
+
+    constexpr ResourceId src_id = 50, dst_id = 51;
+    ResourceBinding src_binding{}, dst_binding{};
+    src_binding.buffer = src;
+    src_binding.size = bytes;
+    src_binding.va = va_src;
+    dst_binding.buffer = dst;
+    dst_binding.size = bytes;
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        if (id == src_id) return &src_binding;
+        if (id == dst_id) return &dst_binding;
+        return nullptr;
+    };
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.pipeline_barrier2 = d.fn<PFN_vkCmdPipelineBarrier2>("vkCmdPipelineBarrier2");
+    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");  // replay wants all four copy functions
+    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+    vk.update_buffer = d.fn<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer");
+    vk.buffer_at = [&](std::uint64_t va, std::uint64_t length, VkBuffer& buffer, VkDeviceSize& offset) {
+        if (va < va_src || va - va_src >= bytes || length > bytes - (va - va_src)) return false;
+        buffer = src;
+        offset = va - va_src;
+        return true;
+    };
+
+    namespace ac = d3d12_access;
+    namespace y = d3d12_sync;
+    CommandList list;
+    EXPECT(list.write_immediate({va_src + 8, value, write_immediate_mode::normal}));
+    EXPECT(list.barrier(BufferBarrier{y::copy, y::copy, ac::copy_dest, ac::copy_source, src_id}));
+    EXPECT(list.copy_buffer({dst_id, 16, src_id, 8, 4}));
+    EXPECT(list.close());
+
+    const unsigned errors_before = d.validation_errors();
+    ReplayResult result = ReplayResult::success;
+    EXPECT(d.run([&](VkCommandBuffer cb) {
+        result = replay(list, cb, resolve, vk);
+        if (result != ReplayResult::success) std::fprintf(stderr, "K: replay returned %d\n", int(result));
+        return result == ReplayResult::success;
+    }));
+    const unsigned errors = d.validation_errors() - errors_before;
+    std::uint32_t copied = 0;
+    std::memcpy(&copied, static_cast<const std::uint8_t*>(dst_mapped) + 16, 4);
+    if (copied != value) {
+        std::fprintf(stderr, "K: copied 0x%08x, want 0x%08x\n", copied, value);
+        ++g_mismatches;
+    }
+    if (errors) {
+        std::fprintf(stderr, "K: %u validation errors: a SYNC_COPY barrier does not cover vkCmdUpdateBuffer\n", errors);
+        return 1;
+    }
+    std::printf("K: SYNC_COPY orders WriteBufferImmediate (vkCmdUpdateBuffer, CLEAR stage) before a copy\n");
+    return 0;
+}
+
+// Part L: an enhanced barrier into LAYOUT_UNDEFINED releases a texture (D3D-BARRIER-INTO-UNDEFINED). Vulkan has no
 // transition into UNDEFINED, so the replay keeps the layout of every plane and only orders the accesses. Released
 // here: a colour target after a clear, a depth buffer whose two planes are in different layouts, and an image nothing
 // has used. The colour target is then taken from UNDEFINED again, cleared and read back. Under
 // LEONIDA_VK_VALIDATION=1 these barriers must pass the validation layer.
-int part_k(vktest::Device& d) {
+int part_l(vktest::Device& d) {
     if (!d.depth_format_usable(VK_FORMAT_D32_SFLOAT_S8_UINT)) {
-        std::printf("K: skipped, no D32_SFLOAT_S8_UINT\n");
+        std::printf("L: skipped, no D32_SFLOAT_S8_UINT\n");
         return 0;
     }
     constexpr std::uint32_t size = 4, texels = size * size;
@@ -1372,9 +1447,9 @@ int part_k(vktest::Device& d) {
     EXPECT(before[2] != before[1] && before[2] != VK_IMAGE_LAYOUT_UNDEFINED && after[2] == before[2]);
     EXPECT(tracker.layout(rt_id, 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     const auto* data = static_cast<const std::uint8_t*>(mapped);
-    for (std::uint32_t i = 0; i < texels; ++i) expect_rgba("K reuse", data, i, green);
+    for (std::uint32_t i = 0; i < texels; ++i) expect_rgba("L reuse", data, i, green);
     const unsigned errors = d.validation_errors() - errors_before;
-    std::printf("K: a target, a depth buffer in two plane layouts and an unused image released into UNDEFINED; "
+    std::printf("L: a target, a depth buffer in two plane layouts and an unused image released into UNDEFINED; "
                 "%u texels of the reused target%s\n", texels,
                 d.validation ? (errors ? ": validation errors" : ", no validation errors") : " (validation off)");
     return 0;
@@ -1391,7 +1466,7 @@ int main() {
     }
     EXPECT(status == vktest::DeviceStatus::ready);
     if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device) ||
-        part_g(device) || part_h(device) || part_i(device) || part_j(device) || part_k(device))
+        part_g(device) || part_h(device) || part_i(device) || part_j(device) || part_k(device) || part_l(device))
         return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {
