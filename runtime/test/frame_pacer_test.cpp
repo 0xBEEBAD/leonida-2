@@ -840,6 +840,44 @@ int main() {
         EXPECT(uncap.target_interval_us == 0 && near(uncap.drift_us, 0.0) && uncap.p50_us == period);
     }
 
+    // BL-6 with the bounded queue: the statistics are of PresentX calls, so a frame replaced in a full queue (never
+    // shown) still counts as a present, with its real present-to-present interval; the replacement adds no interval,
+    // removes none, and the frames that are shown keep their vblanks. Latency 1, so every extra present replaces.
+    {
+        auto near = [](double a, double b) { return (a > b ? a - b : b - a) < 1e-6; };
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period);  // origin 1
+        std::uint64_t tok1 = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &tok1) == pacer_hr::ok && tok1 == 1);
+        clock.advance_us(1000);
+        pacer.commit_present_token(tok1, 1);  // latency 1000; queued for vblank 2
+        clock.advance_us(2000);
+        pacer.note_untokened_present();  // interval 2000; replaces tok1 and takes vblank 2
+        clock.advance_us(4000);
+        pacer.note_untokened_present();  // interval 4000; replaces the blank frame
+        EXPECT(pacer.frames_in_flight() == 1);
+        clock.advance_us(period - 7000);  // vblank 2, origin 2
+        EXPECT(pacer.frames_in_flight() == 0);
+        EXPECT(display_time(pacer, tok1) == no_deadline);  // replaced: never shown
+        std::uint64_t tok2 = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &tok2) == pacer_hr::ok && tok2 == 2);
+        clock.advance_us(8000);
+        pacer.commit_present_token(tok2, 1);  // interval period + 1000; latency 8000; vblank 3
+        clock.advance_us(period - 8000);
+        EXPECT(display_time(pacer, tok2) == 3 * std::uint64_t(period));
+
+        // 4 presents (2 of them replaced), 3 intervals {2000, 4000, 17000}: nearest-rank p50 4000, p95 and p99 17000.
+        const FramePacingSummary s = pacer.pacing_summary();
+        EXPECT(s.frames == 4 && s.samples == 3 && s.target_interval_us == period);
+        EXPECT(near(s.mean_us, (2000.0 + 4000.0 + period + 1000.0) / 3.0));
+        EXPECT(near(s.drift_us, s.mean_us - double(period)));
+        EXPECT(s.p50_us == 4000 && s.p95_us == period + 1000 && s.p99_us == period + 1000);
+        // Origin-to-present latencies of the tokened presents, the replaced tok1 included: {1000, 8000}.
+        EXPECT(s.latency_samples == 2 && s.latency_p50_us == 1000 && s.latency_p99_us == 8000);
+    }
+
     std::printf("frame_pacer_test: all cases pass\n");
     return 0;
 }

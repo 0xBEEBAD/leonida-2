@@ -3009,8 +3009,11 @@ queue they came on (one `VkQueue` behind all of them).
   `SuspendX`/`ResumeX` so suspended pauses are excluded), computing nearest-rank `p50`/`p95`/`p99` and the mean drift
   against the active target interval (`FramePacer::pacing_summary()`). On teardown after at least one present,
   `XboxPresentation` logs a single `[rt] present: pacing summary ...` line on stderr, which `tools/boot_trace.py`
-  surfaces beside the D3D12 call counts. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
-  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode) and by
+  surfaces beside the D3D12 call counts. The intervals are between `PresentX` calls, not between frames shown: a frame
+  replaced in a full queue (see the latency limit above) still counts as a present with its real interval, so the
+  percentiles describe the title's present cadence, and a burst of presents between two waits shows up as short
+  intervals. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
+  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode, replaced frames) and by
   `tests/test_boot_trace.py`.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
