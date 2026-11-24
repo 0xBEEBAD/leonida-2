@@ -119,6 +119,14 @@ jobs:
               stop(f"The {label} collection is too large to sync safely.")
           
           
+          def is_rate_limit_error(error):
+              if not isinstance(error, dict):
+                  return False
+              error_type = error.get("type")
+              if error_type is not None:
+                  return error_type == "RATE_LIMITED"
+              return "rate limit" in (error.get("message") or "").casefold()
+
           def graphql_json(payload):
               for attempt in range(2):
                   request = urllib.request.Request(
@@ -136,14 +144,7 @@ jobs:
                       with urllib.request.urlopen(request, timeout=25) as response:
                           result = json.load(response)
                           errors = result.get("errors") or []
-                          limited = bool(errors) and all(
-                              isinstance(error, dict)
-                              and (
-                                  error.get("type") == "RATE_LIMITED"
-                                  or "rate limit" in (error.get("message") or "").casefold()
-                              )
-                              for error in errors
-                          )
+                          limited = bool(errors) and all(is_rate_limit_error(error) for error in errors)
                           retry_after = response.headers.get("Retry-After")
                           try:
                               delay = float(retry_after) if retry_after is not None else None
@@ -155,12 +156,31 @@ jobs:
                           return result
                   except urllib.error.HTTPError as error:
                       detail = error.read().decode("utf-8", "replace")
+                      try:
+                          error_payload = json.loads(detail)
+                      except (TypeError, ValueError):
+                          error_payload = {}
+                      body_errors = error_payload.get("errors") if isinstance(error_payload, dict) else None
+                      if body_errors:
+                          rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
+                      else:
+                          body_message = error_payload.get("message", "") if isinstance(error_payload, dict) else ""
+                          rate_limited_http = error.code == 429 or (
+                              error.code == 403
+                              and "rate limit" in str(body_message or detail).casefold()
+                          )
                       retry_after = error.headers.get("Retry-After")
                       try:
                           delay = float(retry_after) if retry_after is not None else None
                       except (TypeError, ValueError):
                           delay = None
-                      if error.code in (403, 429) and attempt == 0 and delay is not None and 0 <= delay <= 20:
+                      if (
+                          error.code in (403, 429)
+                          and rate_limited_http
+                          and attempt == 0
+                          and delay is not None
+                          and 0 <= delay <= 20
+                      ):
                           time.sleep(delay)
                           continue
                       stop(f"GitHub GraphQL request failed (HTTP {error.code}): {detail}")
@@ -204,10 +224,7 @@ jobs:
                       path = error.get("path") if isinstance(error, dict) else None
                       message = error.get("message") or "" if isinstance(error, dict) else str(error)
                       is_node_error = bool(path and path[0] == "nodes")
-                      is_rate_limited = isinstance(error, dict) and (
-                          error.get("type") == "RATE_LIMITED"
-                          or "rate limit" in message.casefold()
-                      )
+                      is_rate_limited = is_rate_limit_error(error)
                       if is_node_error and not is_rate_limited:
                           node_errors.append(error)
                       else:
@@ -846,6 +863,14 @@ jobs:
               stop(f"The {label} collection is too large to sync safely.")
           
           
+          def is_rate_limit_error(error):
+              if not isinstance(error, dict):
+                  return False
+              error_type = error.get("type")
+              if error_type is not None:
+                  return error_type == "RATE_LIMITED"
+              return "rate limit" in (error.get("message") or "").casefold()
+
           def graphql_json(payload):
               for attempt in range(2):
                   request = urllib.request.Request(
@@ -863,14 +888,7 @@ jobs:
                       with urllib.request.urlopen(request, timeout=25) as response:
                           result = json.load(response)
                           errors = result.get("errors") or []
-                          limited = bool(errors) and all(
-                              isinstance(error, dict)
-                              and (
-                                  error.get("type") == "RATE_LIMITED"
-                                  or "rate limit" in (error.get("message") or "").casefold()
-                              )
-                              for error in errors
-                          )
+                          limited = bool(errors) and all(is_rate_limit_error(error) for error in errors)
                           retry_after = response.headers.get("Retry-After")
                           try:
                               delay = float(retry_after) if retry_after is not None else None
@@ -882,12 +900,31 @@ jobs:
                           return result
                   except urllib.error.HTTPError as error:
                       detail = error.read().decode("utf-8", "replace")
+                      try:
+                          error_payload = json.loads(detail)
+                      except (TypeError, ValueError):
+                          error_payload = {}
+                      body_errors = error_payload.get("errors") if isinstance(error_payload, dict) else None
+                      if body_errors:
+                          rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
+                      else:
+                          body_message = error_payload.get("message", "") if isinstance(error_payload, dict) else ""
+                          rate_limited_http = error.code == 429 or (
+                              error.code == 403
+                              and "rate limit" in str(body_message or detail).casefold()
+                          )
                       retry_after = error.headers.get("Retry-After")
                       try:
                           delay = float(retry_after) if retry_after is not None else None
                       except (TypeError, ValueError):
                           delay = None
-                      if error.code in (403, 429) and attempt == 0 and delay is not None and 0 <= delay <= 20:
+                      if (
+                          error.code in (403, 429)
+                          and rate_limited_http
+                          and attempt == 0
+                          and delay is not None
+                          and 0 <= delay <= 20
+                      ):
                           time.sleep(delay)
                           continue
                       stop(f"GitHub GraphQL request failed (HTTP {error.code}): {detail}")
@@ -932,10 +969,7 @@ jobs:
                       path = error.get("path") if isinstance(error, dict) else None
                       message = error.get("message") or "" if isinstance(error, dict) else str(error)
                       is_node_error = bool(path and path[0] == "nodes")
-                      is_rate_limited = isinstance(error, dict) and (
-                          error.get("type") == "RATE_LIMITED"
-                          or "rate limit" in message.casefold()
-                      )
+                      is_rate_limited = is_rate_limit_error(error)
                       if is_node_error and not is_rate_limited:
                           node_errors.append(error)
                       else:
