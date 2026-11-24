@@ -513,7 +513,7 @@ jobs:
               if len(new_body) > 65536:
                   stop("The activity comment would exceed GitHub's comment limit; the previous comment was kept.")
               if normalize(new_body) == normalize(current_body):
-                  print(f"Activity comment is already current ({len(pulls)} open PRs; {updated_statuses} statuses updated).")
+                  print(f"Activity comment is already current ({len(pulls)} open PRs).")
               else:
                   api_json(
                       f"/repos/{OWNER}/{REPOSITORY}/issues/comments/{comment.get('id')}",
@@ -1024,7 +1024,7 @@ jobs:
               if len(new_body) > 65536:
                   stop("The activity comment would exceed GitHub's comment limit; the previous comment was kept.")
               if normalize(new_body) == normalize(current_body):
-                  print(f"Activity comment is already current ({len(pulls)} open PRs; {updated_statuses} statuses updated).")
+                  print(f"Activity comment is already current ({len(pulls)} open PRs).")
               else:
                   api_json(
                       f"/repos/{OWNER}/{REPOSITORY}/issues/comments/{comment.get('id')}",
