@@ -69,7 +69,7 @@ if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an old
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
-from mc_command import mc_command  # noqa: E402
+from mc_command import install_hint as mc_install_hint, mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
@@ -296,6 +296,14 @@ def appdata_hint(cmd: str) -> str:
                     "%USERPROFILE%\\.leonida\\llvm-mc), set LLVM_MC to the new path and reopen the terminal, or start "
                     "make_game.py with `py`.")
     return ""
+
+
+def spirv_tools_hint() -> str:
+    """Where spirv-as and spirv-val come from on this OS."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return "install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)"
+    return ("install your distribution's SPIRV-Tools package (Debian and Ubuntu: sudo apt install spirv-tools), "
+            "or the Vulkan SDK, https://vulkan.lunarg.com/")
 
 
 def need(exe: str, hint: str) -> str:
@@ -837,14 +845,11 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if "shaders" in stages:
         mc = mc_command()[0]
         if not (os.path.isfile(mc) or shutil.which(mc)):
-            missing.append(
-                "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
-                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
-                "LLVM_MC to the whole command, e.g. "
-                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)." + appdata_hint(mc))
+            missing.append("llvm-mc (LLVM 21+ with the AMDGPU target). " + mc_install_hint().replace("\n", " ")
+                           + " (docs/design.md)." + appdata_hint(mc))
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
-                missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
+                missing.append(f"{t}: " + spirv_tools_hint())
     if "assets" in stages:
         if not dotnet_sdk_ok():
             missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
