@@ -6,10 +6,12 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include "shims.h"
@@ -460,6 +462,41 @@ int main() {
         free_mem(in_va);
         free_mem(out_va);
         check(release_ctx(&xma_ctx) == S_OK, "Release XMA SHAPE contexts joins decoder cleanly");
+    }
+
+    // 9. ENABLE_XMA (starts/wakes the decoder worker) racing bind/release (stops it).
+    //    Every release must return; a lost stop would hang this block.
+    {
+        using RaceConnectFn = HRESULT(__stdcall*)(void*, uint32_t, uint32_t);
+        using RaceSubmitFn = HRESULT(__stdcall*)(void*, uint32_t, uint64_t, uint32_t, const void*, uint32_t);
+        using RaceReleaseFn = HRESULT(__stdcall*)(void*);
+
+        void* race_acp = nullptr;
+        check(create(&race_acp) == S_OK && race_acp != nullptr, "AcpHalCreate for XMA race test");
+        auto race_vt = *static_cast<void* const* const*>(race_acp);
+        const auto race_connect = reinterpret_cast<RaceConnectFn>(race_vt[0]);
+        const auto race_submit = reinterpret_cast<RaceSubmitFn>(race_vt[2]);
+        const auto race_release = reinterpret_cast<RaceReleaseFn>(race_vt[5]);
+        check(race_connect(race_acp, 0x1000, 0x1000) == S_OK, "Connect for XMA race test");
+
+        constexpr int kRaceIterations = 20000;
+        std::atomic<int> bind_failures{0};
+        std::thread enabler([&]() {
+            const uint32_t enable_arg = 1u;
+            for (int i = 0; i < kRaceIterations; ++i) {
+                race_submit(race_acp, 5, 0xe000u + static_cast<uint64_t>(i), 0xffffffffu,
+                            &enable_arg, 0);
+            }
+        });
+        for (int i = 0; i < kRaceIterations; ++i) {
+            TestShapeContexts race_ctx{};
+            race_ctx.numXmaContexts = 4;
+            if (alloc_ctx(&race_ctx) != S_OK) ++bind_failures;
+            if (release_ctx(&race_ctx) != S_OK) ++bind_failures;
+        }
+        enabler.join();
+        check(bind_failures == 0, "20000 bind/release cycles race ENABLE_XMA without hanging");
+        check(race_release(race_acp) == S_OK, "Release race AcpHal succeeds");
     }
 
     std::printf("acphal_test complete: %d checks, %d failures\n", g_checks, g_failures);

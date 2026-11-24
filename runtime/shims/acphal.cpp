@@ -34,6 +34,7 @@
 #include <optional>
 #include <set>
 #include <shared_mutex>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
@@ -666,34 +667,34 @@ private:
     void ensure_worker_and_wake() {
         std::lock_guard lock(worker_mutex_);
         if (!worker_.joinable()) {
-            stopping_ = false;
-            worker_ = std::thread([this]() { worker_loop(); });
+            worker_ = std::jthread([this](std::stop_token stop) { worker_loop(stop); });
         }
         wake_requested_ = true;
         worker_cv_.notify_one();
     }
 
+    // Each worker owns its stop_token, so a stop only ever reaches the thread it was
+    // sent to; a worker started after this call is unaffected by it.
     void stop_worker() {
-        std::thread to_join;
+        std::jthread to_join;
         {
             std::lock_guard lock(worker_mutex_);
             if (!worker_.joinable()) return;
-            stopping_ = true;
-            wake_requested_ = true;
-            worker_cv_.notify_one();
+            worker_.request_stop();
+            worker_cv_.notify_all();
             to_join = std::move(worker_);
         }
         if (to_join.joinable()) to_join.join();
     }
 
-    void worker_loop() {
+    void worker_loop(std::stop_token stop) {
         for (;;) {
             {
                 std::unique_lock lock(worker_mutex_);
-                if (stopping_) return;
+                if (stop.stop_requested()) return;
                 if (active_count_.load(std::memory_order_relaxed) == 0 && !wake_requested_) {
-                    worker_cv_.wait(lock, [this]() { return stopping_ || wake_requested_; });
-                    if (stopping_) return;
+                    worker_cv_.wait(lock, stop, [this]() { return wake_requested_; });
+                    if (stop.stop_requested()) return;
                 }
                 wake_requested_ = false;
             }
@@ -701,11 +702,11 @@ private:
             pump_all();
 
             std::unique_lock lock(worker_mutex_);
-            if (stopping_) return;
+            if (stop.stop_requested()) return;
             if (!wake_requested_ && active_count_.load(std::memory_order_relaxed) > 0) {
                 // One 256-byte output block lasts ~2.67 ms at 48 kHz mono.
-                worker_cv_.wait_for(lock, std::chrono::milliseconds(2),
-                                    [this]() { return stopping_ || wake_requested_; });
+                worker_cv_.wait_for(lock, stop, std::chrono::milliseconds(2),
+                                    [this]() { return wake_requested_; });
             }
         }
     }
@@ -716,9 +717,8 @@ private:
     std::atomic<uint32_t> active_count_{0};
 
     std::mutex worker_mutex_;
-    std::condition_variable worker_cv_;
-    std::thread worker_;
-    bool stopping_ = false;
+    std::condition_variable_any worker_cv_;
+    std::jthread worker_;
     bool wake_requested_ = false;
 };
 
