@@ -1622,7 +1622,8 @@ if(TARGET Vulkan::Headers)
   endif()
   if(WIN32 AND BUILD_TESTING)
     # Whole title-region import capability: one host allocation bound as a BDA buffer. The default case uses the
-    # measured 185 MiB placeholder size; a driver import-budget refusal is a reported capability result.
+    # measured 185 MiB placeholder size. A machine that cannot import (no importable usage/handle, an import-budget
+    # refusal, no host memory to commit it) exits 77 and is a reported capability result.
     add_executable(vk_host_region_import_test test/vk_host_region_import_test.cpp)
     target_link_libraries(vk_host_region_import_test PRIVATE Vulkan::Headers)
     target_compile_definitions(vk_host_region_import_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1631,6 +1632,11 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME vk_host_region_import COMMAND vk_host_region_import_test 185)
     set_tests_properties(vk_host_region_import PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The same import under VK_LAYER_KHRONOS_validation with synchronization validation. The binary exits 77 when
+    # the layer is not installed, so a machine without the SDK skips this variant instead of failing it.
+    add_test(NAME vk_host_region_import_validation COMMAND vk_host_region_import_test 185)
+    set_tests_properties(vk_host_region_import_validation PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+                         ENVIRONMENT "LEONIDA_VK_VALIDATION=1;VK_VALIDATE_SYNC=1")
     # VulkanPresenter tracker lock / failed-submit rollback and capture-buffer WAW synchronization.
     add_executable(vk_presenter_sync_test test/vk_presenter_sync_test.cpp)
     target_link_libraries(vk_presenter_sync_test PRIVATE Vulkan::Headers user32)
