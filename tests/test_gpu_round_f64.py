@@ -97,11 +97,15 @@ class RoundF64Oracle(unittest.TestCase):
         self.assertEqual(expected[word(8, 7):word(9, 0)], [0, 0])
 
 
+LLVMPIPE = "device: llvmpipe (LLVM 20.1.2, 256 bits) (subgroup 8..8)\n"
+NVIDIA = "device: NVIDIA GeForce RTX 4070 Ti (subgroup 32..32)\n"
+
+
 class RoundF64Judge(unittest.TestCase):
-    def judge(self, change):
+    def judge(self, change, out=""):
         _, expected = check.round_f64_words()
         change(expected)
-        return check.round_f64_problem(tuple(expected))
+        return check.round_f64_problem(tuple(expected), out)
 
     def set_result(self, thread, slot, bits):
         def change(data):
@@ -142,6 +146,66 @@ class RoundF64Judge(unittest.TestCase):
         self.assertIn(f"word {RESULTS}: an input changed", self.judge(lambda data: data.__setitem__(RESULTS, 1)))
         self.assertIn(f"word {WORDS - 1}: an input changed",
                       self.judge(lambda data: data.__setitem__(WORDS - 1, 0)))
+
+    def test_llvmpipe_s_float_path_passes_for_trunc_and_rndne_and_on_no_other_device(self):
+        index = check.ROUND_F64_VALUES.index
+        above_half, big = index(0x3FE0000000000001), index(bits_of(123456789.0625))
+        half_tie = index(0x4320000000000001)                      # 2^51 + 0.5
+        # What llvmpipe gave on a CPU without AVX-512: (thread, slot, the word it returned, what the judge calls it).
+        measured = ((above_half, 2, bits_of(0.0), "rndne of 0x3fe0000000000001"),
+                    (index(bits_of(1.5)), 2, bits_of(1.0), "rndne of 0x3ff8000000000000"),
+                    (index(0xC004000000000001), 2, bits_of(-2.0), "rndne of 0xc004000000000001"),
+                    (index(bits_of(5.5)), 7, bits_of(5.0), "rndne of 0x4016000000000000"),
+                    (big, 0, bits_of(123456789.0625), "trunc of 0x419d6f3454400000"),
+                    (big, 2, bits_of(123456789.0625), "rndne of 0x419d6f3454400000"),
+                    (half_tie, 4, 0xC320000000000001, "trunc of 0xc320000000000001"))   # the neg source
+        for thread, slot, bits, what in measured:
+            with self.subTest(what=what):
+                change = self.set_result(thread, slot, bits)
+                self.assertEqual(self.judge(change, LLVMPIPE), "")
+                for out in ("", NVIDIA):
+                    self.assertIn(f"word {word(thread, slot)} (thread {thread}): {what}", self.judge(change, out))
+
+    def test_llvmpipe_s_float_path_is_no_wider_than_measured(self):
+        index = check.ROUND_F64_VALUES.index
+        big, tie = index(bits_of(123456789.0625)), index(bits_of(2.5))
+        for thread, slot, wrong, what in (
+                (tie, 2, bits_of(4.0), "rndne of"),                        # not a neighbouring integer
+                (tie, 2, bits_of(-2.0), "rndne of"),                       # the sign of the source is lost
+                (tie, 0, bits_of(2.5), "trunc of"),                        # unchanged, but not above 2^24
+                (big, 0, bits_of(123456790.0), "trunc of"),                # above 2^24 only the source itself
+                (index(bits_of(1.5)), 1, bits_of(1.0), "ceil of"),         # Ceil is exact on that path
+                (big, 3, bits_of(123456789.0625), "floor of"),             # and so is Floor
+                (index(0x7FF0000000000000), 2, bits_of(1.0), "rndne of"),  # an infinity stays
+                (2, 2, bits_of(1.0), "rndne of"),                          # the smallest subnormal: below 0.5
+                (index(bits_of(0.25)), 0, bits_of(1.0), "trunc of"),       # and so is 0.25
+                (9, 7, 0, "the pair an inactive lane keeps")):
+            with self.subTest(thread=thread, slot=slot, wrong=hex(wrong)):
+                result = self.judge(self.set_result(thread, slot, wrong), LLVMPIPE)
+                self.assertIn(f"word {word(thread, slot)} (thread {thread}): {what}", result)
+
+    def test_the_float_path_allowance_covers_the_48_results_measured(self):
+        """The readback llvmpipe gives without AVX-512, as measured: RoundEven truncates where the binary32 of its
+        source is a tie or the source is just past one, and Trunc and RoundEven return a magnitude above 2^24
+        unchanged. Rebuilt here from those two rules for the inputs they change."""
+        _, data = check.round_f64_words()
+        changed = 0
+        truncating = {0x3FE0000000000001, 0xBFE0000000000001, bits_of(1.5), bits_of(-1.5), bits_of(3.5),
+                      bits_of(-3.5), 0xC004000000000001, bits_of(5.5), bits_of(-5.5)}
+        for thread, results in enumerate(check.round_f64_results()):
+            for slot, (op, source) in enumerate(results):
+                value = None
+                if op in ("trunc", "rndne") and math.isfinite(as_float(source)) and abs(as_float(source)) > 1 << 24:
+                    value = source
+                elif op == "rndne" and source in truncating:
+                    value = check.round_f64("trunc", source)
+                if value is not None and value != check.round_f64(op, source):
+                    data[word(thread, slot)], data[word(thread, slot) + 1] = value & 0xFFFFFFFF, value >> 32
+                    changed += 1
+        self.assertEqual(changed, 48)
+        self.assertEqual(check.round_f64_problem(tuple(data), LLVMPIPE), "")
+        self.assertIn("word 164 (thread 10): rndne of 0x3fe0000000000001 gave 0x0000000000000000",
+                      check.round_f64_problem(tuple(data)))
 
 
 class RoundF64Fixture(unittest.TestCase):
@@ -215,6 +279,15 @@ class RoundF64Readback(unittest.TestCase):
         self.assertIn(f"expected {4 * WORDS} dump bytes, got {4 * WORDS - 4}",
                       self.run_readback(lambda data: data.pop()))
         self.assertIn("no VKC_DUMP", self.run_readback(missing=True))
+
+    def test_the_device_line_reaches_the_judge(self):
+        thread = check.ROUND_F64_VALUES.index(bits_of(1.5))
+
+        def truncated_tie(data):
+            data[word(thread, 2)], data[word(thread, 2) + 1] = 0, bits_of(1.0) >> 32
+
+        self.assertEqual(self.run_readback(truncated_tie, output=LLVMPIPE), "")
+        self.assertIn("rndne of 0x3ff8000000000000", self.run_readback(truncated_tie, output=NVIDIA))
 
     def test_unsupported_float64_skips_but_nonzero_exit_fails(self):
         self.assertIsInstance(self.run_readback(code=77, output="unsupported: no Float64\n"), check.Skip)
