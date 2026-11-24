@@ -134,7 +134,9 @@ const char* slot_name(unsigned slot) {
         case 14: return "CreateDescriptorHeap";
         case 16: return "CreateRootSignature";
         case 25: return "GetResourceAllocationInfo";
+        case 26: return "GetCustomHeapProperties";
         case 27: return "CreateCommittedResource (PC slot 27)";
+        case 58: return "GetResourceAllocationInfo1";
         case 31: return "CreateSharedHandle (proxies unwrapped)";
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
         case 34: return "MakeResident (proxies unwrapped)";
@@ -1438,8 +1440,21 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
-                                                     *riid, &created);
+    const IID pc_list_iid = __uuidof(ID3D12GraphicsCommandList);
+    HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, *riid, &created);
+    if (hr == E_NOINTERFACE) {
+        // Console command-list IIDs are not exposed by PC/Vulkan devices (docs/retail_boot_chain.md §3.3); fall back
+        // to the base PC graphics command list and wrap it in the console list proxy.
+        static std::atomic<bool> iid_fallback_logged{false};
+        if (first_call(iid_fallback_logged)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 73 CreateCommandListX: console list IID rejected with E_NOINTERFACE; "
+                         "falling back to ID3D12GraphicsCommandList\n");
+        }
+        hr = self->real->CreateCommandList(0, type, allocator, initial_state, pc_list_iid, &created);
+        if (FAILED(hr)) return hr;
+        return wrap_list(static_cast<IUnknown*>(created), self, &pc_list_iid, out);
+    }
     if (FAILED(hr)) return hr;
     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
 }
@@ -1817,6 +1832,38 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     return handler(self->real, va, pc_desc, state, *riid, out);
 }
 
+void** get_vtable();
+
+// Xbox device slot 48 (CreateCommandQueueX): console queue descriptions can carry extra Xbox flag bits, non-PC
+// priority words or node masks past 1 (docs/retail_boot_chain.md §3.2). Clean PC descriptions are passed through
+// unchanged so callers and tests observe the original pointer; console-extended ones are sanitized into a PC copy.
+HRESULT proxy_create_command_queue_x(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* raw, const IID* riid,
+                                     void** out) {
+    if (!raw) return proxy_create_command_queue(self, nullptr, riid, out);
+    const auto raw_flags = static_cast<std::uint32_t>(raw->Flags);
+    const auto pc_flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(
+        raw_flags & static_cast<std::uint32_t>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT));
+    const bool valid_priority = raw->Priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ||
+                                raw->Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH ||
+                                raw->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME;
+    const bool needs_sanitize = (pc_flags != raw->Flags) || !valid_priority || raw->NodeMask > 1;
+    if (!needs_sanitize) return proxy_create_command_queue(self, raw, riid, out);
+
+    D3D12_COMMAND_QUEUE_DESC sanitized = *raw;
+    sanitized.Flags = pc_flags;
+    if (!valid_priority) sanitized.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    if (sanitized.NodeMask > 1) sanitized.NodeMask = 0;
+    static std::atomic<bool> logged{false};
+    if (first_call(logged)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 48 CreateCommandQueueX sanitized console desc "
+                     "(type=%d priority=%d->%d flags=0x%x->0x%x node=%u->%u)\n",
+                     static_cast<int>(raw->Type), raw->Priority, sanitized.Priority, raw_flags,
+                     static_cast<std::uint32_t>(sanitized.Flags), raw->NodeMask, sanitized.NodeMask);
+    }
+    return proxy_create_command_queue(self, &sanitized, riid, out);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1829,6 +1876,43 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return proxy_add_ref(self);
     } else if constexpr (Slot == 2) {
         return proxy_release(self);
+    } else if constexpr (Slot == 25 || Slot == 26 || Slot == 58) {
+        // Struct-returning device methods (docs/retail_boot_chain.md §3.1): Xbox callers pass
+        // (return_buffer, this, ...) in RCX/RDX, whereas PC MSVC expects (this, return_buffer, ...). Detect the
+        // swapped form by checking which of the first two registers holds the device proxy vtable.
+        DeviceProxy* proxy = self;
+        std::uint64_t ret_buf = a1;
+        void** const expected_vtbl = get_vtable();
+        if (!readable_range(proxy, sizeof(void*)) || proxy->vtable != expected_vtbl) {
+            auto* candidate = reinterpret_cast<DeviceProxy*>(a1);
+            if (readable_range(candidate, sizeof(void*)) && candidate->vtable == expected_vtbl) {
+                ret_buf = reinterpret_cast<std::uint64_t>(self);
+                proxy = candidate;
+                static std::atomic<bool> swap_logged[3];
+                const unsigned idx = Slot == 25 ? 0u : (Slot == 26 ? 1u : 2u);
+                if (first_call(swap_logged[idx])) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: device slot %u (%s) swapped (return_buffer, this) -> PC ABI\n",
+                                 Slot, slot_name(Slot));
+                }
+            }
+        }
+        note_slot(Slot);
+        if (!proxy || Slot >= proxy->slot_count) {
+            if (proxy) refuse_beyond_device(Slot, proxy->slot_count);
+            return ret_buf;
+        }
+        if constexpr (Slot == 26) {
+            using Fn4 = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t);
+            return reinterpret_cast<Fn4>(proxy->real_vtable[26])(proxy->real, ret_buf, a2, a3);
+        } else if constexpr (Slot == 25) {
+            using Fn5 = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+            return reinterpret_cast<Fn5>(proxy->real_vtable[25])(proxy->real, ret_buf, a2, a3, a4);
+        } else {
+            using Fn6 = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                               std::uint64_t);
+            return reinterpret_cast<Fn6>(proxy->real_vtable[58])(proxy->real, ret_buf, a2, a3, a4, a5);
+        }
     } else if constexpr (Slot == 8) {
         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
                                                     reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
@@ -1903,9 +1987,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         }
         if (Slot == routes.queue_x) {
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
-                                                        reinterpret_cast<const IID*>(a2),
-                                                        reinterpret_cast<void**>(a3)));
+            return hr_to_u64(proxy_create_command_queue_x(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+                                                          reinterpret_cast<const IID*>(a2),
+                                                          reinterpret_cast<void**>(a3)));
         }
         if (Slot == routes.list_x) {
             log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
@@ -2070,9 +2154,9 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76 || slot == 133)
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 25 || slot == 26 || slot == 31 || slot == 32 ||
+        slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 58 ||
+        slot == 62 || slot == 67 || slot == 75 || slot == 76 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

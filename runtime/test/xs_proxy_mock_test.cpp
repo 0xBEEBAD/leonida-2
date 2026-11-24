@@ -208,6 +208,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (a1 == kFenceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a2, a3));
                 if (a1 == kResourceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::resource, a2, a3));
                 return static_cast<std::uint32_t>(E_INVALIDARG);
+            case 25: case 26: case 58: return a1;  // struct-returning PC methods return their hidden buffer pointer
             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
@@ -1239,6 +1240,83 @@ int check_console_command_list() {
     return 0;
 }
 
+// ---- 11. Retail boot stops 7–9: struct-returning ABI swap (25/26/58), slot 48 desc sanitization, slot 73 IID fallback ----
+
+int check_boot_stops_7_9() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 11, true);
+    EXPECT(device != nullptr);
+    xs::reset_device_proxy_stats();
+
+    EXPECT(xs::device_slot_overridden(25) && xs::device_slot_overridden(26) && xs::device_slot_overridden(58));
+
+    // Stop 7: slots 25, 26, and 58 accept both PC (this, ret_buf, ...) and Xbox swapped (ret_buf, this, ...) order.
+    D3D12_HEAP_PROPERTIES heap_out{};
+    D3D12_RESOURCE_ALLOCATION_INFO alloc_out{};
+    D3D12_RESOURCE_ALLOCATION_INFO1 alloc1_out{};
+    using Raw4 = std::uint64_t(WINAPI*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+    using Raw5 = std::uint64_t(WINAPI*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+    using Raw6 = std::uint64_t(WINAPI*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                        std::uint64_t);
+    void** const vtbl = *static_cast<void***>(device);
+
+    // PC order on slot 26: (device, &heap_out, node_mask, heap_type)
+    EXPECT(reinterpret_cast<Raw4>(vtbl[26])(word(device), word(&heap_out), 1, D3D12_HEAP_TYPE_DEFAULT) ==
+           word(&heap_out));
+    EXPECT(mock->calls[26] == 1 && mock->args[26][0] == word(&heap_out) && mock->args[26][1] == 1 &&
+           mock->args[26][2] == static_cast<std::uint64_t>(D3D12_HEAP_TYPE_DEFAULT));
+
+    // Xbox swapped order on slot 26: (&heap_out, device, node_mask, heap_type)
+    EXPECT(reinterpret_cast<Raw4>(vtbl[26])(word(&heap_out), word(device), 0, D3D12_HEAP_TYPE_UPLOAD) ==
+           word(&heap_out));
+    EXPECT(mock->calls[26] == 2 && mock->args[26][0] == word(&heap_out) && mock->args[26][1] == 0 &&
+           mock->args[26][2] == static_cast<std::uint64_t>(D3D12_HEAP_TYPE_UPLOAD));
+
+    // Xbox swapped order on slot 25: (&alloc_out, device, visible_mask, count, descs)
+    EXPECT(reinterpret_cast<Raw5>(vtbl[25])(word(&alloc_out), word(device), 0, 1, 0x1234) == word(&alloc_out));
+    EXPECT(mock->calls[25] == 1 && mock->args[25][0] == word(&alloc_out) && mock->args[25][1] == 0 &&
+           mock->args[25][2] == 1 && mock->args[25][3] == 0x1234);
+
+    // Xbox swapped order on slot 58: (&alloc_out, device, visible_mask, count, descs, &alloc1_out)
+    EXPECT(reinterpret_cast<Raw6>(vtbl[58])(word(&alloc_out), word(device), 1, 2, 0x5678, word(&alloc1_out)) ==
+           word(&alloc_out));
+    EXPECT(mock->calls[58] == 1 && mock->args[58][0] == word(&alloc_out) && mock->args[58][1] == 1 &&
+           mock->args[58][2] == 2 && mock->args[58][3] == 0x5678 && mock->args[58][4] == word(&alloc1_out));
+
+    // Stop 8: slot 48 sanitizes Xbox flags, non-PC priority, and NodeMask > 1 into a valid PC queue desc.
+    D3D12_COMMAND_QUEUE_DESC console_qdesc{};
+    console_qdesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    console_qdesc.Priority = 0x1234;  // non-PC priority word
+    console_qdesc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(0x80000001u);  // extra console bit + DISABLE_GPU_TIMEOUT
+    console_qdesc.NodeMask = 7;
+    void* queue = nullptr;
+    const IID queue_iid = __uuidof(ID3D12CommandQueue);
+    EXPECT(hr_of(raw(device, 48, word(&console_qdesc), word(&queue_iid), word(&queue))) == S_OK);
+    EXPECT(xs::is_queue_proxy(queue) && mock->calls[8] == 1 && mock->args[8][0] != word(&console_qdesc));
+    EXPECT(release(queue) == 0);
+
+    // Stop 9: slot 73 falls back to ID3D12GraphicsCommandList when the real device refuses a console command-list IID.
+    void* allocator = nullptr;
+    const IID alloc_iid = __uuidof(ID3D12CommandAllocator);
+    EXPECT(hr_of(raw(device, 9, 0, word(&alloc_iid), word(&allocator))) == S_OK);
+    struct {
+        std::uint32_t type, reserved;
+    } list_desc{static_cast<std::uint32_t>(D3D12_COMMAND_LIST_TYPE_DIRECT), 0};
+    // Synthetic console-only IID unknown to the mock device (distinct from any PC IID).
+    const IID synthetic_console_list_iid{0x22222222, 0x3333, 0x4444, {0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc}};
+    void* list_proxy = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&list_desc), word(allocator), 0, word(&synthetic_console_list_iid),
+                     word(&list_proxy))) == S_OK);
+    EXPECT(xs::is_command_list_proxy(list_proxy));
+    EXPECT(mock->calls[12] == 2);  // first attempt returned E_NOINTERFACE, fallback succeeded with ID3D12GraphicsCommandList
+    EXPECT(release(list_proxy) == 0);
+    EXPECT(release(allocator) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+
+    std::printf("%s: stops 7-9 (struct-return swap 25/26/58, slot 48 sanitize, slot 73 IID fallback) passed\n", g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1249,7 +1327,8 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
+        check_boot_stops_7_9())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
