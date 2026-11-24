@@ -116,6 +116,37 @@ jobs:
               stop(f"The {label} collection is too large to sync safely.")
           
           
+          def attach_comment_edit_metadata(comments):
+              query = (
+                  "query($ids: [ID!]!) { nodes(ids: $ids) { "
+                  "... on IssueComment { fullDatabaseId lastEditedAt } } }"
+              )
+              for offset in range(0, len(comments), 100):
+                  batch = comments[offset : offset + 100]
+                  node_ids = [comment.get("node_id") for comment in batch]
+                  if any(not node_id for node_id in node_ids):
+                      stop("Cannot verify issue comment edit history.")
+                  result = api_json(
+                      "/graphql",
+                      method="POST",
+                      payload={"query": query, "variables": {"ids": node_ids}},
+                  )
+                  if result.get("errors"):
+                      stop("Cannot verify issue comment edit history.")
+                  nodes = ((result.get("data") or {}).get("nodes"))
+                  if not isinstance(nodes, list) or len(nodes) != len(batch):
+                      stop("GitHub returned invalid issue comment edit metadata.")
+                  edited_at_by_id = {}
+                  for node in nodes:
+                      if not isinstance(node, dict) or node.get("fullDatabaseId") is None:
+                          stop("GitHub returned invalid issue comment edit metadata.")
+                      edited_at_by_id[str(node["fullDatabaseId"])] = node.get("lastEditedAt")
+                  for comment in batch:
+                      comment_id = str(comment.get("id") or "")
+                      if comment_id not in edited_at_by_id:
+                          stop("Could not match issue comment edit metadata.")
+                      comment["_last_edited_at"] = edited_at_by_id[comment_id]
+
           def ids_from_text(text):
               return {value.upper() for value in WORK_ID_RE.findall(text or "")}
           
@@ -235,6 +266,7 @@ jobs:
                       if (
                           created_at is not None
                           and updated_at == created_at
+                          and comment.get("_last_edited_at") is None
                           and created_at < opened_at
                       ):
                           prior.append(comment)
@@ -442,6 +474,7 @@ jobs:
               f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments",
               "issue #14 comments",
           )
+          attach_comment_edit_metadata(comments)
           pulls = get_collection(
               f"/repos/{OWNER}/{REPOSITORY}/pulls?state=open",
               "open pull requests",
@@ -660,6 +693,37 @@ jobs:
               stop(f"The {label} collection is too large to sync safely.")
           
           
+          def attach_comment_edit_metadata(comments):
+              query = (
+                  "query($ids: [ID!]!) { nodes(ids: $ids) { "
+                  "... on IssueComment { fullDatabaseId lastEditedAt } } }"
+              )
+              for offset in range(0, len(comments), 100):
+                  batch = comments[offset : offset + 100]
+                  node_ids = [comment.get("node_id") for comment in batch]
+                  if any(not node_id for node_id in node_ids):
+                      stop("Cannot verify issue comment edit history.")
+                  result = api_json(
+                      "/graphql",
+                      method="POST",
+                      payload={"query": query, "variables": {"ids": node_ids}},
+                  )
+                  if result.get("errors"):
+                      stop("Cannot verify issue comment edit history.")
+                  nodes = ((result.get("data") or {}).get("nodes"))
+                  if not isinstance(nodes, list) or len(nodes) != len(batch):
+                      stop("GitHub returned invalid issue comment edit metadata.")
+                  edited_at_by_id = {}
+                  for node in nodes:
+                      if not isinstance(node, dict) or node.get("fullDatabaseId") is None:
+                          stop("GitHub returned invalid issue comment edit metadata.")
+                      edited_at_by_id[str(node["fullDatabaseId"])] = node.get("lastEditedAt")
+                  for comment in batch:
+                      comment_id = str(comment.get("id") or "")
+                      if comment_id not in edited_at_by_id:
+                          stop("Could not match issue comment edit metadata.")
+                      comment["_last_edited_at"] = edited_at_by_id[comment_id]
+
           def ids_from_text(text):
               return {value.upper() for value in WORK_ID_RE.findall(text or "")}
           
@@ -779,6 +843,7 @@ jobs:
                       if (
                           created_at is not None
                           and updated_at == created_at
+                          and comment.get("_last_edited_at") is None
                           and created_at < opened_at
                       ):
                           prior.append(comment)
@@ -987,6 +1052,7 @@ jobs:
               f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments",
               "issue #14 comments",
           )
+          attach_comment_edit_metadata(comments)
           pulls = get_collection(
               f"/repos/{OWNER}/{REPOSITORY}/pulls?state=open",
               "open pull requests",
