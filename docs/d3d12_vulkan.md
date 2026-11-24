@@ -372,9 +372,8 @@ What is implemented (all of it testable without the game):
   SDK's `d3d12.h` by `tools/gen_d3d12_stubs.py`. The stub reports its name once, so the vtables follow the SDK
   order exactly and nothing derived from the SDK is checked in. Unknown IIDs are logged and refused. Resources
   are identified by their `ID3D12Resource` pointer, and RTV/DSV CPU handles point at a `TargetView`.
-  `OMSetFrontAndBackStencilRef` records its two `UINT`s on the list (and `Reset` clears them), but nothing applies
-  them yet: Vulkan can set the faces with `vkCmdSetStencilReference` and a face mask, but only a pipeline that
-  consumes the dynamic state can, and this layer has no pipeline or draw path.
+  `OMSetFrontAndBackStencilRef` records its two `UINT`s on the list (and `Reset` clears them); each draw sets them
+  with `vkCmdSetStencilReference` and a face mask.
 - **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
   proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
   work unchanged. It creates the objects above, plus:
@@ -832,7 +831,10 @@ The compute path, end to end:
     state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`).
     `d3d12_state_sweep_test` checks the mapping against the host on the same adapter: 482 full-screen draws over
     every blend factor pair, blend operation, write mask, comparison function and stencil operation, with the stencil
-    plane read back, are byte-identical on an RTX 5080 and a Radeon iGPU.
+    plane read back, are byte-identical on an RTX 5080 and a Radeon iGPU. Sixteen more build the PSO from a stream
+    with `DEPTH_STENCIL2` and different masks per face, front- and back-facing, with one reference or two
+    (`OMSetFrontAndBackStencilRef`): 498 in all, byte-identical on an RTX 5070 Ti (driver 617.42), and 6 of the 16
+    differ when the back face is given the front face's masks.
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.
@@ -2111,8 +2113,10 @@ The trace will enumerate them.
     a VS stream builds the same PSO as the classic call.
   - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
     tessellation or GS, CS with a graphics stage, or no stage at all.
-  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, separate front and back stencil
-    masks, view instancing.
+  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, view instancing.
+  - `DEPTH_STENCIL2`'s per-face read and write masks go to each face's `VkStencilOpState` (the front face's in the
+    description, the back face's beside it), so `OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported` is TRUE:
+    with `OMSetFrontAndBackStencilRef`'s per-face references, both of that cap's parts.
   - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.
 - **Mesh PSO:** the MS (`ms` index entry by FSSM hash) and PS on the mesh stage. It has no vertex input or input
   assembly; the input layout, topology type and strip cut are ignored, as D3D12 ignores them for mesh PSOs. Topology
@@ -2260,6 +2264,30 @@ The trace will enumerate them.
   Intel Raptor Lake-S (101.7092) and RTX 5060 Laptop (621.24) hosts wrap, two 2^63 buffers to 0, and WARP on that
   PC still saturates. A wrapped total could make a caller allocate less than one of its resources, so the layer
   keeps saturating, and the test accepts a host that wraps.
+  Behind the Xbox-ABI proxy (device slots 25 and 56) a 2D render target of a listed colour format with one sample is
+  padded to whole console tiles: the size is the sum over its mips (MipLevels 0 is the full chain, an odd extent
+  rounds up), each mip rounded up to the RDNA2 SW_64KB_D tile shape (`runtime/src/gfx10_tiling.h`: 256 x 128 pixels
+  for 2-byte elements, 128 x 128 for 4-byte, 128 x 64 for 8-byte, 64 x 64 for 16-byte), with the first mip that fits
+  in half a tile's width and a whole tile's height, and the mips after it, sharing one tail tile, times the array
+  size. A 1920 x 1080 RGBA8 target is 135 tiles, 8,847,360 bytes, where the PC answer is 8,323,072. The proxy lays
+  the descriptions out as the PC device does (each at its own alignment, the total rounded up to the largest
+  alignment, sums saturating) with each render target at the larger of its console size and its PC size; a 4 MiB
+  aligned multisampled neighbour therefore keeps its place (a 1 x 1 four-sample target and a 1080p target need 16 MiB,
+  not 12.5). Slot 56 reports the same offsets. The PC layout stands when no description grows
+  (`d3d12_xs_alloc_size.h`; `xs_proxy_mock_test`). **Assumption**: the
+  retail title's own sizes are not measured (#6982, stop 17), so that its allocation is these shapes and no DCC or
+  CMask memory is open until they are.
+  The descriptions the title passes to slot 25 carry console values (layout word `0x101`/`0x1`, flag bits above the PC
+  ones). For console-form calls or descriptors explicitly using layout `0x101`, the proxy strips Xbox-only flags and
+  translates layout `0x101` to ROW_MAJOR for buffers or UNKNOWN for textures. Other PC-form descriptors reach the host
+  unchanged for validation (`d3d12_xs_desc_clean.h`; #6982 section 3.7).
+  A committed resource made through slots 76 and 127 also allocates that size through the title's
+  `__XMemAllocationHooks__`, as the console runtime's `XMemAlloc` for the resource does, and frees it when the
+  resource is destroyed (a lease kept with `SetPrivateDataInterface`; the bytes are not used). The retail title
+  budgets its first full-screen render targets with such a hook: it bump-allocates the allocations whose XALLOC
+  page-size field is 2 out of a range it reserved and asserts that less than 2 MiB is left (RT-5 stop 17). The
+  lease's attribute word (allocator ID 0x80, page-size field 2, object type 0) is an **assumption**; the measured
+  hook reads only the page-size field.
 - `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
   adapter's LUID; `d3d12_fence_timing_test` finds it with `IDXGIFactory4::EnumAdapterByLuid` (RTX 4090, driver
   621.14). A driver that reports `deviceLUIDValid = VK_FALSE` gets a zero LUID, logged.
@@ -2276,8 +2304,9 @@ The trace will enumerate them.
   RDX, node mask in R8 and heap type in R9: three calls right after device creation, node mask 1 and types 1, 2
   and 3 (measured under `gta6rt --run` with a register probe in the slot's thunk). A PC C++ method has the device
   in RCX and the buffer in RDX, so the Xbox-ABI proxy takes the console form when RDX holds the proxy
-  (`d3d12_xs_device.cpp`; `xs_proxy_mock_test`, `device_proxy_test`). Slots 25 and 43 return structs too; the
-  executable has not been seen calling them yet, so the proxy still forwards them in the PC form.
+  (`d3d12_xs_device.cpp`; `xs_proxy_mock_test`, `device_proxy_test`). Slot 43 returns a struct too and the
+  proxy still forwards it in the PC form: no call of slot 43 has been seen. Slots 25 and 56 take the same form by the
+  same rule (reported later in the boot, #6982; not measured), as #6973 first did for slot 25.
 - Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
   `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
   `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.
