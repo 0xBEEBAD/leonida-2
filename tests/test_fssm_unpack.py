@@ -570,6 +570,53 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(self.src, "fssm")), ["current.fssm"])
         self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.dxbc")))
 
+    def test_program_counts_separate_containers_from_payloads(self):
+        # BL-5: a container is one carved file, a program is one tag-0x0D payload. Three containers, four payloads:
+        # the vertex shader carries two (its ES and VS hardware variants), as 195 of the corpus' containers do.
+        es = make_fssm(version=0x0101, instructions=[(0x100, S_ENDPGM)])
+        vs = make_fssm(version=0x0102, instructions=[(0x100, S_ENDPGM)])
+        one = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        two = make_dxbc([(b"DXIL", make_xdat_list([(0x0D, make_xbch(es)), (0x0D, make_xbch(vs))]))])
+        for name, data in (("vertex", two), ("geometry", one), ("unstaged", one)):
+            with open(os.path.join(self.src, name + ".dxbc"), "wb") as f:
+                f.write(data)
+        index = os.path.join(self.src, "index.json")
+        with open(index, "w", encoding="utf-8") as f:
+            json.dump([{"file": "vertex.dxbc", "stage": "vs"}, {"file": "geometry.dxbc", "stage": "gs"},
+                       {"file": "unstaged.dxbc"}], f)
+
+        result = subprocess.run([sys.executable, "-I", TOOL, self.src, "--carve-index", index],
+                                capture_output=True, text=True, errors="replace")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("programs: 4 tag-0x0D payloads in 3 containers, 1 containers with more than one "
+                      "(--payload last is the one unpacked)", result.stdout)
+        self.assertIn("  gs: 1 containers, 1 payloads, 0 with more than one", result.stdout)
+        self.assertIn("  vs: 1 containers, 2 payloads, 1 with more than one", result.stdout)
+        # A row the carve index gives no stage is counted, under its own heading, not dropped or guessed.
+        self.assertIn("  stage unknown: 1 containers, 1 payloads, 0 with more than one", result.stdout)
+        # The file written for the two-payload container is still one program: the last payload.
+        with open(os.path.join(self.src, "fssm", "vertex.fssm"), "rb") as f:
+            self.assertEqual(f.read(), vs)
+
+        with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
+            rows = json.load(f)
+        counts = fssm_unpack.program_counts(rows, {"vertex": "vs", "geometry": "gs", "unstaged": None})
+        self.assertEqual(counts, {"vs": {"containers": 1, "programs": 2, "multi_payload": 1},
+                                  "gs": {"containers": 1, "programs": 1, "multi_payload": 0},
+                                  None: {"containers": 1, "programs": 1, "multi_payload": 0}})
+
+    def test_program_counts_without_a_carve_index_have_no_stage_breakdown(self):
+        two = make_dxbc([(b"DXIL", make_xdat_list([(0x0D, make_xbch(make_fssm(version=0x0101))),
+                                                   (0x0D, make_xbch(make_fssm(version=0x0102)))]))])
+        with open(os.path.join(self.src, "pair.dxbc"), "wb") as f:
+            f.write(two)
+        result = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True,
+                                errors="replace")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("programs: 2 tag-0x0D payloads in 1 containers, 1 containers with more than one",
+                      result.stdout)
+        self.assertNotIn("stage unknown", result.stdout)
+
     def test_main_rejects_invalid_fssm_magic(self):
         bad_payload = b"JUNK\x01\x01" + bytes(58)
         bad_dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(bad_payload)}))])
