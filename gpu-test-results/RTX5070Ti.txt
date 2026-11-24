@@ -36,9 +36,13 @@ Failed:     d3d12_execute_indirect_validation:
             The argument-range discrepancy discussed in #337 and #306.
 
 Notes:
-- ms_wave_info_s3: 4096/4096 pixels exact in both modes. The old
-  original-repository issue 8369 ("fails consistently on RTX 5070 Ti")
-  no longer reproduces.
+- ms_wave_info_s3: 4096/4096 pixels exact in both modes, in the full run
+  and in three more isolated runs per mode (run_gpu_tests.py --filter
+  ms_wave_info_s3, scripts at 21625bca8; vk_harness reports "NVIDIA GeForce
+  RTX 5070 Ti (subgroup 32..32)"): 4 of 4 native, 4 of 4 emulated. The old
+  original-repository issue 8369 ("fails consistently on RTX 5070 Ti") did
+  not reproduce in these runs; this test is flaky on some AMD hosts
+  (docs/gpu_test_results.md), so 4 runs do not rule out a rare failure.
 - cs_signed_zero_nan: PASS in both modes.
 - The same runtime build with LEONIDA_VK_VALIDATION=1: vk_queue reports
   10 synchronization-validation WRITE_AFTER_WRITE hazards between
