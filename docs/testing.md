@@ -418,6 +418,19 @@ of -1. Rules broken one at a time each failed the test on both devices: `rndne` 
 26), the low result word taken from the high one (word 8), and the fixture without its `v_cmpx` (word 30). Replacing
 `RoundEven` by GLSL `Round` changed nothing on either device: both send a tie to the even integer.
 
+llvmpipe gave those results on a CPU with AVX-512. On one without it, `Trunc` and `RoundEven` of a double go through
+the code llvmpipe has for a float, because its double vectors are twice its native width (512 bits at the usual 256)
+and it only has the exact rounding for a width the CPU has an extension for. There a magnitude above 2^24 comes back
+unchanged (`v_trunc_f64` of 123456789.0625 is 123456789.0625) and `RoundEven` of a smaller one can give the other
+neighbouring integer (1 for 1.5, 0 for the value just above 0.5): 48 of the 512 results, the same 48 with Mesa
+25.2.8 (LLVM 20.1.2) on a CI runner and with Mesa 26.2.6 under `GALLIUM_OVERRIDE_CPU_CAPS=avx`, which is how to see
+it on a CPU that has AVX-512. `Floor` and `Ceil` are exact on that path. The CI's runners differ in this, so the
+unchanged fixture passed or failed there by the machine it got. On llvmpipe the judge therefore lets `v_trunc_f64`
+and `v_rndne_f64` return what that path can give, the source itself above 2^24 and either neighbouring integer
+from 0.5 up to it, and nothing else (`ROUND_F64_FLOAT_PATH` in `check.py`); `v_floor_f64`, `v_ceil_f64`, the kept
+pair and the inputs stay exact there, and no other device gets the allowance. `LP_NATIVE_VECTOR_WIDTH=128` makes
+llvmpipe exact on a CPU with AVX.
+
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
 Graphics stages have no emulation: on a 32-wide subgroup a wave64 VS, PS or GS runs as two 32-lane halves, and the

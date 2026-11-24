@@ -528,13 +528,42 @@ def round_f64_words():
     return [0xEEEEEEEE] * len(results) + inputs, results + inputs
 
 
-def round_f64_problem(got):
-    """Judge a readback of cs_w32_round_f64: "" or the first word that is wrong. Every result is exact except for
-    the two kinds of source Vulkan leaves to the driver's double-precision rounding: a NaN may come back as any NaN
-    (a signalling one comes back quiet on the drivers measured), and a subnormal may be read as a zero of its sign,
-    because the module does not declare DenormPreserve for 64 bits."""
+# Drivers that round a binary64 with code written for a binary32, by the first word of the device name on
+# vk_compute_test's "device: ..." line (as UNJUDGED_WORDS is keyed), and the ops they do it for.
+# - Mesa llvmpipe: Trunc and RoundEven of a double take its float fallback whenever the CPU has no vector extension
+#   as wide as its double vectors, which are twice its native width: 512 bits at the usual 256, so every CPU without
+#   AVX-512. There a magnitude above 2^24 comes back unchanged (trunc of 123456789.0625 is 123456789.0625), and
+#   RoundEven of a smaller one can be the other neighbouring integer (1 for 1.5, 0 for the value just above 0.5).
+#   Floor and Ceil are exact on that path. Measured with Mesa 25.2.8 (LLVM 20.1.2) on the CI's runners, where the
+#   CPU decides from run to run, and with Mesa 26.2.6 (LLVM 23.1.4) under GALLIUM_OVERRIDE_CPU_CAPS=avx: 48 of the
+#   512 results. With AVX-512, or with AVX at LP_NATIVE_VECTOR_WIDTH=128, all four ops are exact.
+ROUND_F64_FLOAT_PATH = {"llvmpipe": ("trunc", "rndne")}
+
+
+def round_f64_float_path(op, source, value):
+    """Whether `value` is what a driver in ROUND_F64_FLOAT_PATH may give for the rounding of the finite `source`
+    instead of round_f64's word: the source itself when its magnitude is above 2^24, else one of its two
+    neighbouring integers, with the source's sign. Nothing below 0.5, a subnormal included: Trunc and RoundEven
+    give the zero of the source's sign there on either path."""
+    x = struct.unpack("<d", struct.pack("<Q", source))[0]
+    if x != x or x in (math.inf, -math.inf) or abs(x) < 0.5:
+        return False
+    if abs(x) > 1 << 24:
+        return value == source
+    return value in (round_f64("floor", source), round_f64("ceil", source))
+
+
+def round_f64_problem(got, out=""):
+    """Judge a readback of cs_w32_round_f64: "" or the first word that is wrong. `out` is vk_compute_test's output,
+    for its "device: ..." line. Every result is exact except for the two kinds of source Vulkan leaves to the
+    driver's double-precision rounding: a NaN may come back as any NaN (a signalling one comes back quiet on the
+    drivers measured), and a subnormal may be read as a zero of its sign, because the module does not declare
+    DenormPreserve for 64 bits. On a device in ROUND_F64_FLOAT_PATH the ops named there are held to
+    round_f64_float_path instead."""
     _, expected = round_f64_words()
     results = [result for thread in round_f64_results() for result in thread]
+    device = re.search(r"^device: (\S+)", out, re.MULTILINE)
+    float_path = ROUND_F64_FLOAT_PATH.get(device.group(1), ()) if device else ()
     for index, (op, source) in enumerate(results):
         value = got[2 * index] | got[2 * index + 1] << 32
         want = expected[2 * index] | expected[2 * index + 1] << 32
@@ -543,6 +572,8 @@ def round_f64_problem(got):
         if op is not None and f64_is_nan(source) and f64_is_nan(value):
             continue
         if op is not None and f64_is_subnormal(source) and value == round_f64(op, source & ROUND_F64_SIGN):
+            continue
+        if op in float_path and round_f64_float_path(op, source, value):
             continue
         what = "the pair an inactive lane keeps" if op is None else f"{op} of {source:#018x}"
         return f"word {2 * index} (thread {index // 8}): {what} gave {value:#018x}, expected {want:#018x}"
@@ -1029,8 +1060,8 @@ def failure(code, output, lines):
 
 def dump_test(tools, spirv, name, want, words, env=None, judge=None):
     """Run one group with a heap of `words` words and compare the first len(want) words of the whole dump. The
-    console dump stops at word 7. With `judge`, the whole dump goes to it instead, as a tuple of words, and its
-    answer ("" for a pass) is returned."""
+    console dump stops at word 7. With `judge`, the whole dump goes to it instead, as a tuple of words, with the
+    test program's output (it names the device), and its answer ("" for a pass) is returned."""
     with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
         dump = Path(tmp) / "out.bin"
         # VKC_OUT_WORDS sets a minimum. Pin this dispatch to exactly `words` words.
@@ -1047,7 +1078,7 @@ def dump_test(tools, spirv, name, want, words, env=None, judge=None):
     if len(data) != 4 * words:
         return f"expected {4 * words} dump bytes, got {len(data)}"
     if judge:
-        return judge(struct.unpack(f"<{words}I", data))
+        return judge(struct.unpack(f"<{words}I", data), out)
     for i, (expected, got) in enumerate(zip(want, struct.unpack(f"<{words}I", data))):
         if got != expected:
             return f"word {i}: expected {expected:#010x}, got {got:#010x}"
