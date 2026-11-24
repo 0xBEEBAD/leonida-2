@@ -1625,8 +1625,19 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
 
    Each direct or indirect compute dispatch records the 32-bit arena offsets at those positions. An unbound heap
    contributes zero. Rebinding affects subsequent commands. A heap that cannot fit in the inline user data is
-   reported once. `LEONIDA_COMPUTE_DIRECT_HEAPS=0` restores the previous arguments. Spilled signatures and graphics
-   stages remain open on question 3.
+   reported once. `LEONIDA_COMPUTE_DIRECT_HEAPS=0` restores the previous arguments. Spilled signatures remain open
+   on question 3.
+
+   **Graphics stages (RT-DIRECT-HEAP-GRAPHICS).** The same two dwords follow the graphics root arguments: from s8 in
+   VS/PS/GS and s16 in mesh shaders, every directly indexed program of the retail library reads the resource heap's
+   address in the dword after its root arguments and the sampler heap's in the next one (issue #14, comment
+   7143020922, measured on the retail title with DadaCap's `boot-prototype`). Each `DrawInstanced`,
+   `DrawIndexedInstanced` and `DispatchMesh` records them right after the inline graphics arguments
+   (`RootArgumentLayout::graphics_arguments_end`); a mesh shader reads the same push dwords through its window
+   (section 3.5). An unbound heap contributes zero, a heap past s31 is reported once, and a signature with
+   parameters in the argument block, or under `LEONIDA_GRAPHICS_ROOT_LAYOUT=pc`, gets nothing written (no slot is
+   measured there). `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` restores the previous arguments. `d3d12_mesh_test` checks a
+   vertex and a mesh draw, a rebind, a signature ending at s30 and a spilled one.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 

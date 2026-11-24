@@ -6092,6 +6092,7 @@ public:
         layout.mesh_ok = graphics_console && mesh.ok;
         layout.compute_ok = compute.ok;
         if (compute.ok) layout.compute_arguments_end = compute.end_sgpr;
+        if (graphics_console && graphics.first_spilled == SIZE_MAX) layout.graphics_arguments_end = graphics.end_sgpr;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = rt::rootsig::kNoSgpr;
             if (graphics_console) {

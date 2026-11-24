@@ -405,6 +405,10 @@ struct RootArgumentLayout {
     bool mesh_ok = true;  // the graphics layout also fits a mesh shader's 16-dword window
     bool compute_ok = true;
     std::uint32_t compute_arguments_end = rt::rootsig::kNoSgpr;
+    // One past the last graphics root dword (the push dword where a VS/PS/GS reads s<end>, a mesh shader s<end + 8>),
+    // where the directly indexed heaps' addresses follow (RT-DIRECT-HEAP-GRAPHICS). kNoSgpr when the graphics layout is
+    // not the console's, or when a parameter went to the argument block: no slot is measured for the heaps then.
+    std::uint32_t graphics_arguments_end = rt::rootsig::kNoSgpr;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a

@@ -492,7 +492,7 @@ public:
             return check(false);
         }
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+        leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
         check(list_.draw(std::move(draw)));
@@ -1362,15 +1362,11 @@ private:
             if (!cbv_srv_uav_heap_)
                 note_once(compute ? "dispatch uses direct resource indexing with no CBV/SRV/UAV heap bound"
                                   : "draw uses direct resource indexing with no CBV/SRV/UAV heap bound");
-            else if (!compute)
-                note_once("draw uses direct resource indexing; graphics heap-base SGPR is not supplied");
         }
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
             if (!sampler_heap_)
                 note_once(compute ? "dispatch uses direct sampler indexing with no sampler heap bound"
                                   : "draw uses direct sampler indexing with no sampler heap bound");
-            else if (!compute)
-                note_once("draw uses direct sampler indexing; graphics heap-base SGPR is not supplied");
         }
     }
 
@@ -1432,6 +1428,39 @@ private:
         return data;
     }
 
+    // The graphics side of the same layout (RT-DIRECT-HEAP-GRAPHICS): with CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED the dword
+    // after the graphics root arguments holds the resource heap's 32-bit address, and with
+    // SAMPLER_HEAP_DIRECTLY_INDEXED the next one the sampler heap's; every directly indexed program of the retail
+    // library reads them there, from s4 in compute, s8 in VS/PS/GS and s16 in mesh shaders (issue #14, comment
+    // 7143020922). A mesh shader reads the same dwords through its window (+8). Not written when the signature has no
+    // measured slot for them (graphics_arguments_end) or under LEONIDA_GRAPHICS_DIRECT_HEAPS=0.
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> graphics_user_data() const {
+        note_direct_heap_indexing(graphics_.layout, false);
+        auto data = graphics_.data;
+        static const bool enabled = [] {
+            char value[2]{};
+            return GetEnvironmentVariableA("LEONIDA_GRAPHICS_DIRECT_HEAPS", value, 2) != 1 || value[0] != '0';
+        }();
+        const auto flags = graphics_.layout->flags;
+        const bool direct = flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                     D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
+        if (!enabled || !direct) return data;
+        auto slot = graphics_.layout->graphics_arguments_end;
+        if (slot == rt::rootsig::kNoSgpr) {
+            note_once("draw uses direct heap indexing; its root signature has no measured slot for the heap addresses");
+            return data;
+        }
+        if (flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
+            if (slot < data.size()) data[slot++] = static_cast<std::uint32_t>(cbv_srv_uav_base_);
+            else note_once("graphics root arguments leave no inline SGPR for the resource heap");
+        }
+        if (flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
+            if (slot < data.size()) data[slot] = static_cast<std::uint32_t>(sampler_base_);
+            else note_once("graphics root arguments leave no inline SGPR for the sampler heap");
+        }
+        return data;
+    }
+
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
@@ -1453,11 +1482,10 @@ private:
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
-        note_direct_heap_indexing(graphics_.layout, false);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
+        leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
         check(list_.draw(std::move(draw)));
