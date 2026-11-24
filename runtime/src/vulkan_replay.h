@@ -1,7 +1,6 @@
 #include <atomic>
 #pragma once
 #include <cfloat>
-#include "vulkan_gpu_labels.h"
 
 #include "resource_tiling.h"
 
@@ -826,6 +825,7 @@ enum class ReplayResult {
     unsupported
 };
 struct ReplayFunctions {
+    std::function<void(VkCommandBuffer, const label::Write&)> gpu_label;
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
@@ -3233,7 +3233,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
             }
         } else if (std::holds_alternative<label::Write>(command)) {
-            // No GPU destination pointer is expected: the batch publishes only a registered title allocation.
+            if (!vk.gpu_label) return ReplayResult::unsupported;
         } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
             if (!vk.update_buffer || !vk.buffer_at) return ReplayResult::unsupported;
             std::uint64_t bytes = 4;
@@ -4312,7 +4312,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                               any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
         } else if (const auto* label_write=std::get_if<label::Write>(&command)) {
-            label::completions().record(command_buffer,*label_write);
+            vk.gpu_label(command_buffer, *label_write);
         } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
             // vkCmdUpdateBuffer runs in the transfer stage. MARKER_OUT waits for every earlier command to finish
             // and sees its writes. MARKER_IN only needs them started, which Vulkan cannot express (TOP_OF_PIPE in a

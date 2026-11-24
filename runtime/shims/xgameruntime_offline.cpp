@@ -594,8 +594,7 @@ const GUID kAccessibilityInterfaces[] = {
     {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}},   // IXAccessibilityImpl2
 };
 
-// Forward the speech family to the
-// operating system's installed runtime. Other offline services keep their existing providers.
+// The first-run profile forwards speech synthesis to the locally installed Windows gaming runtime.
 struct HostSpeechProvider {
     HMODULE module=nullptr;
     IUnknown* base=nullptr;

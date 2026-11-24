@@ -1,0 +1,37 @@
+# Offline first-run UI on Windows
+
+This integration combines the retail frame-loop runtime with the shader and rendering changes needed to display the first-run controller prompts. The visual milestone is a solid background with legible prompts at the lower right. Gameplay and the 3D world are outside the verified result.
+
+## Build
+
+Use an x64 Developer PowerShell with MSVC, CMake and Ninja. Install the Vulkan SDK and put the SPIR-V tools and an AMDGPU-capable `llvm-mc` on `PATH`. The shader tool setup is described in [testing.md](testing.md). Supply an extracted Xbox 1.0.2.1 package and its matching executable from your own files.
+
+Run the commands from the checkout. Set `$game` to the local package and `$scratch` to a writable directory outside both the package and the checkout. These commands support a fresh shader workspace. SDL3 is fetched during configuration if there is no installed static SDL3 package.
+
+```powershell
+$game = Read-Host 'Path to the extracted Xbox 1.0.2.1 package'
+$scratch = Read-Host 'Path for the build, shader workspace and port'
+$game = (Resolve-Path -LiteralPath $game).Path
+$build = Join-Path $scratch 'build'
+$work = Join-Path $scratch 'work'
+$port = Join-Path $scratch 'port'
+cmake -S runtime -B $build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEONIDA_REQUIRE_VULKAN=ON -DLEONIDA_D3D12_SHIM_TESTS=ON -DLEONIDA_SDL3_FETCH=ON
+cmake --build $build --target gta6rt
+python -I make_game.py --game $game --work $work --out $port --runtime-build $build --stages check,shaders,runtime
+```
+
+Keep the generated shader workspace. The port reads the shader directory recorded in `shader_path.txt`. Native graphics pipelines also use the source containers in the sibling `dxbc` directory. The build indexes the base, library, FidelityFX, BVH and executable-embedded programs.
+
+## Launch
+
+Run the title offline. The original boot runbook explains which socket imports reach Windows. The hardware verification used a Windows AppContainer with zero network capabilities. [Boot runbook](boot.md)
+
+```powershell
+& (Join-Path $port 'gta6rt.exe') --first-run-ui (Join-Path $game 'game_scarlett_master.exe')
+```
+
+The profile selects Vulkan, a 2 GiB graphics address arena, on-demand pipelines, console root-argument layout, GPU completion labels, frame pacing, local speech and the keyboard gamepad. Explicit environment settings take precedence. The package directory is the working directory. Guest output goes under `first-run-ui/overlay` beside the runtime, and sparse physical-memory backing uses `first-run-ui/xmem` on that volume. Use `--overlay DIR` or the absolute directory in `LEONIDA_XMEM_BACKING_DIR` to choose other writable locations.
+
+## Contributions
+
+The frame-loop stack comes from [#321](https://github.com/ubiquitarianism/leonida/pull/321). The archive and shader catalog, shader translation, depth and texture support, presentation window and rectangle-list changes retain their upstream commits. Native and derived pipeline support incorporates the work of enx, TomBox, LooperSalty and KkelebekK. The graphics root-layout and descriptor-table integration also uses the published [graphics runtime patches](https://github.com/Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches/tree/d9a0bc1b070d8a36c81b182bc67edd7d24b41bf2).

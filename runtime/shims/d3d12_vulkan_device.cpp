@@ -6797,7 +6797,6 @@ public:
 
     ~Device() override {
         raw_images_.clear();
-        leonida::label::completions().stop(state_.info.device);
         leonida::title_va_aliases().clear_resolver(&state_);
         {
             std::lock_guard lock(state_.title_window_mutex);
@@ -10663,8 +10662,6 @@ leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t a
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     Device* d = Device::from<Device>(device);
     if (!d) return;
-    const auto& label_info=d->state().info;
-    leonida::label::completions().initialize(label_info.device,reinterpret_cast<PFN_vkGetDeviceProcAddr>(label_info.get_instance_proc(label_info.instance,"vkGetDeviceProcAddr")));
 
     // A caller passes what create_device_proxy returned, which is the proxy's DXGI pointer when the title asked
     // for IDXGIDevice1: the device's outer identity is the proxy itself either way.

@@ -29,6 +29,7 @@
 #include "d3d12_xs_device.h"
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "present_window.h"
+#include "../src/vulkan_gpu_labels.h"
 #endif
 #include "d3d12_xs_placed_depth.h"
 #include "d3d12_trace.h"
