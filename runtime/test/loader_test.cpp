@@ -655,10 +655,10 @@ void test_initialise_rejects() {
 }
 
 // IMAGE_FILE_RELOCS_STRIPPED against a relocation directory, when the preferred base is taken. Measured on the
-// Windows 11 (26200) loader with synthetic DLLs (#8847): with no relocation directory the flag refuses the move and
-// an image with the flag clear is moved with nothing fixed up; with a relocation table the image is moved and fixed
-// up whatever the flag says. The DllMain stub stores through an absolute address in this process, not in the image,
-// so it runs correctly wherever the image lands.
+// Windows 11 (26200) loader with synthetic DLLs (runtime/README.md): with no relocation directory the flag refuses
+// the move and an image with the flag clear is moved with nothing fixed up; with a relocation table the image is
+// moved and fixed up whatever the flag says. The DllMain stub stores through an absolute address in this process,
+// not in the image, so it runs correctly wherever the image lands.
 void test_moved_without_relocations() {
     auto img = make_image();
     auto* nt = nt_of(img);
@@ -706,7 +706,7 @@ void test_moved_without_relocations() {
     if (held) VirtualFree(held, 0, MEM_RELEASE);
     {
         // At a free base such an image maps, as it did before. Not Windows parity: the Windows 11 loader refused these
-        // DLLs (error 487) at a free base too, for a reason not yet known (#8847); runtime/README.md keeps the question.
+        // DLLs (error 487) at a free base too, for a reason not yet known; runtime/README.md keeps the question.
         auto stripped = img;
         nt_of(stripped)->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
         expect_loads("an image with IMAGE_FILE_RELOCS_STRIPPED and no relocations maps at its free base", stripped);

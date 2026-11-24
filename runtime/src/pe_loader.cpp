@@ -1452,7 +1452,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     int64_t delta = reinterpret_cast<int64_t>(m->base) - static_cast<int64_t>(oh.ImageBase);
     // A moved image with a relocation table is fixed up, whatever IMAGE_FILE_RELOCS_STRIPPED says. Without a table,
     // the flag refuses the move; with the flag clear the image is moved and nothing is fixed up, so it is trusted to
-    // hold no absolute addresses. The Windows 11 loader does all three (measured in #8847); that move is logged so
+    // hold no absolute addresses. The Windows 11 loader does all three (runtime/README.md); that move is logged so
     // it shows in traces. base_reservation::needed still keeps the main image's range free when it has no
     // relocation directory, so a main image is moved this way only where the range could not be had.
     const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
