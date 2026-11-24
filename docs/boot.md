@@ -29,8 +29,11 @@ Two traces are written independently:
 
 `tools/boot_trace.py` reads both and prints the triage units: modules, unimplemented calls and callers,
 DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12 calls by outcome and first call
-per method. The `[rt]` lines in the same stderr log carry the device parameters, feature ids and warnings; the
-summary leaves them as a count, so grep `^\[rt\]` for those.
+per method. When `XboxPresentation` logs its teardown `[rt] present: pacing summary ...` line (BL-6), the D3D12
+summary also reports the frame count, interval count, target interval, mean and drift against target, `p50`/`p95`/`p99`
+frame times, and `p50`/`p95`/`p99` origin-to-present latencies (and includes the numeric `frame_pacing` object in
+`--json` and `--counts-only`). The remaining `[rt]` lines in the same stderr log carry the device parameters, feature
+ids and warnings; the summary leaves them as a count, so grep `^\[rt\]` for those.
 
 For `xmem_physical_pages`, the shim records the first request for each distinct attribute word. The text and
 JSON summaries list the API, raw attribute word, requested page count and caller for the first `--limit`
