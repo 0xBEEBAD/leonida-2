@@ -3,13 +3,40 @@
 make_game.py (vk_pipeline_check) and first_light.py (vk_harness) take a program already in runtime/build when there
 is one. After a pull that changed the program, that copy is from the old sources and would run silently. The
 sources are runtime/test/<name>.cpp and the headers it pulls in with #include "..." (followed through other
-headers): a change to any of them recompiles and relinks the program, so a current build is never older than them.
+headers, each looked up next to the including file, then in the include directories of runtime/CMakeLists.txt): a
+change to any of them recompiles and relinks the program, so a current build is never older than them.
 runtime/CMakeLists.txt isn't one: a change there that doesn't concern the program leaves it as it was.
 """
 import os
 import re
 
 _INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+
+# The include directories runtime/CMakeLists.txt gives the runtime/test programs, searched after the directory of the
+# including file: runtime/src and runtime/shims (target_include_directories of pe_loader_test, lines 657-660, which
+# other test programs repeat), then the xtaskqueue ones (lines 90-92, 1206-1210 and 1227-1229). Paths are relative to
+# the repository root.
+_INCLUDE_DIRS = (
+    "runtime/src",
+    "runtime/shims",
+    "runtime/shims/xtaskqueue",
+    "third_party/xtaskqueue/Source/Task",
+    "third_party/xtaskqueue/Source/Common",
+    "third_party/xtaskqueue/Include",
+)
+
+
+def _resolve_include(root, path, inc):
+    """The file a quoted `#include inc` in `path` names: next to `path` first, then in _INCLUDE_DIRS; None if neither
+    has it (a system or generated header)."""
+    local = os.path.join(os.path.dirname(path), inc)
+    if os.path.isfile(local):
+        return local
+    for directory in _INCLUDE_DIRS:
+        candidate = os.path.join(root, directory, inc)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def program_sources(root, name):
@@ -29,7 +56,10 @@ def program_sources(root, name):
                 text = f.read()
         except OSError:
             continue
-        pending.extend(os.path.join(os.path.dirname(path), inc) for inc in _INCLUDE.findall(text))
+        for inc in _INCLUDE.findall(text):
+            resolved = _resolve_include(root, path, inc)
+            if resolved is not None:
+                pending.append(resolved)
     return found
 
 
