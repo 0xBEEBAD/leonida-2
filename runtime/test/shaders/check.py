@@ -487,14 +487,6 @@ ROUND_F64_SIGN = 1 << 63
 ROUND_F64_KEPT = 0xCAFEF00DDEADBEEF   # the pair an inactive lane keeps: 0xdeadbeef low, 0xcafef00d high
 
 
-def f64_is_nan(bits):
-    return bits & 0x7FF0000000000000 == 0x7FF0000000000000 and bits & 0x000FFFFFFFFFFFFF != 0
-
-
-def f64_is_subnormal(bits):
-    return bits & 0x7FF0000000000000 == 0 and bits & 0x000FFFFFFFFFFFFF != 0
-
-
 def round_f64(op, bits):
     """The binary64 pattern RDNA2 gives for `bits` rounded to an integral value by "trunc", "ceil", "rndne" or
     "floor" (docs/design.md): exact IEEE-754, a tie of rndne going to the even integer, the result keeping the
@@ -556,12 +548,11 @@ def round_f64_float_path(op, source, value):
 
 
 def round_f64_problem(got, out=""):
-    """Judge a readback of cs_w32_round_f64: "" or the first word that is wrong. `out` is vk_compute_test's output,
-    for its "device: ..." line. Every result is exact except for the two kinds of source Vulkan leaves to the
-    driver's double-precision rounding: a NaN may come back as any NaN (a signalling one comes back quiet on the
-    drivers measured), and a subnormal may be read as a zero of its sign, because the module does not declare
-    DenormPreserve for 64 bits. On a device in ROUND_F64_FLOAT_PATH the ops named there are held to
-    round_f64_float_path instead."""
+    """Judge a readback of cs_w32_round_f64: "" or the first word that is wrong, named by its op and source. `out` is
+    vk_compute_test's output, for its "device: ..." line. Every word is exact, the results of a NaN and of a
+    subnormal included: the translated code rounds those two itself and does not leave them to the driver's
+    double-precision functions (docs/design.md). On a device in ROUND_F64_FLOAT_PATH the ops named there are held
+    to round_f64_float_path instead."""
     _, expected = round_f64_words()
     results = [result for thread in round_f64_results() for result in thread]
     device = re.search(r"^device: (\S+)", out, re.MULTILINE)
@@ -569,13 +560,7 @@ def round_f64_problem(got, out=""):
     for index, (op, source) in enumerate(results):
         value = got[2 * index] | got[2 * index + 1] << 32
         want = expected[2 * index] | expected[2 * index + 1] << 32
-        if value == want:
-            continue
-        if op is not None and f64_is_nan(source) and f64_is_nan(value):
-            continue
-        if op is not None and f64_is_subnormal(source) and value == round_f64(op, source & ROUND_F64_SIGN):
-            continue
-        if op in float_path and round_f64_float_path(op, source, value):
+        if value == want or op in float_path and round_f64_float_path(op, source, value):
             continue
         what = "the pair an inactive lane keeps" if op is None else f"{op} of {source:#018x}"
         return f"word {2 * index} (thread {index // 8}): {what} gave {value:#018x}, expected {want:#018x}"

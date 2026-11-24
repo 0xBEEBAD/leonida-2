@@ -17,14 +17,14 @@
 ;   +56  v_rndne_f64 x                with the odd threads turned off first: they keep the pair 0xdeadbeef,
 ;                                     0xcafef00d that was in the destination
 ; RDNA2 ISA VOP1 opcodes 23..26. A result that is zero keeps the sign of its source (ceil of -0.25 is -0), a value
-; of magnitude 2^52 or more is already integral, an infinity stays, and on the hardware a NaN and a subnormal are
-; rounded like any other value: a NaN comes back unchanged, ceil of the smallest subnormal is 1 and floor of its
-; negative is -1 (docs/design.md). The translator gives the four ops to the driver's double-precision Trunc, Ceil,
-; RoundEven and Floor, so check.py judges two kinds of input by what Vulkan lets a driver do with them: a NaN may
-; come back as another NaN (a signalling one comes back quiet on the drivers measured), and a subnormal may be read
-; as a zero of its sign, since the module does not ask for binary64 denormals to be kept. Every other word is exact,
-; and the input records must come back unchanged.
-; Run with the heap initialized by check.py's round_f64_test; all 1152 words are judged.
+; of magnitude 2^52 or more is already integral, an infinity stays, and a NaN and a subnormal are rounded like any
+; other value: a NaN comes back unchanged, signalling ones included, ceil of the smallest subnormal is 1 and floor
+; of its negative is -1 (docs/design.md). The translator gives the four ops to the driver's double-precision Trunc,
+; Ceil, RoundEven and Floor, except for a NaN and a subnormal, which it rounds with integer ops: Vulkan lets a driver
+; return any NaN for a NaN (a signalling one came back quiet on an RTX 4070 Ti and on llvmpipe) and, with no
+; DenormPreserve for 64 bits, read a subnormal as zero (llvmpipe did).
+; Run with the heap initialized by check.py's round_f64_test; all 1152 words are compared, and the input records
+; must come back unchanged.
 v_lshlrev_b32_e32 v1, 3, v0
 v_add_nc_u32_e32 v1, 0x1000, v1
 v_lshlrev_b32_e32 v10, 6, v0
