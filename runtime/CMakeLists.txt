@@ -106,11 +106,39 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
   )
 
+  # Rust XMA2 decoder (runtime/xma_decoder), built at configure time when cargo is on PATH.
+  # Without it (or if that build fails) the runtime still builds and XMA voices output silence.
+  find_program(LEONIDA_CARGO cargo)
+  if(LEONIDA_CARGO)
+    set(_xma_target_dir ${CMAKE_BINARY_DIR}/xma_decoder)
+    set(_xma_lib ${_xma_target_dir}/release/leonida_xma2_decoder.lib)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.lock
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/src/lib.rs)
+    execute_process(
+      COMMAND ${LEONIDA_CARGO} build --release --locked
+              --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+              --target-dir ${_xma_target_dir}
+      RESULT_VARIABLE _xma_result)
+    if(_xma_result EQUAL 0 AND EXISTS ${_xma_lib})
+      add_library(leonida_xma2_decoder STATIC IMPORTED)
+      set_target_properties(leonida_xma2_decoder PROPERTIES
+        IMPORTED_LOCATION ${_xma_lib}
+        INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder
+        INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
+        INTERFACE_LINK_LIBRARIES "ws2_32;userenv;ntdll")
+    else()
+      message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
+    endif()
+  else()
+    message(STATUS "cargo not found: runtime/xma_decoder not built, XMA voices will be silent")
+  endif()
+
   add_executable(gta6rt
     src/main.cpp
     src/host_cpu.cpp
     src/pe_loader.cpp
-    src/xma2_decoder.cpp
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
@@ -244,13 +272,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(acphal_test
     test/acphal_test.cpp
     shims/acphal.cpp
-    src/xma2_decoder.cpp
     shims/registry.cpp
   )
-  target_include_directories(acphal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_include_directories(acphal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
+
+  if(TARGET leonida_xma2_decoder)
+    target_link_libraries(gta6rt PRIVATE leonida_xma2_decoder)
+    target_link_libraries(acphal_test PRIVATE leonida_xma2_decoder)
+  endif()
 
   # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
   # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
@@ -555,13 +587,6 @@ if(BUILD_TESTING)
   add_test(NAME vulkan_device_filter COMMAND vulkan_device_filter_test)
   add_executable(vk_presenter_capture_colour_test test/vk_presenter_capture_colour_test.cpp)
   add_test(NAME vk_presenter_capture_colour COMMAND vk_presenter_capture_colour_test)
-  # Portable XMA2 packet parser and WMA Pro frame decoder (src/xma2_decoder.cpp): pure stdlib, no GPU.
-  add_executable(xma2_decoder_test test/xma2_decoder_test.cpp src/xma2_decoder.cpp)
-  target_include_directories(xma2_decoder_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  if(MSVC)
-    target_compile_options(xma2_decoder_test PRIVATE /W4 /permissive- /utf-8)
-  endif()
-  add_test(NAME xma2_decoder COMMAND xma2_decoder_test)
   if(TARGET gta6rt)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
       add_executable(cpp_unwind_test test/cpp_unwind_test.cpp)

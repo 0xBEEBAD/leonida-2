@@ -17,3 +17,9 @@ cargo build --manifest-path runtime/xma_decoder/Cargo.toml --locked
 ```
 
 The C++ smoke test is run by the xma2-decoder workflow with MSVC. It links ws2_32, userenv, and ntdll for Rust's Windows standard library.
+
+## Use in the runtime
+
+`runtime/CMakeLists.txt` builds this crate at configure time when `cargo` is on `PATH` (the first build fetches the pinned `xma` git dependency) and links it into `gta6rt` and `acphal_test` with `LEONIDA_HAVE_XMA2_DECODER` defined. `runtime/shims/acphal.cpp` calls `leonida_xma2_decoder_create_hardware` once per XMA context and decodes whole 2048-byte packets, so loop points are rounded to packets.
+
+Without `cargo`, when that build fails, or with the cl.exe fallback of `scripts/build_runtime.ps1`, XMA voices output silence.

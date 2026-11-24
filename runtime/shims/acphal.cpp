@@ -41,7 +41,9 @@
 
 #include "shims.h"
 #include "startup_trace.h"
-#include "../src/xma2_decoder.h"
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+#include "leonida_xma2_decoder.h"
+#endif
 
 namespace {
 
@@ -355,10 +357,28 @@ constexpr uint64_t kAudioFramesPerSecond = 375;
 //   Word 7: output ring APU address.
 //   Word 8: overlap buffer APU address.
 //   Word 9: output read block index (0..4).
+//
+// Packets are decoded by the Rust decoder in runtime/xma_decoder when CMake found cargo (LEONIDA_HAVE_XMA2_DECODER);
+// otherwise each packet becomes silence for its frame count. The read offset (word 2) and the loop points (words 3
+// and 4) are used per 2048-byte packet, so the loop-end subframe (word 1 bits 12..13) is not applied.
 
 constexpr std::size_t kXmaBlockBytes = 256;
 constexpr std::size_t kXmaSamplesPerBlock = kXmaBlockBytes / 2;
+constexpr std::size_t kXmaPacketBytes = 2048;
+constexpr std::size_t kXmaPacketBits = kXmaPacketBytes * 8;
+constexpr std::size_t kXmaSubframeSamples = 128;
+constexpr std::size_t kXmaFrameSamples = 512;
 constexpr uint32_t kXmaErrorInputInvalid = 4;
+
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+constexpr uint32_t kXmaRates[4] = {24000, 32000, 44100, 48000};
+struct Xma2DecoderFree {
+    void operator()(LeonidaXma2Decoder* d) const noexcept { leonida_xma2_decoder_destroy(d); }
+};
+struct Xma2PcmFree {
+    void operator()(LeonidaXma2PcmBlock* b) const noexcept { leonida_xma2_pcm_destroy(b); }
+};
+#endif
 
 struct XmaContextView {
     volatile uint32_t* words = nullptr;
@@ -381,14 +401,12 @@ struct XmaContextView {
 };
 
 struct XmaVoice {
-    std::optional<leonida::xma2::Decoder> decoder;
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+    std::unique_ptr<LeonidaXma2Decoder, Xma2DecoderFree> decoder;
+#endif
     std::deque<int16_t> pcm;
     std::size_t skip = 0;  // samples per channel to drop (start/loop subframe skip)
     bool ended = false;
-    std::size_t produced = 0;
-    uint32_t frames = 0;
-    uint32_t bad_frames = 0;
-    int16_t peak = 0;
 };
 
 struct XmaVoiceSlot {
@@ -474,8 +492,7 @@ public:
             ctx.set_field(2, 26, 6, 0);
 
             XmaVoice voice;
-            voice.skip = static_cast<std::size_t>(ctx.field(1, 24, 3)) *
-                         leonida::xma2::kSubframeSamples;
+            voice.skip = static_cast<std::size_t>(ctx.field(1, 24, 3)) * kXmaSubframeSamples;
             voices_[index]->voice.emplace(std::move(voice));
             if (!was_active) {
                 active_count_.fetch_add(1, std::memory_order_relaxed);
@@ -520,7 +537,39 @@ private:
         return XmaContextView{array_ + static_cast<std::size_t>(index) * 16};
     }
 
-    static bool decode_one_frame(XmaContextView ctx, XmaVoice& voice) {
+    // Fills `pcm` (interleaved s16) for one 2048-byte packet. Without the Rust decoder, or when it
+    // fails, the packet becomes silence for its frame count (header bits 26..31) so timing holds.
+    static void decode_packet(XmaContextView ctx, XmaVoice& voice, const uint8_t* bytes,
+                              std::vector<int16_t>& pcm) {
+        const std::size_t channels = ctx.channels();
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+        if (!voice.decoder) {
+            LeonidaXma2Decoder* raw = nullptr;
+            if (leonida_xma2_decoder_create_hardware(kXmaRates[ctx.field(1, 27, 2) & 3u],
+                                                     static_cast<uint32_t>(channels), &raw) == LEONIDA_XMA2_OK) {
+                voice.decoder.reset(raw);
+            }
+        }
+        if (voice.decoder) {
+            LeonidaXma2PcmBlock* raw = nullptr;
+            if (leonida_xma2_decode_buffer(voice.decoder.get(), bytes, kXmaPacketBytes, &raw) == LEONIDA_XMA2_OK) {
+                const std::unique_ptr<LeonidaXma2PcmBlock, Xma2PcmFree> block(raw);
+                const int16_t* samples = leonida_xma2_pcm_data(block.get());
+                const std::size_t count = leonida_xma2_pcm_sample_count(block.get());
+                pcm.assign(samples, samples + count);
+                return;
+            }
+        }
+#else
+        (void)voice;
+#endif
+        pcm.assign(static_cast<std::size_t>(bytes[0] >> 2) * kXmaFrameSamples * channels, 0);
+    }
+
+    // Decodes the packet at the read offset of the current input buffer and queues its PCM.
+    // Offsets and loop points are used per packet: a loop plays its end packet in full and
+    // restarts at the start of the packet holding the loop start.
+    static bool decode_one_packet(XmaContextView ctx, XmaVoice& voice) {
         if (voice.ended) return false;
 
         const std::size_t channels = ctx.channels();
@@ -530,12 +579,6 @@ private:
         if ((valid & (1u << current)) == 0) {
             const uint32_t other = 1u - current;
             if ((valid & (1u << other)) == 0) {
-                // Both inputs exhausted: flush remaining overlap tail, then signal INPUT_INVALID.
-                if (voice.decoder.has_value()) {
-                    std::vector<int16_t> tail;
-                    voice.decoder->flush(tail);
-                    voice.pcm.insert(voice.pcm.end(), tail.begin(), tail.end());
-                }
                 voice.ended = true;
                 ctx.set_field(2, 26, 5, kXmaErrorInputInvalid);
                 ctx.set_field(2, 31, 1, 1);
@@ -547,69 +590,39 @@ private:
         }
 
         const uint32_t address = (current == 0) ? ctx.get(5) : ctx.get(6);
-        const uint32_t packets = (current == 0) ? ctx.field(0, 0, 12) : ctx.field(1, 0, 12);
-        const std::size_t input_bytes =
-            static_cast<std::size_t>(packets) * leonida::xma2::kPacketBytes;
-        const uint8_t* data = apu_span(address & ~0x7FFu, input_bytes);
-        if (!data) {
+        const std::size_t packets = (current == 0) ? ctx.field(0, 0, 12) : ctx.field(1, 0, 12);
+        const std::size_t packet = ctx.field(2, 0, 26) / kXmaPacketBits;
+        const uint8_t* data = apu_span(address & ~0x7FFu, packets * kXmaPacketBytes);
+        if (!data || packet >= packets) {
             ctx.set_field(0, 20 + current, 1, 0);
+            ctx.set_field(2, 0, 26, 0);
             return true;
-        }
-
-        std::size_t at = static_cast<std::size_t>(ctx.field(2, 0, 26));
-        if (at < leonida::xma2::kHeaderBits) {
-            const auto pkt = leonida::xma2::parse_packet(data, input_bytes, 0);
-            at = leonida::xma2::kHeaderBits + (pkt.has_value() ? pkt->first_frame_bit : 0u);
-        }
-
-        const auto frame = leonida::xma2::read_frame(data, input_bytes, at);
-        if (!frame.has_value()) {
-            ctx.set_field(0, 20 + current, 1, 0);
-            return true;
-        }
-
-        if (!voice.decoder.has_value()) {
-            static constexpr uint32_t kRates[4] = {24000, 32000, 44100, 48000};
-            const uint32_t rate_idx = ctx.field(1, 27, 2) & 3u;
-            voice.decoder.emplace(channels, kRates[rate_idx]);
         }
 
         std::vector<int16_t> pcm;
-        pcm.reserve(leonida::xma2::kFrameSamples * channels);
-        ++voice.frames;
-        if (!voice.decoder->decode(frame->data.data(), frame->bits, pcm)) {
-            ++voice.bad_frames;
-        }
-
-        std::size_t next = frame->next.value_or(0);
-        const uint32_t loops = ctx.field(0, 12, 8);
-        const std::size_t loop_end = static_cast<std::size_t>(ctx.field(4, 0, 26));
-        const bool ends_loop =
-            loop_end != 0 &&
-            (frame->start == loop_end ||
-             (frame->start < loop_end && (!frame->next.has_value() || loop_end < *frame->next)));
-        if (loops > 0 && ends_loop) {
-            const std::size_t keep =
-                (static_cast<std::size_t>(ctx.field(1, 12, 2)) + 1u) *
-                leonida::xma2::kSubframeSamples * channels;
-            if (keep < pcm.size()) pcm.resize(keep);
-            next = static_cast<std::size_t>(ctx.field(3, 0, 26));
-            voice.skip = static_cast<std::size_t>(ctx.field(1, 17, 3)) *
-                         leonida::xma2::kSubframeSamples;
-            if (loops != 255u) {
-                ctx.set_field(0, 12, 8, loops - 1u);
-            }
-        }
-
+        decode_packet(ctx, voice, data + packet * kXmaPacketBytes, pcm);
         const std::size_t skip_samples = std::min(voice.skip * channels, pcm.size());
         voice.skip -= skip_samples / channels;
-        voice.pcm.insert(voice.pcm.end(), pcm.begin() + static_cast<std::ptrdiff_t>(skip_samples),
-                         pcm.end());
+        voice.pcm.insert(voice.pcm.end(), pcm.begin() + static_cast<std::ptrdiff_t>(skip_samples), pcm.end());
 
-        if (next == 0) {
-            ctx.set_field(0, 20 + current, 1, 0);
+        std::size_t next = packet + 1;
+        const uint32_t loops = ctx.field(0, 12, 8);
+        const std::size_t loop_end = ctx.field(4, 0, 26);
+        if (loops > 0 && loop_end != 0 && packet == loop_end / kXmaPacketBits) {
+            next = ctx.field(3, 0, 26) / kXmaPacketBits;
+            voice.skip = static_cast<std::size_t>(ctx.field(1, 17, 3)) * kXmaSubframeSamples;
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+            // A frame spilling out of the loop-end packet does not continue in the loop-start packet:
+            // start a fresh decoder there rather than decode the spliced bits.
+            voice.decoder.reset();
+#endif
+            if (loops != 255u) ctx.set_field(0, 12, 8, loops - 1u);
         }
-        ctx.set_field(2, 0, 26, static_cast<uint32_t>(next));
+        if (next >= packets) {
+            ctx.set_field(0, 20 + current, 1, 0);
+            next = 0;
+        }
+        ctx.set_field(2, 0, 26, static_cast<uint32_t>(next * kXmaPacketBits));
         return true;
     }
 
@@ -620,7 +633,7 @@ private:
         while (ctx.field(1, 31, 1) == 1) {
             int decode_guard = 0;
             while (voice.pcm.size() < kXmaSamplesPerBlock && decode_guard++ < 16) {
-                if (!decode_one_frame(ctx, voice)) break;
+                if (!decode_one_packet(ctx, voice)) break;
             }
             if (voice.pcm.empty()) return;
 
@@ -636,15 +649,11 @@ private:
                     sample = voice.pcm.front();
                     voice.pcm.pop_front();
                 }
-                const int32_t mag =
-                    (sample == INT16_MIN) ? INT16_MAX : std::abs(static_cast<int32_t>(sample));
-                if (mag > voice.peak) voice.peak = static_cast<int16_t>(mag);
                 const uint16_t raw = static_cast<uint16_t>(sample);
                 out[2 * i] = static_cast<uint8_t>(raw & 0xFFu);
                 out[2 * i + 1] = static_cast<uint8_t>((raw >> 8) & 0xFFu);
             }
 
-            voice.produced += kXmaSamplesPerBlock / ctx.channels();
             const uint32_t next_write = (write + 1u) % size;
             ctx.set_field(0, 27, 5, next_write);
             if (next_write == ctx.field(9, 0, 5)) {

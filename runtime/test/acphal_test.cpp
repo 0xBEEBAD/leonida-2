@@ -464,6 +464,99 @@ int main() {
         check(release_ctx(&xma_ctx) == S_OK, "Release XMA SHAPE contexts joins decoder cleanly");
     }
 
+    // 8b. Loops are rounded to whole packets: the loop end packet plays in full and the read
+    //     restarts at the packet holding the loop start. One 1-frame packet = 512 samples = 4 blocks.
+    {
+        // Two packets with one silent mono frame each.
+        std::vector<uint8_t> stream(2 * 2048, 0xFFu);
+        auto put_bits = [&](size_t at, uint32_t value, size_t width) {
+            for (size_t i = 0; i < width; ++i) {
+                const size_t p = at + i;
+                const uint32_t bit = (value >> (width - 1 - i)) & 1u;
+                stream[p / 8] = static_cast<uint8_t>(
+                    (stream[p / 8] & ~(0x80u >> (p % 8))) |
+                    (bit << (7 - (p % 8))));
+            }
+        };
+        for (size_t packet = 0; packet < 2; ++packet) {
+            const size_t base = packet * 2048 * 8;
+            put_bits(base, 1u << 26, 32);  // 1 frame, first_frame_bit = 0
+            const size_t at = base + 32;
+            put_bits(at, 31, 15);          // frame length
+            put_bits(at + 15, 0b10u, 2);   // fixed layout, one 512-sample subframe
+            put_bits(at + 17, 0, 14);      // gain(8) + trim(1) + subframe_skip/empty(5)
+        }
+
+        TestShapeContexts xma_ctx{};
+        xma_ctx.numXmaContexts = 4;
+        check(alloc_ctx(&xma_ctx) == S_OK && xma_ctx.xmaContextArray != nullptr,
+              "Allocate 4 XMA SHAPE contexts for the packet loop test");
+
+        void* in_va = nullptr;
+        uint32_t in_apu = 0;
+        check(alloc(&in_va, &in_apu, 0x1000, 0x800, 1) == S_OK && in_va != nullptr,
+              "ApuAlloc 2-packet loop input buffer");
+        std::memcpy(in_va, stream.data(), stream.size());
+
+        void* out_va = nullptr;
+        uint32_t out_apu = 0;
+        check(alloc(&out_va, &out_apu, 0x1000, 0x100, 2) == S_OK && out_va != nullptr,
+              "ApuAlloc 16-block loop output ring");
+
+        // Voice index 2.
+        auto* words = static_cast<volatile uint32_t*>(xma_ctx.xmaContextArray) + 32;
+
+        using ConnectFn = HRESULT(__stdcall*)(void*, uint32_t, uint32_t);
+        using SubmitFn = HRESULT(__stdcall*)(void*, uint32_t, uint64_t, uint32_t, const void*, uint32_t);
+        using ReleaseFn = HRESULT(__stdcall*)(void*);
+
+        void* x_acp = nullptr;
+        check(create(&x_acp) == S_OK && x_acp != nullptr, "AcpHalCreate for packet loop test");
+        auto vt = *static_cast<void* const* const*>(x_acp);
+        const auto fn_connect = reinterpret_cast<ConnectFn>(vt[0]);
+        const auto fn_submit = reinterpret_cast<SubmitFn>(vt[2]);
+        const auto fn_release = reinterpret_cast<ReleaseFn>(vt[5]);
+        check(fn_connect(x_acp, 0x1000, 0x1000) == S_OK, "Connect for packet loop test");
+
+        // Decodes the stream once on voice 2 with the given loop count and returns the number of
+        // blocks written when the error flag rose, or -1 on timeout.
+        auto run_blocks = [&](uint32_t loops) -> int {
+            std::memset(out_va, 0x55, 0x1000);
+            words[0] = 2u | (loops << 12) | (1u << 20) | (16u << 22);
+            words[1] = (1u << 31) | (3u << 27);  // 48 kHz, mono, writable
+            words[2] = 32u;                       // read at packet 0
+            words[3] = 32u;                       // loop start: packet 0
+            words[4] = 100u;                      // loop end: packet 0
+            words[5] = in_apu;
+            words[7] = out_apu;
+            words[9] = 0u;
+
+            const uint32_t enable_arg = 2u;
+            check(fn_submit(x_acp, 5, 0xf3, 0xffffffffu, &enable_arg, 0) == S_OK,
+                  "ENABLE_XMA voice 2 succeeds");
+            int wait = 0;
+            for (; wait < 1000 && ((words[2] >> 31) & 1u) == 0u; ++wait) {
+                Sleep(1);
+            }
+            const int blocks = ((words[2] >> 31) & 1u) != 0u
+                                   ? static_cast<int>((words[0] >> 27) & 0x1Fu)
+                                   : -1;
+            const uint32_t disable_arg = 2u;
+            check(fn_submit(x_acp, 7, 0xf4, 0xffffffffu, &disable_arg, 0) == S_OK,
+                  "DISABLE_XMA voice 2 succeeds");
+            return blocks;
+        };
+
+        check(run_blocks(0) == 8, "Two 1-frame packets without a loop write 8 blocks (1024 samples)");
+        check(run_blocks(1) == 12, "One loop of packet 0 writes 12 blocks (packets 0, 0, 1)");
+        check(((words[0] >> 12) & 0xFFu) == 0u, "Loop count is consumed by the single loop");
+
+        check(fn_release(x_acp) == S_OK, "Release packet loop AcpHal succeeds");
+        free_mem(in_va);
+        free_mem(out_va);
+        check(release_ctx(&xma_ctx) == S_OK, "Release packet loop SHAPE contexts");
+    }
+
     // 9. ENABLE_XMA (starts/wakes the decoder worker) racing bind/release (stops it).
     //    Every release must return; a lost stop would hang this block.
     {
