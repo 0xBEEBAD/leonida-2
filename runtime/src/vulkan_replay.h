@@ -518,6 +518,21 @@ inline bool two_planes(const ResourceBinding& resource) {
 // R32_FLOAT/UINT/SINT (R32_TYPELESS) and D16_UNORM with R16_FLOAT/UNORM/SNORM/UINT/SINT (R16_TYPELESS). Single-sampled, single-plane depth only: D24 and D32 with stencil have two planes, and a D24
 // stored as D32 would need the depth24 conversion. Vulkan's vkCmdCopyImage refuses mismatched aspects, so the replay
 // stages these through a buffer.
+// An A8_UNORM texture is a VK_FORMAT_A8_UNORM_KHR image when it is a render target (VulkanDeviceInfo::
+// a8_render_target) and an R8_UNORM image otherwise; D3D12 copies between the two as between any two A8_UNORM
+// textures. Vulkan puts A8 in a compatibility class of its own, so vkCmdCopyImage refuses the pair
+// (VUID-vkCmdCopyImage-srcImage-01548) although both have one byte per texel: the replay stages it through a buffer,
+// as it does a depth <-> colour pair.
+inline bool a8_mixed_backing(VkFormat a, VkFormat b) {
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    return a != b && (a == VK_FORMAT_A8_UNORM_KHR || b == VK_FORMAT_A8_UNORM_KHR);
+#else
+    (void)a;
+    (void)b;
+    return false;
+#endif
+}
+
 inline bool depth_colour_pair(const ResourceBinding& a, const ResourceBinding& b) {
     const auto family = [](VkFormat format) -> int {
         switch (format) {
@@ -3020,9 +3035,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 result = detail::prepare_resource_copy(p);
             }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
-                p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask) {
+                (p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask ||
+                 a8_mixed_backing(p.source.format, p.binding.format))) {
                 // Depth <-> colour: vkCmdCopyImage cannot mix aspects, so each region goes image -> scratch -> image,
-                // tightly packed. Depth aspects want 4-byte buffer offsets; 16 covers every texel size here.
+                // tightly packed. Depth aspects want 4-byte buffer offsets; 16 covers every texel size here. The two
+                // backings of A8_UNORM take the same route: one byte per texel on both sides, but Vulkan does not
+                // count VK_FORMAT_A8_UNORM_KHR as size-compatible with R8_UNORM (VUID-vkCmdCopyImage-srcImage-01548).
                 const std::uint32_t texel =
                     block_format(p.source.format, p.image_copies[0].srcSubresource.aspectMask).bytes;
                 VkDeviceSize total = 0;

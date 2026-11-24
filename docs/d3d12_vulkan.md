@@ -478,7 +478,9 @@ What is implemented (all of it testable without the game):
     format instead: its RTVs, PSO `RTVFormats` and clears use the alpha channel, its SRVs view it in the same format
     (the T# names its one channel X, gfx10's `channels_a`), and format support adds `RENDER_TARGET` and
     `BLENDABLE`. Vulkan puts A8 in a compatibility class of its own, so the two kinds of A8 texture cannot share
-    an image. A castable-format list naming `A8_UNORM` itself is a no-op; any other format in it is refused with
+    an image, and `vkCmdCopyImage` refuses a copy between them (`VUID-vkCmdCopyImage-srcImage-01548`):
+    `CopyResource` and `CopyTextureRegion` between the two go image → transfer scratch → image, as depth ↔ colour
+    copies do, one byte per texel (`d3d12_a8_copy_test`). A castable-format list naming `A8_UNORM` itself is a no-op; any other format in it is refused with
     `E_INVALIDARG` for such a render target, since no other format can view its image. Without that format,
     render targets are refused as before; depth-stencil and UAV creation are
     unsupported for this format.
