@@ -224,8 +224,13 @@ jobs:
           for item_id in sorted(candidates):
               prior_claims = []
               for comment in claims_by_id.get(item_id, []):
-                  effective_at = parse_time(comment.get("updated_at") or comment.get("created_at"))
-                  if effective_at is not None and effective_at < opened_at:
+                  created_at = parse_time(comment.get("created_at"))
+                  updated_at = parse_time(comment.get("updated_at") or comment.get("created_at"))
+                  if (
+                      created_at is not None
+                      and updated_at == created_at
+                      and created_at < opened_at
+                  ):
                       prior_claims.append(comment)
               claim_owners = {
                   ((comment.get("user") or {}).get("login") or "").casefold()
