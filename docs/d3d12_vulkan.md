@@ -2034,7 +2034,9 @@ The Xbox native graphics pipeline descriptor identifies stages by the digest in 
 carved DXBC containers and translation index. After the version header, each line contains the 16-byte digest
 in lowercase hex, the translated stage and a container path relative to the index, separated by tabs.
 Containers sharing a digest must agree on stage and FSSM hash. A collision fails the stage and preserves the
-previous catalog. Existing translated workspaces can build the catalog by rerunning the shaders stage.
+previous catalog. Rerunning the shaders stage checks its source fingerprint, including the catalog writer.
+To add or refresh just the catalog in an existing translation, run
+`python -I tools/native_pso_hashes.py "<work>/shaders/dxbc" "<work>/shaders/spirv"`.
 
 A D3D12 PSO carries DXBC containers, not SPIR-V. The layer identifies a shader by hashing the **FSSM payload** (the
 native RDNA2 program inside the container) and looking it up in a build-time table keyed by `(stage, hash)`. The
