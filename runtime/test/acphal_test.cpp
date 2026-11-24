@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -68,6 +69,14 @@ struct TestShapeContexts {
 static_assert(sizeof(TestShapeContexts) == 120, "TestShapeContexts is 120 bytes");
 static_assert(offsetof(TestShapeContexts, xmaContextArray) == 0x38,
               "xmaContextArray is at offset +0x38");
+
+struct XmaWords {
+    uint32_t* data;
+
+    std::atomic_ref<uint32_t> operator[](std::size_t index) const {
+        return std::atomic_ref(data[index]);
+    }
+};
 
 }  // namespace
 
@@ -348,7 +357,8 @@ int main() {
 
     // 8. End-to-end XMA2 context ring decoding via background decoder thread
     {
-        // Build a 2-packet XMA2 buffer with 3 silent mono frames per packet (6 frames total).
+        // Two synthetic XMA2 packets with three mono frames each. Each frame
+        // transmits one positive spectral coefficient so decoded PCM differs from fallback silence.
         std::vector<uint8_t> stream(2 * 2048, 0xFFu);
         auto put_bits = [&](size_t at, uint32_t value, size_t width) {
             for (size_t i = 0; i < width; ++i) {
@@ -361,12 +371,29 @@ int main() {
         };
         for (size_t packet = 0; packet < 2; ++packet) {
             const size_t base = packet * 2048 * 8;
-            put_bits(base, 3u << 26, 32);  // 3 frames, first_frame_bit = 0, skip = 0
+            put_bits(base, (3u << 26) | (1u << 8), 32);
+            constexpr size_t frame_bits = 82;
             for (size_t f = 0; f < 3; ++f) {
-                const size_t at = base + 32 + f * 31;
-                put_bits(at, 31, 15);        // frame length
-                put_bits(at + 15, 0b10u, 2); // fixed layout, one 512-sample subframe
-                put_bits(at + 17, 0, 14);    // gain(8) + trim(1) + subframe_skip/empty(5)
+                size_t at = base + 32 + f * frame_bits;
+                auto put = [&](uint32_t value, size_t width) {
+                    put_bits(at, value, width);
+                    at += width;
+                };
+                put(frame_bits, 15);
+                put(0b10u, 2);               // Fixed layout, one 512-sample subframe.
+                put(0, 11);                  // Gain, trim, fill and subframe error flag.
+                put(1, 1);                   // Coefficients are present.
+                put(1, 1);                   // Explicit vector coefficient count.
+                put(0, 8);                   // Use only run/level coding.
+                put(0, 6);                   // Quantizer adjustment.
+                put(0, 2);                   // Scale factor step.
+                put((1u << 23) - 1, 23);     // One zero delta per 48 kHz scale band.
+                put(0, 1);                   // Run/level table 0.
+                put(0b00u, 2);               // Run 0, level 1.
+                put(1, 1);                   // Positive sign.
+                put(0b0101011u, 7);          // End of coefficients.
+                put(0, 1);                   // Frame padding bit.
+                put(f < 2 ? 1u : 0u, 1);    // Another frame follows in this packet.
             }
         }
 
@@ -389,7 +416,7 @@ int main() {
 
         // Configure voice index 1: 2 packets in input 0, input 0 valid, 4 output blocks,
         // writable = 1, 48 kHz mono, read_bit = 32.
-        auto* words = static_cast<volatile uint32_t*>(xma_ctx.xmaContextArray) + 16;
+        const XmaWords words{static_cast<uint32_t*>(xma_ctx.xmaContextArray) + 16};
         words[0] = 2u | (1u << 20) | (4u << 22);
         words[1] = (1u << 31) | (3u << 27);
         words[2] = 32u;
@@ -418,27 +445,28 @@ int main() {
         for (int wait = 0; wait < 500 && ((words[1] >> 31) & 1u) == 1u; ++wait) {
             Sleep(1);
         }
-        check(((words[1] >> 31) & 1u) == 0u,
-              "Background XMA2 decoder fills ring and clears writable flag");
+        const bool ring_full = (words[1] >> 31) == 0u;
+        check(ring_full, "Background XMA2 decoder fills ring and clears writable flag");
         check(((words[0] >> 27) & 0x1Fu) == 0u,
               "Write block wrapped back to 0 after filling 4 blocks");
 
-        bool ring_zeroed = true;
         const auto* ring_bytes = static_cast<const uint8_t*>(out_va);
-        for (size_t i = 0; i < 0x400; ++i) {
-            if (ring_bytes[i] != 0) {
-                ring_zeroed = false;
-                break;
-            }
-        }
-        check(ring_zeroed, "Decoded silent PCM overwrote sentinel bytes across all 4 ring blocks");
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+        check(ring_full && std::any_of(ring_bytes, ring_bytes + 0x400,
+                                       [](uint8_t b) { return b != 0 && b != 0x55; }),
+              "The Rust decoder writes non-silent PCM");
+#else
+        check(ring_full && std::all_of(ring_bytes, ring_bytes + 0x400, [](uint8_t b) { return b == 0; }),
+              "The fallback writes silence");
+#endif
 
         // Advance read pointer 4 blocks at a time until input exhausts and INPUT_INVALID fires.
         const uint32_t advance_args[2] = {1u, 4u};
-        for (int step = 0; step < 20; ++step) {
-            check(fn_submit(x_acp, 18, 0xf2 + static_cast<uint64_t>(step),
-                            0xffffffffu, advance_args, 0) == S_OK,
-                  "ADVANCE_XMA_READ succeeds");
+        int written_blocks = ring_full ? 4 : 0;
+        bool advanced = true;
+        for (int step = 0; step < 6; ++step) {
+            advanced &= fn_submit(x_acp, 18, 0xf2 + static_cast<uint64_t>(step),
+                                  0xffffffffu, advance_args, 0) == S_OK;
             // Wait until either ring fills again (writable == 0) or stream hits error bit.
             for (int wait = 0; wait < 200; ++wait) {
                 const uint32_t w1 = words[1];
@@ -449,7 +477,11 @@ int main() {
             if (((words[2] >> 31) & 1u) == 1u && ((words[1] >> 31) & 1u) == 1u) {
                 break;
             }
+            if ((words[1] >> 31) != 0u) break;
+            written_blocks += 4;
         }
+        check(advanced, "ADVANCE_XMA_READ succeeds");
+        check(written_blocks == 24, "Six frames write exactly 24 blocks before input exhaustion");
         check(((words[0] >> 20) & 3u) == 0u, "XMA input buffer valid bits cleared on exhaustion");
         check(((words[2] >> 31) & 1u) == 1u, "XMA error flag set on exhaustion");
         check(((words[2] >> 26) & 0x1Fu) == 4u, "XMA error status is INPUT_INVALID (4)");
@@ -505,7 +537,7 @@ int main() {
               "ApuAlloc 16-block loop output ring");
 
         // Voice index 2.
-        auto* words = static_cast<volatile uint32_t*>(xma_ctx.xmaContextArray) + 32;
+        const XmaWords words{static_cast<uint32_t*>(xma_ctx.xmaContextArray) + 32};
 
         using ConnectFn = HRESULT(__stdcall*)(void*, uint32_t, uint32_t);
         using SubmitFn = HRESULT(__stdcall*)(void*, uint32_t, uint64_t, uint32_t, const void*, uint32_t);
@@ -519,23 +551,27 @@ int main() {
         const auto fn_release = reinterpret_cast<ReleaseFn>(vt[5]);
         check(fn_connect(x_acp, 0x1000, 0x1000) == S_OK, "Connect for packet loop test");
 
-        // Decodes the stream once on voice 2 with the given loop count and returns the number of
-        // blocks written when the error flag rose, or -1 on timeout.
-        auto run_blocks = [&](uint32_t loops, bool split_inputs = false) -> int {
+        auto configure_voice = [&](uint32_t loops, uint32_t input_0_packets, uint32_t ring_size,
+                                   uint32_t write, uint32_t read) {
             std::memset(out_va, 0x55, 0x1000);
-            words[0] = (split_inputs ? 2u : 3u) | (loops << 12) |
-                       ((split_inputs ? 3u : 1u) << 20) | (16u << 22);
-            words[1] = (1u << 31) | (3u << 27) | (split_inputs ? 1u : 0u);
+            const uint32_t input_1_packets = 3u - input_0_packets;
+            words[0] = input_0_packets | (loops << 12) |
+                       ((input_1_packets != 0 ? 3u : 1u) << 20) | (ring_size << 22) | (write << 27);
+            words[1] = (1u << 31) | (3u << 27) | input_1_packets;
             words[2] = 32u;                       // read at packet 0
             words[3] = 32u;                       // loop start: packet 0
             words[4] = 100u;                      // loop end: packet 0
             words[5] = in_apu;
-            words[6] = in_apu + 0x1000u;
+            words[6] = in_apu + input_0_packets * 2048u;
             words[7] = out_apu;
-            words[9] = 0u;
+            words[9] = read;
+        };
 
-            const uint32_t enable_arg = 2u;
-            check(fn_submit(x_acp, 5, 0xf3, 0xffffffffu, &enable_arg, 0) == S_OK,
+        const uint32_t voice_index = 2u;
+        // Returns the number of blocks written before input exhaustion, or -1 on timeout.
+        auto run_blocks = [&](uint32_t loops, uint32_t input_0_packets = 3) -> int {
+            configure_voice(loops, input_0_packets, 16, 0, 0);
+            check(fn_submit(x_acp, 5, 0xf3, 0xffffffffu, &voice_index, 0) == S_OK,
                   "ENABLE_XMA voice 2 succeeds");
             int wait = 0;
             for (; wait < 1000 && ((words[2] >> 31) & 1u) == 0u; ++wait) {
@@ -544,8 +580,7 @@ int main() {
             const int blocks = ((words[2] >> 31) & 1u) != 0u
                                    ? static_cast<int>((words[0] >> 27) & 0x1Fu)
                                    : -1;
-            const uint32_t disable_arg = 2u;
-            check(fn_submit(x_acp, 7, 0xf4, 0xffffffffu, &disable_arg, 0) == S_OK,
+            check(fn_submit(x_acp, 7, 0xf4, 0xffffffffu, &voice_index, 0) == S_OK,
                   "DISABLE_XMA voice 2 succeeds");
             return blocks;
         };
@@ -553,8 +588,24 @@ int main() {
         check(run_blocks(0) == 8, "Packets 0 and 2 write 8 blocks, skipping packet 1");
         check(run_blocks(1) == 12, "One loop of packet 0 writes 12 blocks (packets 0, 0, 2)");
         check(((words[0] >> 12) & 0xFFu) == 0u, "Loop count is consumed by the single loop");
-        check(run_blocks(0, true) == 8 && (words[4] >> 31) == 1u,
+        check(run_blocks(0, 2) == 8 && (words[4] >> 31) == 1u,
               "A skip to the end of input 0 continues at input 1");
+        check(run_blocks(0, 1) == 8 && (words[4] >> 31) == 1u,
+              "An overshooting skip starts at packet 1 of input 1");
+
+        configure_voice(255, 3, 4, 7, 9);
+        check(fn_submit(x_acp, 5, 0xf3, 0xffffffffu, &voice_index, 0) == S_OK,
+              "Enable infinite loop with out-of-range ring indices");
+        for (int wait = 0; wait < 1000 && (words[1] >> 31) != 0u; ++wait) Sleep(1);
+        check((words[1] >> 31) == 0u && ((words[0] >> 27) & 0x1Fu) == 1u,
+              "Ring stops at the normalized read index");
+        check(fn_submit(x_acp, 7, 0xf4, 0xffffffffu, &voice_index, 0) == S_OK,
+              "Disable infinite loop after filling bounded ring");
+        check(((words[0] >> 12) & 0xFFu) == 255u, "Infinite loop does not consume its loop count");
+        const auto* ring_bytes = static_cast<const uint8_t*>(out_va);
+        check(std::all_of(ring_bytes + 0x400, ring_bytes + 0x1000,
+                          [](uint8_t b) { return b == 0x55; }),
+              "Output never writes beyond the configured four-block ring");
 
         words[0] = 3u << 22;  // three ring blocks
         words[9] = 2u;

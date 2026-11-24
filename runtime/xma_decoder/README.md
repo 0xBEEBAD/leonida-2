@@ -6,8 +6,6 @@ Each decoder handle serializes decode calls. The returned PCM block owns its sam
 
 The tests build packets in memory; they do not open or contain audio fixtures. The synthetic C++ smoke test verifies the exported ABI and ownership boundary.
 
-This PR adds the decoder boundary only; the Windows XAudio2 engine/source-voice adapter is a follow-up stage.
-
 Run:
 
 ```powershell
@@ -22,6 +20,6 @@ The C++ smoke test is run by the xma2-decoder workflow with MSVC. It links ws2_3
 
 `runtime/CMakeLists.txt` builds this crate for `x86_64-pc-windows-msvc` at configure time when `cargo` is on `PATH` and links it into `gta6rt` and `acphal_test` with `LEONIDA_HAVE_XMA2_DECODER` defined. The first build fetches the pinned `xma` git dependency. Set `CARGO_NET_OFFLINE=true` for a configure that uses only the local Cargo cache.
 
-`runtime/shims/acphal.cpp` uses `leonida_xma2_decoder_create_hardware` and decodes whole 2048-byte packets, so loop points are rounded to packets.
+`runtime/shims/acphal.cpp` uses `leonida_xma2_decoder_create_hardware` and decodes whole 2048-byte packets, so loop points are rounded to packets. The shim creates a fresh decoder after a loop rewind or a decoder error.
 
 Without `cargo`, when that build fails, or with the cl.exe fallback of `scripts/build_runtime.ps1`, XMA voices output silence.

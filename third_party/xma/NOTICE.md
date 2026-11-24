@@ -11,4 +11,4 @@ The upstream NOTICE identifies this package as a Rust port of FFmpeg's WMA Pro/X
 
 Leonida's C ABI wrapper is independently written and licensed under GPL-3.0-or-later. No upstream implementation source is copied or vendored.
 
-When `cargo` is found, `runtime/CMakeLists.txt` links this package statically into `gta6rt`; the runtime is GPL-3.0 and its full source is in this repository.
+When the Cargo build succeeds, `runtime/CMakeLists.txt` links the decoder and its `xma` dependency statically into `gta6rt` and `acphal_test`. The wrapper source is in `runtime/xma_decoder`. The pinned dependency source is available from the commit linked above.

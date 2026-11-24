@@ -139,24 +139,7 @@ struct SHAPE_DMA_CONTEXT {
 static_assert(sizeof(SHAPE_DMA_CONTEXT) == 16, "SHAPE_DMA_CONTEXT is 16 bytes per GDK");
 
 struct SHAPE_XMA_CONTEXT {
-    uint32_t sizeRead0 : 12;
-    uint32_t numLoops : 8;
-    uint32_t validBuffer : 2;
-    uint32_t sizeWrite : 5;
-    uint32_t offsetWrite : 5;
-    uint32_t sizeRead1 : 12;
-    uint32_t sequenceNumber : 12;
-    uint32_t stopSampleAddress : 8;
-    uint32_t subframeOffset : 4;
-    uint32_t reserved0 : 1;
-    uint32_t isLooping : 1;
-    uint32_t subframeSkip : 2;
-    uint32_t packetMetadata : 16;
-    uint32_t currentByteOffset : 26;
-    uint32_t reserved1 : 6;
-    uint32_t loopStartOffset : 26;
-    uint32_t loopEndOffset : 6;
-    uint32_t reserved[11];  // the GDK's 64-byte context: the published field list leaves one trailing word
+    uint32_t words[16];  // See the shared word layout above the XMA engine.
 };
 static_assert(sizeof(SHAPE_XMA_CONTEXT) == 64, "SHAPE_XMA_CONTEXT is 64 bytes per GDK");
 
@@ -382,10 +365,9 @@ struct Xma2PcmFree {
 #endif
 
 struct XmaContextView {
-    volatile uint32_t* words = nullptr;
+    uint32_t* words = nullptr;
 
-    uint32_t get(std::size_t index) const { return words[index]; }
-    void set(std::size_t index, uint32_t value) const { words[index] = value; }
+    uint32_t get(std::size_t index) const { return std::atomic_ref(words[index]).load(); }
 
     uint32_t field(std::size_t index, uint32_t shift, uint32_t bits) const {
         const uint32_t mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
@@ -395,7 +377,10 @@ struct XmaContextView {
     void set_field(std::size_t index, uint32_t shift, uint32_t bits, uint32_t value) const {
         const uint32_t raw_mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
         const uint32_t mask = raw_mask << shift;
-        set(index, (get(index) & ~mask) | ((value << shift) & mask));
+        const uint32_t field_value = (value << shift) & mask;
+        std::atomic_ref word(words[index]);
+        uint32_t previous = word.load();
+        while (!word.compare_exchange_weak(previous, (previous & ~mask) | field_value)) {}
     }
 
     std::size_t channels() const { return 1u + static_cast<std::size_t>(field(1, 29, 1)); }
@@ -407,6 +392,7 @@ struct XmaVoice {
 #endif
     std::deque<int16_t> pcm;
     std::size_t skip = 0;  // samples per channel to drop (start/loop subframe skip)
+    std::optional<std::size_t> next_input_packet;
     bool ended = false;
 };
 
@@ -422,7 +408,7 @@ public:
     void bind(SHAPE_XMA_CONTEXT* array, uint32_t count) {
         unbind();
         std::unique_lock lock(table_mutex_);
-        array_ = reinterpret_cast<volatile uint32_t*>(array);
+        array_ = array;
         voices_.clear();
         voices_.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
@@ -522,8 +508,8 @@ public:
         bool wake = false;
         {
             std::lock_guard slot_lock(voices_[index]->mutex);
-            const uint32_t raw_size = ctx.field(0, 22, 5);
-            const uint32_t size = raw_size ? raw_size : 1u;
+            const uint32_t size = ctx.field(0, 22, 5);
+            if (size == 0) return;
             const uint32_t read = (ctx.field(9, 0, 5) + blocks % size) % size;
             ctx.set_field(9, 0, 5, read);
             if (blocks > 0) {
@@ -537,7 +523,7 @@ public:
 private:
     XmaContextView context_locked(uint32_t index) const {
         if (!array_ || index >= voices_.size()) return {};
-        return XmaContextView{array_ + static_cast<std::size_t>(index) * 16};
+        return XmaContextView{array_[index].words};
     }
 
     // Fills `pcm` (interleaved s16) for one 2048-byte packet. Without the Rust decoder, or when it
@@ -559,7 +545,7 @@ private:
                 const std::unique_ptr<LeonidaXma2PcmBlock, Xma2PcmFree> block(raw);
                 const int16_t* samples = leonida_xma2_pcm_data(block.get());
                 const std::size_t count = leonida_xma2_pcm_sample_count(block.get());
-                pcm.assign(samples, samples + count);
+                if (count != 0) pcm.assign(samples, samples + count);
                 return;
             }
             voice.decoder.reset();  // Resume with a clean state after replacing a packet with silence.
@@ -580,7 +566,7 @@ private:
         uint32_t current = ctx.field(4, 31, 1);
         const uint32_t valid = ctx.field(0, 20, 2);
 
-        if ((valid & (1u << current)) == 0) {
+        if (voice.next_input_packet || (valid & (1u << current)) == 0) {
             const uint32_t other = 1u - current;
             if ((valid & (1u << other)) == 0) {
                 voice.ended = true;
@@ -590,7 +576,9 @@ private:
             }
             current = other;
             ctx.set_field(4, 31, 1, current);
-            ctx.set_field(2, 0, 26, 0);
+            const auto next_bit = voice.next_input_packet.value_or(0) * kXmaPacketBits;
+            ctx.set_field(2, 0, 26, static_cast<uint32_t>(next_bit));
+            voice.next_input_packet.reset();
         }
 
         const uint32_t address = (current == 0) ? ctx.get(5) : ctx.get(6);
@@ -599,6 +587,7 @@ private:
         const uint8_t* data = apu_span(address & ~0x7FFu, packets * kXmaPacketBytes);
         if (!data || packet >= packets) {
             ctx.set_field(0, 20 + current, 1, 0);
+            voice.next_input_packet = 0;
             ctx.set_field(2, 0, 26, 0);
             return true;
         }
@@ -627,6 +616,7 @@ private:
         }
         if (next >= packets) {
             ctx.set_field(0, 20 + current, 1, 0);
+            voice.next_input_packet = next - packets;
             next = 0;
         }
         ctx.set_field(2, 0, 26, static_cast<uint32_t>(next * kXmaPacketBits));
@@ -635,20 +625,18 @@ private:
 
     static void pump_voice(XmaContextView ctx, XmaVoice& voice) {
         const uint32_t size = ctx.field(0, 22, 5);
-        if (size == 0) return;
+        auto* ring = apu_span(ctx.get(7), size * kXmaBlockBytes);
+        if (!ring) return;
 
-        while (ctx.field(1, 31, 1) == 1) {
+        for (uint32_t blocks = 0; blocks < size && ctx.field(1, 31, 1) == 1; ++blocks) {
             int decode_guard = 0;
             while (voice.pcm.size() < kXmaSamplesPerBlock && decode_guard++ < 16) {
                 if (!decode_one_packet(ctx, voice)) break;
             }
             if (voice.pcm.empty()) return;
 
-            const uint32_t write = ctx.field(0, 27, 5);
-            const uint32_t out_addr =
-                ctx.get(7) + write * static_cast<uint32_t>(kXmaBlockBytes);
-            uint8_t* out = apu_span(out_addr, kXmaBlockBytes);
-            if (!out) return;
+            const uint32_t write = ctx.field(0, 27, 5) % size;
+            uint8_t* out = ring + write * kXmaBlockBytes;
 
             for (std::size_t i = 0; i < kXmaSamplesPerBlock; ++i) {
                 int16_t sample = 0;
@@ -663,7 +651,7 @@ private:
 
             const uint32_t next_write = (write + 1u) % size;
             ctx.set_field(0, 27, 5, next_write);
-            if (next_write == ctx.field(9, 0, 5)) {
+            if (next_write == ctx.field(9, 0, 5) % size) {
                 ctx.set_field(1, 31, 1, 0);
             }
         }
@@ -728,7 +716,7 @@ private:
     }
 
     mutable std::shared_mutex table_mutex_;
-    volatile uint32_t* array_ = nullptr;
+    SHAPE_XMA_CONTEXT* array_ = nullptr;
     std::vector<std::unique_ptr<XmaVoiceSlot>> voices_;
     std::atomic<uint32_t> active_count_{0};
 
