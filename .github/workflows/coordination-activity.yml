@@ -52,7 +52,7 @@ jobs:
           END = "<!-- END AUTO PR ACTIVITY -->"
           ID_PATTERN = r"(?<![A-Za-z0-9-])[A-Z0-9]+(?:-[A-Z0-9]+)+(?![A-Za-z0-9-])"
           WORK_ID_RE = re.compile(ID_PATTERN)
-          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)")
+          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)(?![A-Za-z0-9-])")
           CLAIM_FIELD_RE = re.compile(
               r"(?im)^\s*>?\s*Claimed in the coordination issue as:\s*(.*?)\s*$"
           )
@@ -616,7 +616,7 @@ jobs:
           END = "<!-- END AUTO PR ACTIVITY -->"
           ID_PATTERN = r"(?<![A-Za-z0-9-])[A-Z0-9]+(?:-[A-Z0-9]+)+(?![A-Za-z0-9-])"
           WORK_ID_RE = re.compile(ID_PATTERN)
-          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)")
+          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)(?![A-Za-z0-9-])")
           CLAIM_FIELD_RE = re.compile(
               r"(?im)^\s*>?\s*Claimed in the coordination issue as:\s*(.*?)\s*$"
           )
