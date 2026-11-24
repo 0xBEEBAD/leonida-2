@@ -449,6 +449,153 @@ def cmp_f64_test(tools, spirv, env=None):
         return dump_test(tools, spirv, "cs_w32_cmp_f64", expected, len(expected), child)
 
 
+# cs_w32_round_f64.asm: the binary64 input of each thread, a value and its negative side by side.
+ROUND_F64_VALUES = (
+    0x0000000000000000, 0x8000000000000000,   # +0, -0
+    0x0000000000000001, 0x8000000000000001,   # the smallest subnormal and its negative
+    0x3FD0000000000000, 0xBFD0000000000000,   # +-0.25
+    0x3FDFFFFFFFFFFFFF, 0xBFDFFFFFFFFFFFFF,   # +-the largest value below 0.5: x + 0.5 already rounds to 1
+    0x3FE0000000000000, 0xBFE0000000000000,   # +-0.5, a tie that goes to 0
+    0x3FE0000000000001, 0xBFE0000000000001,   # +-the value just above 0.5
+    0x3FE8000000000000, 0xBFE8000000000000,   # +-0.75
+    0x3FEFFFFFFFFFFFFF, 0xBFEFFFFFFFFFFFFF,   # +-the value just below 1
+    0x3FF0000000000000, 0xBFF0000000000000,   # +-1
+    0x3FF0000000000001, 0xBFF0000000000001,   # +-the value just above 1
+    0x3FF8000000000000, 0xBFF8000000000000,   # +-1.5, a tie that goes to 2
+    0x4004000000000000, 0xC004000000000000,   # +-2.5, a tie that goes to 2
+    0x400C000000000000, 0xC00C000000000000,   # +-3.5, a tie that goes to 4
+    0x4003FFFFFFFFFFFF, 0xC004000000000001,   # just below 2.5, and just beyond -2.5
+    0x4320000000000001, 0xC320000000000001,   # +-(2^51 + 0.5), a tie that goes to 2^51
+    0x4320000000000003, 0xC320000000000003,   # +-(2^51 + 1.5), a tie that goes to 2^51 + 2
+    0x432FFFFFFFFFFFFF, 0xC32FFFFFFFFFFFFF,   # +-(2^52 - 0.5), the largest value with a fraction; a tie to 2^52
+    0x4330000000000000, 0x4330000000000001,   # 2^52, and the odd integer 2^52 + 1
+    0xC330000000000001, 0x433FFFFFFFFFFFFF,   # -(2^52 + 1), and 2^53 - 1
+    0x4340000000000000, 0x43E0000000000000,   # 2^53, and 2^63
+    0xC3E0000000000000, 0x7E37E43C8800759C,   # -2^63, and 1e300
+    0xFE37E43C8800759C, 0x7FEFFFFFFFFFFFFF,   # -1e300, and the largest finite value
+    0xFFEFFFFFFFFFFFFF, 0x7FF0000000000000,   # its negative, and +inf
+    0xFFF0000000000000, 0x7FF8000000000000,   # -inf, and a quiet NaN
+    0xFFF8000000000000, 0x7FF0000000000001,   # a negative quiet NaN, and a signalling NaN (payload in the low dword)
+    0xFFF0000080000000, 0x7FF8DEADBEEF1234,   # a negative signalling NaN, and a quiet NaN with a payload
+    0x419D6F3454400000, 0xC19D6F3457000000,   # 123456789.0625, and -123456789.75
+    0x3FB999999999999A, 0xBFB999999999999A,   # +-0.1
+    0x4012000000000000, 0xC012000000000000,   # +-4.5, a tie that goes to 4
+    0x4016000000000000, 0xC016000000000000,   # +-5.5, a tie that goes to 6
+    0x0010000000000000, 0x8010000000000000,   # +-the smallest normal
+    0x41E0000000100000, 0xC1E0000000100000)   # +-(2^31 + 0.5), a tie that goes to 2^31
+ROUND_F64_SIGN = 1 << 63
+ROUND_F64_KEPT = 0xCAFEF00DDEADBEEF   # the pair an inactive lane keeps: 0xdeadbeef low, 0xcafef00d high
+
+
+def f64_is_nan(bits):
+    return bits & 0x7FF0000000000000 == 0x7FF0000000000000 and bits & 0x000FFFFFFFFFFFFF != 0
+
+
+def f64_is_subnormal(bits):
+    return bits & 0x7FF0000000000000 == 0 and bits & 0x000FFFFFFFFFFFFF != 0
+
+
+def round_f64(op, bits):
+    """The binary64 pattern RDNA2 gives for `bits` rounded to an integral value by "trunc", "ceil", "rndne" or
+    "floor" (docs/design.md): exact IEEE-754, a tie of rndne going to the even integer, the result keeping the
+    sign of the source even when it is zero, and an infinity or a NaN coming back unchanged."""
+    x = struct.unpack("<d", struct.pack("<Q", bits))[0]
+    if x != x or x in (math.inf, -math.inf):
+        return bits
+    whole = {"trunc": math.trunc, "ceil": math.ceil, "rndne": round, "floor": math.floor}[op](x)
+    return struct.unpack("<Q", struct.pack("<d", math.copysign(float(whole), x)))[0]
+
+
+def round_f64_results():
+    """cs_w32_round_f64: for each thread its eight results in store order, as (op, source bits). The source has the
+    VOP3 modifier applied. The last result of an odd thread is (None, the pair it keeps): the lane was off."""
+    threads = []
+    for thread, x in enumerate(ROUND_F64_VALUES):
+        threads.append([("trunc", x), ("ceil", x), ("rndne", x), ("floor", x), ("trunc", x ^ ROUND_F64_SIGN),
+                        ("ceil", x & ~ROUND_F64_SIGN), ("floor", x),
+                        ("rndne", x) if thread % 2 == 0 else (None, ROUND_F64_KEPT)])
+    return threads
+
+
+def round_f64_words():
+    """cs_w32_round_f64: the input heap and the readback RDNA2's rules give, low dword first, with Python floats as
+    the oracle."""
+    results, inputs = [], []
+    for thread in round_f64_results():
+        for op, source in thread:
+            value = source if op is None else round_f64(op, source)
+            results.extend((value & 0xFFFFFFFF, value >> 32))
+    for x in ROUND_F64_VALUES:
+        inputs.extend((x & 0xFFFFFFFF, x >> 32))
+    return [0xEEEEEEEE] * len(results) + inputs, results + inputs
+
+
+# Drivers that round a binary64 with code written for a binary32, by the first word of the device name on
+# vk_compute_test's "device: ..." line (as UNJUDGED_WORDS is keyed), and the ops they do it for.
+# - Mesa llvmpipe: Trunc and RoundEven of a double take its float fallback whenever the CPU has no vector extension
+#   as wide as its double vectors, which are twice its native width: 512 bits at the usual 256, so every CPU without
+#   AVX-512. There a magnitude above 2^24 comes back unchanged (trunc of 123456789.0625 is 123456789.0625), and
+#   RoundEven of a smaller one can be the other neighbouring integer (1 for 1.5, 0 for the value just above 0.5).
+#   Floor and Ceil are exact on that path. Measured with Mesa 25.2.8 (LLVM 20.1.2) on the CI's runners, where the
+#   CPU decides from run to run, and with Mesa 26.2.6 (LLVM 23.1.4) under GALLIUM_OVERRIDE_CPU_CAPS=avx: 48 of the
+#   512 results. With AVX-512, or with AVX at LP_NATIVE_VECTOR_WIDTH=128, all four ops are exact.
+ROUND_F64_FLOAT_PATH = {"llvmpipe": ("trunc", "rndne")}
+
+
+def round_f64_float_path(op, source, value):
+    """Whether `value` is what a driver in ROUND_F64_FLOAT_PATH may give for the rounding of the finite `source`
+    instead of round_f64's word: the source itself when its magnitude is above 2^24, else one of its two
+    neighbouring integers, with the source's sign. Nothing below 0.5, a subnormal included: Trunc and RoundEven
+    give the zero of the source's sign there on either path."""
+    x = struct.unpack("<d", struct.pack("<Q", source))[0]
+    if x != x or x in (math.inf, -math.inf) or abs(x) < 0.5:
+        return False
+    if abs(x) > 1 << 24:
+        return value == source
+    return value in (round_f64("floor", source), round_f64("ceil", source))
+
+
+def round_f64_problem(got, out=""):
+    """Judge a readback of cs_w32_round_f64: "" or the first word that is wrong. `out` is vk_compute_test's output,
+    for its "device: ..." line. Every result is exact except for the two kinds of source Vulkan leaves to the
+    driver's double-precision rounding: a NaN may come back as any NaN (a signalling one comes back quiet on the
+    drivers measured), and a subnormal may be read as a zero of its sign, because the module does not declare
+    DenormPreserve for 64 bits. On a device in ROUND_F64_FLOAT_PATH the ops named there are held to
+    round_f64_float_path instead."""
+    _, expected = round_f64_words()
+    results = [result for thread in round_f64_results() for result in thread]
+    device = re.search(r"^device: (\S+)", out, re.MULTILINE)
+    float_path = ROUND_F64_FLOAT_PATH.get(device.group(1), ()) if device else ()
+    for index, (op, source) in enumerate(results):
+        value = got[2 * index] | got[2 * index + 1] << 32
+        want = expected[2 * index] | expected[2 * index + 1] << 32
+        if value == want:
+            continue
+        if op is not None and f64_is_nan(source) and f64_is_nan(value):
+            continue
+        if op is not None and f64_is_subnormal(source) and value == round_f64(op, source & ROUND_F64_SIGN):
+            continue
+        if op in float_path and round_f64_float_path(op, source, value):
+            continue
+        what = "the pair an inactive lane keeps" if op is None else f"{op} of {source:#018x}"
+        return f"word {2 * index} (thread {index // 8}): {what} gave {value:#018x}, expected {want:#018x}"
+    for index in range(2 * len(results), len(expected)):
+        if got[index] != expected[index]:
+            return f"word {index}: an input changed, expected {expected[index]:#010x}, got {got[index]:#010x}"
+    return ""
+
+
+def round_f64_test(tools, spirv, env=None):
+    """Verify the four binary64 roundings on 64 memory-fed inputs, including the untouched input records."""
+    initial, expected = round_f64_words()
+    with tempfile.TemporaryDirectory(prefix="leonida-round-f64-") as tmp:
+        path = Path(tmp) / "input.bin"
+        path.write_bytes(struct.pack(f"<{len(initial)}I", *initial))
+        child = dict(os.environ if env is None else env, VKC_HEAP_INIT=str(path))
+        child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_round_f64") or 32))
+        return dump_test(tools, spirv, "cs_w32_round_f64", expected, len(expected), child, judge=round_f64_problem)
+
+
 # cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
@@ -803,9 +950,10 @@ def failure(code, output, lines):
     return f"exit {code}: {details or 'no test output'}"
 
 
-def dump_test(tools, spirv, name, want, words, env=None):
+def dump_test(tools, spirv, name, want, words, env=None, judge=None):
     """Run one group with a heap of `words` words and compare the first len(want) words of the whole dump. The
-    console dump stops at word 7."""
+    console dump stops at word 7. With `judge`, the whole dump goes to it instead, as a tuple of words, with the
+    test program's output (it names the device), and its answer ("" for a pass) is returned."""
     with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
         dump = Path(tmp) / "out.bin"
         # VKC_OUT_WORDS sets a minimum. Pin this dispatch to exactly `words` words.
@@ -821,6 +969,8 @@ def dump_test(tools, spirv, name, want, words, env=None):
         data = dump.read_bytes()
     if len(data) != 4 * words:
         return f"expected {4 * words} dump bytes, got {len(data)}"
+    if judge:
+        return judge(struct.unpack(f"<{words}I", data), out)
     for i, (expected, got) in enumerate(zip(want, struct.unpack(f"<{words}I", data))):
         if got != expected:
             return f"word {i}: expected {expected:#010x}, got {got:#010x}"
@@ -1946,6 +2096,7 @@ def main():
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_w32_shift64", shift64_test(tools, spirv)))
     results.append(("cs_w32_cmp_f64", cmp_f64_test(tools, spirv)))
+    results.append(("cs_w32_round_f64", round_f64_test(tools, spirv)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
