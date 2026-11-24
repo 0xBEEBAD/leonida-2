@@ -17510,9 +17510,35 @@ def translate(path):
         # translate only code reachable from entry; a branch into data is rejected below.
         blob = native_blob(path, info["name"])
         pos = info["code_start"]
+        # llvm-mc's own messages say where it rejected a word, and it moves on by 4 bytes after each: with them the
+        # stream is anchored exactly, with no forward search (which can match a later copy of the same encoding when
+        # the printed bytes are not the bytes read, and then loses every instruction after it). A listed offset whose
+        # bytes are the next instruction is not skipped, so a listing whose messages do not match its blob still reads.
+        bad = set(info.get("invalid_at") or ())
+        exact = bool(bad) and len(bad) == info["invalid"]
         for ins in insns:
             enc = bytes.fromhex(ins["enc"])
             op, operand_count = ins["op"], len(ins["args"])
+            if exact:
+                while pos in bad and not same_encoding(blob[pos:pos + len(enc)], enc, op, operand_count):
+                    pos += 4
+                window = blob[pos:pos + len(enc)]
+                if not same_encoding(window, enc, op, operand_count):
+                    literal = mix_literal(window, enc, base_op(op))
+                    if literal is not None:
+                        restore_mix_literal(ins, window, literal)
+                    else:
+                        literal = mix_inline_literal(blob[pos:pos + 12], enc, base_op(op))
+                        if literal is not None:
+                            restore_mix_inline_literal(ins, blob[pos:pos + 12], literal)
+                            enc = blob[pos:pos + 12]
+                        elif pos + len(enc) > len(blob):
+                            raise Unsupported("undecodable words (cannot re-anchor)")
+                        else:
+                            ins["normalized"] = True
+                ins["pc"] = pos
+                pos += len(enc)
+                continue
             skipped, at = 0, pos
             while not same_encoding(blob[at:at + len(enc)], enc, op, operand_count):
                 literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
