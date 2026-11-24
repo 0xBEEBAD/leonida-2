@@ -81,8 +81,8 @@ jobs:
           author = (pull.get("user") or {}).get("login") or ""
           title = pull.get("title") or ""
           body = pull.get("body") or ""
-          clean_body = re.sub(r"<!--[\\s\\S]*?-->", "", body)
-          submitted_text = title + "\\n" + clean_body
+          clean_body = re.sub(r"<!--[\s\S]*?-->", "", body)
+          submitted_text = title + "\n" + clean_body
 
           issue = get_json(f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}")
           work_ids = open_work_ids(issue.get("body") or "")
@@ -112,11 +112,11 @@ jobs:
           }
 
           claim_field = re.search(
-              r"(?im)^Claimed in the coordination issue as:\\s*(.*)$",
+              r"(?im)^Claimed in the coordination issue as:\s*(.*)$",
               clean_body,
           )
           if claim_field:
-              link = re.search(r"#issuecomment-(\\d+)", claim_field.group(1))
+              link = re.search(r"#issuecomment-(\d+)", claim_field.group(1))
               if link:
                   linked_comment_id = link.group(1)
                   linked_comment = next(
