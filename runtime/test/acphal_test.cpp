@@ -22,6 +22,8 @@
 // Fail only the calling test thread's designated allocation.
 static thread_local int allocations_before_failure = -1;
 static std::atomic<bool> fail_worker_allocation{false};
+static std::atomic<bool> count_worker_allocations{false};
+static std::atomic<unsigned> worker_allocations{0};
 static DWORD test_thread_id;
 void* operator new(std::size_t size) {
     if (allocations_before_failure == 0) {
@@ -31,6 +33,9 @@ void* operator new(std::size_t size) {
     if (fail_worker_allocation.load() && GetCurrentThreadId() != test_thread_id &&
         fail_worker_allocation.exchange(false)) {
         throw std::bad_alloc();
+    }
+    if (count_worker_allocations.load() && GetCurrentThreadId() != test_thread_id) {
+        worker_allocations.fetch_add(1, std::memory_order_relaxed);
     }
     if (allocations_before_failure > 0) --allocations_before_failure;
     if (void* memory = std::malloc(size ? size : 1)) return memory;
@@ -145,7 +150,7 @@ void write_xma_packet(uint8_t* packet, uint32_t frames, uint8_t packet_skip,
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_thread_id = GetCurrentThreadId();
     std::printf("acphal_test: registered acphal.dll shim verification\n");
@@ -184,6 +189,25 @@ int main() {
         !free_mem || !is_valid || !map_apu || !map_virtual) {
         std::printf("Fatal: Missing export bindings for acphal.dll\n");
         return 1;
+    }
+
+    // Heap configuration is process-wide, so CTest exercises this mode separately.
+    if (argc == 2 && std::strcmp(argv[1], "--noncached-only") == 0) {
+        check(create_heap(0, 0x6000u) == S_OK, "Create only the non-cached APU heap");
+        void* noncached = nullptr;
+        uint32_t noncached_address = 0;
+        check(alloc(&noncached, &noncached_address, 0x1000, 0x800, 2) == S_OK && noncached != nullptr,
+              "Allocate from the non-cached heap");
+        void* cached = noncached;
+        uint32_t cached_address = noncached_address;
+        check(alloc(&cached, &cached_address, 0x1000, 0x800, 1) == E_OUTOFMEMORY &&
+                  cached == nullptr && cached_address == 0,
+              "A missing cached heap stays unavailable after explicit configuration");
+        check(map_apu(noncached_address) == noncached && map_virtual(noncached) == noncached_address,
+              "A failed cached allocation leaves the non-cached mapping unchanged");
+        free_mem(noncached);
+        std::printf("acphal_test complete: %d checks, %d failures\n", g_checks, g_failures);
+        return g_failures != 0;
     }
 
     // 1. AcpHalCreate
@@ -500,6 +524,8 @@ int main() {
 
         // ENABLE_XMA (cmd 5) on voice 1.
         const uint32_t enable_arg = 1u;
+        worker_allocations.store(0);
+        count_worker_allocations.store(true);
         check(fn_submit(x_acp, 5, 0xf1, 0xffffffffu, &enable_arg, 0) == S_OK,
               "ENABLE_XMA voice 1 succeeds");
 
@@ -544,6 +570,11 @@ int main() {
         }
         check(advanced, "ADVANCE_XMA_READ succeeds");
         check(written_blocks == 24, "Six frames write exactly 24 blocks before input exhaustion");
+        count_worker_allocations.store(false);
+        const unsigned allocation_count = worker_allocations.load();
+        std::printf("C++ worker allocations for six PCM frames: %u\n", allocation_count);
+        check(allocation_count > 0 && allocation_count < 16,
+              "PCM storage is reused across packets instead of allocating per sample block");
         check(((words[0] >> 20) & 3u) == 0u, "XMA input buffer valid bits cleared on exhaustion");
         check(((words[2] >> 31) & 1u) == 1u, "XMA error flag set on exhaustion");
         check(((words[2] >> 26) & 0x1Fu) == 4u, "XMA error status is INPUT_INVALID (4)");
@@ -647,9 +678,9 @@ int main() {
 #endif
         check(run_blocks(1, 3, 2, 1) == 9 && ((words[1] >> 24) & 7u) == 0,
               "Initial and loop subframe skips consume 3 blocks and clear the initial skip");
-        check(run_blocks(0, 2) == 8 && (words[4] >> 31) == 1u,
+        check(run_blocks(0, 2) == 8,
               "A skip to the end of input 0 continues at input 1");
-        check(run_blocks(0, 1) == 8 && (words[4] >> 31) == 1u,
+        check(run_blocks(0, 1) == 8,
               "An overshooting skip starts at packet 1 of input 1");
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
         check(has_signal(ring_bytes) && has_signal(ring_bytes + 0x400),
@@ -739,6 +770,22 @@ int main() {
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
         check(has_signal(ring_bytes), "Rust decodes non-silent PCM after a double refill");
 #endif
+
+        check(fn_submit(x_acp, 8, 0, 0xffffffffu, &voice_bit, 0) == S_OK,
+              "Reset the voice before exhausting both inputs");
+        write_xma_packet(packets, 1, 0);
+        write_xma_packet(packets + 0x800, 1, 0);
+        configure_voice(0, 1, 8, 0, 0);
+        words[1] = (words[1] & ~0xFFFu) | 1u;
+        check(fn_submit(x_acp, 6, 0, 0xffffffffu, &voice_bit, 0) == S_OK && wait_for_ring() &&
+                  ((words[0] >> 20) & 3u) == 0u,
+              "The voice exhausts input 0 and then input 1");
+        write_xma_packet(packets, 2, 0);
+        words[0].fetch_or(3u << 20);
+        const uint32_t full_ring[2] = {voice_index, 8};
+        check(fn_submit(x_acp, 18, 0, 0xffffffffu, full_ring, 0) == S_OK && wait_for_ring() &&
+                  ((words[0] >> 20) & 3u) == 2u,
+              "A double refill plays input 0 first even after exhausting input 1");
 
         // Reconfigure the still-enabled slot and verify that no queued PCM or old format survives.
         bool reconfigured = true;

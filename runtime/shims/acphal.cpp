@@ -390,25 +390,28 @@ struct XmaContextView {
         return (get(index) >> shift) & mask;
     }
 
-    void set_field(std::size_t index, uint32_t shift, uint32_t bits, uint32_t value) const {
+    uint32_t set_field(std::size_t index, uint32_t shift, uint32_t bits, uint32_t value) const {
         const uint32_t raw_mask = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
         const uint32_t mask = raw_mask << shift;
         const uint32_t field_value = (value << shift) & mask;
         std::atomic_ref word(words[index]);
         uint32_t previous = word.load();
         while (!word.compare_exchange_weak(previous, (previous & ~mask) | field_value)) {}
+        return previous;
     }
 
 };
 
 struct XmaVoice {
-    explicit XmaVoice(uint32_t format_bits) : format(format_bits) {}
+    explicit XmaVoice(uint32_t format_bits) : pcm(0), format(format_bits) {}
     std::size_t channels() const { return 1u + (format >> 2); }
+    std::size_t queued_samples() const { return pcm.size() - pcm_read; }
 
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
     std::unique_ptr<LeonidaXma2Decoder, Xma2DecoderFree> decoder;
 #endif
-    std::deque<int16_t> pcm;
+    std::vector<int16_t> pcm;
+    std::size_t pcm_read = 0;
     std::size_t loop_skip = 0;  // samples per channel to drop after a rewind
     uint32_t format;  // SHAPE word 1 bits 27..29, rate and channel layout
     bool ended = false;
@@ -503,6 +506,7 @@ public:
                 active_count_.fetch_add(1, std::memory_order_relaxed);
             } else if (voice->format != format) {
                 voice->pcm.clear();
+                voice->pcm_read = 0;
                 voice->loop_skip = 0;
                 voice->format = format;
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
@@ -550,10 +554,9 @@ private:
         return XmaContextView{array_[index].words};
     }
 
-    // Fills `pcm` (interleaved s16) for one 2048-byte packet. Without the Rust decoder, or when it
+    // Appends interleaved s16 for one 2048-byte packet. Without the Rust decoder, or when it
     // fails, the packet becomes silence for its frame count (header bits 26..31) so timing holds.
-    static void decode_packet(XmaVoice& voice, const uint8_t* bytes,
-                              std::vector<int16_t>& pcm) {
+    static void decode_packet(XmaVoice& voice, const uint8_t* bytes) {
         const std::size_t channels = voice.channels();
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
         if (!voice.decoder) {
@@ -569,13 +572,13 @@ private:
                 const std::unique_ptr<LeonidaXma2PcmBlock, Xma2PcmFree> block(raw);
                 const int16_t* samples = leonida_xma2_pcm_data(block.get());
                 const std::size_t count = leonida_xma2_pcm_sample_count(block.get());
-                if (count != 0) pcm.assign(samples, samples + count);
+                if (count != 0) voice.pcm.insert(voice.pcm.end(), samples, samples + count);
                 return;
             }
             voice.decoder.reset();  // Resume with a clean state after replacing a packet with silence.
         }
 #endif
-        pcm.assign(static_cast<std::size_t>(bytes[0] >> 2) * kXmaFrameSamples * channels, 0);
+        voice.pcm.resize(voice.pcm.size() + static_cast<std::size_t>(bytes[0] >> 2) * kXmaFrameSamples * channels);
     }
 
     // Decodes the packet at the read offset of the current input buffer and queues its PCM.
@@ -591,7 +594,7 @@ private:
         if (valid == 0) {
             voice.ended = true;
             ctx.set_field(2, 26, 6, kXmaErrorInputInvalid | 32u);
-            return !voice.pcm.empty();
+            return voice.queued_samples() != 0;
         }
         if ((valid & (1u << current)) == 0) {
             current ^= 1u;
@@ -609,20 +612,28 @@ private:
 
         const uint8_t* packet_data = data + packet * kXmaPacketBytes;
         const uint8_t packet_skip = packet_data[3];
-        // The sized constructor can propagate even an MSVC Debug allocation failure.
-        std::vector<int16_t> pcm(0);
-        decode_packet(voice, packet_data, pcm);
+        // Decoding is only requested when less than a ring block remains. Keep that
+        // tail and reuse the packet storage as the voice consumes subsequent packets.
+        voice.pcm.erase(voice.pcm.begin(), voice.pcm.begin() + static_cast<std::ptrdiff_t>(voice.pcm_read));
+        voice.pcm_read = 0;
+        const std::size_t packet_start = voice.pcm.size();
+        decode_packet(voice, packet_data);
+        const std::size_t packet_samples = voice.pcm.size() - packet_start;
         const std::size_t subframe_samples = kXmaSubframeSamples * channels;
         const std::size_t initial_skip = ctx.field(1, 24, 3);
-        const std::size_t skipped_subframes = std::min(initial_skip, pcm.size() / subframe_samples);
+        const std::size_t skipped_subframes = std::min(initial_skip, packet_samples / subframe_samples);
+        const std::size_t initial_samples = skipped_subframes * subframe_samples;
+        const std::size_t loop_samples = std::min(voice.loop_skip * channels, packet_samples - initial_samples);
+        const std::size_t skip_samples = initial_samples + loop_samples;
+        if (skip_samples != 0) {
+            const auto first = voice.pcm.begin() + static_cast<std::ptrdiff_t>(packet_start);
+            voice.pcm.erase(first, first + static_cast<std::ptrdiff_t>(skip_samples));
+        }
+        // Update the context only after the PCM append succeeds.
         if (skipped_subframes != 0) {
             ctx.set_field(1, 24, 3, static_cast<uint32_t>(initial_skip - skipped_subframes));
         }
-        const std::size_t initial_samples = skipped_subframes * subframe_samples;
-        const std::size_t loop_samples = std::min(voice.loop_skip * channels, pcm.size() - initial_samples);
         voice.loop_skip -= loop_samples / channels;
-        const std::size_t skip_samples = initial_samples + loop_samples;
-        voice.pcm.insert(voice.pcm.end(), pcm.begin() + static_cast<std::ptrdiff_t>(skip_samples), pcm.end());
 
         // XMA2 packet headers link packets from the same stream; 0xff ends the chain.
         std::size_t next = packet_skip == 0xFFu ? packets : packet + 1 + packet_skip;
@@ -651,8 +662,10 @@ private:
         // Publish the next offset before telling the title it can refill this input.
         ctx.set_field(2, 0, 26, static_cast<uint32_t>(skip_packets * kXmaPacketBits));
         const uint32_t other = 1u - current;
-        if (ctx.field(0, 20 + other, 1) != 0) ctx.set_field(4, 31, 1, other);
-        ctx.set_field(0, 20 + current, 1, 0);
+        const uint32_t retired = ctx.set_field(0, 20 + current, 1, 0);
+        // Take the other input if it was queued at retirement. Otherwise a double
+        // refill of the empty pair starts at input 0. A lone input can still run.
+        ctx.set_field(4, 31, 1, (retired & (1u << (20 + other))) != 0 ? other : 0u);
     }
 
     static void pump_voice(XmaContextView ctx, XmaVoice& voice) {
@@ -663,19 +676,18 @@ private:
 
         for (uint32_t blocks = 0; blocks < size && ctx.field(1, 31, 1) == 1; ++blocks) {
             int decode_guard = 0;
-            while (voice.pcm.size() < kXmaSamplesPerBlock && decode_guard++ < 16) {
+            while (voice.queued_samples() < kXmaSamplesPerBlock && decode_guard++ < 16) {
                 if (!decode_one_packet(ctx, voice)) break;
             }
-            if (voice.pcm.empty()) return;
+            if (voice.queued_samples() == 0) return;
 
             const uint32_t write = ctx.field(0, 27, 5) % size;
             uint8_t* out = ring + write * kXmaBlockBytes;
 
             for (std::size_t i = 0; i < kXmaSamplesPerBlock; ++i) {
                 int16_t sample = 0;
-                if (!voice.pcm.empty()) {
-                    sample = voice.pcm.front();
-                    voice.pcm.pop_front();
+                if (voice.pcm_read != voice.pcm.size()) {
+                    sample = voice.pcm[voice.pcm_read++];
                 }
                 const uint16_t raw = static_cast<uint16_t>(sample);
                 out[2 * i] = static_cast<uint8_t>(raw & 0xFFu);
@@ -1111,6 +1123,7 @@ HRESULT __stdcall ApuAlloc(void** virtualAddress, uint32_t* physicalAddress,
 
     if (!target->base) {
         if (!prefer_noncached) {
+            if (g_apu_heap_created) return E_OUTOFMEMORY;
             // Lazy default cached heap if ApuCreateHeap wasn't called yet
             constexpr uint32_t kDefaultHeapSize = 64 * 1024 * 1024;
             target->base = VirtualAlloc(nullptr, kDefaultHeapSize,
