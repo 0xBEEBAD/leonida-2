@@ -3,8 +3,9 @@ Driver:     NVIDIA 617.42 (proprietary), Vulkan 1.4.351
 Subgroup:   32..32 (default 32)
 OS:         Windows 11 Pro, build 26300
 Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31
-Tools:      llvm-mc 23.1.5 (AMDGPU; Arch Linux under WSL, passed as
-            --llvm-mc "wsl -d Arch-Work -e llvm-mc"), SPIRV-Tools v2026.4,
+Tools:      llvm-mc 23.1.5 (Windows, built with MSVC from the llvm-project
+            23.1.5 source release with LLVM_TARGETS_TO_BUILD=AMDGPU; the
+            release's Windows binaries carry no AMDGPU target), SPIRV-Tools v2026.4,
             Vulkan SDK 1.4.363.0, CMake 4.4.4,
             MSVC 19.50.35721.0 (Visual Studio 2026 Build Tools), Python 3.13.13
 CPU:        AMD Ryzen 9 7900X
