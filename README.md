@@ -20,7 +20,7 @@
   <a href="#want-to-help">Want to help?</a> |
   <a href="#credits">Credits</a> |
   <a href="#license">License</a> |
-  <a href="https://discord.gg/xsqS3DqqVF">Discord</a>
+  <a href="https://discord.gg/ZuserE2RGU">Discord</a>
 </p>
 
 Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
@@ -34,9 +34,14 @@ happens **on your PC, from your own copy of the game**.
 > Everything the build creates (the generated shaders, extracted assets, the runtime folder and your saves) comes
 > from your game and stays on your PC. Never share those files.
 
-Discord: https://discord.gg/xsqS3DqqVF
+> [!NOTE]
+> **This is a continuation of [NotRexed's Leonida project](https://github.com/ItsNotRexed/Leonida).** The original
+> author has left the project, and development continues here with its full commit history. Credit for the work up to
+> that point belongs to NotRexed and the contributors listed in the history.
 
-Custom Git Mirror: https://git.notrexed.dev/notrexed/Leonida
+Discord: https://discord.gg/ZuserE2RGU
+
+Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 <br>
 
 ## Project status
@@ -86,7 +91,7 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
 **The easy way:**
 
 1. Install the prerequisites below.
-2. Download this project **with its submodule**: `git clone --recursive https://github.com/ItsNotRexed/Leonida`. A
+2. Download this project **with its submodule**: `git clone --recursive https://github.com/ubiquitarianism/leonida`. A
    "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**.
@@ -272,6 +277,8 @@ pull requests.
 
 ## Credits
 
+- [Leonida](https://github.com/ItsNotRexed/Leonida) by NotRexed and contributors: the original project, which this
+  repository continues.
 - [rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) by breadbbbb: the RPF9 model, texture-pool and AWC
   decoders used by `tools/rpf9dump` (git submodule).
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (MIT): GFX10 resource-descriptor layout (`tools/gfx10_formats.json`),
