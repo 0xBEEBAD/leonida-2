@@ -1,11 +1,11 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/logo.svg" alt="Leonida" width="200">
+  <img src="assets/logo.svg" alt="Leonida Continued" width="200">
 </a>
 
   <br>
-  <b>Leonida</b>
+  <b>Leonida Continued</b>
   <br>
 </h1>
 
