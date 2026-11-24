@@ -279,17 +279,24 @@ jobs:
           
           def run_matches_pull(run, pull):
               head = pull.get("head") or {}
-              if run.get("event") != "pull_request" or run.get("head_sha") != head.get("sha"):
+              if run.get("event") != "pull_request":
                   return False
               associated = run.get("pull_requests") or []
               if associated:
-                  return any(
-                      str(item.get("number")) == str(pull.get("number"))
+                  matches = [
+                      item
                       for item in associated
-                  )
-              return run.get("head_branch") == head.get("ref")
-          
-          
+                      if str(item.get("number")) == str(pull.get("number"))
+                  ]
+                  if not matches:
+                      return False
+                  associated_head = ((matches[0].get("head") or {}).get("sha") or "")
+                  if associated_head:
+                      return associated_head == head.get("sha")
+              return (
+                  run.get("head_sha") == head.get("sha")
+                  and run.get("head_branch") == head.get("ref")
+              )
           def latest_runs_by_pull(pulls, runs):
               latest = {}
               for run in runs:
