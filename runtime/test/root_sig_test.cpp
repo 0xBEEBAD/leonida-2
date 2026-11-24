@@ -595,6 +595,16 @@ void test_deserializer() {
         check(SUCCEEDED(hr_zero) && shim_zero && shim_zero->GetRootSignatureDesc()->Flags == 0,
               "shim deserializer accepts an all-zero-checksum Xbox blob with the high byte cleared");
         if (shim_zero) shim_zero->Release();
+
+        if (versioned) {
+            ID3D12VersionedRootSignatureDeserializer* v_zero = nullptr;
+            const HRESULT v_hr_zero = versioned(zero_hash.data(), zero_hash.size(), IID_PPV_ARGS(&v_zero));
+            const auto* desc = v_zero ? v_zero->GetUnconvertedRootSignatureDesc() : nullptr;
+            check(SUCCEEDED(v_hr_zero) && v_zero && desc &&
+                      desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 && desc->Desc_1_0.Flags == 0,
+                  "versioned shim accepts an all-zero-checksum Xbox blob with the high byte cleared");
+            if (v_zero) v_zero->Release();
+        }
     }
 }
 
