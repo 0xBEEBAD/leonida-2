@@ -39,10 +39,13 @@ jobs:
           WORK_ID_RE = re.compile(ID_PATTERN)
           ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)(?![A-Za-z0-9-])")
           CLAIM_FIELD_RE = re.compile(
-              r"(?im)^[ \t]{0,128}>?[ \t]{0,128}Claimed in the coordination issue as:[ \t]{0,128}([^\r\n]{0,65536})[ \t]{0,128}$"
+              r"(?im)^[ \t]{0,128}>?[ \t]{0,128}Claimed in the coordination issue as:[ \t]{0,128}([^\r\n]{0,4096})[ \t]{0,128}$"
           )
-          BACKTICK = chr(96)
+          CLAIM_FIELD_HEADER_RE = re.compile(
+              r"(?im)^[ \t]{0,128}>?[ \t]{0,128}Claimed in the coordination issue as:"
+          )          BACKTICK = chr(96)
           MAX_CLAIM_BODY_CHARS = 65536
+          MAX_CLAIM_VALUE_CHARS = 4096
           
           
           def fail(message):
@@ -257,7 +260,9 @@ jobs:
               lines = body.splitlines()
               found = set()
               for index, line in enumerate(lines):
-                  match = re.match(r"^[ \t]{0,128}claiming:[ \t]{0,128}([^\r\n]{0,65536})$", line, re.IGNORECASE)
+                  if len(line) > MAX_CLAIM_VALUE_CHARS + 265 and line.lstrip(" \t").casefold().startswith("claiming:"):
+                      return set()
+                  match = re.match(r"^[ \t]{0,128}claiming:[ \t]{0,128}([^\r\n]{0,4096})$", line, re.IGNORECASE)
                   if not match:
                       continue
                   tail = unwrap_work_id_code(match.group(1).strip())
@@ -283,22 +288,15 @@ jobs:
                           stripped_bullet = lines[cursor].lstrip(" \t")
                           if stripped_bullet.startswith(("-", "*")):
                               candidate_text = stripped_bullet[1:].lstrip(" \t")
-                              candidate_inline = re.match(
-                                  "^" + re.escape(BACKTICK) + "([^" + BACKTICK + "]+)" + re.escape(BACKTICK),
-                                  candidate_text,
-                              )
-                              candidate_ids = (
-                                  ID_LIST_RE.match(candidate_inline.group(1).strip())
-                                  if candidate_inline else ID_LIST_RE.match(candidate_text)
-                              )
-                              if (
-                                  len(candidate_text) > 512
-                                  and (
-                                      candidate_ids
-                                      or re.match(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+", candidate_text)
-                                  )
-                              ):
-                                  batch_valid = False
+                              if len(candidate_text) > 512:
+                                  candidate_prefix = candidate_text[:512]
+                                  if candidate_prefix.startswith(BACKTICK):
+                                      candidate_prefix = candidate_prefix[1:]
+                                  if (
+                                      ID_LIST_RE.match(candidate_prefix)
+                                      or re.match(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+", candidate_prefix)
+                                  ):
+                                      batch_valid = False
                           break
                       bullet_text = unwrap_work_id_code(bullet.group(1))
                       first_ids = work_id_list(bullet_text)
@@ -362,8 +360,15 @@ jobs:
           def pull_claim_ids(pull, comments_by_id):
               found = ids_from_text(pull.get("title") or "")
               unresolved_links = []
-              body = re.sub(r"<!--[\s\S]*?-->", "", pull.get("body") or "")
-              for field in CLAIM_FIELD_RE.finditer(body):
+              raw_body = pull.get("body") or ""
+              if len(raw_body) > MAX_CLAIM_BODY_CHARS:
+                  return found, ["PR body exceeds the claim parser size limit"]
+              body = re.sub(r"<!--[\s\S]*?-->", "", raw_body)
+              field_headers = list(CLAIM_FIELD_HEADER_RE.finditer(body))
+              fields = list(CLAIM_FIELD_RE.finditer(body))
+              if len(field_headers) != len(fields):
+                  unresolved_links.append("Claimed in the coordination issue field exceeds the parser limit")
+              for field in fields:
                   value = field.group(1)
                   found.update(ids_from_text(value))
                   for comment_id in re.findall(r"#issuecomment-(\d+)", value):
