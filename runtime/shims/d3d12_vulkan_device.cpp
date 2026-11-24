@@ -5190,16 +5190,23 @@ public:
         if (info.host_pointer_alignment)
             state_.get_host_pointer_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
                 get_device(info.device, "vkGetMemoryHostPointerPropertiesEXT"));
-        // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
-        state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
-            return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        });
+        // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU. With buffer
+        // device addresses the same scratch holds the triangle indices of indexed quad lists (quad_index_expand.h):
+        // a compute pass writes them through the chunk's address and the draw binds the chunk as its index buffer.
+        const bool index_scratch = info.buffer_device_address;
+        state_.context->enable_copy_scratch(
+            get_device,
+            [this, index_scratch](const VkMemoryRequirements& requirements) {
+                return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, index_scratch);
+            },
+            index_scratch ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
         if (info.buffer_device_address && info.physical && info.get_instance_proc) {
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
                 VkPhysicalDeviceProperties props{};
                 get_props(info.physical, &props);
                 state_.context->configure_counted_dispatch(get_device, state_.memory, props.limits);
+                state_.context->configure_quad_indices(get_device, props.limits);
             }
         }
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
