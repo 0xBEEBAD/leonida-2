@@ -102,7 +102,8 @@ private:
     std::function<void()> wake_;
 };
 
-// Frame event kinds (0: origin, 1: vblank, 2: flip) and wait flags.
+// Provisional definitions of ours: the real constants and layouts of the console API are unmeasured. Frame event
+// kinds (0: origin, 1: vblank, 2: flip) and wait flags.
 inline constexpr std::uint32_t frame_event_origin = 0;
 inline constexpr std::uint32_t frame_event_vblank = 1;
 inline constexpr std::uint32_t frame_event_flip = 2;

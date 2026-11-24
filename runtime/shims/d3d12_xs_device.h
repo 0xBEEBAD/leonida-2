@@ -133,10 +133,11 @@ using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12
 void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
 
 // Presentation wiring: connects device frame-event slots (78/79/80/81: SetFrameIntervalX, ScheduleFrameEventX,
-// WaitFrameEventX, GetFrameStatisticsX) and queue presentation slots (PresentX, SuspendX, ResumeX, default 30/31/32,
-// configurable via LEONIDA_XS_PRESENT_X_SLOT / LEONIDA_XS_SUSPEND_X_SLOT / LEONIDA_XS_RESUME_X_SLOT) to an external
-// presenter such as rt::d3d12::XboxPresentation without coupling d3d12_xs_device to Vulkan headers. Passing nullptr
-// detaches the handler and restores the default mock/fallback behavior.
+// WaitFrameEventX, GetFrameStatisticsX; 81 is LEONIDA_XS_FRAME_STATISTICS_SLOT) and queue presentation slots (PresentX
+// at 30, or LEONIDA_XS_PRESENT_X_SLOT; SuspendX and ResumeX are routed only when LEONIDA_XS_SUSPEND_X_SLOT /
+// LEONIDA_XS_RESUME_X_SLOT are set) to an external presenter such as rt::d3d12::XboxPresentation without coupling
+// d3d12_xs_device to Vulkan headers. Passing nullptr detaches the handler and restores the default mock/fallback
+// behavior.
 struct PresentationHandler {
     void* context = nullptr;
     HRESULT (*set_frame_interval)(void* context, IUnknown* output, UINT interval_us, UINT latency, UINT flags) = nullptr;
