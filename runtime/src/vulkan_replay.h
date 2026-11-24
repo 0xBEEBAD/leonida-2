@@ -4231,7 +4231,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 } else {
                     // Both triangles start at the quad's first vertex for flat inputs. One draw also preserves
                     // the original instance order, and VertexIndex - BaseVertex still gives 4q + k.
-                    constexpr std::uint32_t indices_per_quad = quad_triangle_indices.size();
+                    constexpr auto indices_per_quad = std::uint32_t(quad_triangle_indices.size());
                     const std::uint32_t wanted = draw->count / 4;
                     const std::uint32_t quads = std::min(wanted, vk.quad_index_count / indices_per_quad);
                     if (quads < wanted)
