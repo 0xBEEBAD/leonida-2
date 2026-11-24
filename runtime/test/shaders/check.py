@@ -1003,7 +1003,7 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
             return Skip(f"SKIP ({out.strip() or 'unsupported device'})")
         if code == 0 and (skip := wave32_lane_skip(out)):
             return skip
-    if sg and (skip := unpinned_subgroup_skip(out)):
+    if code == 0 and sg and (skip := unpinned_subgroup_skip(out)):
         return skip
     if code != 0:
         return failure(code, out, 2)

@@ -303,7 +303,7 @@ class FloatToIntSweep(unittest.TestCase):
 
         def harness(_tool, _shader, *_args, env=None):
             calls.append(env.get("VKC_SUBGROUP_SIZE"))
-            return 1, "compute subgroup size: 32 not available\n"
+            return 0, "compute subgroup size: 32 not available\n"
 
         with patch.object(check, "run", side_effect=harness), \
                 patch.object(check, "subgroup_size", return_value=32):
@@ -967,7 +967,12 @@ class Wave32LaneDumps(unittest.TestCase):
             out = "compute subgroup size: 32 not available\nout[0..7] = 0 0 0 0 0 0 0 0\n"
             with patch.object(check, "run", return_value=(0, out)):
                 problem = check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[128])
-        self.assertIsInstance(problem, check.Skip)
+            self.assertIsInstance(problem, check.Skip)
+            for code in (1, -11, 0xC0000005):
+                with self.subTest(code=code), patch.object(check, "run", return_value=(code, out)):
+                    problem = check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[128])
+                    self.assertNotIsInstance(problem, check.Skip)
+                    self.assertIn(f"exit {code}:", problem)
 
     def test_skipped_when_32_lanes_cannot_be_pinned(self):
         for name in check.WAVE32_LANE_DUMPS:
