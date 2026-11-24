@@ -36,7 +36,7 @@ jobs:
           ISSUE_NUMBER = 14
           ID_PATTERN = r"[A-Z0-9]+(?:-[A-Z0-9]+)+"
           WORK_ID_RE = re.compile(ID_PATTERN)
-          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)", re.IGNORECASE)
+          ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)")
           CLAIM_FIELD_RE = re.compile(
               r"(?im)^\s*>?\s*Claimed in the coordination issue as:\s*(.*?)\s*$"
           )
@@ -83,42 +83,40 @@ jobs:
               return {value.upper() for value in WORK_ID_RE.findall(text or "")}
           
           
-          def ids_from_claim_comment(body):
-              lines = (body or "").splitlines()
-              found = set()
-              for index, line in enumerate(lines):
-                  match = re.match(r"^\s*claiming:\s*(.*)$", line, re.IGNORECASE)
-                  if not match:
-                      continue
-                  tail = match.group(1).strip()
-                  listed = ID_LIST_RE.match(tail)
-                  if listed:
-                      found.update(ids_from_text(listed.group(1)))
-                      continue
-                  batch_intro = re.match(
-                      r"^(?:the items below|a second batch)\b",
-                      tail,
-                      re.IGNORECASE,
-                  )
-                  if tail and not batch_intro:
-                      continue
-                  cursor = index + 1
-                  while cursor < len(lines) and not lines[cursor].strip():
-                      cursor += 1
-                  bullets = []
-                  while cursor < len(lines):
-                      bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
-                      if not bullet:
-                          break
-                      bullets.append(bullet.group(1))
-                      cursor += 1
-                  for bullet in bullets:
-                      first_ids = ID_LIST_RE.match(bullet.strip().strip(BACKTICK))
-                      if first_ids:
-                          found.update(ids_from_text(first_ids.group(1)))
-              return found
-          
-          
+                    def ids_from_claim_comment(body):
+                        lines = (body or "").splitlines()
+                        found = set()
+                        for index, line in enumerate(lines):
+                            match = re.match(r"^\s*claiming:\s*(.*)$", line, re.IGNORECASE)
+                            if not match:
+                                continue
+                            tail = match.group(1).strip()
+                            listed = ID_LIST_RE.match(tail)
+                            if listed:
+                                found.update(ids_from_text(listed.group(1)))
+                                continue
+                            batch_intro = re.match(
+                                r"^(?:the items below|a second batch)\b",
+                                tail,
+                                re.IGNORECASE,
+                            )
+                            if tail and not batch_intro:
+                                continue
+                            cursor = index + 1
+                            while cursor < len(lines) and not lines[cursor].strip():
+                                cursor += 1
+                            while cursor < len(lines):
+                                bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
+                                if not bullet:
+                                    break
+                                first_ids = ID_LIST_RE.match(
+                                    bullet.group(1).strip().strip(BACKTICK)
+                                )
+                                if not first_ids:
+                                    break
+                                found.update(ids_from_text(first_ids.group(1)))
+                                cursor += 1
+                        return found
           def open_work_ids(body):
               in_open_work = False
               result = set()
@@ -164,14 +162,21 @@ jobs:
               return found
           
           
-          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
-              event = json.load(event_file)
-          pull = event.get("pull_request") or {}
-          author = ((pull.get("user") or {}).get("login") or "").casefold()
-          opened_at = parse_time(pull.get("created_at"))
-          if not author or opened_at is None:
-              fail("Cannot determine the PR author or opening time.")
-          
+                    with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+                        event = json.load(event_file)
+                    event_pull = event.get("pull_request") or {}
+                    pull_number = event_pull.get("number") or event.get("number")
+                    event_head_sha = ((event_pull.get("head") or {}).get("sha") or "")
+                    if not pull_number or not event_head_sha:
+                        fail("Cannot determine the PR number or event head SHA.")
+                    pull = request_json(f"/repos/{OWNER}/{REPOSITORY}/pulls/{pull_number}")
+                    live_head_sha = ((pull.get("head") or {}).get("sha") or "")
+                    if live_head_sha != event_head_sha:
+                        fail("The PR head changed after this run was queued; check the current PR head.")
+                    author = ((pull.get("user") or {}).get("login") or "").casefold()
+                    opened_at = parse_time(pull.get("created_at"))
+                    if not author or opened_at is None:
+                        fail("Cannot determine the current PR author or opening time.")
           issue = request_json(f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}")
           comments = get_collection(
               f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments"
