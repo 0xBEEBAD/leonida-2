@@ -24,6 +24,7 @@
 // 78 SetFrameIntervalX, 79 ScheduleFrameEventX and 80 WaitFrameEventX. The slots can be moved with LEONIDA_XS_*_SLOT
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
+#include "../src/title_va_alias.h"
 #include "title_window.h"
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
@@ -166,9 +167,6 @@ bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap,
         return false;
     try {
         std::lock_guard lock(descriptor_range_mutex());
-        std::fprintf(stderr, "[rt] localdbg: descriptor range custom=0x%llx..0x%llx real_cpu=0x%llx heap=%p\n",
-                     static_cast<unsigned long long>(custom_start), static_cast<unsigned long long>(custom_start + byte_size),
-                     static_cast<unsigned long long>(real_start), static_cast<const void*>(heap));
         descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap});
         g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
         return true;
@@ -216,10 +214,33 @@ bool local_desc_mirror() {
     return on;
 }
 
+// Whether [address, address + bytes) is committed memory that can be read (and, with `write`, written). A handle
+// that is only a number (a mock's, or a range the title has released) is left alone instead of faulting.
+bool local_accessible(std::uint64_t address, std::uint64_t bytes, bool write) {
+    const std::uint64_t end = address + bytes;
+    if (!address || end < address) return false;
+    while (address < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) || info.State != MEM_COMMIT)
+            return false;
+        const DWORD protect = info.Protect & 0xff;
+        if (info.Protect & PAGE_GUARD) return false;
+        const bool writable = protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+                              protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+        const bool readable = writable || protect == PAGE_READONLY || protect == PAGE_EXECUTE_READ;
+        if (write ? !writable : !readable) return false;
+        address = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+    }
+    return true;
+}
+
 void local_write_through(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE custom, SIZE_T count) {
     if (!local_desc_mirror() || !custom.ptr || !count) return;
     const D3D12_CPU_DESCRIPTOR_HANDLE real = translate_cpu_handle(device, custom);
     if (real.ptr == custom.ptr) return;
+    if (!local_accessible(real.ptr, count * kLocalDescriptorBytes, false) ||
+        !local_accessible(custom.ptr, count * kLocalDescriptorBytes, true))
+        return;
     std::memcpy(reinterpret_cast<void*>(custom.ptr), reinterpret_cast<const void*>(real.ptr),
                 count * kLocalDescriptorBytes);
     static std::atomic<bool> said{false};
@@ -240,6 +261,9 @@ void local_mirror_table(const DeviceProxy* device, std::uint64_t gpu_handle) {
         if (!gpu_start || gpu_handle < gpu_start || gpu_handle >= gpu_start + bytes) continue;
         const std::uint64_t offset = (gpu_handle - gpu_start) / kLocalDescriptorBytes * kLocalDescriptorBytes;
         const std::uint64_t slots = (std::min<std::uint64_t>)(kLocalMirrorSlots, (bytes - offset) / kLocalDescriptorBytes);
+        if (!local_accessible(range.custom_start + offset, slots * kLocalDescriptorBytes, false) ||
+            !local_accessible(range.real_start + offset, slots * kLocalDescriptorBytes, true))
+            return;
         std::uint64_t copied = 0;
         for (std::uint64_t i = 0; i < slots; ++i) {
             const auto* from = reinterpret_cast<const std::uint64_t*>(range.custom_start + offset + i * kLocalDescriptorBytes);
@@ -740,22 +764,12 @@ D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
 
 D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
     note_heap_slot(10);
-    {
-        static std::atomic<int> said{0};
-        if (said.fetch_add(1) < 8) std::fprintf(stderr, "[rt] localdbg: heap slot 10 (GPU handle) asked on heap %p\n", static_cast<void*>(self));
-    }
     constexpr UINT64 kUnset = ~static_cast<UINT64>(0);
     D3D12_GPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = kUnset;
     using Fn = D3D12_GPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_GPU_DESCRIPTOR_HANDLE*);
     const D3D12_GPU_DESCRIPTOR_HANDLE returned =
         reinterpret_cast<Fn>(self->real_vtable[10])(self->real, &handle);
-    {
-        static std::atomic<int> said{0};
-        if (said.fetch_add(1) < 4)
-            std::fprintf(stderr, "[rt] localdbg: heap %p slot 10 answers GPU handle 0x%llx\n", static_cast<void*>(self),
-                         static_cast<unsigned long long>(handle.ptr != kUnset ? handle.ptr : returned.ptr));
-    }
     return handle.ptr != kUnset ? handle : returned;
 }
 
@@ -2538,12 +2552,6 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
         std::uint64_t custom;
         ~LocalWriteThrough() { local_write_through(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(custom)}, 1); }
     } local_write_back{self, destination};
-    {
-        static std::atomic<int> calls{0};
-        const int n = calls.fetch_add(1);
-        if (n < 4 || n % 5000 == 0)
-            std::fprintf(stderr, "[rt] localdbg: slot 70 call #%d dest=0x%llx\n", n, static_cast<unsigned long long>(destination));
-    }
     // The console hands a CPU descriptor handle in the title's heap memory; #7021 translates it to the real heap's.
     destination = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)}).ptr;
 
@@ -2561,7 +2569,10 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
         // LOCAL: a small raw view over the title's own memory becomes a raw buffer V# through the constant-view path,
         // which resolves a title address to its GPU copy (#9137). LEONIDA_SLOT70_TITLE=0 keeps the null view.
         static const bool title_views = [] { const char* v = std::getenv("LEONIDA_SLOT70_TITLE"); return !(v && *v == '0'); }();
-        if (title_views && shape.va && shape.va < 0x100000000ull && shape.resource.Width && shape.resource.Width <= 65536) {
+        std::uint64_t title_lo = 0, title_hi = 0;
+        if (title_views && shape.resource.Width && shape.resource.Width <= 65536 &&
+            leonida::title_va_aliases().title_memory(shape.va, title_lo, title_hi) &&
+            shape.resource.Width <= title_hi - shape.va) {
             D3D12_CONSTANT_BUFFER_VIEW_DESC constants{};
             constants.BufferLocation = shape.va;
             constants.SizeInBytes = static_cast<UINT>(shape.resource.Width);
@@ -2573,13 +2584,6 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
             return;
         }
         log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
-        {
-            static std::atomic<int> nulls{0};
-            const int n = nulls.fetch_add(1);
-            if (n < 3 || n % 5000 == 0)
-                std::fprintf(stderr, "[rt] localdbg: slot 70 null #%d: no buffer holds va=0x%llx width=%llu\n", n,
-                             static_cast<unsigned long long>(shape.va), static_cast<unsigned long long>(shape.resource.Width));
-        }
         write_null_srv(self, destination);
         return;
     }
@@ -2783,25 +2787,6 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
-    {   // LOCAL DIAGNOSTIC
-        static std::atomic<int> said{0};
-        const int n = said.fetch_add(1);
-        if (n < 6 || (n > 3000 && n < 3008)) {
-            const D3D12_CPU_DESCRIPTOR_HANDLE t = translate_cpu_handle(self, dest);
-            std::fprintf(stderr, "[rt] localdbg: CreateCBV #%d dest=0x%llx -> 0x%llx location=0x%llx size=%u\n", n,
-                         static_cast<unsigned long long>(dest.ptr), static_cast<unsigned long long>(t.ptr),
-                         desc ? static_cast<unsigned long long>(desc->BufferLocation) : 0ull, desc ? desc->SizeInBytes : 0u);
-            MEMORY_BASIC_INFORMATION q{};
-            if (desc && desc->BufferLocation && desc->BufferLocation < 0x100000000ull &&
-                VirtualQuery(reinterpret_cast<const void*>(desc->BufferLocation), &q, sizeof(q)) && q.State == MEM_COMMIT &&
-                !(q.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
-                const float* f = reinterpret_cast<const float*>(desc->BufferLocation);
-                std::fprintf(stderr, "[rt] localdbg:   constants now:");
-                for (int w = 0; w < 24 && w * 4u < desc->SizeInBytes; ++w) std::fprintf(stderr, " %g", f[w]);
-                std::fprintf(stderr, "\n");
-            }
-        }
-    }
     self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
     local_write_through(self, dest, 1);
 }

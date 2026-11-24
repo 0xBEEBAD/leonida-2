@@ -809,20 +809,6 @@ enum class ReplayResult {
     invalid_draw,  // DispatchMesh with a pipeline that has no mesh shader, or a vertex draw with one that has
     unsupported
 };
-// LOCAL DIAGNOSTIC: the arena's host mapping and size, for dumps of what a shader would read.
-inline std::uint8_t* g_local_arena_mapped = nullptr;
-inline std::uint64_t g_local_arena_size = 0;
-inline std::atomic<std::uint64_t> g_local_last_cb96{0};  // title address of the last 96-byte constant view created
-
-// LOCAL DIAGNOSTIC: which check returned unresolved_resource (first 3 times per source line).
-inline ReplayResult local_unresolved_at(int line) {
-    static std::atomic<int> seen[8192];
-    if (line >= 0 && line < 8192 && seen[line].fetch_add(1, std::memory_order_relaxed) < 3)
-        std::fprintf(stderr, "[rt] localdbg: unresolved_resource at vulkan_replay.h:%d\n", line);
-    return ReplayResult::unresolved_resource;
-}
-
-
 struct ReplayFunctions {
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
@@ -882,7 +868,7 @@ struct ReplayFunctions {
     // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
     // of it.
     std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer&, VkDeviceSize&)> buffer_at;
-    // LOCAL: a vertex or index view whose VA is the title's own CPU memory, not a registered buffer (on the console
+    // A vertex or index view whose VA is the title's own CPU memory, not a registered buffer (on the console
     // the GPU reads title memory directly). Copies [va, va + size) into a GPU-visible ring and names the copy; false
     // when the range is not readable host memory.
     std::function<bool(std::uint64_t va, std::uint64_t size, VkBuffer&, VkDeviceSize&)> title_memory;
@@ -2131,7 +2117,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
-    if (!pipeline || !pipeline->pipeline) return local_unresolved_at(__LINE__);
+    if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
@@ -2152,7 +2138,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const TargetView& target = draw.views->render_targets[slot];
         if (!target.resource) continue;
         const ResourceBinding* binding = resolve(target.resource);
-        if (!binding) return local_unresolved_at(__LINE__);
+        if (!binding) return ReplayResult::unresolved_resource;
         auto& a = p.colors[slot];
         a.binding = *binding;
         a.id = target.resource;
@@ -2169,7 +2155,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     }
     if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
         const ResourceBinding* binding = resolve(draw.depth.resource);
-        if (!binding) return local_unresolved_at(__LINE__);
+        if (!binding) return ReplayResult::unresolved_resource;
         auto& a = p.depth;
         a.binding = *binding;
         a.id = draw.depth.resource;
@@ -2210,7 +2196,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const bool bound = draw.views && slot < draw.views->vertex_buffers.size() &&
                            draw.views->vertex_buffers[slot].va;
         if (!bound) {
-            if (!vk.zero_buffer) return local_unresolved_at(__LINE__);
+            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
             p.vertex_buffers[slot] = vk.zero_buffer;
             p.vertex_offsets[slot] = vk.zero_offset;
             p.vertex_sizes[slot] = vk.zero_size;
@@ -2222,101 +2208,20 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot])) {
             size = view.size;
             if (!vk.title_memory || !vk.title_memory(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
-                return local_unresolved_at(__LINE__);
-            {   // LOCAL DIAGNOSTIC: the first draws that read title memory
-                static std::atomic<int> shown{0};
-                const int nth = shown.fetch_add(1, std::memory_order_relaxed);
-                if (nth < 12 || (nth % 20000) < 3) {
-                    const float* f = reinterpret_cast<const float*>(view.va);
-                    std::fprintf(stderr, "[rt] localdbg: draw slot=%u topology=%u count=%u instances=%u first=%u stride=%u "
-                                 "bytes=%llu viewport=%.0f,%.0f %.0fx%.0f depth %.2f..%.2f\n", slot, draw.topology,
-                                 draw.count, draw.instances, draw.first, view.stride,
-                                 static_cast<unsigned long long>(view.size), draw.viewport.x, draw.viewport.y,
-                                 draw.viewport.width, draw.viewport.height, draw.viewport.min_depth, draw.viewport.max_depth);
-                    for (std::uint32_t t = 0; draw.views && t < draw.views->render_target_count; ++t)
-                        std::fprintf(stderr, "[rt] localdbg:   target %u resource=0x%llx mip=%u pipeline=0x%llx depth=0x%llx "
-                                     "scissor=%d,%d..%d,%d\n", t,
-                                     static_cast<unsigned long long>(draw.views->render_targets[t].resource),
-                                     draw.views->render_targets[t].mip, static_cast<unsigned long long>(draw.pipeline),
-                                     static_cast<unsigned long long>(draw.depth.resource), draw.scissor.left,
-                                     draw.scissor.top, draw.scissor.right, draw.scissor.bottom);
-                    std::fprintf(stderr, "[rt] localdbg:   heap_base=0x%llx user_data:", static_cast<unsigned long long>(vk.heap_base));
-                    for (int w = 0; w < 16; ++w) std::fprintf(stderr, " %08x", draw.user_data[w]);
-                    std::fprintf(stderr, "\n");
-                    for (int w = 0; w < 16; ++w) {  // which root words name a registered buffer
-                        std::uint64_t room = 1; VkBuffer bb = VK_NULL_HANDLE; VkDeviceSize bo = 0;
-                        if (draw.user_data[w] && vk.buffer_at(draw.user_data[w], room, bb, bo))
-                            std::fprintf(stderr, "[rt] localdbg:   user_data[%d] is a registered buffer VA\n", w);
-                    }
-                    const std::uint32_t local_table = draw.user_data[0] ? draw.user_data[0] : draw.user_data[8];
-                    if (g_local_arena_mapped && local_table && local_table + 256ull <= g_local_arena_size) {
-                        const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(g_local_arena_mapped + local_table);
-                        for (int e = 0; e < 4; ++e) {
-                            std::fprintf(stderr, "[rt] localdbg:   table[%d]:", e);
-                            for (int w = 0; w < 8; ++w) std::fprintf(stderr, " %08x", t[e * 8 + w]);
-                            std::fprintf(stderr, "\n");
-                            const std::uint64_t va = (std::uint64_t(t[e * 8 + 1] & 0xffff) << 32) | t[e * 8];
-                            if (va && va + 128 <= g_local_arena_size) {
-                                const float* f2 = reinterpret_cast<const float*>(g_local_arena_mapped + va);
-                                std::fprintf(stderr, "[rt] localdbg:     at va 0x%llx:", static_cast<unsigned long long>(va));
-                                for (int w = 0; w < 32; ++w) std::fprintf(stderr, " %g", f2[w]);
-                                std::fprintf(stderr, "\n");
-                            }
-                        }
-                    }
-                    {   // the same table read from the title's memory, taking the high dword from the vertex view's VA
-                        const std::uint64_t guess = (view.va & 0xffffffff00000000ull) | draw.user_data[0];
-                        std::fprintf(stderr, "[rt] localdbg:   vertex va=0x%llx table guess=0x%llx delta=%lld\n",
-                                     static_cast<unsigned long long>(view.va), static_cast<unsigned long long>(guess),
-                                     static_cast<long long>(view.va - guess));
-                        std::uint64_t probe = 256; VkBuffer pb = VK_NULL_HANDLE; VkDeviceSize po = 0;
-                        if (draw.user_data[0] && vk.title_memory && vk.title_memory(guess, probe, pb, po)) {
-                            const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(guess);
-                            for (int e = 0; e < 3; ++e) {
-                                std::fprintf(stderr, "[rt] localdbg:   title table[%d]:", e);
-                                for (int w = 0; w < 8; ++w) std::fprintf(stderr, " %08x", t[e * 8 + w]);
-                                std::fprintf(stderr, "\n");
-                            }
-                        } else {
-                            std::fprintf(stderr, "[rt] localdbg:   title table guess is not readable title memory\n");
-                        }
-                    }
-                    if (const std::uint64_t cb = g_local_last_cb96.load()) {
-                        const float* f3 = reinterpret_cast<const float*>(cb);
-                        std::fprintf(stderr, "[rt] localdbg:   96-byte constants in title memory at draw time:");
-                        for (int w = 0; w < 24; ++w) std::fprintf(stderr, " %g", f3[w]);
-                        std::fprintf(stderr, "\n");
-                    }
-                    {   // what sits just before the vertices in the title's ring
-                        const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(view.va - 0x60);
-                        for (int e = 0; e < 3; ++e) {
-                            std::fprintf(stderr, "[rt] localdbg:   before vertices[-0x%x]:", 0x60 - e * 0x20);
-                            for (int w = 0; w < 8; ++w) std::fprintf(stderr, " %08x", t[e * 8 + w]);
-                            std::fprintf(stderr, "\n");
-                        }
-                    }
-                    const std::uint32_t words = view.stride / 4 ? view.stride / 4 : 1;
-                    for (std::uint32_t v = 0; v < 4 && (draw.first + v + 1) * view.stride <= view.size; ++v) {
-                        const float* q = f + (draw.first + v) * words;
-                        std::fprintf(stderr, "[rt] localdbg:   v%u = %g %g %g %g %g %g\n", v, q[0], q[1],
-                                     words > 2 ? q[2] : 0.f, words > 3 ? q[3] : 0.f, words > 4 ? q[4] : 0.f,
-                                     words > 5 ? q[5] : 0.f);
-                    }
-                }
-            }
+                return ReplayResult::unresolved_resource;
         }
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
     // A non-indexed quad list is drawn from the shared triangle index buffer (emit).
     if (!draw.indexed && !draw.mesh && draw.topology == topology_quad_list && !vk.quad_indices)
-        return local_unresolved_at(__LINE__);
+        return ReplayResult::unresolved_resource;
     if (draw.indexed) {
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
         else if (draw.index.va) return ReplayResult::unsupported;
         if (!draw.index.va) {  // no index buffer: every index reads 0
-            if (!vk.zero_buffer) return local_unresolved_at(__LINE__);
+            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
             p.index_buffer = vk.zero_buffer;
             p.index_offset = vk.zero_offset;
         } else {
@@ -2324,7 +2229,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset)) {
                 size = draw.index.size;
                 if (!vk.title_memory || !vk.title_memory(draw.index.va, size, p.index_buffer, p.index_offset))
-                    return local_unresolved_at(__LINE__);
+                    return ReplayResult::unresolved_resource;
             }
         }
     }
@@ -2746,7 +2651,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         };
 
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
-            if (!bind(transition->resource)) return local_unresolved_at(__LINE__);
+            if (!bind(transition->resource)) return ReplayResult::unresolved_resource;
             if (p.binding.image == VK_NULL_HANDLE) {
                 if (transition->subresource != 0 && transition->subresource != all_subresources)
                     return ReplayResult::invalid_subresource;
@@ -2756,14 +2661,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
             if (const auto* buffer_barrier = std::get_if<BufferBarrier>(&command))
-                if (!bind(buffer_barrier->resource)) return local_unresolved_at(__LINE__);
+                if (!bind(buffer_barrier->resource)) return ReplayResult::unresolved_resource;
         } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
-            if (!bind(texture->resource)) return local_unresolved_at(__LINE__);
+            if (!bind(texture->resource)) return ReplayResult::unresolved_resource;
             if (!p.binding.image || !barrier_range(p.binding, texture->range, p.range))
                 return ReplayResult::invalid_subresource;
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
-            if (!bind(color_clear->target.resource)) return local_unresolved_at(__LINE__);
+            if (!bind(color_clear->target.resource)) return ReplayResult::unresolved_resource;
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
                 return ReplayResult::invalid_subresource;
@@ -2785,7 +2690,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                        r != ReplayResult::success) return r;
             if (!p.skip && p.rects.empty() && !vk.clear_color_image) return ReplayResult::unsupported;
         } else if (const auto* depth_clear = std::get_if<ClearDepthStencil>(&command)) {
-            if (!bind(depth_clear->target.resource)) return local_unresolved_at(__LINE__);
+            if (!bind(depth_clear->target.resource)) return ReplayResult::unresolved_resource;
             VkImageAspectFlags aspects = 0;
             if (depth_clear->flags & clear_depth) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
             if (depth_clear->flags & clear_stencil) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -2805,7 +2710,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!p.skip && p.rects.empty() && !vk.clear_depth_stencil_image) return ReplayResult::unsupported;
         } else if (const auto* uav = std::get_if<ClearUnorderedAccess>(&command)) {
             const UavView& view = uav->view;
-            if (!bind(view.resource)) return local_unresolved_at(__LINE__);
+            if (!bind(view.resource)) return ReplayResult::unresolved_resource;
             if (view.buffer) {
                 if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
                 if (predicated) ++out.unpredicated_copies;  // fills and copies are transfer commands
@@ -2865,7 +2770,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (predicated && !std::holds_alternative<CopyBuffer>(command)) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
-            if (!bind(dst_id) || !source) return local_unresolved_at(__LINE__);
+            if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
             ReplayResult result = ReplayResult::success;
             if (const auto* buffer_copy = std::get_if<CopyBuffer>(&command)) {
@@ -2998,7 +2903,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.resolve_image) return ReplayResult::unsupported;
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(resolve_command->src);
-            if (!bind(resolve_command->dst) || !source) return local_unresolved_at(__LINE__);
+            if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
@@ -3029,7 +2934,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
-            if (!bind(discard->resource)) return local_unresolved_at(__LINE__);
+            if (!bind(discard->resource)) return ReplayResult::unresolved_resource;
             const std::uint64_t end = std::uint64_t(discard->first_subresource) + discard->count;
             if (!p.binding.image) {
                 if (!discard->whole && end > 1) return ReplayResult::invalid_subresource;
@@ -3049,7 +2954,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.update_buffer || !vk.buffer_at) return ReplayResult::unsupported;
             std::uint64_t bytes = 4;
             if (!vk.buffer_at(write->address, bytes, p.write_buffer, p.write_offset) || bytes < 4)
-                return local_unresolved_at(__LINE__);
+                return ReplayResult::unresolved_resource;
             if (p.write_offset % 4) return ReplayResult::invalid_copy;
             // WriteBufferImmediate resolves by VA and may target a readback buffer in COPY_DEST.
             out.wrote_readback = true;
@@ -3058,14 +2963,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.copy_buffer) return ReplayResult::unsupported;
             if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(atomic->src);
-            if (!bind(atomic->dst) || !source) return local_unresolved_at(__LINE__);
+            if (!bind(atomic->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
             if (!p.binding.buffer || !p.source.buffer || !detail::within(atomic->dst_offset, atomic->bytes, p.binding.size) ||
                 !detail::within(atomic->src_offset, atomic->bytes, p.source.size))
                 return ReplayResult::invalid_copy;
             for (const auto& d : atomic->dependencies) {
                 const ResourceBinding* dependent = resolve(d.resource);
-                if (!dependent) return local_unresolved_at(__LINE__);
+                if (!dependent) return ReplayResult::unresolved_resource;
                 if (!dependent->image) {
                     const std::uint64_t end = d.end == UINT64_MAX ? dependent->size : d.end;
                     if (d.subresource != 0 || d.begin >= end || end > dependent->size)
@@ -3084,7 +2989,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!conditional) return ReplayResult::unsupported;
             // Without physical segments the capture dispatch would pollute CSInvocations.
             if (statistics_active && !statistics_helpers) return ReplayResult::unsupported;
-            if (!bind(predication->buffer)) return local_unresolved_at(__LINE__);
+            if (!bind(predication->buffer)) return ReplayResult::unresolved_resource;
             if (!p.binding.buffer || !detail::within(predication->offset, 8, p.binding.size) ||
                 predication->offset > UINT64_MAX - p.binding.buffer_offset)
                 return ReplayResult::invalid_predication;
@@ -3096,7 +3001,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // not suppress them (emit_query suspends conditional rendering around ResolveQueryData).
             if (!queries) return ReplayResult::unsupported;
             QueryPool* heap = vk.query_pool(range.heap);
-            if (!heap) return local_unresolved_at(__LINE__);
+            if (!heap) return ReplayResult::unresolved_resource;
             if (!query_fits_heap(heap->heap_type, range.type)) return ReplayResult::invalid_query;
             if (range.first >= heap->count || range.count > heap->count - range.first)
                 return ReplayResult::invalid_query;
@@ -3119,7 +3024,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             if (const auto* resolve_queries = std::get_if<ResolveQueries>(&command)) {
                 // The destination is a buffer, as D3D12 requires, large enough for every result.
-                if (!bind(resolve_queries->dst)) return local_unresolved_at(__LINE__);
+                if (!bind(resolve_queries->dst)) return ReplayResult::unresolved_resource;
                 const std::uint64_t bytes = std::uint64_t(range.count) * query_result_size(range.type);
                 if (!p.binding.buffer || p.binding.buffer_offset % 8 ||
                     !detail::within(resolve_queries->offset, bytes, p.binding.size) ||
@@ -3137,7 +3042,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             out.queries.push_back({i, heap, statistics_active});
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
-            if (!bind(ind->argument_buffer) || !p.binding.buffer) return local_unresolved_at(__LINE__);
+            if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
             const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
             if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))
                 return ReplayResult::invalid_indirect_arguments;
@@ -3151,7 +3056,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_indirect_arguments;
             if (ind->count_buffer) {
                 const ResourceBinding* cnt = resolve(ind->count_buffer);
-                if (!cnt || !cnt->buffer) return local_unresolved_at(__LINE__);
+                if (!cnt || !cnt->buffer) return ReplayResult::unresolved_resource;
                 if (!detail::indirect_range(*cnt, ind->count_offset, sizeof(std::uint32_t)))
                     return ReplayResult::invalid_indirect_arguments;
                 p.source = *cnt;
@@ -3177,7 +3082,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
-                if (!pipeline || !pipeline->pipeline) return local_unresolved_at(__LINE__);
+                if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
             }
@@ -3189,10 +3094,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
                     return ReplayResult::unsupported;
                 p.accel_dst = vk.resolve_acceleration_structure(build->dst_va);
-                if (!p.accel_dst) return local_unresolved_at(__LINE__);
+                if (!p.accel_dst) return ReplayResult::unresolved_resource;
                 if (build->update && build->src_va) {
                     p.accel_src = vk.resolve_acceleration_structure(build->src_va);
-                    if (!p.accel_src) return local_unresolved_at(__LINE__);
+                    if (!p.accel_src) return ReplayResult::unresolved_resource;
                 }
                 if (build->is_tlas && build->instance_pointers && build->instance_count) {
                     if (!vk.prepare_khr_instances || !vk.host_at || !vk.buffer_at) return ReplayResult::unsupported;
@@ -3226,7 +3131,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 std::uint64_t room = 8 * info->sources.size();
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
-                if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return local_unresolved_at(__LINE__);
+                if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
                 if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
             } else if (info->type == 0 && vk.write_acceleration_structures_properties &&
                        vk.resolve_acceleration_structure && vk.reset_query_pool && vk.copy_query_pool_results &&
@@ -3265,7 +3170,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
                 return ReplayResult::unsupported;
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
-            if (!pipeline || !pipeline->pipeline) return local_unresolved_at(__LINE__);
+            if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
