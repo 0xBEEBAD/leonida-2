@@ -112,17 +112,23 @@ jobs:
                   cursor = index + 1
                   while cursor < len(lines) and not lines[cursor].strip():
                       cursor += 1
+                  batch_ids = set()
+                  batch_valid = True
                   while cursor < len(lines):
                       bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
                       if not bullet:
                           break
-                      first_ids = work_id_list(
-                          bullet.group(1).strip().strip(BACKTICK)
-                      )
+                      bullet_text = bullet.group(1).strip().strip(BACKTICK)
+                      first_ids = work_id_list(bullet_text)
                       if not first_ids:
+                          leading_id = re.match(rf"^{ID_PATTERN}", bullet_text)
+                          if leading_id and re.match(r"^\s*,", bullet_text[leading_id.end():]):
+                              batch_valid = False
                           break
-                      found.update(ids_from_text(first_ids.group(1)))
+                      batch_ids.update(ids_from_text(first_ids.group(1)))
                       cursor += 1
+                  if batch_valid:
+                      found.update(batch_ids)
               return found
           def open_work_ids(body):
               in_open_work = False
