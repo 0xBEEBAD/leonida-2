@@ -3245,7 +3245,11 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
 - **Heaps.** One `VkQueryPool` per `ID3D12QueryHeap`, registered with the `VulkanContext` by its pointer, as
   resources are. `OCCLUSION` heaps are `VK_QUERY_TYPE_OCCLUSION` pools and hold both `OCCLUSION` and
   `BINARY_OCCLUSION` queries, as in D3D12. `TIMESTAMP` and `COPY_QUEUE_TIMESTAMP` heaps are
-  `VK_QUERY_TYPE_TIMESTAMP` pools; they are refused when the queue family's `timestampValidBits` is 0.
+  `VK_QUERY_TYPE_TIMESTAMP` pools. `OPTIONS3.CopyQueueTimestampQueriesSupported` and copy timestamp heap creation
+  agree: both require timestamp bits and graphics or compute support in every family a copy queue can use (its
+  dedicated family, if configured, and the graphics fallback). Transfer-only families can write timestamps on some
+  devices but cannot reset or resolve their queries. Query commands and `GetTimestampFrequency` also check the
+  queue's actual family.
   `PIPELINE_STATISTICS` heaps count all eleven Vulkan statistics (`0x7ff`), whose result order is the field order
   of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
   clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
