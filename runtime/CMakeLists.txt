@@ -129,11 +129,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       add_library(leonida_xma2_decoder STATIC IMPORTED)
       # Link Rust's Windows SDK dependencies. CMake's C++ target selects its own CRT
       # (/MD or /MDd); the C ABI keeps allocation and deallocation on the same side.
+      # synchronization: Rust's std imports WaitOnAddress and WakeByAddress*, which MSVC's
+      # default libraries cover but clang-cl with an xwin SDK does not (lld-link: undefined symbol).
       set_target_properties(leonida_xma2_decoder PROPERTIES
         IMPORTED_LOCATION ${_xma_lib}
         INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder
         INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
-        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp")
+        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp;synchronization")
     else()
       message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
     endif()
@@ -1477,6 +1479,11 @@ if(TARGET Vulkan::Headers)
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
   add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
+  add_executable(xdxr_builder_validation_test test/xdxr_builder_validation_test.cpp)
+  target_link_libraries(xdxr_builder_validation_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME xdxr_builder_validation COMMAND xdxr_builder_validation_test)
+  endif()
   # LEONIDA_VK_DEVICE names the GPU in every harness (docs/testing.md, "Choosing the GPU"): a filter that matches no
   # device fails the run in vk_descriptor_bench and vk_sandbox too, instead of testing another GPU (TEST-1141).
   find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -1676,6 +1683,18 @@ if(TARGET Vulkan::Headers)
   endif()
   if(BUILD_TESTING)
     add_test(NAME vk_buffer_registration_oom COMMAND vk_buffer_registration_oom_test)
+  endif()
+  # VulkanContext::replay_.host_at resolves aliasing placed upload buffers across the full requested byte range.
+  add_executable(vk_host_at_aliasing_test test/vk_host_at_aliasing_test.cpp)
+  target_link_libraries(vk_host_at_aliasing_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_host_at_aliasing_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(vk_host_at_aliasing_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_host_at_aliasing COMMAND vk_host_at_aliasing_test)
   endif()
   # CPU-only: ScratchBuffers chunk alignment, retire/collect/forget, and spare cap (runtime/src/vulkan_scratch.h).
   add_executable(vulkan_scratch_test test/vulkan_scratch_test.cpp)

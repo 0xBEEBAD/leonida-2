@@ -404,6 +404,7 @@ struct RootArgumentLayout {
     bool graphics_console = true;
     bool mesh_ok = true;  // the graphics layout also fits a mesh shader's 16-dword window
     bool compute_ok = true;
+    std::uint32_t compute_arguments_end = rt::rootsig::kNoSgpr;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a

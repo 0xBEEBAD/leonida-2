@@ -863,7 +863,7 @@ public:
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_.data;
+            cmd.user_data = compute_user_data();
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1357,19 +1357,20 @@ private:
         if ((cbv && cbv != cbv_srv_uav_heap_) || (smp && smp != sampler_heap_)) check(false);
     }
 
-    void note_direct_heap_indexing(const RootArgumentLayout* layout) const {
-        if (!layout) return;
+    void note_direct_heap_indexing(const RootArgumentLayout* layout, bool compute) const {
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
             if (!cbv_srv_uav_heap_)
-                note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
-            else
-                note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+                note_once(compute ? "dispatch uses direct resource indexing with no CBV/SRV/UAV heap bound"
+                                  : "draw uses direct resource indexing with no CBV/SRV/UAV heap bound");
+            else if (!compute)
+                note_once("draw uses direct resource indexing; graphics heap-base SGPR is not supplied");
         }
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
             if (!sampler_heap_)
-                note_once("draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
-            else
-                note_once("SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+                note_once(compute ? "dispatch uses direct sampler indexing with no sampler heap bound"
+                                  : "draw uses direct sampler indexing with no sampler heap bound");
+            else if (!compute)
+                note_once("draw uses direct sampler indexing; graphics heap-base SGPR is not supplied");
         }
     }
 
@@ -1407,10 +1408,33 @@ private:
                       : leonida::IndexBufferView{};
     }
 
+    // Section 3.4 documents the observed resource-heap slot. Appending flagged heaps in this
+    // order is a working hypothesis for signatures without a matched program and layout.
+    // Snapshot them for each command so rebinding a heap cannot change a recorded dispatch.
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> compute_user_data() const {
+        note_direct_heap_indexing(compute_.layout, true);
+        auto data = compute_.data;
+        static const bool enabled = [] {
+            char value[2]{};
+            return GetEnvironmentVariableA("LEONIDA_COMPUTE_DIRECT_HEAPS", value, 2) != 1 || value[0] != '0';
+        }();
+        if (!enabled) return data;
+        const auto flags = compute_.layout->flags;
+        auto slot = compute_.layout->compute_arguments_end;
+        if (flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
+            if (slot < data.size()) data[slot++] = static_cast<std::uint32_t>(cbv_srv_uav_base_);
+            else note_once("compute root arguments leave no inline SGPR for the resource heap");
+        }
+        if (flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
+            if (slot < data.size()) data[slot] = static_cast<std::uint32_t>(sampler_base_);
+            else note_once("compute root arguments leave no inline SGPR for the sampler heap");
+        }
+        return data;
+    }
+
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
-        note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
@@ -1429,7 +1453,7 @@ private:
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
-        note_direct_heap_indexing(graphics_.layout);
+        note_direct_heap_indexing(graphics_.layout, false);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
