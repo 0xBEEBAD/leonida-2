@@ -165,15 +165,22 @@ jobs:
                       except (TypeError, ValueError):
                           error_payload = {}
                       body_errors = error_payload.get("errors") if isinstance(error_payload, dict) else None
-                      if body_errors:
+                      top_level_type = error_payload.get("type") if isinstance(error_payload, dict) else None
+                      if top_level_type is not None:
+                          if top_level_type != "RATE_LIMITED":
+                              rate_limited_http = False
+                          elif body_errors:
+                              rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
+                          else:
+                              rate_limited_http = True
+                      elif body_errors:
                           rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
                       else:
                           body_message = error_payload.get("message", "") if isinstance(error_payload, dict) else ""
                           rate_limited_http = error.code == 429 or (
                               error.code == 403
                               and "rate limit" in str(body_message or detail).casefold()
-                          )
-                      retry_after = error.headers.get("Retry-After")
+                          )                      retry_after = error.headers.get("Retry-After")
                       try:
                           delay = float(retry_after) if retry_after is not None else None
                       except (TypeError, ValueError):
@@ -266,7 +273,28 @@ jobs:
               return comments
 
           def ids_from_text(text):
-              return {value.upper() for value in WORK_ID_RE.findall(text or "")}
+              text = text or ""
+              if len(text) > MAX_CLAIM_BODY_CHARS:
+                  return set()
+              return {value.upper() for value in WORK_ID_RE.findall(text)}
+
+          def strip_html_comments(text):
+              text = text or ""
+              if len(text) > MAX_CLAIM_BODY_CHARS:
+                  return ""
+              visible = []
+              cursor = 0
+              while cursor < len(text):
+                  start = text.find("<!--", cursor)
+                  if start < 0:
+                      visible.append(text[cursor:])
+                      break
+                  visible.append(text[cursor:start])
+                  end = text.find("-->", start + 4)
+                  if end < 0:
+                      break
+                  cursor = end + 3
+              return "".join(visible)
           
           
           def work_id_list(text):
@@ -326,16 +354,17 @@ jobs:
                       if not bullet:
                           stripped_bullet = lines[cursor].lstrip(" \t")
                           if stripped_bullet.startswith(("-", "*")):
+                              indent = len(lines[cursor]) - len(stripped_bullet)
                               candidate_text = stripped_bullet[1:].lstrip(" \t")
-                              if len(candidate_text) > 512:
-                                  candidate_prefix = candidate_text[:512]
-                                  if candidate_prefix.startswith(BACKTICK):
-                                      candidate_prefix = candidate_prefix[1:]
-                                  if (
-                                      ID_LIST_RE.match(candidate_prefix)
-                                      or re.match(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+", candidate_prefix)
-                                  ):
-                                      batch_valid = False
+                              candidate_prefix = candidate_text[:512]
+                              if candidate_prefix.startswith(BACKTICK):
+                                  candidate_prefix = candidate_prefix[1:]
+                              candidate_id_like = (
+                                  ID_LIST_RE.match(candidate_prefix)
+                                  or re.match(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+", candidate_prefix)
+                              )
+                              if candidate_id_like and (indent > 128 or len(candidate_text) > 512):
+                                  batch_valid = False
                           break
                       bullet_text = unwrap_work_id_code(bullet.group(1))
                       first_ids = work_id_list(bullet_text)
@@ -348,6 +377,18 @@ jobs:
                           if (
                               malformed_inline_id
                               and ID_LIST_RE.fullmatch(malformed_inline_id.group(1).strip())
+                          ):
+                              batch_valid = False
+                          malformed_code_span = re.match(
+                              "^" + re.escape(BACKTICK) + "([^" + BACKTICK + "]+)" + re.escape(BACKTICK),
+                              bullet_text,
+                          )
+                          if malformed_code_span and any(
+                              re.match(
+                                  r"^[A-Z0-9]+(?:-[A-Z0-9]+)+[A-Za-z0-9-]",
+                                  code_item.strip(),
+                              )
+                              for code_item in malformed_code_span.group(1).split(",")
                           ):
                               batch_valid = False
                           leading_id = re.match(rf"^{ID_PATTERN}", bullet_text)
@@ -402,7 +443,7 @@ jobs:
               raw_body = pull.get("body") or ""
               if len(raw_body) > MAX_CLAIM_BODY_CHARS:
                   return found, ["PR body exceeds the claim parser size limit"]
-              body = re.sub(r"<!--[\s\S]*?-->", "", raw_body)
+              body = strip_html_comments(raw_body)
               field_headers = list(CLAIM_FIELD_HEADER_RE.finditer(body))
               fields = list(CLAIM_FIELD_RE.finditer(body))
               if len(field_headers) != len(fields):
@@ -491,7 +532,10 @@ jobs:
               candidates, _unresolved = pull_claim_ids(pull, comments_by_id)
               if candidates & changed_ids:
                   return True
-              body = re.sub(r"<!--[\s\S]*?-->", "", pull.get("body") or "")
+              raw_body = pull.get("body") or ""
+              if len(raw_body) > MAX_CLAIM_BODY_CHARS:
+                  return False
+              body = strip_html_comments(raw_body)
               linked_ids = {
                   linked_id
                   for field in CLAIM_FIELD_RE.finditer(body)
@@ -915,15 +959,22 @@ jobs:
                       except (TypeError, ValueError):
                           error_payload = {}
                       body_errors = error_payload.get("errors") if isinstance(error_payload, dict) else None
-                      if body_errors:
+                      top_level_type = error_payload.get("type") if isinstance(error_payload, dict) else None
+                      if top_level_type is not None:
+                          if top_level_type != "RATE_LIMITED":
+                              rate_limited_http = False
+                          elif body_errors:
+                              rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
+                          else:
+                              rate_limited_http = True
+                      elif body_errors:
                           rate_limited_http = all(is_rate_limit_error(item) for item in body_errors)
                       else:
                           body_message = error_payload.get("message", "") if isinstance(error_payload, dict) else ""
                           rate_limited_http = error.code == 429 or (
                               error.code == 403
                               and "rate limit" in str(body_message or detail).casefold()
-                          )
-                      retry_after = error.headers.get("Retry-After")
+                          )                      retry_after = error.headers.get("Retry-After")
                       try:
                           delay = float(retry_after) if retry_after is not None else None
                       except (TypeError, ValueError):
@@ -1017,7 +1068,28 @@ jobs:
               return comments
 
           def ids_from_text(text):
-              return {value.upper() for value in WORK_ID_RE.findall(text or "")}
+              text = text or ""
+              if len(text) > MAX_CLAIM_BODY_CHARS:
+                  return set()
+              return {value.upper() for value in WORK_ID_RE.findall(text)}
+
+          def strip_html_comments(text):
+              text = text or ""
+              if len(text) > MAX_CLAIM_BODY_CHARS:
+                  return ""
+              visible = []
+              cursor = 0
+              while cursor < len(text):
+                  start = text.find("<!--", cursor)
+                  if start < 0:
+                      visible.append(text[cursor:])
+                      break
+                  visible.append(text[cursor:start])
+                  end = text.find("-->", start + 4)
+                  if end < 0:
+                      break
+                  cursor = end + 3
+              return "".join(visible)
           
           
           def work_id_list(text):
@@ -1077,16 +1149,17 @@ jobs:
                       if not bullet:
                           stripped_bullet = lines[cursor].lstrip(" \t")
                           if stripped_bullet.startswith(("-", "*")):
+                              indent = len(lines[cursor]) - len(stripped_bullet)
                               candidate_text = stripped_bullet[1:].lstrip(" \t")
-                              if len(candidate_text) > 512:
-                                  candidate_prefix = candidate_text[:512]
-                                  if candidate_prefix.startswith(BACKTICK):
-                                      candidate_prefix = candidate_prefix[1:]
-                                  if (
-                                      ID_LIST_RE.match(candidate_prefix)
-                                      or re.match(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+", candidate_prefix)
-                                  ):
-                                      batch_valid = False
+                              candidate_prefix = candidate_text[:512]
+                              if candidate_prefix.startswith(BACKTICK):
+                                  candidate_prefix = candidate_prefix[1:]
+                              candidate_id_like = (
+                                  ID_LIST_RE.match(candidate_prefix)
+                                  or re.match(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+", candidate_prefix)
+                              )
+                              if candidate_id_like and (indent > 128 or len(candidate_text) > 512):
+                                  batch_valid = False
                           break
                       bullet_text = unwrap_work_id_code(bullet.group(1))
                       first_ids = work_id_list(bullet_text)
@@ -1099,6 +1172,18 @@ jobs:
                           if (
                               malformed_inline_id
                               and ID_LIST_RE.fullmatch(malformed_inline_id.group(1).strip())
+                          ):
+                              batch_valid = False
+                          malformed_code_span = re.match(
+                              "^" + re.escape(BACKTICK) + "([^" + BACKTICK + "]+)" + re.escape(BACKTICK),
+                              bullet_text,
+                          )
+                          if malformed_code_span and any(
+                              re.match(
+                                  r"^[A-Z0-9]+(?:-[A-Z0-9]+)+[A-Za-z0-9-]",
+                                  code_item.strip(),
+                              )
+                              for code_item in malformed_code_span.group(1).split(",")
                           ):
                               batch_valid = False
                           leading_id = re.match(rf"^{ID_PATTERN}", bullet_text)
@@ -1153,7 +1238,7 @@ jobs:
               raw_body = pull.get("body") or ""
               if len(raw_body) > MAX_CLAIM_BODY_CHARS:
                   return found, ["PR body exceeds the claim parser size limit"]
-              body = re.sub(r"<!--[\s\S]*?-->", "", raw_body)
+              body = strip_html_comments(raw_body)
               field_headers = list(CLAIM_FIELD_HEADER_RE.finditer(body))
               fields = list(CLAIM_FIELD_RE.finditer(body))
               if len(field_headers) != len(fields):
@@ -1242,7 +1327,10 @@ jobs:
               candidates, _unresolved = pull_claim_ids(pull, comments_by_id)
               if candidates & changed_ids:
                   return True
-              body = re.sub(r"<!--[\s\S]*?-->", "", pull.get("body") or "")
+              raw_body = pull.get("body") or ""
+              if len(raw_body) > MAX_CLAIM_BODY_CHARS:
+                  return False
+              body = strip_html_comments(raw_body)
               linked_ids = {
                   linked_id
                   for field in CLAIM_FIELD_RE.finditer(body)
