@@ -616,21 +616,18 @@ struct DeviceState {
     QueueClock clock;  // device-wide calibration entry points
     std::vector<std::uint32_t> timestamp_bits;
 
-    std::uint32_t timestamp_bits_for(std::uint32_t family) const {
-        return family < timestamp_bits.size() ? timestamp_bits[family] : 0;
-    }
-
     QueueClock clock_for(std::uint32_t family) const {
         QueueClock result = clock;
-        result.timestamp_valid_bits = timestamp_bits_for(family);
+        result.timestamp_valid_bits = leonida::queue_family_timestamp_bits(timestamp_bits, family);
         return result;
     }
 
     bool copy_timestamps_supported() const {
         // Copy queues can fall back to a graphics queue when their own pool is busy.
         const bool has_copy_pool = !info.command_queues.empty() && !info.copy_queues.empty();
-        return context->timestamp_period() > 0 &&
-               (!has_copy_pool || timestamp_bits_for(info.copy_family) != 0);
+        const auto dedicated_copy = has_copy_pool ? std::optional{info.copy_family} : std::nullopt;
+        return context->timestamp_period() > 0 && leonida::copy_queue_timestamp_families_supported(
+            timestamp_bits, info.queue_family, dedicated_copy);
     }
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
