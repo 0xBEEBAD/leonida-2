@@ -189,8 +189,11 @@ reached on the way to the first frame. A bound import is not a working one (the 
 that name exists), and an unimplemented import stops the run only if the title calls it
 ([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
 functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
-host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
-which opens none.
+host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim, which opens none, and `mfplat.dll` is partially overridden so
+`MFCreateSourceResolver` wraps the host `IMFSourceResolver` (`runtime/shims/mfplat_offline.cpp`): network schemes
+(`http`, `https`, `rtsp`, `mms`), UNC shares and remote `file://` hosts are refused with `MF_E_UNSUPPORTED_SCHEME`,
+while local paths and `file:///` URLs pointing at console drives (`GAME:`, `G:`, `T:`) are rewritten through
+`rt::fs::resolve_read_path` before reaching Media Foundation.
 
 ## Console paths and the write overlay
 
