@@ -1,8 +1,9 @@
 // Checks the offline Winsock2 (ws2_32.dll) shim (runtime/shims/ws2_offline.cpp).
 //
-// Resolves every shimmed symbol through rt::shims::find under ws2_32.dll (by name and by standard Windows ordinal)
-// and verifies that external addresses (RFC 5737 192.0.2.1 / RFC 3849 2001:db8::1) and .invalid hostnames are refused
-// in-process while loopback (127.0.0.1 / ::1 / localhost) still works. Nothing touches the network.
+// Resolves every shimmed symbol through rt::shims::find under ws2_32.dll (by name and by standard Windows ordinal),
+// checks that wsock32.dll resolves its shared entries to the same wrappers, and verifies that external addresses
+// (RFC 5737 192.0.2.1 / RFC 3849 2001:db8::1), .invalid hostnames, octal-looking 0127.0.0.1 and name-service queries
+// are refused in-process while loopback (127.0.0.1 / ::1 / localhost) still works. Nothing touches the network.
 #ifndef _WINSOCK_DEPRECATED_NO_WARNINGS
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #endif
@@ -100,6 +101,7 @@ int main() {
     using GetNameInfoAFn = INT(WSAAPI*)(const sockaddr*, socklen_t, PCHAR, DWORD, PCHAR, DWORD, INT);
     using GetHostByNameFn = hostent*(WSAAPI*)(const char*);
     using GetHostByAddrFn = hostent*(WSAAPI*)(const char*, int, int);
+    using LookupBeginWFn = int(WSAAPI*)(LPWSAQUERYSETW, DWORD, LPHANDLE);
 
     const auto sh_bind = resolve<BindFn>("bind");
     const auto sh_bind_ord = resolve<BindFn>("#2");
@@ -133,6 +135,17 @@ int main() {
           "all offline Winsock2 shims resolve through the registry");
     check(!rt::shims::owns_dll("ws2_32.dll"),
           "ws2_32.dll stays partially overridden (host socket bookkeeping remains available)");
+    check(!rt::shims::owns_dll("wsock32.dll"),
+          "wsock32.dll stays partially overridden (host socket bookkeeping remains available)");
+
+    // wsock32.dll resolves its shared entries to the same wrappers as ws2_32.dll, by name and by ordinal.
+    check(rt::shims::find("wsock32.dll", "connect") == sh_connect && rt::shims::find("wsock32.dll", "#4") == sh_connect,
+          "wsock32.dll connect and #4 resolve to the ws2_32.dll connect shim");
+    check(rt::shims::find("wsock32.dll", "bind") == sh_bind && rt::shims::find("wsock32.dll", "#2") == sh_bind,
+          "wsock32.dll bind and #2 resolve to the ws2_32.dll bind shim");
+    check(rt::shims::find("wsock32.dll", "gethostbyname") == sh_gethostbyname &&
+              rt::shims::find("wsock32.dll", "#52") == sh_gethostbyname,
+          "wsock32.dll gethostbyname and #52 resolve to the ws2_32.dll shim");
 
     // 1. External connect / WSAConnect / WSAConnectByName / WSAConnectByList refused with WSAENETUNREACH.
     {
@@ -281,6 +294,10 @@ int main() {
         ADDRINFOA* res = nullptr;
         check(sh_getaddrinfo("example.invalid", "443", nullptr, &res) == WSAHOST_NOT_FOUND && res == nullptr,
               "getaddrinfo refuses external hostname with WSAHOST_NOT_FOUND");
+        // Windows reads a leading-zero octet as octal, so 0127.0.0.1 is 87.0.0.1 there; it is refused, not loopback.
+        res = nullptr;
+        check(sh_getaddrinfo("0127.0.0.1", "80", nullptr, &res) == WSAHOST_NOT_FOUND && res == nullptr,
+              "getaddrinfo refuses octal-looking 0127.0.0.1 with WSAHOST_NOT_FOUND");
         check(sh_getaddrinfo("127.0.0.1", "80", nullptr, &res) == 0 && res != nullptr,
               "getaddrinfo permits 127.0.0.1");
         if (res) freeaddrinfo(res);
@@ -336,6 +353,74 @@ int main() {
         check(n == 2 && got[0] == 'o' && got[1] == 'k', "loopback UDP payload received");
         closesocket(send_sock);
         closesocket(recv_sock);
+    }
+
+    // 6. Name-service queries are refused with WSASERVICE_NOT_FOUND.
+    {
+        const auto sh_lookup_w = resolve<LookupBeginWFn>("WSALookupServiceBeginW");
+        wchar_t service[] = L"example.invalid";
+        WSAQUERYSETW restrictions{};
+        restrictions.dwSize = sizeof(restrictions);
+        restrictions.lpszServiceInstanceName = service;
+        HANDLE lookup = nullptr;
+        WSASetLastError(0);
+        check(sh_lookup_w && sh_lookup_w(&restrictions, 0, &lookup) == SOCKET_ERROR &&
+                  WSAGetLastError() == WSASERVICE_NOT_FOUND && lookup == nullptr,
+              "WSALookupServiceBeginW refuses with WSASERVICE_NOT_FOUND");
+    }
+
+    // 7. ConnectEx from WSAIoctl connects to a loopback listener through the host's per-socket pointer.
+    {
+        const SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in any = make_v4(127, 0, 0, 1, 0);
+        sockaddr_in listen_addr{};
+        int listen_len = sizeof(listen_addr);
+        check(sh_bind(listener, reinterpret_cast<const sockaddr*>(&any), sizeof(any)) == 0 &&
+                  listen(listener, 1) == 0 && getsockname(listener, reinterpret_cast<sockaddr*>(&listen_addr),
+                                                          &listen_len) == 0,
+              "loopback TCP listener is up");
+
+        const SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        check(sh_bind(client, reinterpret_cast<const sockaddr*>(&any), sizeof(any)) == 0,
+              "ConnectEx client socket is bound to loopback (ConnectEx requires a bound socket)");
+        GUID connect_ex_guid = WSAID_CONNECTEX;
+        LPFN_CONNECTEX connect_ex = nullptr;
+        DWORD returned = 0;
+        check(sh_wsa_ioctl(client, SIO_GET_EXTENSION_FUNCTION_POINTER, &connect_ex_guid, sizeof(connect_ex_guid),
+                           &connect_ex, sizeof(connect_ex), &returned, nullptr, nullptr) == 0 &&
+                  connect_ex != nullptr,
+              "WSAIoctl returns a ConnectEx pointer for a bound TCP socket");
+
+        if (connect_ex) {
+            OVERLAPPED ov{};
+            ov.hEvent = WSACreateEvent();
+            check(connect_ex(client, reinterpret_cast<const sockaddr*>(&listen_addr), sizeof(listen_addr), nullptr, 0,
+                             nullptr, &ov) == TRUE ||
+                      (WSAGetLastError() == WSA_IO_PENDING &&
+                       WSAWaitForMultipleEvents(1, &ov.hEvent, TRUE, 5000, FALSE) == WSA_WAIT_EVENT_0),
+                  "wrapped ConnectEx connects to the loopback listener");
+            DWORD transferred = 0, flags = 0;
+            check(WSAGetOverlappedResult(client, &ov, &transferred, FALSE, &flags) == TRUE,
+                  "ConnectEx completes with no error");
+            WSACloseEvent(ov.hEvent);
+        }
+
+        const SOCKET ext = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in ext_any = make_v4(127, 0, 0, 1, 0);
+        check(sh_bind(ext, reinterpret_cast<const sockaddr*>(&ext_any), sizeof(ext_any)) == 0,
+              "second ConnectEx socket is bound to loopback");
+        if (connect_ex) {
+            const sockaddr_in ext4 = make_v4(192, 0, 2, 1, 443);
+            OVERLAPPED ov{};
+            WSASetLastError(0);
+            check(connect_ex(ext, reinterpret_cast<const sockaddr*>(&ext4), sizeof(ext4), nullptr, 0, nullptr, &ov) ==
+                          FALSE &&
+                      WSAGetLastError() == WSAENETUNREACH,
+                  "wrapped ConnectEx refuses non-loopback 192.0.2.1 with WSAENETUNREACH");
+        }
+        closesocket(ext);
+        closesocket(client);
+        closesocket(listener);
     }
 
     WSACleanup();

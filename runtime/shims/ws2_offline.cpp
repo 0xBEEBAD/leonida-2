@@ -1,9 +1,10 @@
-// ws2_offline: Winsock2 (ws2_32.dll) for a mapped title, restricted to loopback only.
+// ws2_offline: Winsock2 (ws2_32.dll and its wsock32.dll alias) for a mapped title, restricted to loopback only.
 //
 // Nothing in Leonida goes online. While winhttp_offline.cpp owns winhttp.dll, a title can also import Winsock2
 // functions directly (both by name and by standard Windows ws2_32.dll ordinal) or resolve them through
 // GetProcAddress / WSAIoctl. Bound straight to the host's ws2_32.dll, those calls could open external sockets or
-// trigger DNS queries.
+// trigger DNS queries. wsock32.dll exports forward to ws2_32 natively, so its bind/connect/sendto/gethostby* entries
+// go to the same wrappers.
 //
 // ws2_32.dll stays host-owned in rt::shims::owns_dll (partial override, like kernel32.dll), so socket bookkeeping
 // (WSAStartup, socket, closesocket, select, setsockopt, recv, send, byte-order helpers, freeaddrinfo) continues to
@@ -12,15 +13,19 @@
 //   - connect (#4), WSAConnect, WSAConnectByNameA/W, WSAConnectByList, ConnectEx (from WSAIoctl), sendto (#20),
 //     WSASendTo, and WSASendMsg (direct and via WSAIoctl) permit only IPv4 loopback (127.0.0.0/8), IPv6 loopback
 //     (::1), and IPv4-mapped IPv6 loopback (::ffff:127.0.0.0/104). Every other destination fails with WSAENETUNREACH.
+//     WSAConnectByNameA/W pass "localhost" to the host as the literal 127.0.0.1, so the hosts file is never read.
 //   - bind (#2) rewrites wildcard binds (0.0.0.0 or ::) to 127.0.0.1 or ::1 so no external peer can connect in,
 //     allows explicit loopback binds, and refuses any other address with WSAEADDRNOTAVAIL.
 //   - getaddrinfo, GetAddrInfoW, GetAddrInfoExA/W, gethostbyname (#52), gethostbyaddr (#51), and
 //     WSAAsyncGetHostByName/Addr (#103/#102) permit only null/empty nodes, "localhost", and loopback IP literals;
-//     everything else fails with WSAHOST_NOT_FOUND without sending DNS packets.
+//     everything else fails with WSAHOST_NOT_FOUND without sending DNS packets. A dotted octet with a leading zero
+//     (0127.0.0.1) is refused: Windows reads it as octal, so it is not the loopback name it looks like.
+//   - WSALookupServiceBeginA/W (name-service queries) always fail with WSASERVICE_NOT_FOUND.
 //   - getnameinfo / GetNameInfoW force NI_NUMERICHOST for non-loopback addresses (or return WSAHOST_NOT_FOUND when
 //     NI_NAMEREQD is set), avoiding reverse DNS lookups.
 //   - WSAIoctl wraps WSAID_CONNECTEX and WSAID_WSASENDMSG and refuses SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER
-//     with WSAEINVAL so extension functions cannot bypass the checks.
+//     with WSAEINVAL so extension functions cannot bypass the checks. The wrappers ask the host for the native
+//     pointer of the socket they are called on, since each Winsock provider has its own.
 //
 // Every host ws2_32.dll call is resolved dynamically from System32 so gta6rt needs no static ws2_32.lib link
 // dependency. Each refused destination is logged once ("[rt] ws2: offline, refused <op> <target>") with no payload.
@@ -39,7 +44,6 @@
 #include <mswsock.h>
 #include <windows.h>
 
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -188,6 +192,7 @@ bool parse_ipv4_literal(const char* s, uint8_t out[4]) {
     const char* p = s;
     for (int part = 0; part < 4; ++part) {
         if (*p < '0' || *p > '9') return false;
+        const char* start = p;
         unsigned val = 0;
         int digits = 0;
         while (*p >= '0' && *p <= '9') {
@@ -197,6 +202,7 @@ bool parse_ipv4_literal(const char* s, uint8_t out[4]) {
             ++digits;
         }
         if (digits == 0) return false;
+        if (digits > 1 && *start == '0') return false;  // a leading zero is octal to Windows: 0127 is 87, not 127
         out[part] = static_cast<uint8_t>(val);
         if (part < 3) {
             if (*p != '.') return false;
@@ -240,6 +246,10 @@ bool is_loopback_node_w(const wchar_t* node) {
     }
     const std::string ascii = narrow_ascii(node);
     return is_loopback_node_a(ascii.c_str());
+}
+
+bool is_localhost_name_a(const char* node) {
+    return ascii_iequals(node, "localhost") || ascii_iequals(node, "localhost.");
 }
 
 // ---- Socket connect / send / bind shims ----
@@ -291,8 +301,9 @@ BOOL WSAAPI wsa_connect_by_name_a_offline(SOCKET s, LPCSTR nodename, LPCSTR serv
         set_wsa_error(WSAENETUNREACH);
         return FALSE;
     }
-    return real_fn(s, nodename, servicename, local_addr_len, local_addr, remote_addr_len, remote_addr, timeout,
-                   reserved);
+    // The host would resolve "localhost" through its hosts file; hand it the literal instead.
+    LPCSTR node = is_localhost_name_a(nodename) ? "127.0.0.1" : nodename;
+    return real_fn(s, node, servicename, local_addr_len, local_addr, remote_addr_len, remote_addr, timeout, reserved);
 }
 
 BOOL WSAAPI wsa_connect_by_name_w_offline(SOCKET s, LPWSTR nodename, LPWSTR servicename,
@@ -311,8 +322,10 @@ BOOL WSAAPI wsa_connect_by_name_w_offline(SOCKET s, LPWSTR nodename, LPWSTR serv
         set_wsa_error(WSAENETUNREACH);
         return FALSE;
     }
-    return real_fn(s, nodename, servicename, local_addr_len, local_addr, remote_addr_len, remote_addr, timeout,
-                   reserved);
+    // The host would resolve "localhost" through its hosts file; hand it the literal instead.
+    wchar_t loopback[] = L"127.0.0.1";
+    LPWSTR node = is_localhost_name_a(narrow_ascii(nodename).c_str()) ? loopback : nodename;
+    return real_fn(s, node, servicename, local_addr_len, local_addr, remote_addr_len, remote_addr, timeout, reserved);
 }
 
 BOOL WSAAPI wsa_connect_by_list_offline(SOCKET s, PSOCKET_ADDRESS_LIST addr_list, LPDWORD local_addr_len,
@@ -617,10 +630,42 @@ INT WSAAPI get_name_info_w_offline(const sockaddr* sa, socklen_t salen, PWCHAR h
     return real_fn(sa, salen, host, host_size, serv, serv_size, flags);
 }
 
+// ---- Name-service queries (WSALookupServiceBegin) ----
+
+// Name-service (SAP/RNR) queries would reach the host's providers, so every begin call is refused.
+int WSAAPI wsa_lookup_service_begin_a_offline(LPWSAQUERYSETA restrictions, DWORD, LPHANDLE lookup) {
+    if (lookup) *lookup = nullptr;
+    const bool named = restrictions && restrictions->lpszServiceInstanceName;
+    log_refused("WSALookupServiceBeginA", named ? restrictions->lpszServiceInstanceName : "<null>");
+    set_wsa_error(WSASERVICE_NOT_FOUND);
+    return SOCKET_ERROR;
+}
+
+int WSAAPI wsa_lookup_service_begin_w_offline(LPWSAQUERYSETW restrictions, DWORD, LPHANDLE lookup) {
+    if (lookup) *lookup = nullptr;
+    const bool named = restrictions && restrictions->lpszServiceInstanceName;
+    log_refused("WSALookupServiceBeginW", named ? narrow_ascii(restrictions->lpszServiceInstanceName) : "<null>");
+    set_wsa_error(WSASERVICE_NOT_FOUND);
+    return SOCKET_ERROR;
+}
+
 // ---- WSAIoctl extension-function interception (ConnectEx / WSASendMsg) ----
 
-std::atomic<LPFN_CONNECTEX> g_host_connect_ex{nullptr};
-std::atomic<LPFN_WSASENDMSG> g_host_wsa_send_msg_ext{nullptr};
+// The provider's own extension function for `s`. Asked per socket: each Winsock provider has its own pointers.
+template <typename Fn>
+Fn host_extension(SOCKET s, const GUID& guid) {
+    using IoctlFn = int(WSAAPI*)(SOCKET, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPWSAOVERLAPPED,
+                                 LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+    static IoctlFn ioctl = host_proc<IoctlFn>("WSAIoctl");
+    if (!ioctl) return nullptr;
+    GUID requested = guid;
+    Fn fn = nullptr;
+    DWORD returned = 0;
+    if (ioctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &requested, sizeof(requested), &fn, sizeof(fn), &returned, nullptr,
+              nullptr) != 0)
+        return nullptr;
+    return fn;
+}
 
 BOOL PASCAL connect_ex_offline(SOCKET s, const sockaddr* name, int namelen, PVOID send_buf, DWORD send_len,
                                LPDWORD bytes_sent, LPOVERLAPPED overlapped) {
@@ -629,7 +674,8 @@ BOOL PASCAL connect_ex_offline(SOCKET s, const sockaddr* name, int namelen, PVOI
         set_wsa_error(WSAENETUNREACH);
         return FALSE;
     }
-    LPFN_CONNECTEX real_fn = g_host_connect_ex.load(std::memory_order_acquire);
+    static constexpr GUID kConnectExGuid = WSAID_CONNECTEX;
+    LPFN_CONNECTEX real_fn = host_extension<LPFN_CONNECTEX>(s, kConnectExGuid);
     if (!real_fn) {
         set_wsa_error(WSAENETUNREACH);
         return FALSE;
@@ -644,7 +690,8 @@ int PASCAL wsa_send_msg_ext_offline(SOCKET s, LPWSAMSG msg, DWORD flags, LPDWORD
         set_wsa_error(WSAENETUNREACH);
         return SOCKET_ERROR;
     }
-    LPFN_WSASENDMSG real_fn = g_host_wsa_send_msg_ext.load(std::memory_order_acquire);
+    static constexpr GUID kSendMsgGuid = WSAID_WSASENDMSG;
+    LPFN_WSASENDMSG real_fn = host_extension<LPFN_WSASENDMSG>(s, kSendMsgGuid);
     if (!real_fn) {
         set_wsa_error(WSAENETUNREACH);
         return SOCKET_ERROR;
@@ -684,7 +731,6 @@ int WSAAPI wsa_ioctl_offline(SOCKET s, DWORD io_control_code, LPVOID in_buf, DWO
             const int rc = real_fn(s, io_control_code, in_buf, in_len, &real_ext, sizeof(real_ext), &returned,
                                    overlapped, completion);
             if (rc != 0) return rc;
-            g_host_connect_ex.store(real_ext, std::memory_order_release);
             LPFN_CONNECTEX wrapped = &connect_ex_offline;
             std::memcpy(out_buf, &wrapped, sizeof(wrapped));
             *bytes_returned = sizeof(wrapped);
@@ -700,7 +746,6 @@ int WSAAPI wsa_ioctl_offline(SOCKET s, DWORD io_control_code, LPVOID in_buf, DWO
             const int rc = real_fn(s, io_control_code, in_buf, in_len, &real_ext, sizeof(real_ext), &returned,
                                    overlapped, completion);
             if (rc != 0) return rc;
-            g_host_wsa_send_msg_ext.store(real_ext, std::memory_order_release);
             LPFN_WSASENDMSG wrapped = &wsa_send_msg_ext_offline;
             std::memcpy(out_buf, &wrapped, sizeof(wrapped));
             *bytes_returned = sizeof(wrapped);
@@ -718,9 +763,10 @@ namespace {
 using namespace rt::ws2;
 }  // namespace
 
-// Both named exports and the fixed Windows ws2_32.dll ordinals (#2 bind, #4 connect, #20 sendto, #51 gethostbyaddr,
+// Both named exports and the fixed Windows ordinals (#2 bind, #4 connect, #20 sendto, #51 gethostbyaddr,
 // #52 gethostbyname, #102 WSAAsyncGetHostByAddr, #103 WSAAsyncGetHostByName) are registered so static imports by
-// ordinal and dynamic GetProcAddress lookups resolve to the same offline wrappers.
+// ordinal and dynamic GetProcAddress lookups resolve to the same offline wrappers. wsock32.dll gets the same
+// wrappers for the entries it shares with ws2_32, since its exports forward to ws2_32 natively.
 SHIM_TABLE(ws2_offline,
     {"ws2_32.dll", "bind", reinterpret_cast<void*>(&bind_offline)},
     {"ws2_32.dll", "#2", reinterpret_cast<void*>(&bind_offline)},
@@ -749,4 +795,20 @@ SHIM_TABLE(ws2_offline,
     {"ws2_32.dll", "WSASendTo", reinterpret_cast<void*>(&wsa_send_to_offline)},
     {"ws2_32.dll", "WSASendMsg", reinterpret_cast<void*>(&wsa_send_msg_offline)},
     {"ws2_32.dll", "WSAIoctl", reinterpret_cast<void*>(&wsa_ioctl_offline)},
+    {"ws2_32.dll", "WSALookupServiceBeginA", reinterpret_cast<void*>(&wsa_lookup_service_begin_a_offline)},
+    {"ws2_32.dll", "WSALookupServiceBeginW", reinterpret_cast<void*>(&wsa_lookup_service_begin_w_offline)},
+    {"wsock32.dll", "bind", reinterpret_cast<void*>(&bind_offline)},
+    {"wsock32.dll", "#2", reinterpret_cast<void*>(&bind_offline)},
+    {"wsock32.dll", "connect", reinterpret_cast<void*>(&connect_offline)},
+    {"wsock32.dll", "#4", reinterpret_cast<void*>(&connect_offline)},
+    {"wsock32.dll", "sendto", reinterpret_cast<void*>(&sendto_offline)},
+    {"wsock32.dll", "#20", reinterpret_cast<void*>(&sendto_offline)},
+    {"wsock32.dll", "gethostbyaddr", reinterpret_cast<void*>(&gethostbyaddr_offline)},
+    {"wsock32.dll", "#51", reinterpret_cast<void*>(&gethostbyaddr_offline)},
+    {"wsock32.dll", "gethostbyname", reinterpret_cast<void*>(&gethostbyname_offline)},
+    {"wsock32.dll", "#52", reinterpret_cast<void*>(&gethostbyname_offline)},
+    {"wsock32.dll", "WSAAsyncGetHostByAddr", reinterpret_cast<void*>(&wsa_async_get_host_by_addr_offline)},
+    {"wsock32.dll", "#102", reinterpret_cast<void*>(&wsa_async_get_host_by_addr_offline)},
+    {"wsock32.dll", "WSAAsyncGetHostByName", reinterpret_cast<void*>(&wsa_async_get_host_by_name_offline)},
+    {"wsock32.dll", "#103", reinterpret_cast<void*>(&wsa_async_get_host_by_name_offline)},
 );
