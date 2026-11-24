@@ -24,7 +24,7 @@ Keep the generated shader workspace. The port reads the shader directory recorde
 
 ## Launch
 
-Run the title offline. The original boot runbook explains which socket imports reach Windows. The hardware verification used a Windows AppContainer with zero network capabilities. [Boot runbook](boot.md)
+Run the title offline. The Winsock shim permits loopback and the WinHTTP shim refuses outbound requests. The hardware verification used a Windows AppContainer with zero network capabilities. [Boot runbook](boot.md)
 
 ```powershell
 & (Join-Path $port 'gta6rt.exe') --first-run-ui (Join-Path $game 'game_scarlett_master.exe')

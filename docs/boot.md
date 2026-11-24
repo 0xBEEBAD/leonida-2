@@ -1,9 +1,9 @@
 # First boot: the runbook and the two traces
 
 The Windows integration has a dedicated [offline first-run UI profile](first_run_ui.md). The original dry-run
-and initialization measurements in this runbook used a separately supplied executable and identified 30 unimplemented
-imports. The executable's Winsock imports bind to the host, so keep retail runs offline and traces on the player's
-machine. [Original import measurements](runtime_imports.md#the-retail-executable-rt-5)
+and initialization measurements used a separately supplied executable and identified 30 unimplemented imports.
+The Winsock shim restricts connections to loopback and the WinHTTP shim refuses outbound requests. Keep retail runs
+offline and traces on the player's machine. [Original import measurements](runtime_imports.md#the-retail-executable-rt-5)
 
 ## 1. What the first boot produces
 

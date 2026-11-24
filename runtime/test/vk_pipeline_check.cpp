@@ -1141,7 +1141,11 @@ int main(int argc, char** argv) {
     link(&f11, reinterpret_cast<VkBaseOutStructure*>(&f11), nullptr, true);   // shaderDrawParameters (VS v0/v3)
     link(&f12, reinterpret_cast<VkBaseOutStructure*>(&f12), nullptr, true);
     link(&f13, reinterpret_cast<VkBaseOutStructure*>(&f13), nullptr, true);
-    const bool ext_mesh = link(&mesh, reinterpret_cast<VkBaseOutStructure*>(&mesh), VK_EXT_MESH_SHADER_EXTENSION_NAME, want_mesh);
+    // A runtime seed uses the mesh-query device feature even for a compute-only batch.
+    // On NVIDIA this choice changes the application pipeline cache key.
+    const bool runtime_cache = !cache_path.empty();
+    const bool ext_mesh = link(&mesh, reinterpret_cast<VkBaseOutStructure*>(&mesh),
+                               VK_EXT_MESH_SHADER_EXTENSION_NAME, want_mesh || runtime_cache);
     const bool ext_bary = link(&bary, reinterpret_cast<VkBaseOutStructure*>(&bary), VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, want_bary);
     const bool ext_lock = link(&lock, reinterpret_cast<VkBaseOutStructure*>(&lock), VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, want_lock);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
@@ -1187,7 +1191,8 @@ int main(int argc, char** argv) {
         vkGetPhysicalDeviceProperties2(pd, &mesh_device_props);
     }
     if (ext_mesh) {
-        mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = mesh.meshShaderQueries = VK_FALSE;
+        mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+        if (!runtime_cache || !mesh.meshShader) mesh.meshShaderQueries = VK_FALSE;
         mesh.taskShader = VK_FALSE;
     }
     float prio = 1;

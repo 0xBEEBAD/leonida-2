@@ -448,6 +448,7 @@ driver gives it the same cache key in both programs. Measured on Windows with an
 - The three device features `robustBufferAccess`, `scalarBlockLayout` and `robustImageAccess` each affect the key.
   The first two are disabled on both devices. This integration enables supported core image robustness for storage
   views on both the runtime device and the checker. The seed test compares the two using one synthetic pipeline.
+- On a Windows RTX 5070 Ti (617.42), a compute-only seed missed with mesh features omitted and hit with the supported mesh and mesh-query features enabled on both devices. The shader, push constants and pipeline layout were identical. Cache-producing runs request this device configuration for every selected shader batch.
 - The executable's file name is part of the key; its folder is not. A copy of the checker under another name
   misses the cache the original wrote, and the runtime's device hits the checker's cache only from a program
   with the checker's file name. So on this driver a cache written by `vk_pipeline_check.exe` does not hit in
