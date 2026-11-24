@@ -447,8 +447,10 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
         return None, "SKIP (no 64-wide compute subgroup on this device)"
     if rc == 0 and wave64 and "compute subgroup size: 64" not in msg.splitlines():
         return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
+    if rc != 0:
+        return False, f"exit {rc}: {msg or 'no test output'}"
     words = dump_words(msg)
-    if rc != 0 or words is None:
+    if words is None:
         return False, msg
     vals = words[:len(want)]
     return words_match(vals, want), " ".join((hex if hexwords else str)(x) for x in vals)
@@ -1345,7 +1347,7 @@ def run_suite(a, work: str) -> int:
                     continue
                 if rc == 0:
                     skip = wave32_lane_skip(msg)
-            if skip is None and name in WAVE32_PIN_DUMPS:
+            if rc == 0 and skip is None and name in WAVE32_PIN_DUMPS:
                 # the device may not be able to run the wave size this fixture was written for (a 64-only device
                 # can't pin 32, so cs_barrier_loop's words mean nothing); check.py skips it too
                 skip = subgroup_pin_skip(msg, cs_env)
