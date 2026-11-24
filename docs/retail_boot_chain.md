@@ -17,7 +17,7 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 | 1 | The first `XMemVirtualAlloc` calls: two 64 KiB reserve forms, then 2 MiB pages | #6709, #4531 |
 | 2 | The 2 MiB reserve+commit calls carry attribute words the shim refuses, and `PAGE_GRAPHICS_*` bits (0x800..0x40000) on top of `PAGE_READWRITE` | Local: accept the attribute word, drop the graphics bits and keep the CPU protection. All seven startup allocations then succeed. #6843 measures the attribute words; no PR changes the check yet |
 | 3 | `xgameruntime.lib`'s thunk treats a missing `XErrorReport` as fatal | #6582 |
-| 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | #4313 |
+| 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | #4313 in the measured tree: the runtime's own EXE gives up index 0 at process start. `main` has a different fix since `b7a3fed28` (with `4710549af` for threads that were already running): the loader rewrites the executable's index-0 reads so that they reach the image's own block ([boot.md](boot.md) §3, step 3). Checked on `main` with a synthetic `/GA` executable beside a DLL with TLS of its own (`loader_tls`) and a `/GA` build of the stand-in game under `gta6rt --run` (`run_tiny_game_ga_tls`); the retail run was not repeated for this note, it needs game files |
 | 5 | Fatal assert when `DStorageGetFactory` returns null | #4348 |
 | 6 | `XMemAllocatePhysicalPages` unimplemented; the title asserts on FALSE | Local stand-in, §2 |
 | 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | Local, §3.1 |
