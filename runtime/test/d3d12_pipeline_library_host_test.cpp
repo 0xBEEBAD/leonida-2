@@ -105,7 +105,8 @@ const Step kSteps[] = {
          longer.resize(longer.size() + 64, 0);
          return create(c, longer.data(), longer.size());
      }},
-    // The last byte is reserved in the layer's header. On the host, it depends on the driver's format.
+    // The layer's empty LPL1 library contains only the header, so its last byte is in the reserved field.
+    // The native library has its own driver-specific layout.
     {"create: its own blob, last byte flipped [own format]", [](Context& c) {
          std::vector<std::uint8_t> flipped(c.own);
          flipped.back() ^= 0xFF;
