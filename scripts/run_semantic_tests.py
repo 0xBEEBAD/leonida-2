@@ -93,8 +93,10 @@ def run_module(directory, module, verbose, timeout=None):
     # goes to stdout and can hold a line of the same shape. The count therefore comes from stderr alone. Reading the
     # merged output took whichever line came first, which is the test's own when it flushes and unittest's when it does
     # not, so the count depended on stdout buffering.
-    ran = re.search(r"^Ran (\d+) tests? in", p.stderr, re.M)
-    count = int(ran.group(1)) if ran else 0
+    # The last summary in stderr is unittest's own: a test that runs a nested runner writes that runner's summary
+    # while the test runs, before unittest writes its own. The first summary in stderr can be the nested one's.
+    summaries = re.findall(r"^Ran (\d+) tests? in", p.stderr, re.M)
+    count = int(summaries[-1]) if summaries else 0
     out = p.stdout + p.stderr
     # Discover imports every package initializer, but an empty one has no tests to run. It is included in the
     # module list so parallel runs see TestCase classes when there are any; without them, it is not a failure.

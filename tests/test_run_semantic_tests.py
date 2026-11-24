@@ -25,6 +25,9 @@ RAN0 = ("import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
         "        print('Ran 0 tests in 0.000s', flush=True)\n")
 RAN0_AT_EXIT = ("import atexit\nimport unittest\natexit.register(lambda: print('Ran 0 tests in 0.000s'))\n"
                 "class T(unittest.TestCase):\n    def test_a(self):\n        pass\n")
+# A test that runs a nested unittest runner: that runner writes its own summary to stderr while the test runs.
+NESTED = ("import sys\nimport unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
+          "        unittest.TextTestRunner(stream=sys.stderr, verbosity=0).run(unittest.TestSuite())\n")
 
 
 def suite(tmp, files):
@@ -72,6 +75,16 @@ class RunnerTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
                 self.assertNotIn("no tests ran", result.stdout)
+
+    def test_the_count_comes_from_unittest_not_from_a_nested_runner(self):
+        # A test that runs a nested unittest runner writes that runner's summary ("Ran 0 tests in ...") to stderr
+        # while the test runs, before unittest writes its own. The count must come from unittest's own summary.
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_counts.py": NESTED})
+            result = cli(tmp, "-j", "2")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
+            self.assertNotIn("no tests ran", result.stdout)
 
     def test_serial_timeout_keeps_discover_output_and_names_the_suite(self):
         with tempfile.TemporaryDirectory() as tmp:
