@@ -59,6 +59,11 @@ bool is_game_prefix(const std::wstring& s, size_t pos = 0) {
            std::towlower(s[pos + 3]) == L'e' && s[pos + 4] == L':';
 }
 
+bool is_sep(wchar_t c) { return c == L'/' || c == L'\\'; }
+
+// Two leading separators of either kind ("\\\\", "//", "/\\", "\\/") name a UNC share once Windows normalizes them.
+bool is_unc_prefix(const std::wstring& s) { return s.size() >= 2 && is_sep(s[0]) && is_sep(s[1]); }
+
 bool is_scheme_char(wchar_t c) {
     return is_ascii_alpha(c) || (c >= L'0' && c <= L'9') || c == L'+' || c == L'-' || c == L'.';
 }
@@ -296,7 +301,7 @@ HRESULT resolve_media_url(const wchar_t* url, std::wstring& out, std::string* re
             return refuse("unc", narrow_host(rest));
         }
         candidate = text;
-    } else if (text.starts_with(L"\\\\") || text.starts_with(L"//")) {
+    } else if (is_unc_prefix(text)) {
         return refuse("unc", narrow_host(text.substr(2)));
     } else if (is_game_prefix(text) || is_drive_prefix(text)) {
         candidate = text;
@@ -331,9 +336,15 @@ HRESULT resolve_media_url(const wchar_t* url, std::wstring& out, std::string* re
             } else {
                 path_part = rest;
             }
-            size_t trim = 0;
-            while (trim < path_part.size() && (path_part[trim] == L'/' || path_part[trim] == L'\\')) ++trim;
-            std::wstring decoded = percent_decode_wide(path_part.substr(trim));
+            // After the authority and percent-decoding, two or more leading separators name a UNC share
+            // (file:////server/share, file://localhost//server/share, file:///%5C%5Cserver/share).
+            std::wstring decoded = percent_decode_wide(path_part);
+            if (is_unc_prefix(decoded)) {
+                size_t start = 2;
+                while (start < decoded.size() && is_sep(decoded[start])) ++start;
+                return refuse("unc", narrow_host(decoded.substr(start)));
+            }
+            if (!decoded.empty() && is_sep(decoded[0])) decoded.erase(0, 1);
             for (wchar_t& ch : decoded) {
                 if (ch == L'/') ch = L'\\';
             }

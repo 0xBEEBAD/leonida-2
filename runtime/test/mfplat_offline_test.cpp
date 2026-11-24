@@ -237,6 +237,24 @@ int main() {
           "file:\\\\host backslash UNC refused");
     check(rt::mf::resolve_media_url(L"file:////host/share/a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme,
           "file:////host forward-slash UNC refused");
+    // The three forms from the review of #400: each reaches the host as a UNC path, so each is refused as one.
+    check(rt::mf::resolve_media_url(L"file:////server/share/a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme &&
+              scheme == "unc" && host == "server" && out.empty(),
+          "file:////server/share/a.mp4 refused as UNC");
+    check(rt::mf::resolve_media_url(L"file://localhost//server/share", out, &scheme, &host) ==
+                  rt::mf::kUnsupportedScheme &&
+              scheme == "unc" && host == "server" && out.empty(),
+          "file://localhost//server/share refused as UNC");
+    check(rt::mf::resolve_media_url(L"/\\server\\share\\a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme &&
+              scheme == "unc" && host == "server" && out.empty(),
+          "mixed-slash /\\server\\share refused as UNC");
+    check(rt::mf::resolve_media_url(L"\\/server/share/a.mp4", out, &scheme, &host) == rt::mf::kUnsupportedScheme &&
+              scheme == "unc" && host == "server" && out.empty(),
+          "mixed-slash \\/server refused as UNC");
+    check(rt::mf::resolve_media_url(L"file:///%2F%2Fserver/share/a.mp4", out, &scheme, &host) ==
+                  rt::mf::kUnsupportedScheme &&
+              scheme == "unc" && host == "server",
+          "file:/// with percent-encoded // refused as UNC");
     check(rt::mf::resolve_media_url(L"file:///%5C%5Chost/share/a.mp4", out, &scheme, &host) ==
                   rt::mf::kUnsupportedScheme,
           "file:/// percent-encoded UNC refused");
