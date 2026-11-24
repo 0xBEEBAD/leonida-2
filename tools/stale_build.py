@@ -15,7 +15,8 @@ _INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
 # The include directories runtime/CMakeLists.txt gives the runtime/test programs, searched after the directory of the
 # including file: runtime/src and runtime/shims (target_include_directories of pe_loader_test, lines 657-660, which
 # other test programs repeat), then the xtaskqueue ones (lines 90-92, 1206-1210 and 1227-1229). Paths are relative to
-# the repository root.
+# the repository root. The list is the union over the programs, not one target's order: no header name exists in two
+# of these directories today, and if one did, every copy would count as a source of the program.
 _INCLUDE_DIRS = (
     "runtime/src",
     "runtime/shims",
@@ -27,16 +28,15 @@ _INCLUDE_DIRS = (
 
 
 def _resolve_include(root, path, inc):
-    """The file a quoted `#include inc` in `path` names: next to `path` first, then in _INCLUDE_DIRS; None if neither
-    has it (a system or generated header)."""
+    """The files a quoted `#include inc` in `path` may name: the one next to `path` when there is one (the compiler
+    looks there first and nowhere else), otherwise every match in _INCLUDE_DIRS. CMake orders those directories per
+    target, so which match the compiler takes can differ from one program to the next; following all of them can add a
+    rebuild but never miss one. Empty when nothing has it (a system or generated header)."""
     local = os.path.join(os.path.dirname(path), inc)
     if os.path.isfile(local):
-        return local
-    for directory in _INCLUDE_DIRS:
-        candidate = os.path.join(root, directory, inc)
-        if os.path.isfile(candidate):
-            return candidate
-    return None
+        return [local]
+    matches = (os.path.join(root, directory, inc) for directory in _INCLUDE_DIRS)
+    return [candidate for candidate in matches if os.path.isfile(candidate)]
 
 
 def program_sources(root, name):
@@ -57,9 +57,7 @@ def program_sources(root, name):
         except OSError:
             continue
         for inc in _INCLUDE.findall(text):
-            resolved = _resolve_include(root, path, inc)
-            if resolved is not None:
-                pending.append(resolved)
+            pending.extend(_resolve_include(root, path, inc))
     return found
 
 

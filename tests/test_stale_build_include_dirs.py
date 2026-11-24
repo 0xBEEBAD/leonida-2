@@ -53,11 +53,23 @@ class IncludeDirsTest(unittest.TestCase):
         write(self.root, "runtime/src/helper.h", "// shared\n")
         self.assertEqual(self.sources(), ["runtime/test/helper.h", "runtime/test/prog.cpp"])
 
-    def test_runtime_src_wins_over_runtime_shims(self):
+    def test_every_copy_in_the_include_directories_is_a_source(self):
+        # CMake orders the directories per target (`target_include_directories(prog PRIVATE shims src)` takes the
+        # shims copy), so a header present in both must count whichever one a given program compiles.
         write(self.root, "runtime/test/prog.cpp", '#include "helper.h"\n')
         write(self.root, "runtime/src/helper.h", "// src\n")
         write(self.root, "runtime/shims/helper.h", "// shims\n")
-        self.assertEqual(self.sources(), ["runtime/src/helper.h", "runtime/test/prog.cpp"])
+        self.assertEqual(self.sources(), ["runtime/shims/helper.h", "runtime/src/helper.h", "runtime/test/prog.cpp"])
+
+    def test_editing_only_the_shims_copy_marks_the_exe_stale(self):
+        write(self.root, "runtime/test/prog.cpp", '#include "selection.h"\n')
+        write(self.root, "runtime/src/selection.h", "// src\n")
+        write(self.root, "runtime/shims/selection.h", "// shims\n")
+        exe = write(self.root, "build/prog.exe", "exe")
+        for rel in ("runtime/test/prog.cpp", "runtime/src/selection.h", "build/prog.exe"):
+            os.utime(os.path.join(self.root, *rel.split("/")), (1000, 1000))
+        os.utime(os.path.join(self.root, "runtime", "shims", "selection.h"), (5000, 5000))
+        self.assertEqual(stale_build.newer_sources(exe, self.root, "prog"), ["runtime/shims/selection.h"])
 
     def test_header_found_in_runtime_shims(self):
         write(self.root, "runtime/test/prog.cpp", '#include "shim.h"\n')
