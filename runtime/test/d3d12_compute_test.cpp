@@ -559,6 +559,127 @@ int main() {
                                                    IID_PPV_ARGS(&list.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
+        // Direct and indirect compute commands snapshot the bound shader heaps after s4..s8.
+        // Rebinding just the resource heap clears the sampler for the later command.
+        {
+            auto direct_desc = root_desc;
+            direct_desc.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                         D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+            const auto direct_blob = serialize(direct_desc);
+            Ref<ID3D12RootSignature> direct_root;
+            EXPECT(SUCCEEDED(device->CreateRootSignature(0, direct_blob.data(), direct_blob.size(), IID_PPV_ARGS(&direct_root.p))));
+            auto pipeline_desc = pso_desc;
+            pipeline_desc.pRootSignature = direct_root.p;
+            Ref<ID3D12PipelineState> direct_pso;
+            EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&direct_pso.p))));
+            Ref<ID3D12DescriptorHeap> sampler;
+            auto sampler_desc = heap_desc;
+            sampler_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&sampler_desc, IID_PPV_ARGS(&sampler.p))));
+            const auto smp = reinterpret_cast<XboxHeapHandleFn>(slot(sampler.p, 10))(sampler.p);
+            const D3D12_INDIRECT_ARGUMENT_DESC arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+            const D3D12_COMMAND_SIGNATURE_DESC signature_desc{12, 1, &arg, 0};
+            Ref<ID3D12CommandSignature> signature;
+            EXPECT(SUCCEEDED(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature.p))));
+            list->SetPipelineState(direct_pso.p);
+            list->SetComputeRootSignature(direct_root.p);
+            ID3D12DescriptorHeap* both[] = {sampler.p, heap.p};
+            list->SetDescriptorHeaps(2, both);
+            list->SetComputeRootDescriptorTable(2, {gpu + 32});
+            list->Dispatch(1, 1, 1);
+            Ref<ID3D12CommandAllocator> bundle_allocator;
+            Ref<ID3D12GraphicsCommandList> bundle;
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p, nullptr,
+                                                       IID_PPV_ARGS(&bundle.p))));
+            bundle->Dispatch(1, 1, 1);
+            EXPECT(SUCCEEDED(bundle->Close()));
+            list->ExecuteBundle(bundle.p);
+            list->SetDescriptorHeaps(1, &heap.p);
+            list->ExecuteIndirect(signature.p, 1, out_a.p, 0, nullptr, 0);
+            list->SetDescriptorHeaps(1, &sampler.p);
+            list->ExecuteIndirect(signature.p, 1, out_a.p, 0, nullptr, 0);
+            // 27 constants starting at s4 leave room for one heap. At 28, s31 is explicit too.
+            for (UINT count : {27u, 28u}) {
+                auto constants_param = params[0];
+                constants_param.Constants.Num32BitValues = count;
+                auto full_desc = direct_desc;
+                full_desc.Desc_1_0.NumParameters = 1;
+                full_desc.Desc_1_0.pParameters = &constants_param;
+                const auto blob = serialize(full_desc);
+                Ref<ID3D12RootSignature> full;
+                EXPECT(SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&full.p))));
+                pipeline_desc.pRootSignature = full.p;
+                Ref<ID3D12PipelineState> full_pso;
+                EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&full_pso.p))));
+                list->SetPipelineState(full_pso.p);
+                list->SetComputeRootSignature(full.p);
+                list->SetComputeRoot32BitConstant(0, 123, count - 1);
+                list->SetDescriptorHeaps(2, both);
+                list->Dispatch(1, 1, 1);
+            }
+            EXPECT(SUCCEEDED(list->Close()));
+            std::vector<leonida::Command> commands;
+            EXPECT(rt::d3d12::recorded_commands(list.p, commands) && commands.size() == 6);
+            const auto& before = std::get<leonida::Dispatch>(commands[0]).user_data;
+            const auto& after = std::get<leonida::ExecuteIndirect>(commands[2]).user_data;
+            char setting[2]{};
+            const bool enabled = GetEnvironmentVariableA("LEONIDA_COMPUTE_DIRECT_HEAPS", setting, 2) != 1 ||
+                                 setting[0] != '0';
+            EXPECT(before[8] == gpu + 32 && before[9] == (enabled ? gpu : 0) && before[10] == (enabled ? smp : 0));
+            EXPECT(after[8] == gpu + 32 && after[9] == (enabled ? gpu : 0) && after[10] == 0);
+            EXPECT(std::get<leonida::Dispatch>(commands[1]).user_data == before);
+            const auto& sampler_only = std::get<leonida::ExecuteIndirect>(commands[3]).user_data;
+            EXPECT(sampler_only[9] == 0 && sampler_only[10] == (enabled ? smp : 0));
+            const auto& one_slot = std::get<leonida::Dispatch>(commands[4]).user_data;
+            EXPECT(one_slot[30] == 123 && one_slot[31] == (enabled ? gpu : 0));
+            EXPECT(std::get<leonida::Dispatch>(commands[5]).user_data[31] == 123);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            // The shader follows the V# at the heap index in s4. Slot 1 and the unrelated explicit table are null.
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = DXGI_FORMAT_R32_TYPELESS;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Buffer.NumElements = 4;
+            srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            device->CreateShaderResourceView(nullptr, &srv, {cpu + 32});
+            device->CreateShaderResourceView(constants.p, &srv, {cpu + 2 * 32});
+            list->SetComputeRootSignature(direct_root.p);
+            list->SetPipelineState(direct_pso.p);
+            list->SetDescriptorHeaps(2, both);
+            list->SetComputeRootDescriptorTable(2, {gpu + 32});
+            list->SetComputeRootUnorderedAccessView(1, va_a);
+            for (UINT index = 1; index <= 2; ++index) {
+                const UINT inputs[] = {index, 0xfffffffcu};
+                list->SetComputeRoot32BitConstants(0, 2, inputs, 0);
+                list->Dispatch(1, 1, 1);
+                const auto copy = transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &copy);
+                list->CopyBufferRegion(readback.p, (index - 1) * bytes, out_a.p, 0, bytes);
+                const auto resume = transition(out_a.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                list->ResourceBarrier(1, &resume);
+            }
+            EXPECT(SUCCEEDED(list->Close()));
+            ID3D12CommandList* submitted[] = {list.p};
+            queue->ExecuteCommandLists(1, submitted);
+            Ref<ID3D12Fence> done;
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done.p))));
+            EXPECT(SUCCEEDED(queue->Signal(done.p, 1)) && SUCCEEDED(done->SetEventOnCompletion(1, nullptr)));
+            void* results{};
+            EXPECT(SUCCEEDED(readback->Map(0, nullptr, &results)));
+            const auto* values = static_cast<const UINT*>(results);
+            for (UINT i = 0; i < elements; ++i) {
+                EXPECT(values[i] == 0);
+                EXPECT(values[elements + i] == (enabled ? table_values[i % 4] : 0));
+            }
+            readback->Unmap(0, nullptr);
+            std::puts(enabled ? "directly indexed compute heap: 64 buffer reads and 64 null controls matched"
+                              : "directly indexed compute heap disabled: 128 zero controls matched");
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        }
+
         // Misuse is reported by Close: a dispatch without a pipeline, a root view set on a constants parameter.
         list->Dispatch(1, 1, 1);
         EXPECT(list->Close() == E_INVALIDARG);
