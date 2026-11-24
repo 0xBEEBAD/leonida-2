@@ -326,6 +326,17 @@ def versions() -> list:
 PROBES = ("MicrosoftGame.Config", "Catalog000.bin", "appdata0.rpf")
 
 
+def other_case(folder: str, name: str) -> "str | None":
+    """A file in folder whose name differs from name only in letter case, or None. Only reached when name itself is
+    missing, which on a case-insensitive file system (Windows, macOS by default) means no variant exists either;
+    on Linux a copy whose names were lower-cased on the way is otherwise reported as just missing."""
+    try:
+        with os.scandir(folder) as it:
+            return next((e.name for e in it if e.name != name and e.name.casefold() == name.casefold()), None)
+    except OSError:
+        return None
+
+
 def probe_mismatches(game: str, version: dict) -> list[str]:
     """Describe which probe files prevent a version match, using only filesystem metadata."""
     files = version["files"]
@@ -339,7 +350,11 @@ def probe_mismatches(game: str, version: dict) -> list[str]:
         try:
             info = os.stat(os.path.join(game, name))
         except (FileNotFoundError, NotADirectoryError):
-            mismatches.append(f"Missing {name}.")
+            other = other_case(game, name)
+            mismatches.append(f"Missing {name}." if other is None else
+                              f"Missing {name}: there is {other}, but file names are case-sensitive on this file "
+                              f"system and the build opens the package's files by their exact names. Rename it "
+                              f"to {name}, or copy the package again with its names unchanged.")
             continue
         except OSError as error:
             mismatches.append(f"Cannot read file metadata for {name} ({error.strerror}).")
