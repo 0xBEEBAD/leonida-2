@@ -405,6 +405,21 @@ class ClosestHit(unittest.TestCase):
                 self.assertEqual(X._box_test(10.0, [0.0, 0.0, 1.0], d, inv, [0.0, 0.0, 0.0], [1.0, math.nan, 0.0]),
                                  math.inf)
 
+    def test_nan_transform_falls_back_to_zero_inverse_in_tlas(self):
+        _, active_info = X.build_blas([TRI])
+        nan_rot = [[math.nan, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]
+        nan_trans = [[1, 0, 0, math.nan], [0, 1, 0, 0], [0, 0, 1, 0]]
+        for matrix in (nan_rot, nan_trans):
+            with self.subTest(matrix=matrix):
+                with self.assertRaises(ValueError):
+                    X.invert_affine(matrix)
+                inst = X.Instance(matrix, 0x10000, active_info["root"], active_info["bounds"])
+                tlas, info = X.build_tlas([inst])
+                self.assertEqual(X.validate(tlas, expect_bottom=False), [])
+                self.assertEqual(info["bounds"], ([math.inf] * 3, [-math.inf] * 3))
+                off = X.ptr_offset(struct.unpack_from("<I", tlas, X.ptr_offset(info["root"]))[0])
+                self.assertEqual(struct.unpack_from("<12f", tlas, off + 64), (0.0,) * 12)
+
 
 class Validate(unittest.TestCase):
     def setUp(self):

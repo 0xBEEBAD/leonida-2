@@ -187,8 +187,8 @@ def invert_affine(m):
     det = (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
-    if det == 0:
-        raise ValueError("singular instance transform")
+    if det == 0 or not math.isfinite(det):
+        raise ValueError("singular or non-finite instance transform")
     inv = [[0.0] * 3 for _ in range(3)]
     for r in range(3):
         for c in range(3):
@@ -196,7 +196,10 @@ def invert_affine(m):
             c1, c2 = (r + 1) % 3, (r + 2) % 3
             inv[r][c] = (a[r1][c1] * a[r2][c2] - a[r1][c2] * a[r2][c1]) / det
     t = [row[3] for row in m]
-    return [inv[r] + [-(inv[r][0] * t[0] + inv[r][1] * t[1] + inv[r][2] * t[2])] for r in range(3)]
+    out = [inv[r] + [-(inv[r][0] * t[0] + inv[r][1] * t[1] + inv[r][2] * t[2])] for r in range(3)]
+    if any(not math.isfinite(x) for row in out for x in row):
+        raise ValueError("singular or non-finite instance transform")
+    return out
 
 
 # ---- tree construction (ASSUMPTION: the heuristic is ours; any valid BVH4 traverses the same) ----
