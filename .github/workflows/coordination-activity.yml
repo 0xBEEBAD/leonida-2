@@ -250,8 +250,12 @@ jobs:
               inline_code = re.match("^" + quote + "([^" + BACKTICK + "]*)" + quote + "(.*)$", text)
               if inline_code:
                   code_text = inline_code.group(1).strip()
-                  if ID_LIST_RE.fullmatch(code_text):
-                      return code_text + inline_code.group(2)
+                  suffix = inline_code.group(2)
+                  if (
+                      ID_LIST_RE.fullmatch(code_text)
+                      and not re.match(r"^[A-Za-z0-9-]", suffix)
+                  ):
+                      return code_text + suffix
               return text
 
           def ids_from_claim_comment(body):
@@ -923,7 +927,13 @@ jobs:
               pattern = re.escape(BACKTICK) + "([^" + BACKTICK + "]*)" + re.escape(BACKTICK)
               def replace_code_span(match):
                   code_text = match.group(1).strip()
-                  if ID_LIST_RE.fullmatch(code_text):
+                  before = match.string[match.start() - 1:match.start()]
+                  after = match.string[match.end():match.end() + 1]
+                  if (
+                      ID_LIST_RE.fullmatch(code_text)
+                      and not re.match(r"^[A-Za-z0-9-]", before)
+                      and not re.match(r"^[A-Za-z0-9-]", after)
+                  ):
                       return code_text
                   return match.group(0)
               return re.sub(pattern, replace_code_span, text)
