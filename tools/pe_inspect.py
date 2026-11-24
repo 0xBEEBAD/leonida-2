@@ -385,7 +385,7 @@ def dll_strings(data: bytes, imported: set[str], own_name: str | tuple[str, ...]
 # Host DLLs the runtime's shim registry does not own although a SHIM_TABLE lists them: only a few of their functions
 # are replaced (runtime/shims/registry.cpp, owns_dll). API sets are never owned either.
 _SHIM_HOST_DLLS = frozenset({"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
-                             "vulkan-1.dll", "ntdll.dll", "user32.dll"})
+                             "vulkan-1.dll", "ntdll.dll", "user32.dll", "ws2_32.dll", "wsock32.dll"})
 _SHIM_TABLE_DLL = re.compile(r'[{(]\s*"([A-Za-z0-9_.\-]+\.[dD][lL][lL])"\s*[,)]')
 _shim_dlls_cache: dict[str, frozenset[str]] = {}
 
