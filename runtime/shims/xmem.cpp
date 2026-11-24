@@ -37,6 +37,7 @@
 #include "shims.h"
 #include "startup_trace.h"
 #include "../src/title_va_alias.h"
+#include "xmem.h"
 
 namespace {
 
@@ -800,6 +801,36 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
 }
 
 }  // namespace
+
+namespace rt::xmem {
+
+// main's xmem commits physical pages on first touch and exposes these two for code that must see them committed
+// (slot 133's import, d3d12_xmem_placed_test). Here a physical page is committed when it is allocated, so there is
+// nothing to do: the range only has to be mapped, readable memory, and the page array non-null.
+bool commit_physical_range(const void* address, std::size_t size) {
+    if (size == 0) return true;
+    const auto* at = static_cast<const std::uint8_t*>(address);
+    const auto* const end = at + size;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(at, &info, sizeof(info)) || info.State != MEM_COMMIT) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return false;
+        }
+        at = static_cast<const std::uint8_t*>(info.BaseAddress) + info.RegionSize;
+    }
+    return true;
+}
+
+bool commit_physical_pages(const std::uint64_t* page_array, std::size_t count) {
+    if (count && !page_array) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace rt::xmem
 
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
 

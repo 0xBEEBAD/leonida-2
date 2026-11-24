@@ -109,6 +109,8 @@ public:
     // VK_KHR_maintenance5 enabled, where VK_FORMAT_A8_UNORM_KHR can be sampled and blended as a colour attachment, as
     // gta6rt enables it (VulkanDeviceInfo::a8_render_target).
     bool a8_render_target = false;
+    // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
+    VkDeviceSize host_pointer_alignment = 0;
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
@@ -500,6 +502,16 @@ public:
             host_copy.pNext = *v13_.next();  // after the conditional rendering features, if any
             *v13_.next() = &host_copy;
         }
+        // VK_EXT_external_memory_host where the device has it (OpenExistingHeapFromAddress).
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_memory{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host_memory};
+            instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
+            host_pointer_alignment = host_memory.minImportedHostPointerAlignment;
+        }
+
 #ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
         VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
@@ -592,6 +604,7 @@ public:
 #ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
         if (a8_render_target) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif
+        if (host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
 #if defined(VK_KHR_swapchain_maintenance1)

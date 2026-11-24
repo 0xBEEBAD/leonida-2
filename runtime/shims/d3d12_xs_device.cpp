@@ -24,7 +24,6 @@
 // 78 SetFrameIntervalX, 79 ScheduleFrameEventX and 80 WaitFrameEventX. The slots can be moved with LEONIDA_XS_*_SLOT
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
-#include "../src/vulkan_replay.h"
 #include "title_window.h"
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
@@ -2784,8 +2783,6 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
-    if (desc && desc->SizeInBytes == 96 && desc->BufferLocation < 0x100000000ull)
-        leonida::g_local_last_cb96.store(desc->BufferLocation);
     {   // LOCAL DIAGNOSTIC
         static std::atomic<int> said{0};
         const int n = said.fetch_add(1);
