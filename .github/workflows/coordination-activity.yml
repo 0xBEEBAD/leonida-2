@@ -155,7 +155,7 @@ jobs:
                       bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
                       if not bullet:
                           break
-                      bullet_text = bullet.group(1).strip().strip(BACKTICK)
+                      bullet_text = bullet.group(1).replace(BACKTICK, "").strip()
                       first_ids = work_id_list(bullet_text)
                       if not first_ids:
                           leading_id = re.match(rf"^{ID_PATTERN}", bullet_text)
@@ -231,7 +231,7 @@ jobs:
                   prior = []
                   for comment in claims_by_id.get(item_id, []):
                       created_at = parse_time(comment.get("created_at"))
-                      updated_at = parse_time(comment.get("updated_at") or comment.get("created_at"))
+                      updated_at = parse_time(comment.get("updated_at"))
                       if (
                           created_at is not None
                           and updated_at == created_at
@@ -699,7 +699,7 @@ jobs:
                       bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
                       if not bullet:
                           break
-                      bullet_text = bullet.group(1).strip().strip(BACKTICK)
+                      bullet_text = bullet.group(1).replace(BACKTICK, "").strip()
                       first_ids = work_id_list(bullet_text)
                       if not first_ids:
                           leading_id = re.match(rf"^{ID_PATTERN}", bullet_text)
@@ -775,7 +775,7 @@ jobs:
                   prior = []
                   for comment in claims_by_id.get(item_id, []):
                       created_at = parse_time(comment.get("created_at"))
-                      updated_at = parse_time(comment.get("updated_at") or comment.get("created_at"))
+                      updated_at = parse_time(comment.get("updated_at"))
                       if (
                           created_at is not None
                           and updated_at == created_at
