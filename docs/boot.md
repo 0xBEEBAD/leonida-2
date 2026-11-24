@@ -29,8 +29,11 @@ Two traces are written independently:
 
 `tools/boot_trace.py` reads both and prints the triage units: modules, unimplemented calls and callers,
 DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12 calls by outcome and first call
-per method. The `[rt]` lines in the same stderr log carry the device parameters, feature ids and warnings; the
-summary leaves them as a count, so grep `^\[rt\]` for those.
+per method. When `XboxPresentation` logs its teardown `[rt] present: pacing summary ...` line (BL-6), the D3D12
+summary also reports the frame count, interval count, target interval, mean and drift against target, `p50`/`p95`/`p99`
+frame times, and `p50`/`p95`/`p99` origin-to-present latencies (and includes the numeric `frame_pacing` object in
+`--json` and `--counts-only`). The remaining `[rt]` lines in the same stderr log carry the device parameters, feature
+ids and warnings; the summary leaves them as a count, so grep `^\[rt\]` for those.
 
 For `xmem_physical_pages`, the shim records the first request for each distinct attribute word. The text and
 JSON summaries list the API, raw attribute word, requested page count and caller for the first `--limit`
@@ -122,6 +125,17 @@ Read the startup trace first; the first event that is not the expected one is th
    TLS index. The summary shows the address and phase of the last observed TLS callback
    (`last_tls_callback` in JSON). The loader records it before invoking the callback, so the record gives no
    completion result. The loader's own TLS is checked by `run_tiny_game_tls`.
+   An access violation in CRT startup before the first D3D12 call can be the TLS index instead: code built with
+   `/GA` reads its thread-local data at module index 0 without `_tls_index`, and index 0 belongs to `gta6rt.exe`
+   (stop 4 of [retail_boot_chain.md](retail_boot_chain.md)). `load()` rewrites those reads in a mapped executable
+   so that they reach the image's own block, and every other mapped module with a TLS directory has an index of
+   its own ([`runtime/README.md`](../runtime/README.md), "PE loader"). The stderr log has one
+   `[rt] loader: <image>: <N> index-0 TLS reads` line for the executable; `N` 0 on an image that faults there
+   means its reads have a shape the rewrite does not know. `LEONIDA_TLS_GA_PATCH=0` turns the rewrite off, to
+   see the stop without it. `loader_tls` checks both ways with a synthetic `/GA` executable mapped beside a DLL
+   that has TLS of its own, on the loading thread and on a new one, and `run_tiny_game_ga_tls` runs a `/GA`
+   build of the stand-in game through `gta6rt --run`. Not confirmed here on the retail executable: that needs
+   game files.
 4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
    so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it reserves
    the final slot for the last observed exception. The trace also includes handled exceptions, so the last
