@@ -169,9 +169,10 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
             emit(body, op_load, {t_v4, c.v[k], ptr});
         }
         const std::uint32_t sum = id(), diff = id();
-        // LOCAL: measured on the retail title's rectangle draws (corners top-left, bottom-left, bottom-right): the
-        // fourth corner is v1 + v3 - v2. LEONIDA_RECT_FOURTH=old keeps v2 + v3 - v1.
-        static const bool local_old_rule = [] { const char* e = std::getenv("LEONIDA_RECT_FOURTH"); return e && *e == 'o'; }();
+        // The fourth corner is v2 + v3 - v1, the rule d3d12_rect_list tests. OPEN QUESTION, opt-in with
+        // LEONIDA_RECT_FOURTH=v1v3: the retail title's full-screen rectangle draws were measured with corners
+        // top-left, bottom-left, bottom-right, where only v1 + v3 - v2 covers the target (see the pull request).
+        static const bool local_old_rule = [] { const char* e = std::getenv("LEONIDA_RECT_FOURTH"); return !(e && *e == 'v'); }();
         if (local_old_rule) {
             emit(body, op_fadd, {t_v4, sum, c.v[1], c.v[2]});
             emit(body, op_fsub, {t_v4, diff, sum, c.v[0]});
@@ -185,7 +186,7 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     // Two triangles, (v1, v2, v4) and (v1, v4, v3): the diagonal is v1 to v4, so both start at v1 and a flat input
     // (which Vulkan takes from a triangle's first vertex) is v1's over the whole rectangle. The attributes are
     // affine over the parallelogram, so the split does not change any interpolated value.
-    static const bool local_old_split = [] { const char* e = std::getenv("LEONIDA_RECT_FOURTH"); return e && *e == 'o'; }();
+    static const bool local_old_split = [] { const char* e = std::getenv("LEONIDA_RECT_FOURTH"); return !(e && *e == 'v'); }();
     const int triangles_old[2][3] = {{0, 1, 3}, {0, 3, 2}};
     const int triangles_new[2][3] = {{0, 1, 2}, {0, 2, 3}};  // diagonal v1 to v3, both start at v1
     const auto& triangles = local_old_split ? triangles_old : triangles_new;
