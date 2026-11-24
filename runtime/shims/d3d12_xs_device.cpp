@@ -983,6 +983,9 @@ inline void note_list_slot(unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2
                      static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
 }
 
+// The console ID3D12GraphicsCommandListX IID the title passes to slot 73 (docs/retail_boot_chain.md §3.3).
+constexpr IID kXboxGraphicsCommandListX = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+
 inline bool is_list_iid(const IID& iid) {
     return IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
            IsEqualIID(iid, __uuidof(ID3D12DeviceChild)) || IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
@@ -1018,11 +1021,12 @@ inline HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
-    if (!is_list_iid(*riid)) {
+    const IID& pc_iid = IsEqualIID(*riid, kXboxGraphicsCommandListX) ? __uuidof(ID3D12GraphicsCommandList) : *riid;
+    if (!is_list_iid(pc_iid)) {
         if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
     }
-    if (!supports_iid(self->real, *riid)) return E_NOINTERFACE;
+    if (!supports_iid(self->real, pc_iid)) return E_NOINTERFACE;
     *out = self;
     list_add_ref(self);
     return S_OK;
@@ -1442,20 +1446,11 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
     void* created = nullptr;
-    HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, *riid, &created);
-    // The console list IID is not in the PC SDK, so the PC device rejects it (docs/retail_boot_chain.md §3.3).
-    // Retry once with the PC list IID and wrap the list under that IID.
-    if (hr == E_NOINTERFACE && !is_list_iid(*riid)) {
-        static std::atomic<bool> retried{false};
-        if (first_call(retried))
-            std::fprintf(stderr, "[rt] d3d12_xs: slot 73 console list IID not known to the PC device; retrying as "
-                                 "ID3D12GraphicsCommandList\n");
-        const IID pc_iid = __uuidof(ID3D12GraphicsCommandList);
-        created = nullptr;
-        hr = self->real->CreateCommandList(0, type, allocator, initial_state, pc_iid, &created);
-        if (FAILED(hr)) return hr;
-        return wrap_list(static_cast<IUnknown*>(created), self, &pc_iid, out);
-    }
+    // The PC device does not know the console list IID: create the PC base list for it. Any other IID, including a
+    // public list revision the device lacks, goes through unchanged so its E_NOINTERFACE is kept.
+    const IID& create_iid =
+        IsEqualIID(*riid, kXboxGraphicsCommandListX) ? __uuidof(ID3D12GraphicsCommandList) : *riid;
+    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, create_iid, &created);
     if (FAILED(hr)) return hr;
     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
 }
