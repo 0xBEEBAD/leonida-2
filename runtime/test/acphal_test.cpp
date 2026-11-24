@@ -21,9 +21,15 @@
 
 // Fail only the calling test thread's designated allocation.
 static thread_local int allocations_before_failure = -1;
+static std::atomic<bool> fail_worker_allocation{false};
+static DWORD test_thread_id;
 void* operator new(std::size_t size) {
     if (allocations_before_failure == 0) {
         allocations_before_failure = -1;
+        throw std::bad_alloc();
+    }
+    if (fail_worker_allocation.load() && GetCurrentThreadId() != test_thread_id &&
+        fail_worker_allocation.exchange(false)) {
         throw std::bad_alloc();
     }
     if (allocations_before_failure > 0) --allocations_before_failure;
@@ -94,9 +100,13 @@ struct XmaWords {
     }
 };
 
-// Synthetic mono XMA2 with a single positive spectral coefficient in each frame.
-void write_xma_packet(uint8_t* packet, uint32_t frames, uint8_t packet_skip) {
-    constexpr uint32_t frame_bits = 82;
+// Synthetic XMA2 with one nonzero spectral coefficient per channel and frame.
+void write_xma_packet(uint8_t* packet, uint32_t frames, uint8_t packet_skip,
+                      uint32_t rate_index = 3, bool stereo = false) {
+    constexpr uint32_t scale_bands[] = {23, 24, 23, 23};
+    const uint32_t bands = scale_bands[rate_index];
+    const uint32_t channels = stereo ? 2u : 1u;
+    const uint32_t frame_bits = stereo ? 90 + 2 * bands : 59 + bands;
     std::memset(packet, 0xFF, 2048);
     std::size_t at = 0;
     auto put = [&](uint32_t value, std::size_t width) {
@@ -110,17 +120,24 @@ void write_xma_packet(uint8_t* packet, uint32_t frames, uint8_t packet_skip) {
     for (uint32_t frame = 0; frame < frames; ++frame) {
         put(frame_bits, 15);
         put(0b10u, 2);                    // Fixed layout, one 512-sample subframe.
+        if (stereo) put(0, 1);             // No optional decorrelation matrix.
         put(0, 11);                       // Gain, trim, fill and subframe error flag.
-        put(1, 1);                        // Coefficients are present.
+        if (stereo) put(0b010u, 3);        // Two channels without decorrelation.
+        put((1u << channels) - 1, channels); // Coefficients are present in each channel.
         put(1, 1);                        // Explicit vector coefficient count.
-        put(0, 8);                        // Use only run/level coding.
+        put(0, 8 * channels);             // Use only run/level coding.
         put(0, 6);                        // Quantizer adjustment.
-        put(0, 2);                        // Scale factor step.
-        put((1u << 23) - 1, 23);          // One zero delta per 48 kHz scale band.
-        put(0, 1);                        // Run/level table 0.
-        put(0b00u, 2);                    // Run 0, level 1.
-        put(1, 1);                        // Positive sign.
-        put(0b0101011u, 7);               // End of coefficients.
+        if (stereo) put(0, 5);             // No per-channel quantizer modifiers.
+        for (uint32_t channel = 0; channel < channels; ++channel) {
+            put(0, 2);                   // Scale factor step.
+            put((1u << bands) - 1, bands); // One zero delta per scale band.
+        }
+        for (uint32_t channel = 0; channel < channels; ++channel) {
+            put(0, 1);                   // Run/level table 0.
+            put(0b00u, 2);                // Run 0, level 1.
+            put(channel == 0 ? 1u : 0u, 1);
+            put(0b0101011u, 7);           // End of coefficients.
+        }
         put(0, 1);                        // Frame padding bit.
         put(frame + 1 < frames ? 1 : 0, 1);
     }
@@ -130,6 +147,7 @@ void write_xma_packet(uint8_t* packet, uint32_t frames, uint8_t packet_skip) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    test_thread_id = GetCurrentThreadId();
     std::printf("acphal_test: registered acphal.dll shim verification\n");
 
     const auto create = reinterpret_cast<AcpHalCreateFn>(
@@ -174,12 +192,19 @@ int main() {
           "AcpHalCreate returns S_OK with a non-null object");
     check(create(nullptr) == E_POINTER,
           "AcpHalCreate(nullptr) returns E_POINTER");
+    void* failed_hal = acp;
+    allocations_before_failure = 0;
+    const HRESULT create_failure = create(&failed_hal);
+    allocations_before_failure = -1;
+    check(create_failure == E_OUTOFMEMORY && failed_hal == nullptr,
+          "AcpHalCreate returns E_OUTOFMEMORY and clears the output");
 
     if (acp) {
         using Slot0Fn = HRESULT(__stdcall*)(void*, uint32_t, uint32_t);
         using Slot1Fn = HRESULT(__stdcall*)(void*);
-        using Slot2Fn = HRESULT(__stdcall*)(void*, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
-        using Slot3Fn = uint32_t(__stdcall*)(void*);
+        using Slot2Fn = HRESULT(__stdcall*)(void*, uint32_t, uint64_t, uint32_t, const void*, uint32_t);
+        using Slot3Fn = uint32_t(__stdcall*)(void*, void*);
+        using Slot4Fn = uint32_t(__stdcall*)(void*);
         using Slot5Fn = HRESULT(__stdcall*)(void*);
 
         auto vtable = *static_cast<void* const* const*>(acp);
@@ -200,8 +225,8 @@ int main() {
               "IAcpHal slot 2 (submit_command) returns S_OK (vital boot unblocker)");
 
         // Slots 3 and 4: Message polling returns 0
-        check(reinterpret_cast<Slot3Fn>(vtable[3])(acp) == 0, "IAcpHal slot 3 returns 0");
-        check(reinterpret_cast<Slot3Fn>(vtable[4])(acp) == 0, "IAcpHal slot 4 returns 0");
+        check(reinterpret_cast<Slot3Fn>(vtable[3])(acp, nullptr) == 0, "IAcpHal slot 3 returns 0");
+        check(reinterpret_cast<Slot4Fn>(vtable[4])(acp) == 0, "IAcpHal slot 4 returns 0");
 
         // Slot 1: Disconnect returns S_OK
         check(reinterpret_cast<Slot1Fn>(vtable[1])(acp) == S_OK, "IAcpHal slot 1 returns S_OK");
@@ -211,8 +236,8 @@ int main() {
     }
 
     // 2. ApuCreateHeap: title passes (cachedSize, nonCachedSize=0x226e00)
-    check(create_heap(4 * 1024 * 1024, 0x226e00) == S_OK,
-          "ApuCreateHeap(4 MiB, 0x226e00) succeeds");
+    check(create_heap(4 * 1024 * 1024 + 0x400, 0x226e00) == S_OK,
+          "ApuCreateHeap succeeds with an unaligned cached heap size");
     check(create_heap(4 * 1024 * 1024, 0x226e00) != S_OK,
           "ApuCreateHeap second call fails (heap already created)");
 
@@ -329,8 +354,12 @@ int main() {
           "SHAPE allocation can be retried after memory pressure");
 
     // Release shape contexts
+    std::memset(&ctx_all, 0x55, sizeof(ctx_all));
     check(release_ctx(&ctx_all) == S_OK, "AcpHalReleaseShapeContexts succeeds");
-    check(ctx_all.xmaContextArray == nullptr, "xmaContextArray is reset to null");
+    const auto* released_argument = reinterpret_cast<const uint8_t*>(&ctx_all);
+    check(std::all_of(released_argument, released_argument + sizeof(ctx_all),
+                      [](uint8_t b) { return b == 0x55; }),
+          "SHAPE release does not write through an opaque or recycled argument");
     check(release_ctx(nullptr) == S_OK, "AcpHalReleaseShapeContexts(nullptr) succeeds");
 
     // 7. ACP command/message queue protocol (register, complete, overflow drops, disconnect, notify word)
@@ -409,6 +438,11 @@ int main() {
         uint32_t fg_id = 0;
         std::memcpy(&fg_id, msg.data, 4);
         check(fg_id == 0x42u, "FLOWGRAPH_COMPLETED carries flowgraph word");
+
+        const uint32_t command_completed_mask = 0x10u;
+        check(fn_submit(q_acp, 3, 0x100u, 0xffffffffu, &command_completed_mask, 0) == S_OK &&
+                  fn_count(q_acp) == 0u,
+              "UNREGISTER_MESSAGES suppresses command-completed messages");
 
         // Disconnect posts DISCONNECTED.
         check(fn_disconnect(q_acp) == S_OK, "Disconnect succeeds when connected");
@@ -534,8 +568,9 @@ int main() {
 
         void* in_va = nullptr;
         uint32_t in_apu = 0;
-        check(alloc(&in_va, &in_apu, 0x2000, 0x800, 1) == S_OK && in_va != nullptr,
-              "ApuAlloc 4-packet loop and refill input buffer");
+        check(alloc(&in_va, &in_apu, 0x2000, 0x800, 2) == S_OK && in_va != nullptr &&
+                  (in_apu & 0x7FFu) == 0 && map_apu(in_apu) == in_va,
+              "Non-cached XMA input keeps its requested alignment and round trips");
         auto* packets = static_cast<uint8_t*>(in_va);
         write_xma_packet(packets, 1, 1);  // Packet 1 belongs to another stream.
         write_xma_packet(packets + 0x800, 2, 0);
@@ -651,6 +686,10 @@ int main() {
         write_xma_packet(packets, 3, 0);
         check(fn_submit(x_acp, 5, 0xf6, 0xffffffffu, &voice_index, 0) == S_OK && wait_for_ring(),
               "First packet fills the ring and leaves queued PCM");
+        TestShapeContexts source_only{};
+        source_only.numSrcContexts = 1;
+        check(alloc_ctx(&source_only) == S_OK && source_only.srcContextArray != nullptr,
+              "A non-XMA allocation can coexist with the active XMA table");
         words[0].fetch_or(1u << 20);
         check(fn_submit(x_acp, 5, 0xf7, 0xffffffffu, &voice_index, 0) == S_OK,
               "Re-enable while refilling the current input");
@@ -680,6 +719,61 @@ int main() {
               "A skip across both buffers lands on the last packet of the reloaded input");
         check(fn_submit(x_acp, 7, 0xfc, 0xffffffffu, &voice_index, 0) == S_OK,
               "Disable the two-buffer refill voice");
+
+        // Both sides were empty. When both are refilled, the title's first input wins.
+        write_xma_packet(packets, 1, 0);
+        configure_voice(0, 3, 4, 0, 0);
+        words[0] = 1u | (1u << 20) | (4u << 22);
+        const uint32_t voice_bit = 1u << voice_index;
+        check(fn_submit(x_acp, 6, 0, 0xffffffffu, &voice_bit, 0) == S_OK && wait_for_ring(),
+              "ENABLE_XMAS starts the selected voice and exhausts the first input");
+        write_xma_packet(packets, 2, 0);
+        write_xma_packet(packets + 0x800, 1, 0);
+        words[6] = in_apu + 0x800u;
+        words[1].fetch_or(1u);
+        words[0].fetch_or(3u << 20);
+        check(fn_submit(x_acp, 18, 0, 0xffffffffu, refill_read_args, 0) == S_OK && wait_for_ring(),
+              "A double refill supplies the next PCM blocks");
+        check(((words[0] >> 20) & 3u) == 2u && (words[4] >> 31) == 1u,
+              "A double refill plays input 0 before input 1");
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+        check(has_signal(ring_bytes), "Rust decodes non-silent PCM after a double refill");
+#endif
+
+        // Reconfigure the still-enabled slot and verify that no queued PCM or old format survives.
+        bool reconfigured = true;
+        for (uint32_t rate = 0; rate < 4; ++rate) {
+            const bool stereo = (rate & 1u) == 0;
+            write_xma_packet(packets, 1, 0, rate, stereo);
+            words[0] = 1u | (1u << 20) | (16u << 22);
+            words[2] = 32u;
+            words[4] = 0u;
+            words[9] = 12u;
+            std::memset(out_va, 0, 0x1000);
+            // Enable applies the new format before making the output writable.
+            words[1] = ((rate | (stereo ? 4u : 0u)) << 27);
+            reconfigured &= fn_submit(x_acp, 5, 0, 0xffffffffu, &voice_index, 0) == S_OK;
+            reconfigured &= fn_submit(x_acp, 18, 0, 0xffffffffu, refill_read_args, 0) == S_OK;
+            for (int wait = 0; wait < 1000 && (words[2] >> 31) == 0u; ++wait) Sleep(1);
+            reconfigured &= (words[2] >> 31) == 1u && ((words[0] >> 27) & 0x1Fu) == (stereo ? 8u : 4u);
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+            reconfigured &= has_signal(ring_bytes);
+#endif
+        }
+        check(reconfigured, "Re-enabled voices select mono or stereo PCM at all four sample rates");
+        check(fn_submit(x_acp, 8, 0, 0xffffffffu, &voice_bit, 0) == S_OK,
+              "DISABLE_XMAS stops the selected voice");
+
+        configure_voice(0, 3, 4, 0, 0);
+        write_xma_packet(packets, 1, 1);
+        fail_worker_allocation.store(true);
+        check(fn_submit(x_acp, 5, 0, 0xffffffffu, &voice_index, 0) == S_OK,
+              "Enable a voice before an injected worker allocation failure");
+        for (int wait = 0; wait < 1000 && (words[2] >> 31) == 0u; ++wait) Sleep(1);
+        check(!fail_worker_allocation.exchange(false) && (words[2] >> 31) != 0u,
+              "Worker allocation failure surfaces an XMA error without terminating the process");
+        check(fn_submit(x_acp, 5, 0, 0xffffffffu, &voice_index, 0) == S_OK && wait_for_ring(),
+              "A voice can run again after a worker allocation failure");
 
         check(release_ctx(x_acp) == S_OK, "Release SHAPE contexts through the opaque AcpHal handle");
         check(fn_release(x_acp) == S_OK, "Release packet loop AcpHal succeeds");
