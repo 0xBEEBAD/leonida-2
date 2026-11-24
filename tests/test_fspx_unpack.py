@@ -214,7 +214,9 @@ class Cli(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
         self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
 
-    def test_disassembly_with_invalid_words_keeps_listing(self):
+    def test_disassembly_with_invalid_words_takes_the_decoder_listing(self):
+        # llvm-mc reports an invalid word in a program tools/rdna2_decode.py decodes whole: the compute fallback of
+        # shader_disasm.disasm takes the decoder's listing (fewer invalid words), without llvm-mc's messages.
         result, out = self.disassemble("import sys\n"
                                        "print('\\ts_endpgm')\n"
                                        "sys.stderr.write('warning: invalid instruction encoding\\n')\n")
@@ -222,9 +224,10 @@ class Cli(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
             listing = f.read()
-        self.assertIn("1 invalid words", listing)
-        self.assertIn("\ts_endpgm", listing)
-        self.assertIn("warning: invalid instruction encoding", listing)
+        self.assertIn("0 invalid words", listing)
+        self.assertIn("v_mov_b32", listing)
+        self.assertIn("s_endpgm", listing)
+        self.assertNotIn("warning: invalid instruction encoding", listing)
 
     def test_clean_disassembly_keeps_listing(self):
         result, out = self.disassemble("print('\\ts_endpgm')\n")
