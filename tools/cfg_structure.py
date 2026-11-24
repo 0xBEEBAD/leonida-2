@@ -406,5 +406,7 @@ def unwrap_known_pc_guards(tree, out_pcs, entry_pc=0):
         else:
             h, lbody = it[1], it[2]
             child_dst = []
+            # In a structure() tree lbody[0] is always ("block", h), which overwrites cur_pc with out_pcs[h];
+            # keep cur_pc | {h} defensively so back-edge iterations stay sound even on non-structure() trees.
             stack.append([collections.deque(lbody), child_dst, set(cur_pc) | {h}, ("loop", h, child_dst)])
     return root_out
