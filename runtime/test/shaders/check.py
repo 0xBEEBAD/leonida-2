@@ -125,7 +125,9 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_ops", [100, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bound", [10, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
-          ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
+          ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777]),
+          # a VOPC compare with a DPP src0: 1 for the pair compare, 2 for the dpp8 one (cs_dpp_cmp.asm header)
+          ("cs_dpp_cmp", [3, 2, 3, 2, 1, 0, 1, 0])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
 CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
@@ -356,6 +358,95 @@ def heap_init_env():
     with open(path, "wb") as f:
         f.write(HEAP_INIT_FILE)
     return {"VKC_HEAP_INIT": path, "VKC_OUT_WORDS": str(len(HEAP_INIT_FILE) // 4)}
+
+
+def shift64_words():
+    """cs_w32_shift64: input heap and full expected readback, using Python integers as the oracle."""
+    values = (0, 1, 0xFFFFFFFF, 0x100000000, 0x7FFFFFFFFFFFFFFF,
+              0x8000000000000000, 0xFFFFFFFFFFFFFFFF, 0x8123456789ABCDEF)
+    counts = (0, 1, 31, 32, 33, 63, 64, 65)
+    inputs, results = [], []
+    for value in values:
+        for count in counts:
+            inputs.extend((value & 0xFFFFFFFF, value >> 32, count, 0xA5A5A5A5))
+            signed = value if value < (1 << 63) else value - (1 << 64)
+            shift = count & 63
+            for result in (value << shift, value >> shift, signed >> shift):
+                results.extend((result & 0xFFFFFFFF, (result >> 32) & 0xFFFFFFFF))
+    return [0xEEEEEEEE] * len(results) + inputs, results + inputs
+
+
+def shift64_test(tools, spirv, env=None):
+    """Verify all three 64-bit shifts for 64 memory-fed cases, including the untouched input records."""
+    initial, expected = shift64_words()
+    with tempfile.TemporaryDirectory(prefix="leonida-shift64-") as tmp:
+        path = Path(tmp) / "input.bin"
+        path.write_bytes(struct.pack(f"<{len(initial)}I", *initial))
+        child = dict(os.environ if env is None else env, VKC_HEAP_INIT=str(path))
+        child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_shift64") or 32))
+        return dump_test(tools, spirv, "cs_w32_shift64", expected, len(expected), child)
+
+
+# cs_w32_cmp_f64.asm: the 16 binary64 compare predicates in opcode order (bit n of a result word is predicate n), and
+# the operand values every pair is drawn from, in ascending order and then two NaNs.
+CMP_F64_PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
+                      "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru")
+CMP_F64_VALUES = (
+    0xFFF0000000000000,   # -inf
+    0xFFEFFFFFFFFFFFFF,   # -max
+    0xBFF0000000000001,   # -1 - 1 ulp
+    0xBFF0000000000000,   # -1
+    0xBFEFFFFFFFFFFFFF,   # the value above -1: its high dword is the smaller one, its low dword all ones
+    0x8000000000000001,   # the negative smallest subnormal
+    0x8000000000000000,   # -0
+    0x0000000000000000,   # +0
+    0x0000000000000001,   # the smallest subnormal
+    0x0010000000000000,   # the smallest normal
+    0x3FF0000000000000,   # 1
+    0x3FF0000000000001,   # 1 + 1 ulp
+    0x7FEFFFFFFFFFFFFF,   # +max
+    0x7FF0000000000000,   # +inf
+    0x7FF0000000000001,   # a NaN whose payload is only in the low dword: its high dword is +inf's
+    0xFFF8000000000000)   # a negative quiet NaN
+CMP_F64_SIGN = 1 << 63
+
+
+def cmp_f64_predicates(a_bits, b_bits):
+    """The 16 results of comparing two binary64 bit patterns, as a mask with bit n for CMP_F64_PREDICATES[n].
+    IEEE-754 through Python floats: a pair with a NaN is unordered, so lt, eq and gt are all false for it and every
+    negated predicate is true; -0 equals +0 and a subnormal is not zero."""
+    a, b = (struct.unpack("<d", struct.pack("<Q", bits))[0] for bits in (a_bits, b_bits))
+    unordered = a != a or b != b
+    lt, eq, gt = a < b, a == b, a > b
+    results = (False, lt, eq, lt or eq, gt, lt or gt, gt or eq, not unordered,
+               unordered, not (gt or eq), not (lt or gt), not gt, not (lt or eq), not eq, not lt, True)
+    return sum(1 << bit for bit, result in enumerate(results) if result)
+
+
+def cmp_f64_words():
+    """cs_w32_cmp_f64: the input heap and the full expected readback, with Python floats as the oracle. Record
+    16 * ia + ib compares value ia with value ib. Thread i handles records i and i + 128, so a record's thread has
+    the record's parity."""
+    inputs, results = [], []
+    for record, (a, b) in enumerate((a, b) for a in CMP_F64_VALUES for b in CMP_F64_VALUES):
+        inputs.extend((a & 0xFFFFFFFF, a >> 32, b & 0xFFFFFFFF, b >> 32))
+        word = cmp_f64_predicates(a, b)
+        word |= (record % 2 == 0) << 16     # tru with the odd threads turned off first
+        word |= (cmp_f64_predicates(a & ~CMP_F64_SIGN, b ^ CMP_F64_SIGN) >> 1 & 1) << 17    # lt of |a| and -b
+        word |= (cmp_f64_predicates(a ^ CMP_F64_SIGN, b & ~CMP_F64_SIGN) >> 9 & 1) << 18    # nge of -a and |b|
+        results.extend((word, word))        # the v_cmp_ word (VCC), then the v_cmpx_ word (EXEC)
+    return [0xEEEEEEEE] * len(results) + inputs, results + inputs
+
+
+def cmp_f64_test(tools, spirv, env=None):
+    """Verify the 32 binary64 compares on 256 memory-fed operand pairs, including the untouched input records."""
+    initial, expected = cmp_f64_words()
+    with tempfile.TemporaryDirectory(prefix="leonida-cmp-f64-") as tmp:
+        path = Path(tmp) / "input.bin"
+        path.write_bytes(struct.pack(f"<{len(initial)}I", *initial))
+        child = dict(os.environ if env is None else env, VKC_HEAP_INIT=str(path))
+        child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_cmp_f64") or 32))
+        return dump_test(tools, spirv, "cs_w32_cmp_f64", expected, len(expected), child)
 
 
 # cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
@@ -597,6 +688,17 @@ STORE_WORDS = {
     # 3D image atomics: the data register afterwards (sint image) and the six texels afterwards (volume)
     "cs_imgatomic3d": ({}, dict(enumerate([0x101, 0xDB, 0xF4, 0xCE, 0xE6, 0xFF])),
                        {57: 0x111, 19: 3, 44: 0xF4, 6: 0xD00D, 30: 0xE6, 39: 0x10}),
+    # GPU-IMG-ATOMIC-EXT: swap, inc, dec, fmin, fmax and fcmpswap. The 2D cases' texels afterwards (uint image, with the
+    # four that all 64 threads hit at 40..43), the data registers afterwards (sint image: 2D cases at 0..20, 3D cases
+    # at 32..37) and the 3D cases' texels afterwards (volume)
+    "cs_imgatomic_ext": ({0: 0x12345678, 1: 0xABCDEF01, 2: 0, 3: 0x68, 4: 0, 5: 0x68, 6: 0x32, 7: 9, 8: 0x6D,
+                          9: 0x3FC00000, 10: 0xC0400000, 11: 0x40200000, 12: 0x3FC00000, 13: 0x3FC00000,
+                          14: 0x3FC00000, 15: 0x40490FDB, 16: 0x3FC00000, 17: 0x3F800000, 18: 0x7FC00000,
+                          19: 0x78, 20: 0x77, 40: 0xCC, 41: 0x4D, 42: 0x427C0000, 43: 0xC27C0000},
+                         {0: 0x64, 1: 0xABCDEF01, 2: 0x66, 3: 0x67, 4: 0x68, 5: 0x69, 6: 0x6A, 7: 0, 8: 0x1F4,
+                          **dict.fromkeys(range(9, 17), 0x3FC00000), 17: 0, 18: 0x7FC00000, 19: 0x77, 20: 0x78,
+                          32: 0x101, 33: 0xDB, 34: 0xF4, 35: 0x3FC00000, 36: 0x3FC00000, 37: 0x3FC00000},
+                         {6: 0xC0400000, 19: 0xDC, 30: 0x40200000, 39: 0x40490FDB, 44: 0x64, 57: 0x0BADF00D}),
     # image_get_resinfo on a 16x4 image with five levels: (width, height, depth, levels) of levels 0, 1 and 3, then
     # width and height of level 2 and an untouched register, height and levels of level 1, the levels alone, and
     # level 5, past the last (2D depth 0 and the past-the-end zeros measured on RDNA2, SHADER-388)
@@ -1842,6 +1944,8 @@ def main():
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
+    results.append(("cs_w32_shift64", shift64_test(tools, spirv)))
+    results.append(("cs_w32_cmp_f64", cmp_f64_test(tools, spirv)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
@@ -1857,7 +1961,8 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_tfe", ["load"]),
+    for name, args in (("cs_imgstore", []), ("cs_imgstore_cube", ["cube"]), ("cs_imgload", ["load"]),
+                       ("cs_imgload_tfe", ["load"]),
                        ("cs_imgload_d16", ["load-d16"]), ("cs_imgload_d16_tfe", ["load-d16"]),
                        ("cs_sample_lz_int_d16", ["load-d16"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
