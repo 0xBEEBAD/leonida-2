@@ -144,6 +144,27 @@ class Kind0AndCode(unittest.TestCase):
         self.assertEqual(fspx_unpack.code_range(program(with_prologue=False)), (0, 12 + 4))
         self.assertEqual(fspx_unpack.code_range(program(endpgm=False))[1], None)
 
+    def test_two_word_prologue(self):
+        # Some pipeline-library programs carry two hash words (24 bytes), then their code.
+        code = prologue()[:24] + V_MOV * 3 + ENDPGM + S_NOP * 4
+        self.assertEqual(fspx_unpack.code_range(code), (24, 24 + 12 + 4))
+        # One VOP3 word alone is not a prologue.
+        code = prologue()[:12] + V_MOV * 3 + ENDPGM + S_NOP * 4
+        self.assertEqual(fspx_unpack.code_range(code)[0], 0)
+
+    def test_code_range_last(self):
+        code = prologue() + V_MOV * 3 + ENDPGM + V_MOV + ENDPGM + S_NOP
+        self.assertEqual(fspx_unpack.code_range(code), (36, 36 + 12 + 4))
+        self.assertEqual(fspx_unpack.code_range_last(code), (36, 36 + 12 + 4 + 4 + 4))
+
+    def test_branch_targets_inside(self):
+        enc = "; encoding: [0x00,0x00,0x00,0x00]"
+        listing = f"\ts_cbranch_execz 1 {enc}\n\ts_nop 0 {enc}\n\ts_endpgm {enc}\n"
+        self.assertTrue(fspx_unpack.branch_targets_inside(listing, 12))   # 0 + 4 + 4 = 8: inside
+        self.assertFalse(fspx_unpack.branch_targets_inside(listing, 8))   # 8 is past an 8-byte range
+        back = f"\ts_nop 0 {enc}\n\ts_branch 65534 {enc}\n"               # -2: 4 + 4 - 8 = 0
+        self.assertTrue(fspx_unpack.branch_targets_inside(back, 8))
+
     def test_unaligned_endpgm_bytes_are_not_the_end(self):
         code = prologue() + b"\0\0" + ENDPGM + b"\0\0" + V_MOV + ENDPGM
         start, end = fspx_unpack.code_range(code)
