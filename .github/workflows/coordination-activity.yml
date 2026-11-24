@@ -196,25 +196,33 @@ jobs:
                       {"query": query, "variables": {"ids": node_ids}}
                   )
                   errors = result.get("errors") or []
-                  node_errors = [
-                      error for error in errors
-                      if isinstance(error, dict)
-                      and (error.get("path") or [None])[0] == "nodes"
-                  ]
+                  node_errors = []
+                  other_errors = []
+                  for error in errors:
+                      path = error.get("path") if isinstance(error, dict) else None
+                      message = error.get("message") or "" if isinstance(error, dict) else str(error)
+                      is_node_error = bool(path and path[0] == "nodes")
+                      is_rate_limited = isinstance(error, dict) and (
+                          error.get("type") == "RATE_LIMITED"
+                          or "rate limit" in message.casefold()
+                      )
+                      if is_node_error and not is_rate_limited:
+                          node_errors.append(error)
+                      else:
+                          other_errors.append(error)
+                  if other_errors:
+                      details = "; ".join(
+                          str(error.get("message") or "GraphQL error")
+                          if isinstance(error, dict) else str(error)
+                          for error in errors
+                      )
+                      stop("Cannot verify issue comment edit history: " + details)
                   if node_errors:
                       details = "; ".join(
                           str(error.get("message") or "GraphQL node lookup error")
-                          for error in node_errors[:3]
+                          for error in node_errors
                       )
-                      return retry_after_fresh_read(details)
-                  if errors:
-                      details = "; ".join(
-                          str(error.get("message") or "GraphQL error")
-                          for error in errors[:3]
-                          if isinstance(error, dict)
-                      )
-                      stop("Cannot verify issue comment edit history: " + details)
-                  nodes = ((result.get("data") or {}).get("nodes"))
+                      return retry_after_fresh_read(details)                  nodes = ((result.get("data") or {}).get("nodes"))
                   if not isinstance(nodes, list) or len(nodes) != len(batch):
                       stop("GitHub returned invalid issue comment edit metadata.")
                   for node in nodes:
@@ -289,6 +297,16 @@ jobs:
                       bullet_text = unwrap_work_id_code(bullet.group(1))
                       first_ids = work_id_list(bullet_text)
                       if not first_ids:
+                          malformed_inline_id = re.match(
+                              "^" + re.escape(BACKTICK) + "([^" + BACKTICK + "]+)" +
+                              re.escape(BACKTICK) + r"[A-Za-z0-9-]",
+                              bullet_text,
+                          )
+                          if (
+                              malformed_inline_id
+                              and ID_LIST_RE.fullmatch(malformed_inline_id.group(1).strip())
+                          ):
+                              batch_valid = False
                           leading_id = re.match(rf"^{ID_PATTERN}", bullet_text)
                           if leading_id and re.match(r"^\s*,", bullet_text[leading_id.end():]):
                               batch_valid = False
@@ -874,25 +892,33 @@ jobs:
                       {"query": query, "variables": {"ids": node_ids}}
                   )
                   errors = result.get("errors") or []
-                  node_errors = [
-                      error for error in errors
-                      if isinstance(error, dict)
-                      and (error.get("path") or [None])[0] == "nodes"
-                  ]
+                  node_errors = []
+                  other_errors = []
+                  for error in errors:
+                      path = error.get("path") if isinstance(error, dict) else None
+                      message = error.get("message") or "" if isinstance(error, dict) else str(error)
+                      is_node_error = bool(path and path[0] == "nodes")
+                      is_rate_limited = isinstance(error, dict) and (
+                          error.get("type") == "RATE_LIMITED"
+                          or "rate limit" in message.casefold()
+                      )
+                      if is_node_error and not is_rate_limited:
+                          node_errors.append(error)
+                      else:
+                          other_errors.append(error)
+                  if other_errors:
+                      details = "; ".join(
+                          str(error.get("message") or "GraphQL error")
+                          if isinstance(error, dict) else str(error)
+                          for error in errors
+                      )
+                      stop("Cannot verify issue comment edit history: " + details)
                   if node_errors:
                       details = "; ".join(
                           str(error.get("message") or "GraphQL node lookup error")
-                          for error in node_errors[:3]
+                          for error in node_errors
                       )
-                      return retry_after_fresh_read(details)
-                  if errors:
-                      details = "; ".join(
-                          str(error.get("message") or "GraphQL error")
-                          for error in errors[:3]
-                          if isinstance(error, dict)
-                      )
-                      stop("Cannot verify issue comment edit history: " + details)
-                  nodes = ((result.get("data") or {}).get("nodes"))
+                      return retry_after_fresh_read(details)                  nodes = ((result.get("data") or {}).get("nodes"))
                   if not isinstance(nodes, list) or len(nodes) != len(batch):
                       stop("GitHub returned invalid issue comment edit metadata.")
                   for node in nodes:
@@ -969,6 +995,16 @@ jobs:
                       bullet_text = unwrap_work_id_code(bullet.group(1))
                       first_ids = work_id_list(bullet_text)
                       if not first_ids:
+                          malformed_inline_id = re.match(
+                              "^" + re.escape(BACKTICK) + "([^" + BACKTICK + "]+)" +
+                              re.escape(BACKTICK) + r"[A-Za-z0-9-]",
+                              bullet_text,
+                          )
+                          if (
+                              malformed_inline_id
+                              and ID_LIST_RE.fullmatch(malformed_inline_id.group(1).strip())
+                          ):
+                              batch_valid = False
                           leading_id = re.match(rf"^{ID_PATTERN}", bullet_text)
                           if leading_id and re.match(r"^\s*,", bullet_text[leading_id.end():]):
                               batch_valid = False
