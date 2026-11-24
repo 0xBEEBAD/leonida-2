@@ -207,6 +207,7 @@ jobs:
                   .replace("]", "\\]")
                   .replace("<", "&lt;")
                   .replace(">", "&gt;")
+              .replace("@", "&#64;")
               )
               if len(value) > limit:
                   value = value[:limit - 3].rstrip() + "..."
@@ -255,7 +256,7 @@ jobs:
               author_rows = sorted(groups[author], key=lambda row: row[0].get("number", 0), reverse=True)
               section.extend([
                   "",
-                  f"### @{safe_cell(author)} — {len(author_rows)} open PRs",
+                  f"### {BACKTICK}{safe_cell(author)}{BACKTICK} — {len(author_rows)} open PRs",
                   "",
                   "| PR | Claim / owner | Work (PR title) | State |",
                   "|---|---|---|---|",
@@ -273,7 +274,7 @@ jobs:
                               f"#issuecomment-{comment_id}"
                           )
                           rendered.append(f"[{BACKTICK}{item_id}{BACKTICK}]({comment_url})")
-                      claim_cell = ", ".join(rendered) + f" — @{safe_cell(owner)}"
+                      claim_cell = ", ".join(rendered) + f" — {BACKTICK}{safe_cell(owner)}{BACKTICK}"
                   pr_url = pull.get("html_url") or f"https://github.com/{OWNER}/{REPOSITORY}/pull/{pull.get('number')}"
                   pr_label = f"[#{pull.get('number')}]({pr_url})"
                   title = safe_cell(pull.get("title") or "")
