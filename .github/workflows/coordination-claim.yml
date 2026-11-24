@@ -135,6 +135,15 @@ jobs:
               ]
               if not claim_comments:
                   return comments
+          
+              def retry_after_fresh_read(reason):
+                  if retry:
+                      refreshed = get_collection(
+                          "/repos/" + OWNER + "/" + REPOSITORY + "/issues/" + str(ISSUE_NUMBER) + "/comments"
+                      )
+                      return attach_comment_edit_metadata(refreshed, retry=False)
+                  fail("Could not verify issue comment edit history after one fresh read: " + reason)
+          
               query = (
                   "query($ids: [ID!]!) { nodes(ids: $ids) { "
                   "... on IssueComment { fullDatabaseId lastEditedAt } } }"
@@ -149,6 +158,17 @@ jobs:
                       {"query": query, "variables": {"ids": node_ids}}
                   )
                   errors = result.get("errors") or []
+                  node_errors = [
+                      error for error in errors
+                      if isinstance(error, dict)
+                      and (error.get("path") or [None])[0] == "nodes"
+                  ]
+                  if node_errors:
+                      details = "; ".join(
+                          str(error.get("message") or "GraphQL node lookup error")
+                          for error in node_errors[:3]
+                      )
+                      return retry_after_fresh_read(details)
                   if errors:
                       details = "; ".join(
                           str(error.get("message") or "GraphQL error")
@@ -170,12 +190,7 @@ jobs:
                   if str(comment.get("id") or "") not in edited_at_by_id
               ]
               if missing:
-                  if retry:
-                      refreshed = get_collection(
-                          f"/repos/{OWNER}/{REPOSITORY}/issues/{ISSUE_NUMBER}/comments"
-                      )
-                      return attach_comment_edit_metadata(refreshed, retry=False)
-                  fail("Could not verify claim comment metadata after one fresh read.")
+                  return retry_after_fresh_read("one or more claim comments disappeared from the GraphQL lookup")
               for comment in claim_comments:
                   comment["_last_edited_at"] = edited_at_by_id[str(comment["id"])]
               return comments
