@@ -5,8 +5,8 @@
 // V#, each instance after the first moved by a root constant and its red and green swapped) and ps_quad_flat (the
 // colour as a Flat input, so a quad shows the colour of the vertex it takes flat inputs from: its first). Vertices
 // 0..3 and 4..7 are full-screen quads with a different colour at every corner; 8..11 and 12..15 are the left and the
-// right half of the target, red at every corner. The index buffer is in a DEFAULT heap and is written by a copy in
-// the first command list, so nothing but the GPU can read it when the draw is recorded. Six 64x64 frames:
+// right half of the target, red at every corner. Most cases use a DEFAULT heap index buffer written by a copy in
+// the first command list, so nothing but the GPU can read it when the draw is recorded. Seven 64x64 frames:
 //   frame 0, control: a non-indexed quad, DrawInstanced(4) over vertices 0..3. Red (vertex 0) everywhere.
 //   frame 1: 16-bit indices 0 1 2 3. Red everywhere; a triangle fan shows vertices 1 and 2 (black and blue).
 //   frame 2: 32-bit indices 7 4 5 6 from StartIndexLocation 3. Green (vertex 7) everywhere.
@@ -19,6 +19,8 @@
 //   frame 5: eight 16-bit indices, 0 1 2 3 and 7 4 5 6, through a view that ends after the sixth. The last two read
 //     0 (D3D12: an index outside the view), which makes the second quad empty: red everywhere. Read past the view,
 //     the second quad covers the target in green.
+//   frame 6: a standalone 10-byte UPLOAD index buffer, first index 1. All four 16-bit indices are readable, with
+//     the last one at the end of the resource. The backing buffer must accommodate the full word load.
 // Every pixel is compared, bit for bit. LEONIDA_VK_VALIDATION=1 runs it under the validation layer.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -72,6 +74,7 @@ struct Frame {
     UINT count, instances, start;
     INT base_vertex;
     Pixel left, right;  // what the left and the right half of the target must hold
+    bool use_upload_indices = false;
 };
 
 }  // namespace
@@ -97,6 +100,7 @@ int main() {
     const std::uint16_t indices16[28] = {0, 1, 2, 3, 15, 0, 1, 2, 3, 15, 8, 9, 10, 11, 12, 13, 14, 15, 15, 15,
                                          0, 1, 2, 3, 7, 4, 5, 6};
     const std::uint32_t indices32[7] = {15, 15, 15, 7, 4, 5, 6};
+    const std::uint16_t upload_indices16[] = {15, 0, 1, 2, 3};
     constexpr UINT indices32_offset = 64, index_bytes = 128;
     static_assert(sizeof(indices16) <= indices32_offset && indices32_offset + sizeof(indices32) <= index_bytes);
     const Frame frames[] = {
@@ -109,6 +113,8 @@ int main() {
         {"two overlapping instances", DXGI_FORMAT_R16_UINT, 0, sizeof(indices16), 8, 2, 10, 0, red, green},
         {"view ends inside the second quad", DXGI_FORMAT_R16_UINT, 20 * sizeof(std::uint16_t),
          6 * sizeof(std::uint16_t), 8, 1, 0, 0, red, red},
+        {"16-bit indices at the end of an upload buffer", DXGI_FORMAT_R16_UINT, 0,
+         sizeof(upload_indices16), 4, 1, 1, 0, red, red, true},
     };
     constexpr std::size_t frame_count = std::size(frames);
     std::vector<Pixel> pixels[frame_count];
@@ -164,7 +170,7 @@ int main() {
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> vertex_buffer, index_buffer, upload, readback, target;
+        Ref<ID3D12Resource> vertex_buffer, index_buffer, upload_index_buffer, upload, readback, target;
         const auto vb_desc = buffer_desc(sizeof(vertices));
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &vb_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
@@ -173,6 +179,15 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ib_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&index_buffer.p))));
+        const auto upload_ib_desc = buffer_desc(sizeof(upload_indices16));
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_ib_desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         IID_PPV_ARGS(&upload_index_buffer.p))));
+        EXPECT(upload_index_buffer->GetDesc().Width == sizeof(upload_indices16));
+        void* index_map = nullptr;
+        EXPECT(SUCCEEDED(upload_index_buffer->Map(0, nullptr, &index_map)));
+        std::memcpy(index_map, upload_indices16, sizeof(upload_indices16));
+        upload_index_buffer->Unmap(0, nullptr);
         constexpr UINT upload_indices = 512;  // where the index bytes sit in the upload buffer
         const auto upload_desc = buffer_desc(1024);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
@@ -209,7 +224,9 @@ int main() {
         EXPECT(cpu && gpu >= 0x10000 && gpu < (1ull << 32));
         const std::uint64_t buffer_va = vertex_buffer->GetGPUVirtualAddress();
         const std::uint64_t index_va = index_buffer->GetGPUVirtualAddress();
+        const std::uint64_t upload_index_va = upload_index_buffer->GetGPUVirtualAddress();
         EXPECT(buffer_va >= 0x10000 && index_va >= 0x10000 && index_va % 4 == 0);
+        EXPECT(upload_index_va && upload_index_va % 4 == 0);
         leonida::gfx10::Buffer vsharp;
         vsharp.address = buffer_va;
         vsharp.stride = 32;
@@ -271,7 +288,8 @@ int main() {
             if (frame.index_format == DXGI_FORMAT_UNKNOWN) {
                 list->DrawInstanced(frame.count, frame.instances, frame.start, 0);
             } else {
-                const D3D12_INDEX_BUFFER_VIEW view{index_va + frame.view_offset, frame.view_bytes, frame.index_format};
+                const std::uint64_t frame_index_va = frame.use_upload_indices ? upload_index_va : index_va;
+                const D3D12_INDEX_BUFFER_VIEW view{frame_index_va + frame.view_offset, frame.view_bytes, frame.index_format};
                 list->IASetIndexBuffer(&view);
                 list->DrawIndexedInstanced(frame.count, frame.instances, frame.start, frame.base_vertex, 0);
             }
@@ -299,7 +317,7 @@ int main() {
             return 0;
         };
         for (std::size_t i = 0; i < frame_count; ++i) EXPECT(render_frame(i + 1, frames[i], pixels[i]) == 0);
-        for (auto* r : {&vertex_buffer, &index_buffer, &upload, &readback, &target}) r->reset();
+        for (auto* r : {&vertex_buffer, &index_buffer, &upload_index_buffer, &upload, &readback, &target}) r->reset();
         pso.reset();
         root.reset();
         srv_heap.reset();

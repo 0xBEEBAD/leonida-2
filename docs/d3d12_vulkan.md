@@ -2139,17 +2139,19 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
       application's index in a translated vertex shader.
     - The strip-cut values `0xFFFF` and `0xFFFFFFFF` are ordinary indices, as in every list topology: the replay
       enables primitive restart for strips only. What the console does with one inside a quad is not measured.
-    - An index past the end of the index buffer view reads 0, as in D3D12; the pass never reads past the view.
-      A draw's last one to three indices that do not make a quad are dropped.
+    - An index past the end of the index buffer view reads 0, as in D3D12. The pass reads a 16-bit index from its
+      aligned 32-bit word, so standalone shader-addressable Vulkan buffers round their backing size up to a word.
+      The D3D buffer size and view bounds are unchanged. A draw's last one to three indices that do not make a quad
+      are dropped.
     - Needs `bufferDeviceAddress` (the pass uses device addresses, no descriptors). Without it, and inside a
       statistics query that cannot be split, the list fails as unsupported instead of drawing something else.
   - **Why not a triangle fan per quad** (the first version of the indexed path): a fan takes a flat input from
     each triangle's own first vertex, the quad's second and third, and a draw per quad runs every instance of one
     quad before the next quad. `d3d12_quad_index_test` shows both on an RTX 4070 SUPER: a quad with a red first
     vertex came out black and blue (0 of 4096 pixels red), and of two overlapping instances the first one's
-    second quad ended on top (2048 of 4096 pixels right). With the expansion all six frames are exact: 16-bit and
+    second quad ended on top (2048 of 4096 pixels right). With the expansion the seven test frames cover 16-bit and
     32-bit indices, a first index at an address of 2 modulo 4, a base vertex, two instances, and a view that ends
-    inside the second quad.
+    inside the second quad, plus a 16-bit draw that reaches the end of a standalone upload buffer.
   - **Not covered**: quad and rectangle lists through `ExecuteIndirect`, whose draws do not record a topology.
 
 ## 4. Object model mapping

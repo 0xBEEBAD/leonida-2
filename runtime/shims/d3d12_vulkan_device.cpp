@@ -72,6 +72,11 @@ constexpr std::uint32_t kQuadIndexCount = 16 * 1024 * kQuadIndicesPerQuad;
 constexpr VkDeviceSize kArenaReserved = kZeroPage + VkDeviceSize(kQuadIndexCount) * sizeof(std::uint32_t);
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 
+// Saturates at the last multiple of `to` instead of wrapping, as the PC runtime's totals do.
+UINT64 align_up(UINT64 value, UINT64 to) {
+    return value > UINT64_MAX - (to - 1) ? UINT64_MAX / to * to : (value + to - 1) / to * to;
+}
+
 // The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
 // game's shaders arrive as SPIR-V from the offline translator, and the only DXIL path (the BVH builder) is lowered
 // to standard DXIL, whose baseline is 6.0. Answering the driver's own maximum would tell the game it can hand this
@@ -1895,7 +1900,9 @@ public:
         const bool addressable = device_.arena.buffer != VK_NULL_HANDLE;
         const bool need_bda = device_.info.buffer_device_address || device_.info.ray_tracing;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = desc_.Width;
+        // The indexed quad pass loads 16-bit indices from aligned 32-bit words. Keep the final word inside the
+        // Vulkan buffer while the D3D resource and views still use desc_.Width.
+        info.size = addressable || need_bda ? align_up(desc_.Width, sizeof(std::uint32_t)) : desc_.Width;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -1933,7 +1940,7 @@ public:
         if (host) {
             if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
                 return E_OUTOFMEMORY;
-            std::memset(mapped_, 0, std::size_t(desc_.Width));  // committed resources start zeroed
+            std::memset(mapped_, 0, std::size_t(info.size));  // committed resources and private padding start zeroed
         }
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -1986,13 +1993,17 @@ public:
         if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
         const auto start = reinterpret_cast<std::uintptr_t>(address);
         if (!address || !desc_.Width || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
+        const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
+        // Apply the same backing size rule to imports. The committed-range check and Vulkan bind requirements
+        // below cover the padding as well. The import never initializes or writes the caller's padding.
+        const VkDeviceSize backing_size = need_bda ? align_up(desc_.Width, sizeof(std::uint32_t)) : desc_.Width;
         // The import starts at the page that holds `address`, and the buffer is bound at the offset inside it: the
         // title places small buffers inside a page too (a 16-byte UAV at a 64-byte-aligned address on an RTX 5090,
         // found in review), which an import of `address` itself would refuse.
         const std::uintptr_t base = start & ~static_cast<std::uintptr_t>(alignment - 1);
         void* const base_address = reinterpret_cast<void*>(base);
         const VkDeviceSize offset = start - base;
-        const VkDeviceSize bytes = (offset + desc_.Width + alignment - 1) & ~(alignment - 1);
+        const VkDeviceSize bytes = align_up(offset + backing_size, alignment);
         // An imported buffer's VA is its host address, and it joins the same BufferVaIndex as default-heap buffers,
         // whose VAs are offsets in [0, arena size). A host range that reaches into that window (low host addresses,
         // as under Wine) would shadow arena buffers in the index's nearest-start lookup, so it takes the fallback
@@ -2018,11 +2029,10 @@ public:
             at = region_end - base;
         }
         if (!importable) return E_NOTIMPL;
-        const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-        info.size = desc_.Width;
+        info.size = backing_size;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -2040,7 +2050,7 @@ public:
             return E_NOTIMPL;
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
         // An offset off the buffer's own alignment cannot be bound: the fallback answers.
-        if (!types || (offset % requirements.alignment) || bytes < offset + requirements.size) return E_NOTIMPL;
+        if (!types || (offset % requirements.alignment) || requirements.size > bytes - offset) return E_NOTIMPL;
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = base_address;
@@ -8329,10 +8339,6 @@ private:
 
     static constexpr D3D12_RESOURCE_ALLOCATION_INFO kInvalidAllocation{UINT64_MAX,
                                                                        D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
-    // Saturates at the last multiple of `to` instead of wrapping, as the PC runtime's totals do.
-    static UINT64 align_up(UINT64 value, UINT64 to) {
-        return value > UINT64_MAX - (to - 1) ? UINT64_MAX / to * to : (value + to - 1) / to * to;
-    }
 
     // Lays `count` resources out one after another; `each` (optional) gets every resource's offset, size and
     // alignment. As on the PC runtime, the total is rounded up to the largest alignment (1 for no resources) and
