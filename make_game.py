@@ -73,6 +73,7 @@ from mc_command import mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from stale_build import newer_sources  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -900,12 +901,16 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
              "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
-    if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
-        build_pipeline_check(jobs)
-        if not pipeline_check_exe():
-            fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
-                 "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
-                 "runtime/build/linux and run the build again.")
+    if "pipelines" in stages and os.name != "nt":
+        checker = pipeline_check_exe()
+        # A checker built before a pull is rebuilt too; cmake --build only recompiles what changed. Without CMake
+        # the pipelines stage says it is out of date and uses it.
+        if not checker or (stale_checker(checker) and shutil.which("cmake")):
+            build_pipeline_check(jobs)
+            if not pipeline_check_exe():
+                fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
+                     "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
+                     "runtime/build/linux and run the build again.")
     if "assets" in stages:
         ensure_submodule()
 
@@ -2369,6 +2374,18 @@ def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
     return next((p for p in found if os.path.isfile(p) and (windows or os.access(p, os.X_OK))), None)
 
 
+def stale_checker(exe: str) -> list:
+    """The sources of vk_pipeline_check changed after `exe` was built, when `exe` is in this checkout's runtime/build.
+    A checker from elsewhere (--runtime-build) isn't compared: its time stamp says nothing about these sources."""
+    build = os.path.abspath(os.path.join(ROOT, "runtime", "build"))
+    try:
+        if os.path.commonpath([build, os.path.abspath(exe)]) != build:
+            return []
+    except ValueError:   # another drive
+        return []
+    return newer_sources(exe, ROOT, "vk_pipeline_check")
+
+
 def require_translated_shaders(work: str) -> str:
     spirv = os.path.join(work, "shaders", "spirv")
     index = os.path.join(spirv, "index.json")
@@ -2394,6 +2411,13 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         fail("vk_pipeline_check wasn't built. With CMake 3.24+, a C++20 compiler and the Vulkan headers and "
              "loader installed, run: cmake -S runtime -B runtime/build/linux && "
              "cmake --build runtime/build/linux --parallel")
+    newer = stale_checker(exe)
+    if newer:
+        rebuild = ("run the runtime stage with VULKAN_SDK set" if os.name == "nt" else
+                   "cmake --build runtime/build/linux --target vk_pipeline_check")
+        more = f" and {len(newer) - 3} more" if len(newer) > 3 else ""
+        log(f"pipelines: WARNING: {exe} is older than {', '.join(newer[:3])}{more}, so it is not this checkout's "
+            f"checker; to rebuild it, {rebuild}")
     spirv = require_translated_shaders(work)
     log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
     os.makedirs(out, exist_ok=True)
