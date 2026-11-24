@@ -397,6 +397,7 @@ struct RootArgumentLayout {
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
     bool compute_ok = true;
+    std::uint32_t compute_arguments_end = rt::rootsig::kNoSgpr;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a

@@ -6044,6 +6044,7 @@ public:
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
+        if (compute.ok) layout.compute_arguments_end = compute.end_sgpr;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = UINT32_MAX;
             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)

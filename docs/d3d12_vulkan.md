@@ -1609,8 +1609,22 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    translator input. No stride is read at run time: static offsets of T# loads are multiples of 32 and of S# loads
    multiples of 16, so the stride is compiled into the code. In the runtime shim, `CreateRootSignature` records the
    `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and `SAMPLER_HEAP_DIRECTLY_INDEXED` root-signature flags and `SetDescriptorHeaps`
-   tracks the bound shader-visible heap GPU bases (`d3d12_set_descriptor_heaps`), while placing those bases into
-   per-stage user SGPRs remains open on question 3.
+   tracks the bound shader-visible heap GPU bases (`d3d12_set_descriptor_heaps`).
+
+   **Inline compute layout (integration #984).** Run
+   `python -I tools/compute_heap_layout_census.py <carve>/disasm` on each compute carve. Of 5,450 indexed compute
+   entries, 2,959 advertise direct indexing and none of those embeds its root signature. Adding
+   `--group fspx_compute --dispatch-log <dispatch-log>` joined seven resource-indexing entries to independently
+   recorded layouts. In all seven, a dynamically indexed resource descriptor used the first SGPR after the explicit
+   arguments. There were zero mismatches and zero cases without room **among those seven**. For the remaining
+   2,952 entries the layout is unknown. These are entries across carves, which can contain the same program.
+   No sampler-indexing entry had a matched layout. Putting the resource heap first when both flags are set, then the
+   sampler in the next dword, remains a hypothesis. D3D-329's adjacent SGPR examples alone do not establish it.
+
+   Each direct or indirect compute dispatch records the 32-bit arena offsets at those positions. An unbound heap
+   contributes zero. Rebinding affects subsequent commands. A heap that cannot fit in the inline user data is
+   reported once. `LEONIDA_COMPUTE_DIRECT_HEAPS=0` restores the previous arguments. Spilled signatures and graphics
+   stages remain open on question 3.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 
