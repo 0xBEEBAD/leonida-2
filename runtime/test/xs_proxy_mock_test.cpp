@@ -1433,18 +1433,28 @@ int check_xbox_slots() {
     EXPECT(mock->calls[41] == 2 && mock->args[41][0] == word(&pc_sig));
     EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
 
-    // 61 CreateSamplerX(desc, dest): the PC CreateSampler (slot 22) gets the same two words, not the PC slot 61
-    // (CreateMetaCommand). A null description is skipped without reaching the device.
+    // Device slot 61 serves the mapped title and desktop callers through their own ABI.
     D3D12_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     const std::uint64_t sampler_handle = 0x7ff012340040ull;
     raw(device, 61, word(&sampler), sampler_handle);
-    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 1);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 0 && xs::device_slot_hits(61) == 1);
+    // A caller the check calls the title's (here every one): the PC CreateSampler (slot 22) gets the same two words,
+    // not the PC slot 61. A null description is skipped without reaching the device.
+    xs::set_console_caller([](std::uint64_t) { return true; });
+    raw(device, 61, word(&sampler), sampler_handle);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
     EXPECT(mock->args[22][0] == word(&sampler) && mock->args[22][1] == sampler_handle);
     raw(device, 61, 0, sampler_handle);
-    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 3);
+    // A caller outside the title's images is a host one again.
+    xs::set_console_caller([](std::uint64_t) { return false; });
+    raw(device, 61, word(&sampler), sampler_handle);
+    EXPECT(mock->calls[61] == 2 && mock->calls[22] == 1);
+    xs::set_console_caller(nullptr);
+
 
     EXPECT(xs::device_slot_overridden(41) && xs::device_slot_overridden(48) && xs::device_slot_overridden(61) &&
            xs::device_slot_overridden(73) &&
@@ -1823,12 +1833,14 @@ int check_signalx_detection() {
     EXPECT(device4 && queue5 && fence5);
     Mock* const queue5_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue5));
     UINT64 hz = 0;
+    xs::set_console_caller([](std::uint64_t) { return true; });
     EXPECT(hr_of(raw(queue5, 18, word(&hz))) == S_OK && hz == 1000000 &&
            queue5_mock->calls[16] == 1 && queue5_mock->calls[18] == 0);
     hz = 0;
     EXPECT(hr_of(raw(queue5, 16, word(fence5), 8)) == S_OK);
     EXPECT(hr_of(raw(queue5, 18, word(&hz))) == S_OK && hz == 1000000 &&
            queue5_mock->calls[16] == 2 && queue5_mock->calls[18] == 0);
+    xs::set_console_caller(nullptr);
     EXPECT(release(queue5) == 0 && release(fence5) == 0 && release(device4) == 0 && mock4->refs == 0);
     std::printf("xs_proxy_mock: SignalX on an undetected queue's slot 25 forwards as Signal and marks the "
                 "newer layout; proven-older stays older, a fence at 23 does not pin, and an undetected "
@@ -1923,9 +1935,29 @@ int check_slot74() {
         std::uint32_t second[4] = {0x55555555, 0x66666666, 0x77777777, 0x88888888};
         const std::uint32_t first_before[4] = {first[0], first[1], first[2], first[3]};
         const std::uint32_t second_before[4] = {second[0], second[1], second[2], second[3]};
+        // The title's call (a caller the classifier takes for a guest image): the stand-in.
+        xs::set_console_caller([](std::uint64_t) { return true; });
         EXPECT(hr_of(raw(device, 74, word(first), 7, word(second))) == S_OK);
         EXPECT(mock->calls[74] == 0 && xs::device_slot_hits(74) == 1);
         EXPECT(std::memcmp(first, first_before, sizeof(first)) == 0 && std::memcmp(second, second_before, sizeof(second)) == 0);
+        // A host caller, under a classifier and with none installed: the PC slot 74 (ShaderCacheControl) with the
+        // same words where the PC device has it, and the refusal past its table where it does not (found on Windows
+        // in the review of this change: the stand-in used to take a host's ShaderCacheControl too).
+        for (const bool installed : {true, false}) {
+            if (installed)
+                xs::set_console_caller([](std::uint64_t) { return false; });
+            else
+                xs::set_console_caller(nullptr);
+            const std::uint64_t before = mock->calls[74];
+            const HRESULT hr = hr_of(raw(device, 74, 0x1, 0x2));
+            if (level >= 9) {
+                EXPECT(hr == S_OK && mock->calls[74] == before + 1);
+                EXPECT(mock->args[74][0] == 0x1 && mock->args[74][1] == 0x2);
+            } else {
+                EXPECT(hr == E_NOTIMPL && mock->calls[74] == before);
+            }
+        }
+        xs::set_console_caller(nullptr);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
     return 0;

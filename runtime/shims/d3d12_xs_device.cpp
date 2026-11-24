@@ -75,6 +75,7 @@
 namespace rt::d3d12_xs {
 namespace {
 std::atomic<ConsoleCaller> g_console_caller{nullptr};
+thread_local bool g_console_feature_query = false;
 
 bool is_console_caller(const void* address) {
     const ConsoleCaller classify = g_console_caller.load(std::memory_order_acquire);
@@ -3834,6 +3835,24 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 12) {
         return hr_to_u64(proxy_create_command_list(self, a1, a2, a3, a4, reinterpret_cast<const IID*>(a5),
                                                    reinterpret_cast<void**>(a6)));
+    } else if constexpr (Slot == 13) {
+        const bool console = is_console_caller(_ReturnAddress());
+        struct RestoreFeatureQuery {
+            bool previous;
+            ~RestoreFeatureQuery() { g_console_feature_query = previous; }
+        } restore{std::exchange(g_console_feature_query, console)};
+        const auto feature = static_cast<D3D12_FEATURE>(a1);
+        if (feature == D3D12_FEATURE_FORMAT_INFO && a3 == sizeof(D3D12_FEATURE_DATA_FORMAT_INFO) &&
+            console && local_accessible(a2, sizeof(D3D12_FEATURE_DATA_FORMAT_INFO), true)) {
+            auto* info = reinterpret_cast<D3D12_FEATURE_DATA_FORMAT_INFO*>(a2);
+            const auto format = static_cast<unsigned>(info->Format);
+            // Xbox D16/S8 and its depth and stencil aliases occupy slots reserved by desktop DXGI.
+            if (format >= 118 && format <= 120) {
+                info->PlaneCount = 2;
+                return hr_to_u64(S_OK);
+            }
+        }
+        return hr_to_u64(self->real->CheckFeatureSupport(feature, reinterpret_cast<void*>(a2), static_cast<UINT>(a3)));
     } else if constexpr (Slot == 36) {
         return hr_to_u64(proxy_create_fence(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                             reinterpret_cast<void**>(a4)));
@@ -4344,6 +4363,8 @@ unsigned device_proxy_slot_count(const void* device) {
     return static_cast<const DeviceProxy*>(device)->slot_count;
 }
 
+bool console_feature_query() noexcept { return g_console_feature_query; }
+
 void set_console_caller(ConsoleCaller classify) {
     g_console_caller.store(classify, std::memory_order_release);
 }
@@ -4379,7 +4400,7 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 || slot == 31 || slot == 32 ||
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 13 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 || slot == 31 || slot == 32 ||
         slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 57 || slot == 62 ||
         slot == 67 || slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == 133 || slot == 41 || slot == 61 || slot == 74 || slot == 86 || slot == 101 || slot == 108)
         return true;

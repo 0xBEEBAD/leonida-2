@@ -436,7 +436,8 @@ int main(int argc, char** argv) {
                 for (UINT y = 0; y < target_extent; ++y) {
                     for (UINT x = 0; x < target_extent; ++x) {
                         const auto i = y * target_extent + x;
-                        const auto& want = y >= target_extent / 2 && x < target_extent / 2 ? lower_left : triangles[i];
+                        const bool covered = !derived_zero && y >= target_extent / 2 && x < target_extent / 2;
+                        const auto& want = covered ? lower_left : triangles[i];
                         if (pixels[i] != want) {
                             std::fprintf(stderr, "rectangle draw mismatch at (%u, %u) in frame %llu\n", x, y,
                                          static_cast<unsigned long long>(frame));

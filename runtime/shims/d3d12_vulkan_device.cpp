@@ -9515,9 +9515,6 @@ public:
             auto* info = static_cast<D3D12_FEATURE_DATA_FORMAT_INFO*>(data);
             // Plane count describes the DXGI layout even when the backend cannot create the texture.
             switch (info->Format) {
-            case xbox_d16s8:
-            case xbox_d16_plane:
-            case xbox_s8_plane:
             case DXGI_FORMAT_R32G8X24_TYPELESS:
             case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
             case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
@@ -9555,7 +9552,7 @@ public:
             // formats P208/V208/V408 (130-132), and from 192 up; 189-191 are the sampler-feedback formats and
             // A4B4G4R4. UNKNOWN is a buffer format (raw and structured buffers).
             const UINT format_value = static_cast<UINT>(fs->Format);
-            if (format_value > static_cast<UINT>(DXGI_FORMAT_B4G4R4A4_UNORM) && !(format_value>=118 && format_value<=120) &&
+            if (format_value > static_cast<UINT>(DXGI_FORMAT_B4G4R4A4_UNORM) && !(rt::d3d12_xs::console_feature_query() && format_value >= 118 && format_value <= 120) &&
                 (format_value < 189 || format_value > 191))
                 return d3d12_trace::result(method, E_FAIL);
             if (fs->Format == DXGI_FORMAT_UNKNOWN) {
@@ -9806,7 +9803,7 @@ public:
             // output untouched; a known format clears it before the sample count is checked.
             const UINT format_id = UINT(levels->Format);
             if (levels->Format == DXGI_FORMAT_R1_UNORM ||
-                !(format_id <= DXGI_FORMAT_B4G4R4A4_UNORM || (format_id>=118 && format_id<=120) ||
+                !(format_id <= DXGI_FORMAT_B4G4R4A4_UNORM || (rt::d3d12_xs::console_feature_query() && format_id >= 118 && format_id <= 120) ||
                   (format_id >= DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE &&
                    format_id <= DXGI_FORMAT_A4B4G4R4_UNORM)))
                 return d3d12_trace::result(method, E_FAIL);

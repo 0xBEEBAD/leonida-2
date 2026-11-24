@@ -123,6 +123,7 @@ namespace rt::d3d12_xs {
 // Identify calls from a mapped title image when PC and Xbox use the same vtable slot.
 using ConsoleCaller = bool (*)(std::uint64_t address);
 void set_console_caller(ConsoleCaller classify);
+bool console_feature_query() noexcept;
 
 
 // Wraps `real` and returns the requested device interface through `out`. Takes ownership of one reference to

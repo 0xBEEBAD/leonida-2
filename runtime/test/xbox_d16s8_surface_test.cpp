@@ -1,3 +1,4 @@
+#include "../shims/d3d12_xs_device.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -38,9 +39,23 @@ int main() {
     tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     const auto required = dev->GetResourceAllocationInfo(0, 1, &tex);
     CHECK(required.SizeInBytes > 0 && required.SizeInBytes != ~UINT64{0} && required.Alignment);
-    D3D12_FEATURE_DATA_FORMAT_INFO planes{format};
-    CHECK(SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &planes, sizeof(planes))) &&
-          planes.PlaneCount == 2);
+    D3D12_FEATURE_DATA_FORMAT_INFO planes{format, 255};
+    CHECK(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &planes, sizeof(planes)) == E_INVALIDARG);
+    CHECK(planes.PlaneCount == 255);
+    {
+        Ref<ID3D12Device> inner, console;
+        CHECK(SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&inner.p))));
+        CHECK(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner.p, __uuidof(ID3D12Device),
+                                                          reinterpret_cast<void**>(&console.p), true)));
+        inner.p = nullptr;  // the proxy now owns this reference
+        rt::d3d12_xs::set_console_caller([](std::uint64_t) { return true; });
+        for (unsigned alias = 118; alias <= 120; ++alias) {
+            planes = {static_cast<DXGI_FORMAT>(alias), 255};
+            CHECK(SUCCEEDED(console->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &planes, sizeof(planes))));
+            CHECK(planes.PlaneCount == 2);
+        }
+        rt::d3d12_xs::set_console_caller(nullptr);
+    }
     D3D12_HEAP_PROPERTIES def{D3D12_HEAP_TYPE_DEFAULT}, rd{D3D12_HEAP_TYPE_READBACK};
     D3D12_CLEAR_VALUE clear{};
     clear.Format = format;
