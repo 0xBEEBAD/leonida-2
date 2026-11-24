@@ -130,6 +130,7 @@ jobs:
                   if batch_valid:
                       found.update(batch_ids)
               return found
+
           def open_work_ids(body):
               in_open_work = False
               result = set()
