@@ -119,9 +119,9 @@ void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the
-// measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
-// handles for the allocator proxy.
+// 78/79/80/81 (the Xbox slots above, at their configured indices), 62, 67, 76, 86, 108 and 133. Slot 10 is
+// intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
+// CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object

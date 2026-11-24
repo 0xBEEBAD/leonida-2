@@ -235,6 +235,19 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xg_xs_test PRIVATE /OPT:NOREF)
 
+  # D3D12ConfigureVirtualMemoryX user-space VA range test; needs no GPU or game data.
+  add_executable(d3d12_xs_vm_test
+    test/d3d12_xs_vm_test.cpp
+    shims/d3d12_xs.cpp
+    shims/d3d12_xs_device.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(d3d12_xs_vm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(d3d12_xs_vm_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(d3d12_xs_vm_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(d3d12_xs_vm_test PRIVATE /OPT:NOREF)
+  target_link_libraries(d3d12_xs_vm_test PRIVATE gta6rt_d3d12_xs_rootsig)
+
   # acphal shim ABI test: resolves the registered acphal.dll exports through the registry.
   add_executable(acphal_test
     test/acphal_test.cpp
@@ -1140,6 +1153,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xg_xs_test)
     add_test(NAME xg_xs COMMAND xg_xs_test)
+  endif()
+  if(WIN32 AND TARGET d3d12_xs_vm_test)
+    add_test(NAME d3d12_xs_vm COMMAND d3d12_xs_vm_test)
   endif()
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)

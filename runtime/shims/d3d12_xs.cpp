@@ -217,10 +217,29 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
-// Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
-// dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
-// so the policy is accepted and ignored.
-HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
+// Measured call (RT-5, 1.0.2.1): the title calls it once at startup with a 32-byte configuration block.
+// Input words configure console page-table sizing (not used on PC/Vulkan); output words at +0x10 and +0x18 return
+// the user-space graphics VA range [lowest, highest], which matches the host process's application address range
+// because GPU and CPU virtual addresses share the same 64-bit space.
+struct XboxVirtualMemoryConfig {
+    uint32_t flags;
+    uint32_t page_table_pages;
+    uint32_t preserved_bytes;
+    uint32_t reserved;
+    uint64_t lowest;
+    uint64_t highest;
+};
+static_assert(sizeof(XboxVirtualMemoryConfig) == 0x20, "D3D12ConfigureVirtualMemoryX config must be 32 bytes");
+
+HRESULT WINAPI configure_virtual_memory(void* desc) {
+    if (!desc) return E_INVALIDARG;
+    auto* cfg = static_cast<XboxVirtualMemoryConfig*>(desc);
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    cfg->lowest = reinterpret_cast<uint64_t>(si.lpMinimumApplicationAddress);
+    cfg->highest = reinterpret_cast<uint64_t>(si.lpMaximumApplicationAddress);
+    return S_OK;
+}
 
 }  // namespace
 

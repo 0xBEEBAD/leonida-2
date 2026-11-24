@@ -208,6 +208,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (a1 == kFenceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a2, a3));
                 if (a1 == kResourceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::resource, a2, a3));
                 return static_cast<std::uint32_t>(E_INVALIDARG);
+            case 25: return a1;  // GetResourceAllocationInfo returns its hidden buffer pointer
             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
@@ -1239,6 +1240,52 @@ int check_console_command_list() {
     return 0;
 }
 
+// ---- 11. Beyond-PC Xbox device slots 81 (GetFrameStatisticsX), 86 (stream PSO), 108 (GetResourceAllocationInfo2) ----
+
+int check_xbox_extended_slots() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 11, true);
+    EXPECT(device != nullptr);
+    xs::reset_device_proxy_stats();
+
+    EXPECT(xs::device_slot_overridden(81) && xs::device_slot_overridden(86) && xs::device_slot_overridden(108));
+
+    // Slot 81: GetFrameStatisticsX(token, type_mask, &count, stats) sets count=0 and returns S_FALSE when no presenter
+    // is attached, and rejects a null count pointer with E_POINTER.
+    UINT stat_count = 4;
+    std::uint8_t stats[64]{};
+    EXPECT(hr_of(raw(device, 81, 1, 7, word(&stat_count), word(stats))) == S_FALSE && stat_count == 0 &&
+           mock->calls[81] == 0);
+    EXPECT(hr_of(raw(device, 81, 1, 7, 0, word(stats))) == E_POINTER);
+
+    // Slot 86: CreatePipelineState (stream) routes to PC ID3D12Device2::CreatePipelineState (slot 47).
+    EXPECT(hr_of(raw(device, 86, 0x1111, 0x2222, 0x3333)) == S_OK);
+    EXPECT(mock->calls[86] == 0 && mock->calls[47] == 1 && mock->args[47][0] == 0x1111 &&
+           mock->args[47][1] == 0x2222 && mock->args[47][2] == 0x3333);
+
+    // Slot 108: GetResourceAllocationInfo2 routes to PC slot 25 in both PC and swapped Xbox order.
+    D3D12_RESOURCE_ALLOCATION_INFO alloc_out{};
+    using Raw5 = std::uint64_t(WINAPI*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+    void** const vtbl = *static_cast<void***>(device);
+    EXPECT(reinterpret_cast<Raw5>(vtbl[108])(word(device), word(&alloc_out), 1, 2, 0x4444) == word(&alloc_out));
+    EXPECT(mock->calls[25] == 1 && mock->args[25][0] == word(&alloc_out) && mock->args[25][1] == 1 &&
+           mock->args[25][2] == 2 && mock->args[25][3] == 0x4444);
+    EXPECT(reinterpret_cast<Raw5>(vtbl[108])(word(&alloc_out), word(device), 0, 3, 0x5555) == word(&alloc_out));
+    EXPECT(mock->calls[25] == 2 && mock->args[25][0] == word(&alloc_out) && mock->args[25][1] == 0 &&
+           mock->args[25][2] == 3 && mock->args[25][3] == 0x5555);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+
+    // On a Device1-only mock (47 slots, predates ID3D12Device2), slot 86 refuses with E_NOTIMPL.
+    Mock* mock1 = nullptr;
+    void* dev1 = make_device(mock1, 1, true);
+    EXPECT(dev1 != nullptr);
+    EXPECT(hr_of(raw(dev1, 86, 0x1111, 0x2222, 0x3333)) == E_NOTIMPL && mock1->calls[47] == 0);
+    EXPECT(release(dev1) == 0 && mock1->refs == 0);
+
+    std::printf("%s: extended Xbox device slots 81/86/108 passed\n", g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1249,7 +1296,8 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
+        check_xbox_extended_slots())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
