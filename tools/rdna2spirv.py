@@ -1229,7 +1229,8 @@ class Gen:
 
     def emit_fma64(self, r, x, y, z):
         """r = x * y + z on doubles with ONE rounding, as RDNA2's f64 multiply-adds do. GLSL.std.450 Fma may round
-        twice here as for f32, and NVIDIA's driver does (RTX 4090, 621.24: the fma(a, a, c) cancellation probe with
+        twice here as for f32, and NVIDIA's driver does when it folds an all-constant Fma at pipeline compile time
+        (run-time operands are fused there) (RTX 4090, 621.24: the fma(a, a, c) cancellation probe with
         a = 1 + 2^-30 gives 0, not 2^-60). With --fma khr it is OpFmaKHR on doubles, which needs VK_KHR_shader_fma +
         shaderFmaFloat64 (feature shaderFmaFloat64 in the index). --fma exact has no f64 form and keeps Fma."""
         if FMA_KHR:
@@ -5905,6 +5906,9 @@ class Gen:
             sgl = self.tmp()
             self.emit(f"{sgl} = OpLoad %uint %sg_lane")
             self.emit(f"{half} = OpBitwiseAnd %uint {sgl} {self.cu(32)}")
+            self_lane = sgl
+        else:
+            self_lane = lane
         bal = self.tmp()
         self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
         acc = self.cu(0)
@@ -5913,12 +5917,13 @@ class Gen:
             if self.wave64 or self.wave32_fragment:
                 src = self.tmp()
                 self.emit(f"{src} = OpBitwiseOr %uint {half} {self.cu(j)}")
-            ex, shv, v, shd, hit, nxt = (self.tmp() for _ in range(6))
-            # a shuffle from a lane that isn't running (the missing lanes of a partial wave) is undefined
+            ex, safe_src, shv, v, shd, hit, nxt = (self.tmp() for _ in range(7))
+            # Redirect absent source lanes before the shuffle: even a masked undefined result is undefined.
             self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
-            self.emit(f"{shv} = OpGroupNonUniformShuffle %uint %c3 {tp} {src}")
+            self.emit(f"{safe_src} = OpSelect %uint {ex} {src} {self_lane}")
+            self.emit(f"{shv} = OpGroupNonUniformShuffle %uint %c3 {tp} {safe_src}")
             self.emit(f"{v} = OpSelect %uint {ex} {shv} {self.cu(0)}")
-            self.emit(f"{shd} = OpGroupNonUniformShuffle %uint %c3 {dat} {src}")
+            self.emit(f"{shd} = OpGroupNonUniformShuffle %uint %c3 {dat} {safe_src}")
             self.emit(f"{hit} = OpIEqual %bool {v} {mine}")
             self.emit(f"{nxt} = OpSelect %uint {hit} {shd} {acc}")
             acc = nxt
@@ -6593,8 +6598,13 @@ class Gen:
                     self.emit(f"{g} = OpFMul %float {v} {c}")
                     v = g
         if "clamp" in mods:
-            g = self.tmp()
-            self.emit(f"{g} = OpExtInst %float %glsl FClamp {v} %f0 %f1")
+            # The game's MODE has DX10_CLAMP=1, so the clamp bit turns a NaN result into +0
+            # (docs/shader_validation.md). GLSL.std.450 FClamp leaves a NaN operand undefined,
+            # so select +0 for a NaN first, as the div_fixup and cvt_pknorm clamps do.
+            nan, safe, g = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{nan} = OpIsNan %bool {v}")
+            self.emit(f"{safe} = OpSelect %float {nan} %f0 {v}")
+            self.emit(f"{g} = OpExtInst %float %glsl FClamp {safe} %f0 %f1")
             return g
         return v
 
@@ -7134,6 +7144,8 @@ class Gen:
             kv = dict(m.split(":", 1) for m in mods if m.split(":", 1)[0] in ("src0_sel", "src1_sel", "dst_sel", "dst_unused"))
             args = [dict(x) for x in ins["args"]]
             first = 0 if op.startswith("v_cmpx") else 1
+            if op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32") and len(args) > 3:
+                first = 2    # vdst, carry-out, src0, src1, carry-in; the short form (3 operands) has no carry-out
             for i, key in enumerate(("src0_sel", "src1_sel")):
                 j = first + i
                 if j < len(args) and (kv.get(key, "DWORD") != "DWORD" or args[j].get("sext")):
@@ -7247,7 +7259,18 @@ class Gen:
         args = [dict(a) for a in ins["args"]]
         if len(args) < 2:
             raise Unsupported("DPP operands")
-        if args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
+        # A VOPC compare in DPP form (docs/design.md, "DPP on a VOPC compare"): src0 comes through the same lane
+        # selection and the result is a mask bit, not a VGPR. Only the forms where every lane writes its bit are
+        # taken: what a lane that DPP leaves unwritten does to its VCC bit is not measured.
+        compare = base_op(ins["op"]).startswith("v_cmp")
+        if compare:
+            if base_op(ins["op"]).startswith("v_cmpx"):
+                raise Unsupported("DPP on v_cmpx")
+            if len(args) != 3:
+                raise Unsupported("DPP compare operands")
+            if row_mask != 0xF or bank_mask != 0xF or not (dpp8 is not None or bound):
+                raise Unsupported("DPP compare with lanes that keep their mask bit")
+        elif args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
         if args[1].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
@@ -7426,6 +7449,10 @@ class Gen:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
         args[1] = {"k": "ssa", "v": src0}
+        if compare:
+            # Every lane is enabled and an invalid source reads 0 (checked above), so the compare's own EXEC guard
+            # is the only one: the mask write is the plain compare's.
+            return self._insn({**ins, "args": args})
         previous = self.dpp_guard
         self.dpp_guard = write
         try:
@@ -8472,13 +8499,54 @@ class Gen:
             rounding = {"v_trunc_f64": "Trunc", "v_ceil_f64": "Ceil",
                         "v_rndne_f64": "RoundEven", "v_floor_f64": "Floor"}
             self.emit(f"{result} = OpExtInst %double %glsl {rounding[op]} {value}")
-            result = self.clamp_mods_f64(result, mods)
             words = self.tmp()
             self.emit(f"{words} = OpBitcast %v2uint_d {result}")
+            rounded = []
             for index in range(2):
                 word = self.tmp()
                 self.emit(f"{word} = OpCompositeExtract %uint {words} {index}")
-                self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, word)
+                rounded.append(word)
+            # A NaN and a subnormal are not left to the driver's rounding. Vulkan lets it return any NaN for a NaN
+            # operand (NVIDIA 620.70 and llvmpipe quiet a signalling one) and, with no DenormPreserve for 64 bits,
+            # read a subnormal as zero (llvmpipe does); the hardware returns a NaN unchanged and keeps subnormals
+            # (docs/design.md). So a NaN's words pass through, and a subnormal's result is built from its sign and
+            # the op: a zero of its sign, or 1 with its sign where the op rounds that sign away from zero (ceil of a
+            # positive one, floor of a negative one). Every other source takes the driver's result.
+
+            def emit_u(line):
+                t = self.tmp()
+                self.emit(f"{t} = {line}")
+                return t
+
+            exponent = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x7FF00000)}")
+            fraction_high = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x000FFFFF)}")
+            fraction = emit_u(f"OpBitwiseOr %uint {fraction_high} {low}")
+            has_fraction = emit_u(f"OpINotEqual %bool {fraction} {self.cu(0)}")
+            exponent_ones = emit_u(f"OpIEqual %bool {exponent} {self.cu(0x7FF00000)}")
+            exponent_zero = emit_u(f"OpIEqual %bool {exponent} {self.cu(0)}")
+            is_nan = emit_u(f"OpLogicalAnd %bool {exponent_ones} {has_fraction}")
+            is_subnormal = emit_u(f"OpLogicalAnd %bool {exponent_zero} {has_fraction}")
+            sign = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x80000000)}")
+            subnormal_high = sign
+            if op in ("v_ceil_f64", "v_floor_f64"):
+                negative = emit_u(f"OpINotEqual %bool {sign} {self.cu(0)}")
+                one, zero = self.cu(0x3FF00000), self.cu(0)
+                magnitude = emit_u(f"OpSelect %uint {negative} "
+                                   + (f"{zero} {one}" if op == "v_ceil_f64" else f"{one} {zero}"))
+                subnormal_high = emit_u(f"OpBitwiseOr %uint {sign} {magnitude}")
+            special = emit_u(f"OpLogicalOr %bool {is_nan} {is_subnormal}")
+            special_low = emit_u(f"OpSelect %uint {is_nan} {low} {self.cu(0)}")
+            special_high = emit_u(f"OpSelect %uint {is_nan} {high} {subnormal_high}")
+            out = [emit_u(f"OpSelect %uint {special} {special_low} {rounded[0]}"),
+                   emit_u(f"OpSelect %uint {special} {special_high} {rounded[1]}")]
+            if mods:
+                # The output modifiers work on the double: the same scale/clamp path as before, on the selected value.
+                chosen_pair = emit_u(f"OpCompositeConstruct %v2uint_d {out[0]} {out[1]}")
+                chosen = emit_u(f"OpBitcast %double {chosen_pair}")
+                modified = emit_u(f"OpBitcast %v2uint_d {self.clamp_mods_f64(chosen, mods)}")
+                out = [emit_u(f"OpCompositeExtract %uint {modified} {index}") for index in range(2)]
+            for index in range(2):
+                self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, out[index])
         elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
@@ -9912,18 +9980,28 @@ class Gen:
                 self.emit(f"{cin} = OpSelect %uint {self.tmp_bool_nz(cin_m)} {self.cu(1)} {self.cu(0)}")
             else:
                 cin = self.cu(0)
-            s1, c1, s2, c2, r, carry = (self.tmp() for _ in range(6))
-            if sub:
-                self.emit(f"{s1} = OpISubBorrow %umul {x} {y}")
+            if sub and srcs[0] == srcs[1]:
+                # x - x: the difference is 0 and there is no borrow, so D = 0 - carry in and the borrow out is the
+                # carry in. Written out instead of OpISubBorrow %x %x: AMD's Windows driver (amdvlk64.dll,
+                # 32.0.21037.1004 and 32.0.21045.29003, gfx1036) dies with an access violation creating a native
+                # wave64 compute pipeline in which that borrow predicates a subgroup shuffle's value
+                # (docs/design.md, "Carry-out subtract of a register from itself").
+                r = self.tmp()
+                self.emit(f"{r} = OpISub %uint {self.cu(0)} {cin}")
+                carry = cin
             else:
-                self.emit(f"{s1} = OpIAddCarry %umul {x} {y}")
-            r1 = self.tmp()
-            self.emit(f"{r1} = OpCompositeExtract %uint {s1} 0")
-            self.emit(f"{c1} = OpCompositeExtract %uint {s1} 1")
-            self.emit(f"{s2} = {'OpISubBorrow' if sub else 'OpIAddCarry'} %umul {r1} {cin}")
-            self.emit(f"{r} = OpCompositeExtract %uint {s2} 0")
-            self.emit(f"{c2} = OpCompositeExtract %uint {s2} 1")
-            self.emit(f"{carry} = OpBitwiseOr %uint {c1} {c2}")
+                s1, c1, s2, c2, r, carry = (self.tmp() for _ in range(6))
+                if sub:
+                    self.emit(f"{s1} = OpISubBorrow %umul {x} {y}")
+                else:
+                    self.emit(f"{s1} = OpIAddCarry %umul {x} {y}")
+                r1 = self.tmp()
+                self.emit(f"{r1} = OpCompositeExtract %uint {s1} 0")
+                self.emit(f"{c1} = OpCompositeExtract %uint {s1} 1")
+                self.emit(f"{s2} = {'OpISubBorrow' if sub else 'OpIAddCarry'} %umul {r1} {cin}")
+                self.emit(f"{r} = OpCompositeExtract %uint {s2} 0")
+                self.emit(f"{c2} = OpCompositeExtract %uint {s2} 1")
+                self.emit(f"{carry} = OpBitwiseOr %uint {c1} {c2}")
             carry_nz = self.tmp_bool_nz(carry)
             if "clamp" in mods:
                 # Hardware saturates D (0xffffffff on add carry, 0 on sub borrow) while reporting the real carry/borrow.
@@ -11584,7 +11662,9 @@ class Gen:
             # zero and denormals are read as zero (the f32 denormal mode is not modelled, as for the other float ops)
             # and infinities and NaNs (exponent 255) pass through: frexp_mant and ldexp return S0 unchanged,
             # frexp_exp returns 0 (RDNA2 ISA, V_FREXP_MANT_F32 / V_FREXP_EXP_I32_F32 / V_LDEXP_F32).
-            x = self.src_u(a[1])
+            # The three ops only move bits, so abs/neg move the sign bit of the raw word: through FAbs/OpFNegate a
+            # NaN source came back as the driver's default NaN (0x7fffffff on an RTX 4070 Ti, NVIDIA 620.70.06).
+            x = self.src_u_sign_mods(a[1])
             e, em1, isnorm, isden, sgn, r = (self.tmp() for _ in range(6))
             self.emit(f"{e} = OpBitFieldUExtract %uint {x} {self.cu(23)} {self.cu(8)}")
             self.emit(f"{em1} = OpISub %uint {e} {self.cu(1)}")
@@ -12436,7 +12516,9 @@ class Gen:
             (n == 2 and d["k"] == "special" and d["t"] == "vcc")
         slist_dst = d["k"] == "slist" and len(d["r"]) == n
         base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
-                      else list(base["r"]) if base["k"] == "slist" else None)
+                      else list(base["r"]) if base["k"] == "slist"
+                      else ["vcc_lo", "vcc_hi"] if (base["k"] == "special" and base["t"] == "vcc")
+                      else None)
         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
 
@@ -16656,14 +16738,28 @@ def sdwa_reads_dst(op: str, mods: list[str]) -> bool:
             and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_")) for m in mods))
 
 
+# Ops whose VGPR destination is also a source operand (the accumulating forms, and v_swap_b32, which reads both).
+DST_ALSO_READ = ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
+                 "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8", "v_dot8c_i32_i4",
+                 "v_dot8c_u32_u4")
+
+
 # All VGPR operands of these instructions are sources, including store address and data ranges.
 VGPR_READ_ONLY_PREFIXES = ("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "ds_write",
                            "global_store", "flat_store", "scratch_store")
 
 
 def read_before_write_vgprs(insns):
-    """VGPRs a shader reads before writing them: for a fetch-calling VS these are the fetched attributes."""
-    written, first = set(), []
+    """VGPRs a shader reads before writing them: for a fetch-calling VS these are the fetched attributes.
+
+    v_writelane_b32 writes one lane and keeps the others (SHADER-768), so its destination is not written by it: the
+    kept lanes still hold what the register held at entry. They are *carried*, and become a read only when something
+    other than v_readlane_b32 reads the register before a full write (shdann's two cases on #4297: a PS whose first
+    touch of v0 is a writelane, then a v_mov of v0, reads the barycentric in the other lanes; a VS that spills an
+    SGPR into one lane of v40 around the fetch call and reads it back with v_readlane never uses the entry value,
+    so v40 is not a fetched attribute). The approximation: a v_readlane of a lane the writelane didn't write would
+    read the entry value, and is not counted."""
+    written, first, carried = set(), [], set()
     for ins in insns:
         a, op = ins["args"], ins["op"]
         if not a:
@@ -16676,17 +16772,22 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
-                            "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
-                            "v_dot8c_i32_i4", "v_dot8c_u32_u4") or
+        if (base_op(op) in DST_ALSO_READ or
                 (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
                 a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
+        lane_read = base_op(op) == "v_readlane_b32"
         for r in regs:
-            if r not in written and r not in first:
-                first.append(r)
-        if not reads_all and a[0]["k"] == "vgpr":
-            written.update(vgpr_dest_registers(ins))
+            if r in written or r in first or (r in carried and lane_read):
+                continue
+            first.append(r)
+        if base_op(op) == "v_writelane_b32" and a[0]["k"] == "vgpr":
+            if a[0]["r"] not in written:
+                carried.add(a[0]["r"])
+        elif not reads_all and a[0]["k"] == "vgpr":
+            dst = vgpr_dest_registers(ins)
+            written.update(dst)
+            carried.difference_update(dst)
     return set(first)
 
 def interp_ij_analysis(insns, g):
@@ -16937,9 +17038,8 @@ def reg_reads_writes(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
-                           "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
-                           "v_dot8c_i32_i4", "v_dot8c_u32_u4") and a[0]["k"] == "vgpr":
+        if (base_op(op) in DST_ALSO_READ or base_op(op) == "v_writelane_b32") and a[0]["k"] == "vgpr":
+            # v_writelane_b32 keeps the other lanes: over a slice that is a read of the destination
             regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
@@ -17145,6 +17245,30 @@ def restore_mix_inline_literal(ins, raw, literal):
             ins["args"][1 + i] = {"k": "imm", "v": literal, "neg": bool((w1 >> (29 + i)) & 1),
                                   "abs": bool((w0 >> (8 + i)) & 1)}
     ins["enc"] = raw.hex()
+
+
+def widen_wave64_masks(insns):
+    """In place: the lane-mask SGPR operands of VALU instructions become the pairs they are in wave64.
+
+    The listings come from llvm-mc without +wavefrontsize64, so it prints the wave32 form: v_cmp_*_e64 s8 where the
+    wave64 hardware writes s[8:9], and reads s[10:11] for the s10 of v_cndmask_b32_e64. Taken literally the high SGPR
+    keeps its old value, and the next s_mov_b64 exec, s[8:9] gives lanes 32..63 the wrong bits."""
+    for ins in insns:
+        op, a = base_op(ins["op"]), ins["args"]
+        if op.startswith("v_cmp") and len(a) == 3:
+            at = (0,)
+        elif op.startswith("v_") and "_co_ci_" in op:
+            at = (1, 4)
+        elif op.startswith("v_") and "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32",
+                                                            "v_div_scale_f32", "v_div_scale_f64"):
+            at = (1,)
+        elif op in ("v_cndmask_b32", "v_cndmask_b16"):
+            at = (3,)
+        else:
+            continue
+        for i in at:
+            if i < len(a) and a[i]["k"] == "sgpr" and a[i].get("n", 1) == 1:
+                a[i] = dict(a[i], n=2)
 
 
 def output_signature(path, name):
@@ -17477,6 +17601,8 @@ def translate(path):
         g.wave64 = False
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+    if g.wave64:
+        widen_wave64_masks(insns)
     if stage == "gs":
         ins_by_reg = {}
         for reg, mask, sv, ctype in input_signature(path, info["name"]):
