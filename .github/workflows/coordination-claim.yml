@@ -212,8 +212,12 @@ jobs:
               inline_code = re.match("^" + quote + "([^" + BACKTICK + "]*)" + quote + "(.*)$", text)
               if inline_code:
                   code_text = inline_code.group(1).strip()
-                  if ID_LIST_RE.fullmatch(code_text):
-                      return code_text + inline_code.group(2)
+                  suffix = inline_code.group(2)
+                  if (
+                      ID_LIST_RE.fullmatch(code_text)
+                      and not re.match(r"^[A-Za-z0-9-]", suffix)
+                  ):
+                      return code_text + suffix
               return text
 
           def ids_from_claim_comment(body):
