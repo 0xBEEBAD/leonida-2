@@ -29,7 +29,7 @@ from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_
                    fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test, compute_unsupported)
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+from check import (CS_SMEM_VCC, CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
@@ -1161,7 +1161,7 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_smem_vcc_base", "cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_w64",
                       "cs_w64_mask_detect",
@@ -1175,6 +1175,7 @@ def run_suite(a, work: str) -> int:
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
+                "cs_smem_vcc_base": CS_SMEM_VCC,
                 "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
                                         0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
                 # SHADER-52: wave32 lane select & 31 (40 → 8)

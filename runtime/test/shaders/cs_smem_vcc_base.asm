@@ -1,5 +1,17 @@
 ; group: 1,1,1
-; Read the eight application-initialized words at byte 128 through VCC as an ordinary pointer pair.
+; Seed eight consecutive words at byte 128. Read them back with VCC as an ordinary scalar pointer pair.
+; Expected out[0..7]: 0x7210 0x7211 0x7212 0x7213 0x7214 0x7215 0x7216 0x7217.
+v_mov_b32_e32 v1, 0x7210
+v_mov_b32_e32 v2, 0x7211
+v_mov_b32_e32 v3, 0x7212
+v_mov_b32_e32 v4, 0x7213
+buffer_store_dwordx4 v[1:4], off, s[0:3], 0 offset:128
+v_mov_b32_e32 v1, 0x7214
+v_mov_b32_e32 v2, 0x7215
+v_mov_b32_e32 v3, 0x7216
+v_mov_b32_e32 v4, 0x7217
+buffer_store_dwordx4 v[1:4], off, s[0:3], 0 offset:144
+s_waitcnt vmcnt(0)
 s_mov_b32 s4, 128
 s_mov_b32 s5, 0
 s_mov_b64 vcc, s[4:5]

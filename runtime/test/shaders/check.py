@@ -100,6 +100,7 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
+CS_SMEM_VCC = list(range(0x7210, 0x7218))
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 # -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
@@ -128,7 +129,7 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
-CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
@@ -1851,7 +1852,9 @@ def texture_uav_test(tools, spv):
 IMAGE_STORE_CASES = {
     "cs_imgstore": (),
     "cs_imgload": ("load",),
+    "cs_imgload_tfe": ("load",),
     "cs_imgload_d16": ("load-d16",),
+    "cs_imgload_d16_tfe": ("load-d16",),
     "cs_sample_lz_int_d16": ("load-d16",),
     "cs_imgload_mip": ("load-mip",),
 }
