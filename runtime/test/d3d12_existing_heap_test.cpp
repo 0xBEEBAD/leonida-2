@@ -305,7 +305,67 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     EXPECT(waited == WAIT_OBJECT_0);
     EXPECT(std::memcmp(pages, reversed.data(), reversed.size()) == 0);
 
-    if (buffers_only) return 0;
+    if (buffers_only) {
+        // RGBA16 requires an 8-byte Vulkan buffer-image offset, while an imported host prefix may be +4.
+        // Exercise both directions and verify every untouched host byte, including row padding.
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = 1;
+        td.Height = 2;
+        td.DepthOrArraySize = td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        td.SampleDesc.Count = 1;
+        D3D12_HEAP_PROPERTIES gpu_heap{D3D12_HEAP_TYPE_DEFAULT};
+        Ref<ID3D12Resource> image;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&gpu_heap, D3D12_HEAP_FLAG_NONE, &td,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&image.p))));
+        D3D12_TEXTURE_COPY_LOCATION linear{};
+        linear.pResource = buffer.p;
+        linear.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        linear.PlacedFootprint.Footprint = {td.Format, 1, 2, 1, 256};
+        D3D12_TEXTURE_COPY_LOCATION tex{};
+        tex.pResource = image.p;
+        tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        barrier.Transition = {buffer.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        list->ResourceBarrier(1, &barrier);
+        list->CopyTextureRegion(&tex, 0, 0, 0, &linear, nullptr);
+        EXPECT(SUCCEEDED(list->Close()));
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)));
+        done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(done && SUCCEEDED(fence->SetEventOnCompletion(3, done)));
+        const DWORD uploaded = WaitForSingleObject(done, 10000);
+        CloseHandle(done);
+        EXPECT(uploaded == WAIT_OBJECT_0);
+        std::memset(pages, 0x6d, static_cast<size_t>(size));
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        D3D12_RESOURCE_BARRIER transitions[2] = {barrier, barrier};
+        transitions[0].Transition = {image.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        transitions[1].Transition = {buffer.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                     D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST};
+        list->ResourceBarrier(2, transitions);
+        list->CopyTextureRegion(&linear, 0, 0, 0, &tex, nullptr);
+        EXPECT(SUCCEEDED(list->Close()));
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)));
+        done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(done && SUCCEEDED(fence->SetEventOnCompletion(4, done)));
+        const DWORD downloaded = WaitForSingleObject(done, 10000);
+        CloseHandle(done);
+        EXPECT(downloaded == WAIT_OBJECT_0);
+        for (size_t i = 0; i < static_cast<size_t>(size); ++i) {
+            const bool texel = i < 8 || (i >= 256 && i < 264);
+            EXPECT(bytes[i] == (texel ? reversed[i] : 0x6d));
+        }
+        return 0;
+    }
 
     D3D12_RESOURCE_DESC texture = desc;
     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -521,7 +581,7 @@ int check_host_prefix_buffers(ID3D12Device* device) {
     auto* pages = static_cast<unsigned char*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (!pages) return 1;
     int failures = 0;
-    for (unsigned prefix : {0u, 16u, 32u, 64u}) {
+    for (unsigned prefix : {0u, 4u, 8u, 16u, 32u, 64u}) {
         std::memset(pages, 0xa5, size);
         failures += check_title_placed(device, "host prefix buffer", pages + prefix, 0x1000 - prefix,
                                       false, true);
@@ -529,7 +589,7 @@ int check_host_prefix_buffers(ID3D12Device* device) {
         for (SIZE_T i = 0x1000; i < size; ++i) failures += pages[i] != 0xa5;
     }
     VirtualFree(pages, 0, MEM_RELEASE);
-    std::printf("host prefix buffers: 0/16/32/64-byte offsets, bidirectional copies and surrounding bytes: %s\n",
+    std::printf("host prefix buffers: 0/4/8/16/32/64-byte offsets, bidirectional buffer/texture copies and surrounding bytes: %s\n",
                 failures ? "FAIL" : "PASS");
     return failures;
 }
