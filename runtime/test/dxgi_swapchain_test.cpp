@@ -641,11 +641,15 @@ int main() {
     cl->Close();
 
     // Before the test's own swap chain: the host comparison creates and releases its own windows and chains.
+    // Why a comparison was left out: under Wine there is a host device, and it is not the reference (host_wine.h).
+    const char* const not_compared = hostwine::host_is_wine()
+                                         ? "the host's DXGI is Wine's, not compared with it"
+                                         : "no host D3D12 device to compare with, skipped";
     const int argument_mismatches = compare_swap_chain_arguments(factory, dev, queue);
-    if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: no host D3D12 device to compare with, skipped\n");
+    if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: %s\n", not_compared);
     if (argument_mismatches > 0) return fail("CreateSwapChainForHwnd answers differ from the host runtime");
     const int resize_mismatches = compare_failed_resize(factory, queue);
-    if (resize_mismatches < 0) std::printf("failed ResizeBuffers: no host D3D12 device to compare with, skipped\n");
+    if (resize_mismatches < 0) std::printf("failed ResizeBuffers: %s\n", not_compared);
     if (resize_mismatches > 0) return fail("a failed ResizeBuffers differs from the host runtime");
 
     DXGI_SWAP_CHAIN_DESC1 scd{};
