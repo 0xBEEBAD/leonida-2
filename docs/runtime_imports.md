@@ -450,14 +450,23 @@ on the executable, the rest is not:
   card and text entry, which fail before starting.
 
 - **Accessibility and speech** (`IXAccessibilityImpl2`, slots 3-21): `XHighContrastGetMode` (5) answers Off and
-  `XClosedCaptionSetEnabled` (4) is accepted. No voice is installed: `XSpeechSynthesizerEnumerateInstalledVoices`
-  (8) calls back zero times and returns `S_OK`, `XSpeechSynthesizerCreate` (9) fails (`E_FAIL`) with a null handle,
-  and the handle calls (10-16, 21: close, default and custom voice, streams from text and SSML, stream size and
-  data) refuse the handle they were never given (`E_INVALIDARG`, outputs zeroed). The closed-caption properties (3)
-  and the speech-to-text display calls (6, 7, 17-20) fail with `E_FAIL`, writing nothing: their parameter lists
-  are not in the docs' layout.
-- **`XLauncherImpl`** (`IXLauncherImpl`, slots 3-5): `XLaunchUri`, `XDisplayAcquireTimeoutDeferral` (null handle)
-  and `XDisplayCloseTimeoutDeferralHandle` fail with `E_FAIL`; nothing is launched.
+  `XClosedCaptionSetEnabled` (4) is accepted. One silent voice is installed:
+  `XSpeechSynthesizerEnumerateInstalledVoices(context, callback)` (8) calls back once, with voice id `leonida-silent`
+  and language `en-US` (the GDK reference's `XSpeechSynthesizerVoiceInformation` layout), and returns `S_OK`
+  (`E_INVALIDARG` without a callback). `XSpeechSynthesizerCreate` (9) hands
+  out a synthesizer handle that speaks with it (`E_POINTER` for a null out pointer). Close (10), set default voice (11)
+  and set custom voice (12, only for that voice id) accept that handle and refuse any other with `E_INVALIDARG`.
+  Streams from text (13) and SSML (21) are created from it and return a
+  stream handle; its close (14) accepts it. Stream size (15) reports 44 bytes and stream data (16) copies them: a valid
+  RIFF/WAVE header for 16 kHz, 16-bit mono PCM with zero data bytes, so a title that plays narration reads a silent
+  stream (a buffer under 44 bytes gets `ERROR_INSUFFICIENT_BUFFER`). A foreign handle on 15 or 16 gets `E_INVALIDARG`,
+  outputs zeroed. The closed-caption properties (3) and the speech-to-text display calls (6, 7, 17-20) fail with
+  `E_FAIL`, writing nothing: their parameter lists are not in the docs' layout.
+- **`XLauncherImpl`** (`IXLauncherImpl`, slots 3-5): `XLaunchUri` fails with `E_FAIL`; nothing is launched.
+  `XDisplayAcquireTimeoutDeferral` (4) creates a Win32 `PowerRequestDisplayRequired` request and returns its handle (a
+  failing `PowerCreateRequest` or `PowerSetRequest` returns the Win32 error as an HRESULT).
+  `XDisplayCloseTimeoutDeferralHandle` (5) clears that request and closes the handle, so the display may sleep again.
+  Side effect on the host: while the title holds a deferral, Windows keeps the PC's display on.
 - **ASSUMPTION:** the parameter lists of the speech calls and `XHighContrastGetMode` (Off is 0), from the GDK
   reference; only the argument counts were measured, from `tools/gdk_runtime_calls.py` on the executable.
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
