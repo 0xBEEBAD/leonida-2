@@ -996,7 +996,7 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_w32_round_f64":
             detail = round_f64_test(a.build, spirv_dir, cs_env)
             results.append((name, None if isinstance(detail, Skip) else not detail,
-                            detail or "1152 words judged (64 inputs, eight roundings each, and unchanged inputs)"))
+                            detail or "1152 words exact (64 inputs, eight roundings each, and unchanged inputs)"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
             results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"

@@ -41,7 +41,7 @@ class RoundF64Oracle(unittest.TestCase):
         self.assertEqual((len(values), len(set(values))), (64, 64))
         floats = [as_float(bits) for bits in values]
         self.assertEqual(sum(math.isnan(x) for x in floats), 5)
-        self.assertEqual(sum(check.f64_is_subnormal(bits) for bits in values), 2)
+        self.assertEqual(sum(0 < abs(x) < 2.0 ** -1022 for x in floats), 2)
         self.assertEqual(sum(math.isinf(x) for x in floats), 2)
         for x in (0.0, -0.0, 0.5, -0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 0.49999999999999994, 2.0 ** 31 + 0.5,
                   2.0 ** 51 + 0.5, 2.0 ** 52 - 0.5, 2.0 ** 52, 2.0 ** 52 + 1, 2.0 ** 53 - 1, 2.0 ** 63, 1e300):
@@ -111,21 +111,22 @@ class RoundF64Judge(unittest.TestCase):
     def test_the_hardware_s_words_pass(self):
         self.assertEqual(self.judge(lambda data: None), "")
 
-    def test_a_nan_may_come_back_as_another_nan_but_not_as_a_number(self):
+    def test_a_nan_comes_back_with_every_bit_it_had(self):
         signalling = check.ROUND_F64_VALUES.index(0x7FF0000000000001)
-        self.assertEqual(self.judge(self.set_result(signalling, 0, 0x7FF8000000000001)), "")   # quieted
-        self.assertEqual(self.judge(self.set_result(signalling, 4, 0x7FF8000000000000)), "")   # sign and payload lost
-        self.assertIn("trunc of 0x7ff0000000000001 gave 0x7ff0000000000000",
-                      self.judge(self.set_result(signalling, 0, 0x7FF0000000000000)))          # an infinity
+        self.assertIn("trunc of 0x7ff0000000000001 gave 0x7ff8000000000001",              # quieted by a driver
+                      self.judge(self.set_result(signalling, 0, 0x7FF8000000000001)))
+        self.assertIn("trunc of 0xfff0000000000001", self.judge(self.set_result(signalling, 4, 0x7FF0000000000001)))
+        payload = check.ROUND_F64_VALUES.index(0x7FF8DEADBEEF1234)
+        self.assertIn("floor of 0x7ff8deadbeef1234", self.judge(self.set_result(payload, 3, 0x7FF8000000000000)))
         # A number does not come back as a NaN.
         self.assertIn("ceil of", self.judge(self.set_result(16, 1, 0x7FF8000000000000)))
 
-    def test_a_subnormal_may_be_read_as_a_zero_of_its_sign_and_nothing_else(self):
+    def test_a_subnormal_is_not_read_as_zero(self):
         sign = check.ROUND_F64_SIGN
-        self.assertEqual(self.judge(self.set_result(2, 1, 0)), "")              # ceil of +sub read as +0
-        self.assertEqual(self.judge(self.set_result(3, 3, sign)), "")           # floor of -sub read as -0
-        self.assertIn("ceil of 0x0000000000000001", self.judge(self.set_result(2, 1, sign)))
-        self.assertIn("floor of 0x8000000000000001", self.judge(self.set_result(3, 3, 0)))
+        self.assertIn("ceil of 0x0000000000000001 gave 0x0000000000000000, expected 0x3ff0000000000000",
+                      self.judge(self.set_result(2, 1, 0)))                  # a driver that flushes it
+        self.assertIn("floor of 0x8000000000000001 gave 0x8000000000000000, expected 0xbff0000000000000",
+                      self.judge(self.set_result(3, 3, sign)))
         self.assertIn("trunc of 0x0000000000000001", self.judge(self.set_result(2, 0, bits_of(1.0))))
 
     def test_everything_else_is_exact(self):

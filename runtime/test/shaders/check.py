@@ -485,14 +485,6 @@ ROUND_F64_SIGN = 1 << 63
 ROUND_F64_KEPT = 0xCAFEF00DDEADBEEF   # the pair an inactive lane keeps: 0xdeadbeef low, 0xcafef00d high
 
 
-def f64_is_nan(bits):
-    return bits & 0x7FF0000000000000 == 0x7FF0000000000000 and bits & 0x000FFFFFFFFFFFFF != 0
-
-
-def f64_is_subnormal(bits):
-    return bits & 0x7FF0000000000000 == 0 and bits & 0x000FFFFFFFFFFFFF != 0
-
-
 def round_f64(op, bits):
     """The binary64 pattern RDNA2 gives for `bits` rounded to an integral value by "trunc", "ceil", "rndne" or
     "floor" (docs/design.md): exact IEEE-754, a tie of rndne going to the even integer, the result keeping the
@@ -529,23 +521,17 @@ def round_f64_words():
 
 
 def round_f64_problem(got):
-    """Judge a readback of cs_w32_round_f64: "" or the first word that is wrong. Every result is exact except for
-    the two kinds of source Vulkan leaves to the driver's double-precision rounding: a NaN may come back as any NaN
-    (a signalling one comes back quiet on the drivers measured), and a subnormal may be read as a zero of its sign,
-    because the module does not declare DenormPreserve for 64 bits."""
+    """Judge a readback of cs_w32_round_f64: "" or the first word that is wrong, named by its op and source. Every
+    word is exact, the results of a NaN and of a subnormal included: the translated code rounds those two itself
+    and does not leave them to the driver's double-precision functions (docs/design.md)."""
     _, expected = round_f64_words()
     results = [result for thread in round_f64_results() for result in thread]
     for index, (op, source) in enumerate(results):
         value = got[2 * index] | got[2 * index + 1] << 32
         want = expected[2 * index] | expected[2 * index + 1] << 32
-        if value == want:
-            continue
-        if op is not None and f64_is_nan(source) and f64_is_nan(value):
-            continue
-        if op is not None and f64_is_subnormal(source) and value == round_f64(op, source & ROUND_F64_SIGN):
-            continue
-        what = "the pair an inactive lane keeps" if op is None else f"{op} of {source:#018x}"
-        return f"word {2 * index} (thread {index // 8}): {what} gave {value:#018x}, expected {want:#018x}"
+        if value != want:
+            what = "the pair an inactive lane keeps" if op is None else f"{op} of {source:#018x}"
+            return f"word {2 * index} (thread {index // 8}): {what} gave {value:#018x}, expected {want:#018x}"
     for index in range(2 * len(results), len(expected)):
         if got[index] != expected[index]:
             return f"word {index}: an input changed, expected {expected[index]:#010x}, got {got[index]:#010x}"

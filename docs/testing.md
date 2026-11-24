@@ -381,21 +381,25 @@ the largest finite value, the infinities, and quiet and signalling NaNs. Each th
 `v_trunc_f64` with a `neg` source, `v_ceil_f64` with an `abs` source, a `v_floor_f64` whose destination pair overlaps
 its source pair, and a `v_rndne_f64` run with the odd threads turned off, whose destination must keep the pair it
 held. The expected words come from Python (`round_f64` in `check.py`: exact IEEE-754, the result keeping its
-source's sign), and `tests/test_gpu_round_f64.py` checks that oracle against exact rational rounding. Two kinds of
-input are judged by what Vulkan lets a driver do, not by RDNA2: a NaN may come back as another NaN, and a subnormal
-may be read as a zero of its sign, because the module does not declare `DenormPreserve` for 64 bits. All 1152 heap
-words are judged, the 128 unchanged input words included. Run it alone with
+source's sign), and `tests/test_gpu_round_f64.py` checks that oracle against exact rational rounding. All 1152 heap
+words are compared exactly, the 128 unchanged input words included: a NaN and a subnormal are rounded by the
+translated code with integer ops and not by the driver, as the row in [design.md](design.md) says. Run it alone with
 `python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_round_f64 --require-pass`.
 It needs `shaderFloat64`; a device without it reports a skip.
 
-Measured: on an RTX 4070 Ti (NVIDIA 620.70.06, Linux) 497 of the 512 results are RDNA2's, and the other 15 are those
-of the two signalling NaNs, which come back quiet with sign and payload kept (`0x7ff0000000000001` gives
-`0x7ff8000000000001`). On llvmpipe (Mesa 26.2.6, LLVM 23.1.4) five more differ: the two smallest subnormals are read
-as zero, so `v_ceil_f64` of the positive one gives +0 instead of 1 and `v_floor_f64` of the negative one -0 instead
-of -1. Rules broken one at a time each failed the test on both devices: `rndne` lowered as `floor(x + 0.5)` (word
-20, the sign of -0), `trunc` or `ceil` lowered as `Floor`, the `neg` or the `abs` source modifier ignored (words 8 and
-26), the low result word taken from the high one (word 8), and the fixture without its `v_cmpx` (word 30). Replacing
-`RoundEven` by GLSL `Round` changed nothing on either device: both send a tie to the even integer.
+Measured: on an RTX 4070 Ti (NVIDIA 620.70.06, Linux) and on llvmpipe (Mesa 26.2.6, LLVM 23.1.4) all 1152 words
+match. While those two kinds of input still went to the driver's function, 15 of the 512 results differed on the
+4070 Ti, those of the two signalling NaNs, which came back quiet with sign and payload kept (`0x7ff0000000000001`
+gave `0x7ff8000000000001`), and five more on llvmpipe, which read the two smallest subnormals as zero (`v_ceil_f64`
+of the positive one gave +0 instead of 1, `v_floor_f64` of the negative one -0 instead of -1). Rules broken one at a
+time each failed the test on both devices: a NaN left to the driver (word 784), the NaN and subnormal tests ignoring
+the low dword, `v_ceil_f64` or `v_floor_f64` lifting the subnormal of the wrong sign (words 34 and 38), a subnormal's
+result losing its sign (word 40), a NaN's low word dropped (word 784), `rndne` lowered as `floor(x + 0.5)` (word 20,
+the sign of -0), `trunc` or `ceil` lowered as `Floor`, the `neg` or the `abs` source modifier ignored (words 8 and
+26), the two result words swapped (word 8), and the fixture without its `v_cmpx` (word 30). Two changes are not
+caught everywhere: a subnormal left to the driver fails on llvmpipe (word 34) and passes on the 4070 Ti, which keeps
+binary64 denormals, and `RoundEven` replaced by GLSL `Round` changes nothing on either device, since both send a tie
+to the even integer.
 
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
