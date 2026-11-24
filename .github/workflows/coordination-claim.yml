@@ -39,9 +39,10 @@ jobs:
           WORK_ID_RE = re.compile(ID_PATTERN)
           ID_LIST_RE = re.compile(rf"^({ID_PATTERN}(?:\s*,\s*{ID_PATTERN})*)(?![A-Za-z0-9-])")
           CLAIM_FIELD_RE = re.compile(
-              r"(?im)^\s*>?\s*Claimed in the coordination issue as:\s*(.*?)\s*$"
+              r"(?im)^[ \t]{0,128}>?[ \t]{0,128}Claimed in the coordination issue as:[ \t]{0,128}([^\r\n]{0,65536})[ \t]{0,128}$"
           )
           BACKTICK = chr(96)
+          MAX_CLAIM_BODY_CHARS = 65536
           
           
           def fail(message):
@@ -63,7 +64,8 @@ jobs:
                   with urllib.request.urlopen(request, timeout=20) as response:
                       return json.load(response)
               except urllib.error.HTTPError as error:
-                  fail(f"Cannot verify the claim against issue #14 (HTTP {error.code}).")
+                  detail = error.read().decode("utf-8", "replace")
+                  fail(f"Cannot verify the claim against issue #14 (HTTP {error.code}): {detail}")
               except (urllib.error.URLError, TimeoutError):
                   fail("Cannot reach GitHub to verify the claim against issue #14.")
           
@@ -232,13 +234,16 @@ jobs:
               return re.sub(pattern, replace_code_span, text)
 
           def ids_from_claim_comment(body):
-              lines = (body or "").splitlines()
+              body = body or ""
+              if len(body) > MAX_CLAIM_BODY_CHARS:
+                  return set()
+              lines = body.splitlines()
               found = set()
               for index, line in enumerate(lines):
-                  match = re.match(r"^\s*claiming:\s*(.*)$", line, re.IGNORECASE)
+                  match = re.match(r"^[ \t]{0,128}claiming:[ \t]{0,128}([^\r\n]{0,65536})$", line, re.IGNORECASE)
                   if not match:
                       continue
-                  tail = match.group(1).strip()
+                  tail = unwrap_work_id_code(match.group(1).strip())
                   listed = work_id_list(tail)
                   if listed:
                       found.update(ids_from_text(listed.group(1)))
@@ -256,8 +261,27 @@ jobs:
                   batch_ids = set()
                   batch_valid = True
                   while cursor < len(lines):
-                      bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[cursor])
+                      bullet = re.match(r"^[ \t]{0,128}[-*][ \t]{1,128}(.{1,512})[ \t]{0,128}$", lines[cursor])
                       if not bullet:
+                          stripped_bullet = lines[cursor].lstrip(" \t")
+                          if stripped_bullet.startswith(("-", "*")):
+                              candidate_text = stripped_bullet[1:].lstrip(" \t")
+                              candidate_inline = re.match(
+                                  "^" + re.escape(BACKTICK) + "([^" + BACKTICK + "]+)" + re.escape(BACKTICK),
+                                  candidate_text,
+                              )
+                              candidate_ids = (
+                                  ID_LIST_RE.match(candidate_inline.group(1).strip())
+                                  if candidate_inline else ID_LIST_RE.match(candidate_text)
+                              )
+                              if (
+                                  len(candidate_text) > 512
+                                  and (
+                                      candidate_ids
+                                      or re.match(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+", candidate_text)
+                                  )
+                              ):
+                                  batch_valid = False
                           break
                       bullet_text = unwrap_work_id_code(bullet.group(1))
                       first_ids = work_id_list(bullet_text)
@@ -274,6 +298,12 @@ jobs:
                               batch_valid = False
                           leading_id = re.match(rf"^{ID_PATTERN}", bullet_text)
                           if leading_id and re.match(r"^\s*,", bullet_text[leading_id.end():]):
+                              batch_valid = False
+                          malformed_id_suffix = re.match(
+                              r"^[A-Z0-9]+(?:-[A-Z0-9]+)+[A-Za-z0-9-]",
+                              bullet_text,
+                          )
+                          if malformed_id_suffix:
                               batch_valid = False
                           break
                       batch_ids.update(ids_from_text(first_ids.group(1)))
