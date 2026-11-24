@@ -319,9 +319,11 @@ class CheckNoGameData(unittest.TestCase):
 
     def test_outside_a_repository_is_one_stderr_line_and_exit_2(self):
         # GIT_CEILING_DIRECTORIES stops git from finding a repository above the temporary directory, and LC_ALL=C
-        # keeps git's message in English
+        # keeps git's message in English; a GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE of the caller would point git at a
+        # repository anyway (a git hook sets them), so they are removed
         self.write("notes.txt", b"plain text\n")
-        env = dict(os.environ, GIT_CEILING_DIRECTORIES=os.path.dirname(self.dir), LC_ALL="C")
+        env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+        env.update(GIT_CEILING_DIRECTORIES=os.path.dirname(self.dir), LC_ALL="C")
         result = run([], cwd=self.dir, env=env)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "")
