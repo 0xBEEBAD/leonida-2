@@ -1442,8 +1442,20 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
-                                                     *riid, &created);
+    HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, *riid, &created);
+    // The console list IID is not in the PC SDK, so the PC device rejects it (docs/retail_boot_chain.md §3.3).
+    // Retry once with the PC list IID and wrap the list under that IID.
+    if (hr == E_NOINTERFACE && !is_list_iid(*riid)) {
+        static std::atomic<bool> retried{false};
+        if (first_call(retried))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 73 console list IID not known to the PC device; retrying as "
+                                 "ID3D12GraphicsCommandList\n");
+        const IID pc_iid = __uuidof(ID3D12GraphicsCommandList);
+        created = nullptr;
+        hr = self->real->CreateCommandList(0, type, allocator, initial_state, pc_iid, &created);
+        if (FAILED(hr)) return hr;
+        return wrap_list(static_cast<IUnknown*>(created), self, &pc_iid, out);
+    }
     if (FAILED(hr)) return hr;
     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
 }
