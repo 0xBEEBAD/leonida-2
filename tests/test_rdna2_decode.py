@@ -91,6 +91,60 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 self.assertEqual(invalid, 0)
                 self.assertIn(op + " v1, v2, v3, v4", asm)
 
+    def test_vop2_and_vop3_legacy_mac_fmac_target_and_roundtrip(self):
+        # VOP2 0x06 and VOP3 0x106 are v_mac_legacy_f32 on gfx101* (console gfx1013) and v_fmac_legacy_f32 on gfx103*.
+        vop2_code = words((0x06 << 25) | (0 << 17) | (2 << 9) | (256 + 1))         # v0, v1, v2
+        vop3_code = words((0x35 << 26) | (0x106 << 16) | 0, (256 + 2) << 9 | (256 + 1))  # v0, v1, v2
+        for kind, code, suf in (("vop2", vop2_code, "_e32"), ("vop3", vop3_code, "_e64")):
+            for cpu, base in (("gfx1013", "v_mac_legacy_f32"), ("gfx1030", "v_fmac_legacy_f32")):
+                with self.subTest(kind=kind, cpu=cpu):
+                    ins, = rdna2_decode.decode_bytes(code, mcpu=cpu)["insns"]
+                    self.assertEqual(ins["op"], base + suf)
+                    asm, invalid, _ = shader_disasm.disasm(code, cpu, backend="python")
+                    self.assertEqual(invalid, 0)
+                    self.assertIn(f"{base}{suf} v0, v1, v2", asm)
+        # End-to-end gfx1013 binary -> python disasm -> rdna2spirv -> interpreter:
+        # v0 = 4.0; v1 = 2.0; v2 = 2.0; v_mac_legacy_f32 v0, v1, v2 -> 2.0 * 2.0 + 4.0 = 8.0 (0x41000000)
+        prog = words(
+            (0x3F << 25) | (0 << 17) | (1 << 9) | 246,   # v_mov_b32 v0, 4.0
+            (0x3F << 25) | (1 << 17) | (1 << 9) | 244,   # v_mov_b32 v1, 2.0
+            (0x3F << 25) | (2 << 17) | (1 << 9) | 244,   # v_mov_b32 v2, 2.0
+            (0x06 << 25) | (0 << 17) | (2 << 9) | 257,   # v_mac_legacy_f32_e32 v0, v1, v2
+            (0x3E << 26) | (1 << 12) | (1 << 11) | 0xF,  # exp mrt0 v0, v0, v0, v0 done vm
+            0,
+            0xBF810000,                                   # s_endpgm
+        )
+        asm, bad, _ = shader_disasm.disasm(prog, "gfx1013", backend="python")
+        self.assertEqual(bad, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm_dir = os.path.join(tmp, "disasm")
+            os.mkdir(disasm_dir)
+            with open(os.path.join(tmp, "ps_mac.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            src = os.path.join(disasm_dir, "ps_mac.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; ps_mac  code 0x0..0x1c (python), gfx1013, 0 invalid words\n" + asm)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                spv = rdna2spirv.translate(src)
+        self.assertEqual(list(si.run_fragment(spv)["%out_mrt0"]), [0x41000000] * 4)
+        # Negative control: disassembling the same binary for gfx1030 emits v_fmac_legacy_f32_e32,
+        # which rdna2spirv intentionally rejects as Unsupported (docs/design.md).
+        asm1030, bad1030, _ = shader_disasm.disasm(prog, "gfx1030", backend="python")
+        self.assertEqual(bad1030, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm_dir = os.path.join(tmp, "disasm")
+            os.mkdir(disasm_dir)
+            with open(os.path.join(tmp, "ps_fmac.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            src = os.path.join(disasm_dir, "ps_fmac.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; ps_fmac  code 0x0..0x1c (python), gfx1030, 0 invalid words\n" + asm1030)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    rdna2spirv.translate(src)
+
     def test_sopp_endpgm_branch_and_waitcnt(self):
         # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC;
         # s_branch -20 = 0xBF82FFEC; s_endpgm = 0xBF810000

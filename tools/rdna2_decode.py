@@ -589,6 +589,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         if entry is None:
             return None, 4
         name, spec = entry
+        if opc == 0x06 and mcpu.startswith("gfx101"):
+            name = "v_mac_legacy_f32"
         mods = []
         if is_dpp16 or is_dpp8 or is_sdwa:
             if not need(8):
@@ -931,6 +933,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         name, spec = entry
         if opc == 0x140 and mcpu.startswith("gfx101"):
             name = "v_mad_legacy_f32"
+        elif opc == 0x106 and mcpu.startswith("gfx101"):
+            name = "v_mac_legacy_f32"
         sdst = (w0 >> 8) & 0x7F
         abs_bits = 0 if is_vop3b else ((w0 >> 8) & 7)
         op_sel = 0 if is_vop3b else ((w0 >> 11) & 0xF)
