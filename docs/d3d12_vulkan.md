@@ -371,9 +371,8 @@ What is implemented (all of it testable without the game):
   SDK's `d3d12.h` by `tools/gen_d3d12_stubs.py`. The stub reports its name once, so the vtables follow the SDK
   order exactly and nothing derived from the SDK is checked in. Unknown IIDs are logged and refused. Resources
   are identified by their `ID3D12Resource` pointer, and RTV/DSV CPU handles point at a `TargetView`.
-  `OMSetFrontAndBackStencilRef` records its two `UINT`s on the list (and `Reset` clears them), but nothing applies
-  them yet: Vulkan can set the faces with `vkCmdSetStencilReference` and a face mask, but only a pipeline that
-  consumes the dynamic state can, and this layer has no pipeline or draw path.
+  `OMSetFrontAndBackStencilRef` records its two `UINT`s on the list (and `Reset` clears them); each draw sets them
+  with `vkCmdSetStencilReference` and a face mask.
 - **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
   proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
   work unchanged. It creates the objects above, plus:
@@ -831,7 +830,10 @@ The compute path, end to end:
     state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`).
     `d3d12_state_sweep_test` checks the mapping against the host on the same adapter: 482 full-screen draws over
     every blend factor pair, blend operation, write mask, comparison function and stencil operation, with the stencil
-    plane read back, are byte-identical on an RTX 5080 and a Radeon iGPU.
+    plane read back, are byte-identical on an RTX 5080 and a Radeon iGPU. Sixteen more build the PSO from a stream
+    with `DEPTH_STENCIL2` and different masks per face, front- and back-facing, with one reference or two
+    (`OMSetFrontAndBackStencilRef`): 498 in all, byte-identical on an RTX 5070 Ti (driver 617.42), and 6 of the 16
+    differ when the back face is given the front face's masks.
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.
@@ -2107,8 +2109,10 @@ The trace will enumerate them.
     a VS stream builds the same PSO as the classic call.
   - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
     tessellation or GS, CS with a graphics stage, or no stage at all.
-  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, separate front and back stencil
-    masks, view instancing.
+  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, view instancing.
+  - `DEPTH_STENCIL2`'s per-face read and write masks go to each face's `VkStencilOpState` (the front face's in the
+    description, the back face's beside it), so `OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported` is TRUE:
+    with `OMSetFrontAndBackStencilRef`'s per-face references, both of that cap's parts.
   - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.
 - **Mesh PSO:** the MS (`ms` index entry by FSSM hash) and PS on the mesh stage. It has no vertex input or input
   assembly; the input layout, topology type and strip cut are ignored, as D3D12 ignores them for mesh PSOs. Topology
