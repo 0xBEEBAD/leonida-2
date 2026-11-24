@@ -5749,7 +5749,8 @@ public:
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
         if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
         const auto start = reinterpret_cast<std::uintptr_t>(address);
-        if (!address || (start & 3) || !desc_.Width || alignment > UINT64_MAX / 2 ||
+        if (start & 3) return E_NOTIMPL;  // byte-unaligned copies keep the ordinary-buffer fallback
+        if (!address || !desc_.Width || alignment > UINT64_MAX / 2 ||
             (alignment & (alignment - 1)) || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
         // Keep the device-address word padding, and include the host page prefix in the backing buffer.
