@@ -74,7 +74,8 @@ jobs:
           )
           CLAIM_FIELD_HEADER_RE = re.compile(
               r"(?im)^[ \t]{0,128}>?[ \t]{0,128}Claimed in the coordination issue as:"
-          )          BACKTICK = chr(96)
+          )
+          BACKTICK = chr(96)
           MAX_CLAIM_BODY_CHARS = 65536
           MAX_CLAIM_VALUE_CHARS = 4096
           
@@ -823,7 +824,8 @@ jobs:
           )
           CLAIM_FIELD_HEADER_RE = re.compile(
               r"(?im)^[ \t]{0,128}>?[ \t]{0,128}Claimed in the coordination issue as:"
-          )          BACKTICK = chr(96)
+          )
+          BACKTICK = chr(96)
           MAX_CLAIM_BODY_CHARS = 65536
           MAX_CLAIM_VALUE_CHARS = 4096
           
