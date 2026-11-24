@@ -80,6 +80,64 @@ class Generation(unittest.TestCase):
         self.assertEqual(sum(1 for m in self.mutants if m.line == line and m.label == "OpIAdd -> OpISub"), 1)
         self.assertFalse(any(m.line == line and m.label == "OpISub -> OpIAdd" for m in self.mutants))
 
+    def test_docstrings_are_left_alone(self):
+        # A docstring is text: an OpIAdd/UMin named there can't fail a test, so a mutant of it always "survives".
+        source = textwrap.dedent('''\
+            class Gen:
+                def helper(self, x, y):
+                    """Emit OpIAdd, then UMin with self.cu(31)."""
+                    self.emit(f"{r} = OpIAdd %uint {x} {y}")
+
+                def multi(self, x):
+                    """First line.
+
+                    OpISub and NMin are named here too.
+                    """
+                    self.emit(f"{t} = OpExtInst %uint %glsl UMin {x} {self.cu(31)}")
+                    s = "OpISub in a plain string assignment is still code"
+            ''').split("\n")
+        for name, code_lines in (("helper", [4]), ("multi", [11, 12])):
+            first, last = sm.find_function(source, name)
+            lines = {m.line for m in sm.mutants_for(source, first, last)}
+            with self.subTest(function=name):
+                self.assertEqual(sorted(lines), code_lines)
+        # A --lines range can start or end inside a docstring, without its opening or closing delimiter.
+        inside = next(i for i, s in enumerate(source) if "OpISub and NMin" in s)       # 0-based
+        for first, last in ((inside, inside), (inside, inside + 2), (inside - 3, inside)):
+            with self.subTest(lines=(first + 1, last + 1)):
+                lines = {m.line for m in sm.mutants_for(source, first, last)}
+                self.assertEqual(sorted(lines), [n for n in (11,) if first < n <= last + 1])
+
+    def test_docstring_after_a_comment_with_quotes_and_concatenated_docstring(self):
+        # Two forms ast.get_docstring() accepts (@lixonik on #660): a `"""` in a comment before the docstring is no
+        # delimiter, and adjacent literals ("a " "b") are one docstring.
+        source = textwrap.dedent('''\
+            class Gen:
+                def f(self, x, y):
+                    # a comment with """ in it, and one with \'\'\' too
+                    """Start of the docstring.
+
+                    OpIAdd is named here.
+                    """
+                    self.emit(f"{r} = OpIAdd %uint {x} {y}")
+
+                def g(self, x, y):
+                    "OpIAdd is an example. " "Emit an instruction."
+                    self.emit(f"{r} = OpIAdd %uint {x} {y}")
+
+                def h(self, x, y):
+                    ("UMin is not a docstring here: the call reads it, so it is code. "
+                     "OpISub") and self.emit(f"{r} = OpIAdd %uint {x} {y}")
+            ''').split("\n")
+        named = next(i for i, s in enumerate(source) if "OpIAdd is named here" in s)
+        self.assertEqual(sm.mutants_for(source, named, named), [])
+        for name, code_lines in (("f", [8]), ("g", [12])):
+            first, last = sm.find_function(source, name)
+            with self.subTest(function=name):
+                self.assertEqual(sorted({m.line for m in sm.mutants_for(source, first, last)}), code_lines)
+        first, last = sm.find_function(source, "h")
+        self.assertIn(16, {m.line for m in sm.mutants_for(source, first, last)})   # still code: mutated
+
 
 class Tables(unittest.TestCase):
     def test_entry_takes_the_other_values_of_its_table(self):

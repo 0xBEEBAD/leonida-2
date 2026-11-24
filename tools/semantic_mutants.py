@@ -27,7 +27,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
+import tokenize
 from dataclasses import dataclass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -140,9 +142,85 @@ def find_function(lines: list[str], name: str) -> tuple[int, int]:
     raise LookupError(f"no method named {name}")
 
 
+def docstring_lines(lines: list[str]) -> set[int]:
+    """0-based lines that belong to a string standing alone as a statement (a docstring): text, not code, so a
+    mutant there can never fail a test. Empty when the lines do not tokenize."""
+    out: set[int] = set()
+    source = iter(line + "\n" for line in lines)
+    prev = tokenize.NEWLINE
+    try:
+        tokens = list(tokenize.generate_tokens(lambda: next(source, "")))
+    except (tokenize.TokenError, SyntaxError):
+        return out
+    for i, tok in enumerate(tokens):
+        if tok.type == tokenize.STRING and prev in (tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT):
+            # Adjacent literals are one string ("a " "b"), so the statement may go on with more of them.
+            rest = (t for t in tokens[i + 1:] if t.type not in (tokenize.COMMENT, tokenize.NL))
+            end, after = tok, next(rest, None)
+            while after is not None and after.type == tokenize.STRING:
+                end, after = after, next(rest, None)
+            if after is None or after.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+                out.update(range(tok.start[0] - 1, end.end[0]))
+        if tok.type not in (tokenize.COMMENT, tokenize.NL):
+            prev = tok.type
+    return out
+
+
+def open_triple_quote(line: str, open_: str | None) -> str | None:
+    """The triple-quote delimiter still open at the end of `line` (None when none), given the one open at its start.
+    Quotes in a comment or inside a one-line string do not count, nor does an escaped delimiter."""
+    i, n = 0, len(line)
+    while i < n:
+        if open_:
+            j = line.find(open_, i)
+            while j > 0 and (len(line[:j]) - len(line[:j].rstrip("\\"))) % 2 == 1:
+                j = line.find(open_, j + 1)        # \""" inside the string
+            if j < 0:
+                return open_
+            i, open_ = j + 3, None
+        elif line.startswith(('"""', "'''"), i):
+            open_, i = line[i:i + 3], i + 3
+        elif line[i] == "#":
+            return None
+        elif line[i] in "\"'":
+            j = i + 1
+            while j < n and line[j] != line[i]:
+                j += 2 if line[j] == "\\" else 1
+            i = j + 1
+        else:
+            i += 1
+    return open_
+
+
+def string_context(lines: list[str], first: int, last: int) -> tuple[int, int]:
+    """Widen [first, last] to whole triple-quoted strings, so a range that starts or ends inside a docstring (a
+    --lines span) is tokenized with both of its delimiters. Delimiters are followed from the enclosing def or class,
+    a text scan that stays cheap inside the translator's long dispatch method."""
+    top = first
+    while top > 0 and not re.match(r"\s*(async\s+def|def|class)\s", lines[top]):
+        top -= 1
+    open_, opened_at = None, first
+    for i in range(top, first):
+        before, open_ = open_, open_triple_quote(lines[i], open_)
+        if open_ and not before:
+            opened_at = i                               # a string that is still open at `first` began here
+    start = opened_at if open_ else first
+    end, open_ = last, None
+    for i in range(start, len(lines)):
+        open_ = open_triple_quote(lines[i], open_)
+        if i >= last and not open_:
+            end = i
+            break
+    return start, end
+
+
 def mutants_for(lines: list[str], first: int, last: int) -> list[Mutant]:
     out: list[Mutant] = []
     seen: set[tuple[int, str]] = set()
+    # Only the mutated range is tokenized (the whole translator takes seconds); dedented, a branch or method tokenizes.
+    start, end = string_context(lines, first, last)
+    span = textwrap.dedent("\n".join(lines[start:end + 1])).split("\n")
+    docs = {start + i for i in docstring_lines(span)}
 
     def add(i: int, label: str, new: str) -> None:
         if new != lines[i] and (i, new) not in seen:
@@ -150,6 +228,8 @@ def mutants_for(lines: list[str], first: int, last: int) -> list[Mutant]:
             out.append(Mutant(i + 1, label, lines[i], new))
 
     for i in range(first, last + 1):
+        if i in docs:
+            continue
         line = lines[i]
         code = line.split("#", 1)[0] if not line.lstrip().startswith(("f\"", "\"", "'")) else line
         if not code.strip() or code.lstrip().startswith("#"):
