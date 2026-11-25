@@ -341,7 +341,8 @@ measured over all 25,471 graphics records:
 - **`+0xbc` `DB_STENCIL_CONTROL`:** nonzero in 5,512 of the 6,213 records with stencil on, and in 2 without. The ops
   used are `KEEP`, `REPLACE_TEST`, `ADD_WRAP`, `ZERO` and `INVERT`.
 - **`+0xc0`/`+0xc4` `DB_STENCILREFMASK(_BF)`:** the two faces have the same read and write masks in every stencil
-  record, and `STENCILOPVAL` is 1 in all. 245 records use a back-face function of their own.
+  record, and `STENCILOPVAL` is 1 in all. `STENCILTESTVAL` (bits 7:0, the reference) is 0 in all 6,213 stencil records, front and
+  back, so the reference always comes from the title (`OMSetStencilRef`) and the PSO does not need it. 245 records use a back-face function of their own.
 
 `runtime/src/native_pso.h` (`decode_state_a_depth_raster`, `d3d12_depth_raster`) maps them to
 `D3D12_DEPTH_STENCIL_DESC` and the cull, front-face and depth-clip fields of `D3D12_RASTERIZER_DESC`, and
@@ -351,6 +352,8 @@ measured over all 25,471 graphics records:
 - **With the decoded state:** every one of the 25,471 records maps. A pipeline without a DSV keeps depth and stencil
   off.
 - **Not decoded:** depth bias (`PA_SU_POLY_OFFSET_*`). Its D3D12 units depend on the depth format, so it stays 0.
+  The polygon-offset enables in `PA_SU_SC_MODE_CNTL` are set in all 25,471 records. The values look like the floats at
+  `+0xac`/`+0xb0` (scale and offset), which are both 0 in 23,987 records and nonzero in about 1,480.
 - **Front face:** `FACE` is the only field whose effect can't be seen before a world frame. It maps to
   `FrontCounterClockwise = !FACE`, as RADV and PAL program it.
 
