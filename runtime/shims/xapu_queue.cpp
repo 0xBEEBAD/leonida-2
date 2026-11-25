@@ -1,6 +1,7 @@
 // xapu.dll: the console's audio processing unit (APU) command queue. No PC has one, so this keeps the queue the title
-// talks to - one result per accepted command, in command order, with the console's error codes - and decodes nothing:
-// an Opus packet's result carries the frame count its table-of-contents byte gives and silence in its output.
+// talks to - one result per accepted command, in command order, with the console's error codes. With
+// runtime/opus_decoder built (LEONIDA_HAVE_OPUS_DECODER) a process command decodes its Opus packet to PCM; without
+// it the result carries the frame count its table-of-contents byte gives and silence in its output.
 //
 // Read from the executable's call sites (counts in docs/runtime_imports.md, shapes in docs/audio_hal_exe_calls.md),
 // statically, never run:
@@ -35,10 +36,10 @@
 // stream out of range, or the stream already holding `commands_per_stream` results not dequeued) gives no result;
 // every other command gives one, with its error, if any, in the result.
 //
-// What this does not do: decode. A process command's frame count comes from the Opus packet's table-of-contents byte
+// Without runtime/opus_decoder a process command's frame count comes from the Opus packet's table-of-contents byte
 // (RFC 6716, section 3.1), clipped from first_frame, to frame_count and to what output_bytes holds, and that output
-// range is written with zeros. So the title sees streams advance at the right rate and its error checks pass, and the
-// audio stays silent until a decoder is wired in at fill_silence().
+// range is written with zeros, so the title sees streams advance at the right rate and the audio stays silent. With
+// the crate, fill() decodes the packet and writes its PCM instead.
 #include <windows.h>
 #include <intrin.h>
 
@@ -52,6 +53,10 @@
 #include <set>
 #include <string>
 #include <vector>
+
+#if defined(LEONIDA_HAVE_OPUS_DECODER)
+#include "leonida_opus_decoder.h"
+#endif
 
 #include "shims.h"
 #include "startup_trace.h"
@@ -75,7 +80,8 @@ constexpr uint32_t kReset = 5;  // 4 is notify; neither carries anything to do w
 
 constexpr uint32_t kSignalWhenDone = 0x1;  // CommandId::options: set the result event when the result is ready
 constexpr uint32_t kResultEvent = 0x8;     // ConnectInput::options: create an auto-reset event and hand it out
-// ConnectInput::options 0x4 asks for deinterleaved output; silence is the same zeros either way.
+constexpr uint32_t kDeinterleavedOutput = 0x4;  // ConnectInput::options: split stereo into two planes
+constexpr uint32_t kOpusSampleRate = 48000;
 
 constexpr uint32_t kMaxStreams = 500;
 constexpr uint32_t kMaxCommandsPerStream = 16;
@@ -150,12 +156,16 @@ struct Stream {
     bool active = false;
     uint32_t channels = 0;
     uint32_t pending = 0;  // results queued and not dequeued
+#if defined(LEONIDA_HAVE_OPUS_DECODER)
+    LeonidaOpusDecoder* decoder = nullptr;
+#endif
 };
 
 struct Connection {
     void* memory = nullptr;
     HANDLE event = nullptr;
     uint32_t commands_per_stream = 0;
+    bool deinterleaved = false;
     std::mutex mutex;
     std::vector<Stream> streams;
     std::deque<Result> results;
@@ -180,7 +190,7 @@ void note(const char* api, uint64_t value, const void* caller) {
 }
 
 // Samples per channel at 48 kHz in one Opus packet, from its table-of-contents byte and frame count code (RFC 6716,
-// section 3.1); 0 for a packet that is not valid.
+// section 3.1); 0 for a packet that is not valid. The no-decoder path counts frames this way.
 uint32_t opus_packet_frames(const uint8_t* packet, uint32_t bytes) {
     if (!packet || bytes == 0) return 0;
     static constexpr uint32_t kSilk[4] = {480, 960, 1920, 2880};  // 10, 20, 40, 60 ms
@@ -202,8 +212,9 @@ uint32_t opus_packet_frames(const uint8_t* packet, uint32_t bytes) {
     return count * per_frame;
 }
 
-// Fills a process command's result. The decoder belongs here: today the frames are counted, not decoded.
-void fill_silence(const Stream& stream, const ProcessCommand& c, Result& r) {
+// Fills a process command's result: the packet's PCM when runtime/opus_decoder is built, silence (with the frame
+// count from the table-of-contents byte) otherwise.
+void fill(Connection& connection, Stream& stream, const ProcessCommand& c, Result& r) {
     r.input = c.input;
     r.input_bytes = c.input_bytes;
     r.output = c.output;
@@ -211,6 +222,46 @@ void fill_silence(const Stream& stream, const ProcessCommand& c, Result& r) {
         r.error = E_INVALIDARG;
         return;
     }
+#if defined(LEONIDA_HAVE_OPUS_DECODER)
+    if (stream.decoder) {
+        const uint32_t channels = leonida_opus_decoder_channels(stream.decoder);
+        if (channels == 0) {
+            r.error = kInvalidStream;
+            return;
+        }
+        std::vector<float> pcm;
+        try {
+            pcm.resize(size_t(kMaxFrames) * channels);
+        } catch (...) {
+            r.error = E_OUTOFMEMORY;
+            return;
+        }
+        uint32_t decoded = 0;
+        if (leonida_opus_decode_packet(stream.decoder, c.input, c.input_bytes, pcm.data(), kMaxFrames, &decoded) !=
+            LEONIDA_OPUS_OK) {
+            r.error = kBadPacket;
+            return;
+        }
+        const uint32_t first = c.first_frame < decoded ? c.first_frame : decoded;
+        uint32_t frames = decoded - first;
+        if (frames > c.frame_count) frames = c.frame_count;
+        const uint32_t room = c.output_bytes / (4 * channels);
+        if (frames > room) frames = room;
+        const uint32_t bytes = frames * channels * 4;
+        if (connection.deinterleaved && channels == 2) {
+            float* out = reinterpret_cast<float*>(c.output);
+            for (uint32_t i = 0; i < frames; ++i) {
+                out[i] = pcm[(first + i) * 2];
+                out[frames + i] = pcm[(first + i) * 2 + 1];
+            }
+        } else if (bytes != 0) {
+            std::memcpy(c.output, pcm.data() + first * channels, bytes);
+        }
+        r.frames = frames;
+        r.output_bytes = bytes;
+        return;
+    }
+#endif
     const uint32_t decoded = opus_packet_frames(c.input, c.input_bytes);
     if (decoded == 0) {
         r.error = kBadPacket;
@@ -266,17 +317,26 @@ HRESULT __stdcall XApuConnect(const ConnectInput* input, ConnectOutput* output, 
         }
     }
     c->commands_per_stream = in.commands_per_stream;
+    c->deinterleaved = (in.options & kDeinterleavedOutput) != 0;
     const ConnectOutput o{c->memory, c->event};
     std::memcpy(output, &o, sizeof(o));
     *out = c;
-    std::fprintf(stderr, "[rt] xapu: connected for Opus decoding, %u streams; packets are counted, not decoded\n",
+#if defined(LEONIDA_HAVE_OPUS_DECODER)
+    std::fprintf(stderr, "[rt] xapu: connected for Opus decoding, %u streams; packets decoded\n", in.streams);
+#else
+    std::fprintf(stderr, "[rt] xapu: connected for Opus decoding, %u streams; packets counted, not decoded\n",
                  in.streams);
+#endif
     return S_OK;
 }
 
 HRESULT __stdcall XApuDisconnect(Connection* c, uint32_t /*0x20 at the measured site*/) {
     note("XApuDisconnect", 0, _ReturnAddress());
     if (!c) return E_INVALIDARG;
+#if defined(LEONIDA_HAVE_OPUS_DECODER)
+    for (Stream& s : c->streams)
+        if (s.decoder) leonida_opus_decoder_destroy(s.decoder);
+#endif
     if (c->event) CloseHandle(c->event);
     VirtualFree(c->memory, 0, MEM_RELEASE);
     delete c;
@@ -308,14 +368,31 @@ HRESULT __stdcall XApuEnqueueCommand(Connection* c, const void* command, uint32_
         } else {
             stream.active = true;
             stream.channels = a.channels;
+#if defined(LEONIDA_HAVE_OPUS_DECODER)
+            if (leonida_opus_decoder_create(kOpusSampleRate, a.channels, &stream.decoder) != LEONIDA_OPUS_OK) {
+                stream.active = false;
+                stream.channels = 0;
+                r.error = E_INVALIDARG;
+            }
+#endif
         }
     } else if (id.kind == kDeactivate) {
         stream.active = false;
+#if defined(LEONIDA_HAVE_OPUS_DECODER)
+        if (stream.decoder) {
+            leonida_opus_decoder_destroy(stream.decoder);
+            stream.decoder = nullptr;
+        }
+#endif
+    } else if (id.kind == kReset) {
+#if defined(LEONIDA_HAVE_OPUS_DECODER)
+        if (stream.decoder) leonida_opus_decoder_reset(stream.decoder);
+#endif
     } else if (id.kind == kProcess) {
         ProcessCommand p;
         std::memcpy(&p, command, sizeof(p));
         if (!stream.active) r.error = kInvalidStream;
-        else fill_silence(stream, p, r);
+        else fill(*c, stream, p, r);
     }
     try {
         c->results.push_back(r);

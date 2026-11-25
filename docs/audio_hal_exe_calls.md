@@ -67,8 +67,10 @@ which runs the retail executable through these calls. Only the facts are used (s
 | `XApuDisconnect`: the handle, then `0x20` | the second argument is not read |
 
 What the results carry is the shim's own: each accepted command gets one result in command order, with the error codes
-of the layout, and a process result carries the frame count of the Opus packet's table-of-contents byte (RFC 6716,
-section 3.1) with zeros in its output. Nothing is decoded, so the audio stays silent. `xapu_chad_test` covers both DLLs.
+of the layout. A process result carries the frame count and PCM when `runtime/opus_decoder` is built, and otherwise the
+frame count of the Opus packet's table-of-contents byte (RFC 6716, section 3.1) with zeros in its output (silence).
+`xapu_chad_test` covers the layouts and the silent path; `xapu_opus_test` covers the decoded path with a generated
+packet.
 
 ## `xg_xs.dll` and `XCRDAPI.dll`
 
