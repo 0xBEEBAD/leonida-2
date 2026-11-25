@@ -6,6 +6,9 @@
 // LEONIDA_SAMPLE_REPORT_S seconds (10) one block lists the busiest threads (CPU share) and the most frequent call
 // chains (up to eight frames, innermost first): title frames as t+RVA of the function, others as module+RVA. Nothing is
 // allocated or logged while a thread is suspended, so a suspended thread's locks are never waited for.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <tlhelp32.h>
 

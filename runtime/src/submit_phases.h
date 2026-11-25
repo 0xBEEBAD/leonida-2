@@ -5,6 +5,9 @@
 // milliseconds per submission of each phase with the largest single one, and the share of the wall time the
 // submitting threads spent in them. The time is the process's age (GetProcessTimes), so it lines up with the boot.
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 #include <atomic>
