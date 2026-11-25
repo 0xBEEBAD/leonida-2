@@ -438,7 +438,7 @@ def main(argv=None) -> int:
 
     def one(job):
         entry, name, code, start, end = job
-        asm, invalid, err = disasm.disasm(code, a.mcpu, wave32=entry.get("wave32", True))
+        asm, invalid, err = disasm.disasm(code, a.mcpu, wave32=entry.get("wave32", True), compute=True)
         entry["invalid_words"] = invalid
         with open(os.path.join(disasm_dir, name + ".s"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
