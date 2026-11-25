@@ -15080,6 +15080,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
 #endif
+    // Under its own guard only: headers or a driver without VK_KHR_maintenance8 still have the A8 path, and
+    // a8_render_target is never set without this extension being enabled.
 #ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
     if (info.a8_render_target) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 #endif

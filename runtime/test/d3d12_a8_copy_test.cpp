@@ -10,7 +10,11 @@
 //     wraps vkCreateImage and vkCmdCopyImage behind the instance-proc pointer it hands the layer, so it sees this
 //     without the validation layer; with LEONIDA_VK_VALIDATION=1 and the layer installed, the layer's errors also
 //     fail it;
-//   - the same-backing copies (A8 -> A8, R8 -> R8) are the controls and still copy image to image.
+//   - the same-backing copies (A8 -> A8, R8 -> R8) are the controls and still copy image to image;
+//   - a device without the A8 path (a8_render_target false, which VK_KHR_maintenance5 not being enabled means)
+//     takes the documented fallback: A8_UNORM render targets refused, other A8_UNORM textures R8_UNORM images that
+//     copy as before. tests/test_vulkan_extension_guards.py checks that the extension is enabled wherever the path
+//     is taken.
 // Synthetic data only.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -290,7 +294,46 @@ int main() {
             ++failures;
         }
     } else {
-        std::printf("A8 render targets: not on this device, only the R8-backed copies below run\n");
+        std::printf("A8 render targets: not on this device, only the fallback below runs\n");
+    }
+
+    // The documented fallback of a device without VK_FORMAT_A8_UNORM_KHR (or without VK_KHR_maintenance5 enabled,
+    // a8_render_target false; forced here on any device): A8_UNORM render targets are refused at creation and in
+    // the format support, and every other A8_UNORM texture is an R8_UNORM image that copies as before.
+    {
+        Ref<ID3D12Device> device;
+        if (!make_device(vk, false, device)) return 1;
+        const unsigned a8_before = a8_images;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{DXGI_FORMAT_A8_UNORM};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+            !(support.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) ||
+            (support.Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE))) {
+            std::fprintf(stderr, "fallback: A8_UNORM format support 0x%08x (want TEXTURE2D, no RENDER_TARGET or "
+                                 "BLENDABLE)\n", unsigned(support.Support1));
+            ++failures;
+        }
+        const D3D12_RESOURCE_ALLOCATION_INFO size = device->GetResourceAllocationInfo(0, 1, &target);
+        const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        Ref<ID3D12Resource> refused;
+        const HRESULT hr = device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &target,
+                                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                           IID_PPV_ARGS(&refused.p));
+        if (SUCCEEDED(hr) || refused.p || size.SizeInBytes != UINT64_MAX) {
+            std::fprintf(stderr, "fallback: an A8_UNORM render target was not refused (hr 0x%08lx, size %llu)\n",
+                         static_cast<unsigned long>(hr), static_cast<unsigned long long>(size.SizeInBytes));
+            ++failures;
+        } else {
+            std::printf("fallback: A8_UNORM render target refused (hr 0x%08lx), format support 0x%08x\n",
+                        static_cast<unsigned long>(hr), unsigned(support.Support1));
+        }
+        if (!copy_case(device.p, "fallback: CopyResource A8 texture -> A8 texture", plain, plain, true) ||
+            !copy_case(device.p, "fallback: CopyTextureRegion A8 texture -> A8 texture (3x3 box)", plain, plain,
+                       false))
+            ++failures;
+        if (a8_images != a8_before) {
+            std::fprintf(stderr, "fallback: %u VK_FORMAT_A8_UNORM_KHR images created\n", a8_images - a8_before);
+            ++failures;
+        }
     }
 
     if (unknown_copies) {
