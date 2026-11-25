@@ -163,8 +163,11 @@ extern "C" __declspec(allocate(".CRT$XCT")) void(__cdecl* const gta6rt_reserve_t
 
 // Select the settings used to display the offline first-run UI. Keep explicit caller settings.
 bool configure_first_run_ui(const std::filesystem::path& package, std::filesystem::path& overlay) {
+    // A variable that is set but empty is not a setting: Windows cannot hold one, but a caller on Wine can pass one
+    // (NAME= in the environment), and asking for the size alone reports it as present there.
     const auto set_default = [](const wchar_t* name, const wchar_t* value) {
-        return GetEnvironmentVariableW(name, nullptr, 0) != 0 || _wputenv_s(name, value) == 0;
+        wchar_t first[2]{};
+        return GetEnvironmentVariableW(name, first, 2) != 0 || _wputenv_s(name, value) == 0;
     };
     const struct { const wchar_t* name; const wchar_t* value; } settings[] = {
         {L"LEONIDA_D3D12", L"vulkan"}, {L"LEONIDA_ARENA_MB", L"2048"},
