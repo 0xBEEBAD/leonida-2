@@ -304,8 +304,9 @@ The biggest open pieces:
 - **World start**: the story load finishes, but no world frame has been verified yet;
   [Where it stops](docs/linux_proton.md#where-it-stops) lists what stops it.
 - **Shader translator on hardware**: compute, mesh and geometry now translate (see the translator contract in
-  [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
-  unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
+  [docs/design.md](docs/design.md)); still open is wave64 cross-half code in VS/PS/GS on 32-wide subgroups. The
+  vertex-shader input layout is measured: all 2,236 VS are legacy (non-NGG), with `v0` = `VertexIndex` (the
+  *Inputs and outputs* row of [docs/design.md](docs/design.md)).
 - **Xbox D3D12 → Vulkan**: mesh-shader draws, indirect draw state and stream output are still open; #313 tracks the
   remaining method surface. The Windows integration exercises the first-run UI. [Plan and status](docs/d3d12_vulkan.md)
 - **Model recovery**: investigate the 71 unrecovered fragment candidates in [`levels.rpf`](docs/models.md#full-archive-re-count-at-e293917).
