@@ -13,9 +13,12 @@
 //   2. `matching_producer`: an in-flight WriteGroup whose final write to a waited address can satisfy an unmet wait, and
 //      every pending gate preceding that WriteGroup is cycle-free with respect to the waiting queue;
 //   3. `active_work`: unrelated unblocked GPU work (a WriteGroup or action gate with no pending gate ahead of it) is
-//      still executing, paused only up to a finite cap so a continuously streaming queue cannot starve an unmodelled wait.
-// - `GateTimeoutState` tracks idle wait time (`elapsed_us`) separately from paused time, expiring only once `elapsed_us`
-//   reaches `budget_us`.
+//      still executing, paused only up to `active_pause_cap_us` so a continuously streaming queue cannot starve an
+//      unmodelled wait.
+// - `GateTimeoutState` tracks idle wait time (`elapsed_us`) separately from paused time, expiring once `elapsed_us`
+//   reaches `budget_us`. Every pause reason (`releaser_busy` and `matching_producer` included) is bounded by a finite
+//   `max_pause_cap_us` so a producer stuck behind an untracked dependency (e.g. a title fence wait or a hung Signal)
+//   still expires instead of hanging forever, and demoted (`cut_short`) gates scale both caps with their short budget.
 //
 // Pure C++20 standard library only.
 
@@ -61,14 +64,35 @@ struct PendingGate {
     std::span<const WaitPredicate> unmet_waits;  // waits not currently satisfied in memory (empty for action gates)
 };
 
-// Default cap on pausing solely for unrelated unblocked GPU work: 300x the idle timeout, clamped to [1 s, 10 min].
-// At the default 200 ms timeout this allows up to 60 s for slow world-phase frames while preventing an unrelated
-// continuously streaming queue from starving an unmodelled wait indefinitely.
-inline constexpr std::uint64_t default_active_pause_cap_us(unsigned full_timeout_ms) {
-    const std::uint64_t base_ms = full_timeout_ms ? std::uint64_t{full_timeout_ms} : 1u;
-    const std::uint64_t scaled_ms = base_ms > 2000u ? 600000u : base_ms * 300u;
-    const std::uint64_t clamped_ms = scaled_ms < 1000u ? 1000u : (scaled_ms > 600000u ? 600000u : scaled_ms);
-    return clamped_ms * 1000u;
+struct PauseCaps {
+    std::uint64_t active_us = 0;  // cap on pausing solely for unrelated active_work
+    std::uint64_t max_us = 0;     // hard finite cap across ALL pause reasons (releaser_busy, matching_producer, active_work)
+};
+
+// Pause caps scaled with the gate's own timeout budget (`gate_timeout_ms`) and demotion state (`cut_short`):
+// - Normal gates: `active_us = 300x` and `max_us = 1500x` of `gate_timeout_ms`, capped at 10 min. At the default
+//   200 ms timeout this allows up to 60 s for unrelated GPU work and up to 300 s (5 min) while the releaser or an
+//   acyclic matching producer is working (covering multi-minute world-phase pipeline builds), while guaranteeing a
+//   finite exit if a producer is held behind an untracked dependency (title fence wait or stuck Signal).
+// - Demoted (`cut_short`) gates: `active_us = 1x` and `max_us = 4x` of `gate_timeout_ms` (4 ms / 16 ms at the 4 ms
+//   demoted budget), so an unmodelled wait only pays a few milliseconds instead of inheriting the full timeout's cap.
+inline constexpr PauseCaps default_pause_caps(unsigned gate_timeout_ms, bool cut_short = false) {
+    constexpr std::uint64_t kMaxCapMs = 600000u;  // 10 min hard ceiling
+    const std::uint64_t base_ms = gate_timeout_ms ? std::uint64_t{gate_timeout_ms} : 1u;
+    const auto scale_ms = [base_ms](std::uint64_t mult) -> std::uint64_t {
+        return base_ms > kMaxCapMs / mult ? kMaxCapMs : base_ms * mult;
+    };
+    const std::uint64_t active_ms = cut_short ? (base_ms < kMaxCapMs ? base_ms : kMaxCapMs) : scale_ms(300u);
+    const std::uint64_t max_ms = cut_short ? scale_ms(4u) : scale_ms(1500u);
+    return {active_ms * 1000u, max_ms * 1000u};
+}
+
+inline constexpr std::uint64_t default_active_pause_cap_us(unsigned gate_timeout_ms, bool cut_short = false) {
+    return default_pause_caps(gate_timeout_ms, cut_short).active_us;
+}
+
+inline constexpr std::uint64_t default_max_pause_cap_us(unsigned gate_timeout_ms, bool cut_short = false) {
+    return default_pause_caps(gate_timeout_ms, cut_short).max_us;
 }
 
 struct GateTimeoutState {
@@ -76,27 +100,40 @@ struct GateTimeoutState {
     std::uint64_t elapsed_us = 0;
     std::uint64_t active_paused_us = 0;
     std::uint64_t active_pause_cap_us = 0;
+    std::uint64_t total_paused_us = 0;
+    std::uint64_t max_pause_cap_us = 0;
     bool paused_ever = false;
 
-    void reset(std::uint64_t budget, std::uint64_t active_cap) {
+    void reset(std::uint64_t budget, std::uint64_t active_cap, std::uint64_t max_cap) {
         budget_us = budget;
         elapsed_us = 0;
         active_paused_us = 0;
-        active_pause_cap_us = active_cap;
+        total_paused_us = 0;
+        max_pause_cap_us = max_cap;
+        active_pause_cap_us = active_cap < max_cap ? active_cap : max_cap;
         paused_ever = false;
     }
 
     // Advances the gate by `dt_us` under `reason`. Returns true once the idle timeout budget is exhausted.
+    // Every pause reason is bounded by `max_pause_cap_us`; unrelated `active_work` is additionally bounded by
+    // `active_pause_cap_us`.
     bool advance(std::uint64_t dt_us, PauseReason reason) {
+        std::uint64_t room = 0;
         if (reason == PauseReason::releaser_busy || reason == PauseReason::matching_producer) {
-            paused_ever = true;
-            return false;
+            room = total_paused_us < max_pause_cap_us ? max_pause_cap_us - total_paused_us : 0u;
+        } else if (reason == PauseReason::active_work) {
+            const std::uint64_t total_room =
+                total_paused_us < max_pause_cap_us ? max_pause_cap_us - total_paused_us : 0u;
+            const std::uint64_t active_room =
+                active_paused_us < active_pause_cap_us ? active_pause_cap_us - active_paused_us : 0u;
+            room = total_room < active_room ? total_room : active_room;
         }
-        if (reason == PauseReason::active_work && active_paused_us < active_pause_cap_us) {
+        if (room > 0) {
+            if (dt_us == 0) return false;
             paused_ever = true;
-            const std::uint64_t room = active_pause_cap_us - active_paused_us;
             const std::uint64_t absorb = dt_us < room ? dt_us : room;
-            active_paused_us += absorb;
+            total_paused_us += absorb;
+            if (reason == PauseReason::active_work) active_paused_us += absorb;
             dt_us -= absorb;
         }
         if (dt_us > UINT64_MAX - elapsed_us)

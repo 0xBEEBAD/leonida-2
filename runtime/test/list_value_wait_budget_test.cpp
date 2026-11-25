@@ -1,8 +1,10 @@
 // Portable CPU-only unit tests for runtime/src/list_value_wait_budget.h (RT-LIST-VALUE-WAIT-WORK-AWARE-TIMEOUT):
-// work-aware timeout pausing, cycle detection across multi-queue write/gate chains, overwrite-aware write matching,
-// action gates, and bounded unrelated-work pausing. No Windows, D3D12, or Vulkan headers; no game files.
+// work-aware timeout pausing, finite pause caps across all pause reasons (including releaser_busy and
+// matching_producer), demoted-gate cap scaling, cycle detection across multi-queue write/gate chains, overwrite-aware
+// write matching, action gates, and a mock Pump tick driver. No Windows, D3D12, or Vulkan headers; no game files.
 #include "../src/list_value_wait_budget.h"
 
+#include <climits>
 #include <cstdio>
 #include <vector>
 
@@ -48,7 +50,8 @@ int main() {
         CHECK(pause_reason(false, {}, gates, 0, test_met) == PauseReason::none);
 
         GateTimeoutState t;
-        t.reset(200'000, default_active_pause_cap_us(200));
+        const PauseCaps caps = default_pause_caps(200, false);
+        t.reset(200'000, caps.active_us, caps.max_us);
         CHECK(!t.advance(100'000, PauseReason::none));
         CHECK(t.elapsed_us == 100'000 && !t.paused_ever);
         CHECK(!t.advance(99'999, PauseReason::none));
@@ -56,20 +59,32 @@ int main() {
         CHECK(t.elapsed_us == 200'000);
     }
 
-    // 2. Releaser actively executing held work pauses the timeout clock indefinitely without burning idle budget.
+    // 2. Releaser actively executing held work pauses the timeout clock (covering multi-minute world-phase pipeline
+    //    builds without burning idle budget), yet still expires at the finite max_pause_cap_us if a Signal hangs.
     {
         const WaitPredicate waits[] = {{0x1000, 5, 7, true}};
         const PendingGate gates[] = {{q1, 1, false, waits}};
         CHECK(pause_reason(true, {}, gates, 0, test_met) == PauseReason::releaser_busy);
 
         GateTimeoutState t;
-        t.reset(200'000, default_active_pause_cap_us(200));
-        // 30 seconds of releaser executing shadow/texture copies burns 0 us of idle timeout budget.
-        for (int i = 0; i < 30; ++i) CHECK(!t.advance(1'000'000, PauseReason::releaser_busy));
-        CHECK(t.elapsed_us == 0 && t.paused_ever);
+        const PauseCaps caps = default_pause_caps(200, false);
+        CHECK(caps.active_us == 60'000'000ull && caps.max_us == 300'000'000ull);
+        t.reset(200'000, caps.active_us, caps.max_us);
+        // 120 seconds of releaser executing pipeline builds/copies burns 0 us of idle timeout budget.
+        for (int i = 0; i < 120; ++i) CHECK(!t.advance(1'000'000, PauseReason::releaser_busy));
+        CHECK(t.elapsed_us == 0 && t.total_paused_us == 120'000'000ull && t.paused_ever);
         // Once idle again, still gets its full 200 ms budget before expiring.
         CHECK(!t.advance(199'000, PauseReason::none));
         CHECK(t.advance(1'000, PauseReason::none));
+
+        // Hung Signal (releaser_busy forever) hits the finite max_pause_cap_us and then drains budget_us.
+        GateTimeoutState hung;
+        hung.reset(200'000, caps.active_us, caps.max_us);
+        for (int i = 0; i < 300; ++i) CHECK(!hung.advance(1'000'000, PauseReason::releaser_busy));
+        CHECK(hung.total_paused_us == 300'000'000ull && hung.elapsed_us == 0);
+        CHECK(!hung.advance(199'000, PauseReason::releaser_busy));
+        CHECK(hung.advance(1'000, PauseReason::releaser_busy));
+        CHECK(hung.elapsed_us == 200'000);
     }
 
     // 3. Matching unblocked producer write on another queue (Wait-before-Signal) -> PauseReason::matching_producer.
@@ -193,31 +208,70 @@ int main() {
         CHECK(pause_reason(false, {}, blocked_action, 0, test_met) == PauseReason::none);
     }
 
-    // 9. Bounded unrelated active_work pause: pauses up to active_pause_cap_us, then drains idle budget_us cleanly.
+    // 9. Bounded pause caps: active_work, matching_producer, releaser_busy, combined alternating reasons, and
+    //    demoted-gate cap scaling.
     {
-        CHECK(default_active_pause_cap_us(200) == 60'000'000ull);   // 60 s at default 200 ms
-        CHECK(default_active_pause_cap_us(1) == 1'000'000ull);      // 1 s floor
-        CHECK(default_active_pause_cap_us(30000) == 600'000'000ull);  // 10 min ceiling
+        CHECK(default_active_pause_cap_us(200) == 60'000'000ull);
+        CHECK(default_max_pause_cap_us(200) == 300'000'000ull);
+        CHECK(default_active_pause_cap_us(30) == 9'000'000ull);
+        CHECK(default_max_pause_cap_us(30) == 45'000'000ull);
+        CHECK(default_active_pause_cap_us(1) == 300'000ull);
+        CHECK(default_max_pause_cap_us(1) == 1'500'000ull);
+        CHECK(default_active_pause_cap_us(30000) == 600'000'000ull);
+        CHECK(default_max_pause_cap_us(30000) == 600'000'000ull);
+        CHECK(default_active_pause_cap_us(UINT_MAX) == 600'000'000ull);
+        CHECK(default_max_pause_cap_us(UINT_MAX) == 600'000'000ull);
 
+        // Demoted (cut_short) gates scale caps with their short 4 ms budget instead of inheriting 60 s / 300 s.
+        const PauseCaps dem = default_pause_caps(4, true);
+        CHECK(dem.active_us == 4'000ull && dem.max_us == 16'000ull);
+        GateTimeoutState dem_active;
+        dem_active.reset(4'000, dem.active_us, dem.max_us);
+        CHECK(!dem_active.advance(4'000, PauseReason::active_work));  // absorbs 4 ms cap
+        CHECK(dem_active.active_paused_us == 4'000 && dem_active.elapsed_us == 0);
+        CHECK(!dem_active.advance(3'999, PauseReason::active_work));
+        CHECK(dem_active.advance(1, PauseReason::active_work));       // expires at 8 ms total, not 60 s!
+
+        GateTimeoutState dem_prod;
+        dem_prod.reset(4'000, dem.active_us, dem.max_us);
+        CHECK(!dem_prod.advance(16'000, PauseReason::matching_producer));
+        CHECK(dem_prod.total_paused_us == 16'000 && dem_prod.elapsed_us == 0);
+        CHECK(dem_prod.advance(4'000, PauseReason::matching_producer));  // expires at 20 ms total
+
+        // Normal gate active_work cap (5 s) vs larger max cap (20 s).
         GateTimeoutState t;
-        t.reset(200'000, 5'000'000);  // 200 ms budget, 5 s unrelated-work cap
-        // 5 full seconds of unrelated active work exhausts the pause cap, leaving 0 elapsed.
+        t.reset(200'000, 5'000'000, 20'000'000);
         for (int i = 0; i < 5; ++i) CHECK(!t.advance(1'000'000, PauseReason::active_work));
-        CHECK(t.active_paused_us == 5'000'000 && t.elapsed_us == 0 && t.paused_ever);
-        // Next 200 ms of unrelated work now counts against idle budget and expires the gate.
+        CHECK(t.active_paused_us == 5'000'000 && t.total_paused_us == 5'000'000 && t.elapsed_us == 0 && t.paused_ever);
         CHECK(!t.advance(199'000, PauseReason::active_work));
         CHECK(t.advance(1'000, PauseReason::active_work));
         CHECK(t.elapsed_us == 200'000);
 
-        // Partial step straddling the cap splits cleanly between active_paused_us and elapsed_us.
+        // Stuck matching_producer + alternating releaser_busy share total_paused_us <= max_pause_cap_us.
+        GateTimeoutState stuck;
+        stuck.reset(200'000, 2'000'000, 10'000'000);
+        CHECK(!stuck.advance(2'000'000, PauseReason::active_work));        // total = 2 s
+        CHECK(!stuck.advance(5'000'000, PauseReason::matching_producer));  // total = 7 s
+        CHECK(!stuck.advance(3'100'000, PauseReason::releaser_busy));      // 3 s paused (hits 10 s cap), 100 ms elapsed
+        CHECK(stuck.total_paused_us == 10'000'000 && stuck.elapsed_us == 100'000);
+        CHECK(!stuck.advance(99'999, PauseReason::matching_producer));
+        CHECK(stuck.advance(1, PauseReason::matching_producer));
+        CHECK(stuck.elapsed_us == 200'000);
+
+        // Partial step straddling active_pause_cap_us splits cleanly between active_paused_us and elapsed_us.
         GateTimeoutState t2;
-        t2.reset(200'000, 500'000);
+        t2.reset(200'000, 500'000, 1'000'000);
         CHECK(!t2.advance(600'000, PauseReason::active_work));  // 500k paused, 100k elapsed
-        CHECK(t2.active_paused_us == 500'000 && t2.elapsed_us == 100'000);
+        CHECK(t2.active_paused_us == 500'000 && t2.total_paused_us == 500'000 && t2.elapsed_us == 100'000);
         CHECK(t2.advance(100'000, PauseReason::active_work));
+
+        // active_cap > max_cap is clamped to max_cap by reset().
+        GateTimeoutState clamped;
+        clamped.reset(100'000, 9'000'000, 3'000'000);
+        CHECK(clamped.active_pause_cap_us == 3'000'000 && clamped.max_pause_cap_us == 3'000'000);
     }
 
-    // 10. Overflow-safe address / dt_us guards.
+    // 10. Overflow-safe address / dt_us guards and zero-dt paused tick.
     {
         const WaitPredicate overflow_wait[] = {{UINT64_MAX - 2, 1, 7, true}};
         const PendingWrite overflow_write[] = {{UINT64_MAX - 2, 1, 8, false}};
@@ -227,9 +281,66 @@ int main() {
         CHECK(pause_reason(false, groups, gates, 0, test_met) == PauseReason::active_work);
 
         GateTimeoutState t;
-        t.reset(1000, 0);
+        t.reset(1000, 0, 0);
         CHECK(t.advance(UINT64_MAX, PauseReason::none));
         CHECK(t.elapsed_us == UINT64_MAX);
+
+        GateTimeoutState z;
+        z.reset(0, 1000, 1000);
+        CHECK(!z.advance(0, PauseReason::releaser_busy));
+        CHECK(!z.paused_ever);
+    }
+
+    // 11. Mock Pump tick loop driving start_gate + pause_reason + GateTimeoutState end-to-end across 1 ms steps.
+    {
+        // (a) 200 ms gate held while releaser runs a 110 s pipeline build, then producer lands at 110.5 s: met!
+        const WaitPredicate waits[] = {{0x9000, 7, 7, true}};
+        const PendingWrite prod_write[] = {{0x9000, 7, 8, false}};
+        const PendingWriteGroup prod_groups[] = {{q2, 0, prod_write}};
+        const PendingGate gates[] = {{q1, 1, false, waits}};
+
+        GateTimeoutState gate;
+        const PauseCaps full_caps = default_pause_caps(200, false);
+        gate.reset(200'000, full_caps.active_us, full_caps.max_us);
+        for (int ms = 0; ms < 110'000; ++ms) {
+            const PauseReason r = pause_reason(true, prod_groups, gates, 0, test_met);
+            CHECK(r == PauseReason::releaser_busy && !gate.advance(1'000, r));
+        }
+        for (int ms = 0; ms < 500; ++ms) {
+            const PauseReason r = pause_reason(false, prod_groups, gates, 0, test_met);
+            CHECK(r == PauseReason::matching_producer && !gate.advance(1'000, r));
+        }
+        CHECK(gate.elapsed_us == 0 && gate.total_paused_us == 110'500'000ull);
+
+        // (b) Same gate with a matching producer stuck behind an untracked title fence wait: expires at 300.2 s!
+        GateTimeoutState stuck_gate;
+        stuck_gate.reset(200'000, full_caps.active_us, full_caps.max_us);
+        int expired_at_ms = -1;
+        for (int ms = 1; ms <= 305'000; ++ms) {
+            const PauseReason r = pause_reason(false, prod_groups, gates, 0, test_met);
+            if (stuck_gate.advance(1'000, r)) {
+                expired_at_ms = ms;
+                break;
+            }
+        }
+        CHECK(expired_at_ms == 300'200);
+
+        // (c) Demoted gate (4 ms budget) with continuous unrelated GPU work on q2: expires at 8 ms!
+        const PendingWrite unrelated[] = {{0xA000, 1, 8, false}};
+        const PendingWriteGroup unrel_groups[] = {{q2, 0, unrelated}};
+        GateTimeoutState dem_gate;
+        const PauseCaps dem_caps = default_pause_caps(4, true);
+        dem_gate.reset(4'000, dem_caps.active_us, dem_caps.max_us);
+        int dem_expired_ms = -1;
+        for (int ms = 1; ms <= 100; ++ms) {
+            const PauseReason r = pause_reason(false, unrel_groups, gates, 0, test_met);
+            CHECK(r == PauseReason::active_work);
+            if (dem_gate.advance(1'000, r)) {
+                dem_expired_ms = ms;
+                break;
+            }
+        }
+        CHECK(dem_expired_ms == 8);
     }
 
     std::printf("list_value_wait_budget_test: all checks passed\n");

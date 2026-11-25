@@ -32,9 +32,9 @@
 //   the shadow refresh, a deferred Present). That is the releaser, a second thread: the pump only decides, so
 //   writes keep landing and other gates keep timing out while held work runs.
 // Bounded: a gate is signalled after LEONIDA_VALUE_WAIT_TIMEOUT_MS (default 200 ms) of idle wait time, counted from
-// when the gates before it on its queue opened and paused while the releaser is running held work, while an acyclic
-// matching producer write is in flight, or (up to a cap) while unrelated unblocked GPU work is running
-// (src/list_value_wait_budget.h); logged once per address. Short timeouts (4 ms) go to an
+// when the gates before it on its queue opened and paused (up to a finite cap scaled with the gate's own budget) while
+// the releaser is running held work, while an acyclic matching producer write is in flight, or while unrelated
+// unblocked GPU work is running (src/list_value_wait_budget.h); logged once per address. Short timeouts (4 ms) go to an
 // address that timed out three times in a row, and, once four gates in a row timed out (the title waits for values
 // no modelled write stores, a new address each frame), to every wait whose address was never met: a frame then pays
 // a few milliseconds, not the full timeout, per such wait. A wait cut short is watched for the rest of the full
@@ -1015,8 +1015,9 @@ private:
         gate.cut_short = cut_short;
         gate.since = now;
         gate.last_tick = now;
-        gate.timeout.reset(static_cast<std::uint64_t>(cut_short ? kDemotedTimeoutMs : full) * 1000u,
-                           leonida::list_value_wait::default_active_pause_cap_us(full));
+        const unsigned gate_ms = cut_short ? kDemotedTimeoutMs : full;
+        const auto caps = leonida::list_value_wait::default_pause_caps(gate_ms, cut_short);
+        gate.timeout.reset(static_cast<std::uint64_t>(gate_ms) * 1000u, caps.active_us, caps.max_us);
     }
 
     // A wait for `address` was met (in time, or late): the address has met history and its timeouts in a row end.
