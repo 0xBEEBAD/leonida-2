@@ -2168,7 +2168,10 @@ The mask stays unconditional, because it can't touch a public flag: it clears bi
 safe on every descriptor and blob, whatever built it. `root_sig_public_flags_test` pins this:
 
 - the helpers keep every flag value in `[0, 0xFFFF]`;
-- the shims' serializers give the host's blob byte for byte for each public flag;
+- the shims' serializers give the host's blob byte for byte for each public flag the host takes. Where the host
+  refuses only `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` or `SAMPLER_HEAP_DIRECTLY_INDEXED` (Windows 10's in-box `d3d12.dll`),
+  they serialize on purpose: the blob is the host's blob without those bits, with the full flags in `RTS0` and a valid
+  container hash (`kDirectlyIndexedFlags`, `runtime/shims/d3d12_xs_rootsig.h`);
 - a blob with `0x03000080` comes back as `0x80`.
 
 **Version 1.2 on older runtimes.** The in-box `d3d12.dll` of Windows 10 (measured on 22H2, 10.0.19045, without the

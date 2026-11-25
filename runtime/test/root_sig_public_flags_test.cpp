@@ -12,7 +12,10 @@
 // - the helpers, for every flag value in [0, 0xFFFF]: versioned 1.0/1.1/1.2 and legacy descriptors keep the value, and
 //   an RTS0 blob carrying it is not rewritten;
 // - the registered shims against the host d3d12.dll, for each public flag, 0x80 alone and all of them: the serializers
-//   give the host's result byte for byte (1.0 and 1.1), the deserializer returns the same flags;
+//   give the host's result byte for byte (1.0 and 1.1) wherever the host takes the description, the deserializer
+//   returns the same flags. Where the host refuses a description only for the heap-indexed flags (Windows 10's in-box
+//   d3d12.dll, kDirectlyIndexedFlags), the shims serialize it on purpose: their blob is the host's blob for the
+//   flags without those bits, with the full flags in RTS0 and a valid container hash;
 // - a blob carrying 0x03000000 on top of 0x80 has exactly those two bits cleared and nothing else changed.
 #include <windows.h>
 #include <d3d12.h>
@@ -143,6 +146,23 @@ void rehash(std::vector<uint8_t>& blob) {
     std::memcpy(blob.data() + 4, hash, sizeof(hash));
 }
 
+// The host refused flags `f` and took them without kDirectlyIndexedFlags (`host_plain`, its blob for those). The shims
+// serialize again without the two bits and put them back (serialize_*_keeping_heap_flags, d3d12_xs_rootsig.h), so
+// their blob must be `host_plain` byte for byte except the RTS0 flags dword, which holds all of `f`, and the
+// container hash, which must be valid.
+bool is_heap_flag_fallback(const std::vector<uint8_t>& host_plain, const std::vector<uint8_t>& ours, uint32_t f) {
+    const size_t at = rts0_flags_offset(ours);
+    if (!at || ours.size() != host_plain.size() || rts0_flags_offset(host_plain) != at) return false;
+    uint32_t stored = 0;
+    std::memcpy(&stored, ours.data() + at, 4);
+    if (stored != f) return false;
+    for (size_t i = 0; i < ours.size(); ++i)
+        if ((i < 4 || i >= 20) && (i < at || i >= at + 4) && ours[i] != host_plain[i]) return false;
+    uint32_t hash[4];
+    rt::d3d12_xs::dxbc_checksum(ours.data(), ours.size(), hash);
+    return std::memcmp(hash, ours.data() + 4, sizeof(hash)) == 0;
+}
+
 // The helpers, over the whole range the executable's decoder can produce.
 void test_helpers_keep_16_bit_flags(const std::vector<uint8_t>& clean_blob) {
     const D3D_ROOT_SIGNATURE_VERSION versions[] = {D3D_ROOT_SIGNATURE_VERSION_1_0, D3D_ROOT_SIGNATURE_VERSION_1_1,
@@ -216,7 +236,7 @@ void test_serializer_shim_matches_host() {
                                                    D3D_ROOT_SIGNATURE_VERSION_1_2};
     const char* names[] = {"1.0", "1.1", "1.2"};
     for (int v = 0; v < 3; ++v) {
-        int differ = 0, same_bytes = 0, host_refused = 0, lost_flags = 0, touched_input = 0;
+        int differ = 0, same_bytes = 0, host_refused = 0, heap_fallback = 0, lost_flags = 0, touched_input = 0;
         for (uint32_t f : values) {
             const D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc = versioned(versions[v], f);
             const D3D12_VERSIONED_ROOT_SIGNATURE_DESC before = desc;
@@ -230,10 +250,26 @@ void test_serializer_shim_matches_host() {
             } else {
                 ++host_refused;
                 // A host that serializes only up to 1.1 refuses every 1.2 description, and the shim rewrites those
-                // as 1.1. Otherwise (1.0, 1.1, or 1.2 on a host that takes 1.2) the shim must refuse what the host
-                // refuses.
+                // as 1.1. A host that refuses the heap-indexed flags (Windows 10) gets them serialized anyway when it
+                // takes the description without them. Otherwise (1.0, 1.1, or 1.2 on a host that takes 1.2) the shim
+                // must refuse what the host refuses.
                 const bool rewritten_as_1_1 = versions[v] == D3D_ROOT_SIGNATURE_VERSION_1_2 && !host_serializes_1_2;
-                if (!rewritten_as_1_1 && SUCCEEDED(hr_ours)) ++differ;
+                const uint32_t plain_flags = f & ~rt::d3d12_xs::kDirectlyIndexedFlags;
+                bool host_takes_plain = false;
+                if (!rewritten_as_1_1 && plain_flags != f) {
+                    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC plain = versioned(versions[v], plain_flags);
+                    Blobs host_plain;
+                    host_takes_plain =
+                        SUCCEEDED(D3D12SerializeVersionedRootSignature(&plain, &host_plain.blob, &host_plain.error)) &&
+                        host_plain.blob;
+                    if (host_takes_plain) {
+                        ++heap_fallback;
+                        if (hr_ours != S_OK || !ours.blob ||
+                            !is_heap_flag_fallback(bytes_of(host_plain.blob), bytes_of(ours.blob), f))
+                            ++differ;
+                    }
+                }
+                if (!rewritten_as_1_1 && !host_takes_plain && SUCCEEDED(hr_ours)) ++differ;
             }
             if (SUCCEEDED(hr_ours) && ours.blob) {
                 ID3D12VersionedRootSignatureDeserializer* de = nullptr;
@@ -248,11 +284,12 @@ void test_serializer_shim_matches_host() {
                 }
             }
         }
-        char what[200];
+        char what[240];
         std::snprintf(what, sizeof(what),
                       "versioned %s: the shim serializes each public flag, 0x80 and all of them as the host does "
-                      "(%d byte-identical, %d refused by the host too, %d different)",
-                      names[v], same_bytes, host_refused, differ);
+                      "(%d byte-identical, %d refused by the host, %d of those kept with the heap-indexed flags, "
+                      "%d different)",
+                      names[v], same_bytes, host_refused, heap_fallback, differ);
         check(differ == 0, what);
         std::snprintf(what, sizeof(what), "versioned %s: every blob the shim returns deserializes with the same flags",
                       names[v]);
@@ -261,8 +298,8 @@ void test_serializer_shim_matches_host() {
         check(touched_input == 0, what);
     }
 
-    // The legacy entry point, 1.0 only (it has no 1.1 descriptor).
-    int differ = 0;
+    // The legacy entry point, 1.0 only (it has no 1.1 descriptor), with the same heap-indexed fallback.
+    int differ = 0, legacy_fallback = 0;
     for (uint32_t f : values) {
         D3D12_ROOT_SIGNATURE_DESC desc{};
         desc.Flags = as_flags(f);
@@ -270,11 +307,34 @@ void test_serializer_shim_matches_host() {
         const HRESULT hr_host = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &host.blob,
                                                             &host.error);
         const HRESULT hr_ours = legacy(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &ours.blob, &ours.error);
-        if (SUCCEEDED(hr_host) != SUCCEEDED(hr_ours)) ++differ;
-        else if (SUCCEEDED(hr_host) && (!host.blob || !ours.blob || bytes_of(host.blob) != bytes_of(ours.blob)))
-            ++differ;
+        if (SUCCEEDED(hr_host)) {
+            if (FAILED(hr_ours) || !host.blob || !ours.blob || bytes_of(host.blob) != bytes_of(ours.blob)) ++differ;
+            continue;
+        }
+        const uint32_t plain_flags = f & ~rt::d3d12_xs::kDirectlyIndexedFlags;
+        bool host_takes_plain = false;
+        if (plain_flags != f) {
+            D3D12_ROOT_SIGNATURE_DESC plain{};
+            plain.Flags = as_flags(plain_flags);
+            Blobs host_plain;
+            host_takes_plain = SUCCEEDED(D3D12SerializeRootSignature(&plain, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                                     &host_plain.blob, &host_plain.error)) &&
+                               host_plain.blob;
+            if (host_takes_plain) {
+                ++legacy_fallback;
+                if (hr_ours != S_OK || !ours.blob ||
+                    !is_heap_flag_fallback(bytes_of(host_plain.blob), bytes_of(ours.blob), f))
+                    ++differ;
+            }
+        }
+        if (!host_takes_plain && SUCCEEDED(hr_ours)) ++differ;
     }
-    check(differ == 0, "legacy serializer shim gives the host's result for each public flag, 0x80 and all of them");
+    char legacy_what[200];
+    std::snprintf(legacy_what, sizeof(legacy_what),
+                  "legacy serializer shim gives the host's result for each public flag, 0x80 and all of them "
+                  "(%d kept with the heap-indexed flags the host refuses)",
+                  legacy_fallback);
+    check(differ == 0, legacy_what);
 
     // Call site 1 of old upstream PR 7140, by name.
     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC exe = versioned(D3D_ROOT_SIGNATURE_VERSION_1_1, kExecutableFlags);
