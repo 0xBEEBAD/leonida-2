@@ -47,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fspx_unpack  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 MAGIC = b"PS\x00\x09"
 HEADER = 0x80
@@ -281,7 +282,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the pipeline library stored in shaders.rpf.")
     ap.add_argument("src", help="shaders.rpf, or a library file written with --save")
     ap.add_argument("--out", help="output folder (library.json, index.json, fspx/, disasm/)")
-    ap.add_argument("--save", help="write the reassembled library file here")
+    ap.add_argument("--save", help="write the reassembled library file here (must not overlap --out paths)")
     select = ap.add_mutually_exclusive_group()
     select.add_argument("--stages", default="cs,ps,vs,ms",
                         help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
@@ -324,16 +325,20 @@ def main(argv=None) -> int:
             finally:
                 m.close()
     lib = parse(b)
-    if a.save:
+    if not a.out:
         with open(a.save, "wb") as f:
             f.write(b)
-    if not a.out:
         print(f"library: {len(b)} bytes written to {a.save}")
         return 0
+
+    fspx_dir = os.path.join(a.out, "fspx")
+    disasm_dir = os.path.join(a.out, "disasm") if a.disasm else None
+    summary_path = os.path.join(a.out, "library.json")
+    index_path = os.path.join(a.out, "index.json")
+    names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
     want = None if a.stages == "all" else set(a.stages.split(","))
     if hashes is not None:
         want = {"cs"}
-    names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
     variants, compute_names = compute_variants(b, lib, names)
     selected = [i for i in names if want is None or lib["stage"].get(i, set()) & want]
     if hashes is not None:
@@ -342,18 +347,52 @@ def main(argv=None) -> int:
         missing = hashes - {matching[i] for i in selected}
         if missing:
             raise LibraryError(f"{len(missing)} requested compute code hashes not found in the pipeline library")
-    os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
-    disasm = None
-    if a.disasm:
-        import shader_disasm  # noqa: E402  (resolves LLVM_MC at import)
-        disasm = shader_disasm
-        os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
     carve_errors = []
     sources = carve_digests(a.carve, errors=carve_errors) if a.carve else None
-    index, written, work = [], 0, []
-    programs = ((i, name, state) for i in selected
+
+    def carved_sources(i):
+        return sorted({src for d in lib["digest"].get(i, ()) for src in sources.get(d, ())})
+
+    def programs():
+        return ((i, name, state) for i in selected
                 for state, name in variants.get(i, {None: names[i]}).items())
-    for i, name, state in programs:
+
+    def extraction_paths():
+        cur = os.path.abspath(a.out)
+        while True:
+            yield cur
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        yield from (fspx_dir, summary_path, index_path)
+        if disasm_dir:
+            yield disasm_dir
+        for i, name, _ in programs():
+            yield os.path.join(fspx_dir, name + ".code")
+            yield os.path.join(fspx_dir, name + ".json")
+            # Extraction writes the compute state or removes a stale sidecar at this path.
+            yield os.path.join(fspx_dir, name + ".state")
+            if sources is not None and carved_sources(i):
+                yield os.path.join(a.out, name + ".dxbc")
+            if disasm_dir and code_range(program(b, lib, i))[1]:
+                yield os.path.join(disasm_dir, name + ".s")
+
+    if a.save:
+        for path in extraction_paths():
+            if same_report_path(a.save, path):
+                ap.error(f"--save overlaps an --out path: {a.save} and {path}")
+    os.makedirs(fspx_dir, exist_ok=True)
+    disasm = None
+    if disasm_dir:
+        import shader_disasm  # noqa: E402  (resolves LLVM_MC at import)
+        disasm = shader_disasm
+        os.makedirs(disasm_dir, exist_ok=True)
+    if a.save:
+        with open(a.save, "wb") as f:
+            f.write(b)
+    index, written, work = [], 0, []
+    for i, name, state in programs():
         stages = lib["stage"].get(i, set())
         st = "+".join(sorted(stages)) if stages else "unused"
         code = program(b, lib, i)
@@ -366,7 +405,7 @@ def main(argv=None) -> int:
         digests = sorted(lib["digest"].get(i, ()))
         meta["digest"] = [d.hex() for d in digests]
         if sources is not None:
-            found = sorted({src for d in digests for src in sources.get(d, ())})
+            found = carved_sources(i)
             entry["source"] = meta["source"] = sorted({n for n, _ in found})
             if found:
                 # The source container's signatures and PSV0 describe the stage's D3D12 interface, which the
@@ -378,15 +417,15 @@ def main(argv=None) -> int:
         for k in ("threads", "wave32"):
             if k in meta:
                 entry[k] = meta[k]
-        with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+        with open(os.path.join(fspx_dir, name + ".code"), "wb") as f:
             f.write(code)
-        state_path = os.path.join(a.out, "fspx", name + ".state")
+        state_path = os.path.join(fspx_dir, name + ".state")
         if state is not None:
             with open(state_path, "wb") as f:   # kind 0 as it is: its SHA-256 is the index's fspx_state_sha256
                 f.write(state)
         elif os.path.exists(state_path):
             os.unlink(state_path)   # a program that lost its compute record must not keep an old state key
-        with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+        with open(os.path.join(fspx_dir, name + ".json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(meta, f, indent=1)
         if disasm and end:
             work.append((entry, name, code[start:end], start, end))
@@ -397,7 +436,7 @@ def main(argv=None) -> int:
         entry, name, code, start, end = job
         asm, invalid, err = disasm.disasm(code, a.mcpu, wave32=entry.get("wave32", True))
         entry["invalid_words"] = invalid
-        with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+        with open(os.path.join(disasm_dir, name + ".s"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
             f.write(asm)
             if err.strip():
@@ -418,9 +457,9 @@ def main(argv=None) -> int:
         "compute": [{"hash": c["hash"], "state": c["state"], "program": compute_names.get((c["program"], c["state"]))}
                     for c in lib["compute"]],
     }
-    with open(os.path.join(a.out, "library.json"), "w", encoding="utf-8", newline="\n") as f:
+    with open(summary_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=1)
-    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+    with open(index_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=1)
     h = lib["header"]
     print(f"library {h['name']} {h['version']}: {h['graphics']} graphics + {h['compute']} compute pipelines, "

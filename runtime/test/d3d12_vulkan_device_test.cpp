@@ -17,6 +17,7 @@
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
 #include "../src/vulkan_memory.h"  // D3D-96: resizable_bar
 
+#include <d3d12video.h>
 #include <dxgi1_4.h>
 
 #include <dxgi1_4.h>
@@ -142,7 +143,8 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 std::uint8_t texel_byte(UINT x, UINT y, UINT z, UINT i) { return std::uint8_t(x * 31 + y * 7 + z * 61 + i * 3 + 1); }
 
 // WriteToSubresource/ReadFromSubresource on `device`. Textures in a CPU-visible custom heap copy on the host when the
-// device has VK_EXT_host_image_copy, through a staging submit when it doesn't; main runs this once per path. Covers
+// device has VK_EXT_host_image_copy, through a staging submit when it doesn't or when the driver gave the
+// host-transfer image no memory type; main runs this once per path, three paths. Covers
 // zero-filled first reads, boxes with pitches unlike the texture's, a mip, a volume, BC1 blocks, a default-heap
 // texture (always staged), the rejected calls, and both directions between the CPU copies and GPU copies.
 int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
@@ -2424,7 +2426,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     if (o2.DepthBoundsTestSupported ||
         o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
         fail("OPTIONS2 unexpected support");
-    if (o3.CopyQueueTimestampQueriesSupported || o3.CastingFullyTypedFormatSupported ||
+    if (o3.CastingFullyTypedFormatSupported ||
         o3.WriteBufferImmediateSupportFlags != D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE ||
         o3.ViewInstancingTier != D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED || o3.BarycentricsSupported)
         fail("OPTIONS3 unexpected support");
@@ -2448,9 +2450,11 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o13.InvertedViewportHeightFlipsYSupported || o13.InvertedViewportDepthFlipsZSupported ||
         o13.TextureCopyBetweenDimensionsSupported || o13.AlphaBlendFactorSupported)
         fail("OPTIONS13 unexpected support");
-    if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported ||
-        o14.IndependentFrontAndBackStencilRefMaskSupported)
+    if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported)
         fail("OPTIONS14 unexpected support");
+    // DEPTH_STENCIL2's per-face masks and OMSetFrontAndBackStencilRef (d3d12_state_sweep_test draws them).
+    if (!o14.IndependentFrontAndBackStencilRefMaskSupported)
+        fail("OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported should be TRUE");
     if (o15.TriangleFanSupported || o15.DynamicIndexBufferStripCutSupported) fail("OPTIONS15 unexpected support");
     if (o16.DynamicDepthBiasSupported || o16.GPUUploadHeapSupported) fail("OPTIONS16 unexpected support");
     if (o18.RenderPassesValid) fail("OPTIONS18 unexpected support");
@@ -4055,7 +4059,11 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              return command_allocator(d, D3D12_COMMAND_LIST_TYPE(3));
          }},
         {"command allocator: type video encode", [](ID3D12Device* d) {
-             return command_allocator(d, D3D12_COMMAND_LIST_TYPE(6));
+             return command_allocator(d, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE);
+         }, [](ID3D12Device* d) {
+             // A host without the D3D12 video interface, such as WARP on Windows 10, rejects video allocators.
+             Ref<ID3D12VideoDevice> video;
+             return d->QueryInterface(IID_PPV_ARGS(&video.p)) != E_NOINTERFACE;
          }},
         {"command allocator: type 7", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE(7)); }},
         {"command allocator: type 99", [](ID3D12Device* d) {
@@ -5171,6 +5179,12 @@ int main() {
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
         EXPECT(options.ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_3);
         EXPECT(options.MaxGPUVirtualAddressBitsPerResource == 40);
+        // Console 0x40-byte (16-dword) D3D12_OPTIONS query (docs/d3d12_xs_surface.md §7.1): 0x3C PC prefix + zero tail.
+        UINT console_opts[16]{};
+        console_opts[15] = 0xdeadbeefu;
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, console_opts, sizeof(console_opts))));
+        EXPECT(std::memcmp(console_opts, &options, sizeof(options)) == 0);
+        EXPECT(console_opts[15] == 0);
 
         D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va_support{};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va_support, sizeof(va_support))));
@@ -7042,11 +7056,20 @@ int main() {
     EXPECT(!mismatches);
 
     // CPU texture copies, once per path. A second D3D12 device on the same Vulkan device, told the extension is
-    // off, takes the staging path even on a GPU that has host image copy.
-    for (const bool host : {true, false}) {
+    // off, takes the staging path even on a GPU that has host image copy. The third path has the extension but
+    // treats every host-transfer image as one the driver gave no memory type (a GTX 1050 Ti, NVIDIA 582.78): the
+    // image is made again without host-transfer usage and copies on the staging path.
+    struct CopyPath {
+        const char* name;
+        bool host;
+        bool force_retry;
+    };
+    for (const CopyPath path : {CopyPath{"host image copy", true, false}, CopyPath{"staging copy", false, false},
+                                CopyPath{"host image copy refused by the driver", true, true}}) {
+        const bool host = path.host;
         if (host && !d.host_image_copy) {
-            std::printf("WriteToSubresource/ReadFromSubresource (host image copy): no VK_EXT_host_image_copy, "
-                        "skipped\n");
+            std::printf("WriteToSubresource/ReadFromSubresource (%s): no VK_EXT_host_image_copy, skipped\n",
+                        path.name);
             continue;
         }
         rt::d3d12::VulkanDeviceInfo info{};
@@ -7057,9 +7080,10 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.host_image_copy = host;
+        info.force_host_transfer_retry = path.force_retry;
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
-        EXPECT(cpu_copies(device.p, d.bc, host ? "host image copy" : "staging copy") == 0);
+        EXPECT(cpu_copies(device.p, d.bc, path.name) == 0);
     }
 
     {

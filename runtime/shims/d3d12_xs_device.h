@@ -4,15 +4,14 @@
 //   slot 26   GetCustomHeapProperties, the PC slot, but the retail executable calls it with the buffer for the
 //             returned struct in RCX and the device in RDX (node mask in R8, heap type in R9). A PC C++ method has
 //             the device in RCX and the buffer in RDX. The thunk takes the console form when RDX holds a device
-//             proxy, and forwards the PC form otherwise. Slots 25 and 43 return structs too and are still
-//             forwarded in the PC form: 25 is reported called the same way later in the boot (#6982), with console
-//             resource descriptions the PC method cannot take as they are, and no call of 43 has been seen.
+//             proxy, and forwards the PC form otherwise. Slot 43 returns a struct too; no call of it by the
+//             executable has been seen yet, so it is forwarded in the PC form.
 //   slot 41   CreateCommandSignature at its PC position; a console argument of type 105 (a 12-byte dispatch, read
 //             from the retail title's call sites) is created as D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.
 //   slot 61   CreateSamplerX(desc, dest) -> PC CreateSampler (slot 22); the description's PC
 //             D3D12_SAMPLER_DESC prefix is passed. The PC slot 61 is CreateMetaCommand. Measured on the retail title's
-//             boot. The second word separates the two: a node mask is 0 or 1 (one node), a CPU descriptor handle is an
-//             address, so a PC caller (node mask) still reaches the PC CreateMetaCommand.
+//             boot. Only for a caller in a guest-mapped image (set_console_caller, below); a host caller reaches the
+//             PC CreateMetaCommand.
 //   slot 57   DeserializeGraphicsPipelineStateX(desc, iid, out): converts the Xbox 0x68-byte native graphics PSO
 //             description (+0x00 root signature, +0x08/+0x10 state blob, +0x18/+0x20 pipeline input-layout blob,
 //             +0x28/+0x30 and +0x48/+0x50 bare RDNA2 programs, +0x38/+0x40 and +0x58/+0x60 kind-2 stage blobs) to
@@ -49,9 +48,10 @@
 //             CreateCommandList(0, type, allocator, initialState). The type is the first word of the Xbox desc; there
 //             is no node-mask argument in the console call (public HLE; the PC six-argument form differs). An riid the
 //             proxy does not answer (the console's own list IID) is answered with the proxy.
-//   slots 78/79/80/81  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX, GetFrameEventsX. A per-device token
-//             state machine answers them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh
-//             non-zero token and GetFrameEventsX reports zero pending 0x38-byte frame events. Slots 80/81 are outside
+//   slots 78/79/80/81  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX, GetFrameStatisticsX. A presentation
+//             attached with set_presentation_handler (below) answers them; without one a per-device token state
+//             machine does, before the PC vtable is indexed: WaitFrameEventX returns at once with a fresh non-zero
+//             token and GetFrameStatisticsX reports no statistics (S_FALSE, a zero count). Slots 80/81 are outside
 //             a PC ID3D12Device11 table, so they are checked before the beyond-table refusal.
 //   slot 86   CreatePipelineState(desc, riid, out) -> PC ID3D12Device2::CreatePipelineState (PC slot 47).
 //   slot 101  CreateStateObject(desc, riid, out) -> PC ID3D12Device5::CreateStateObject (PC slot 62, displaced on
@@ -64,7 +64,7 @@
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation; slot 81
 // is the observed call shape of the retail title. They can be moved with LEONIDA_XS_QUEUE_X_SLOT,
 // LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT, LEONIDA_XS_SCHEDULE_EVENT_SLOT, LEONIDA_XS_WAIT_EVENT_SLOT
-// and LEONIDA_XS_FRAME_EVENTS_SLOT (3..127; anything else is logged once and ignored).
+// and LEONIDA_XS_FRAME_STATISTICS_SLOT (3..127; anything else is logged once and ignored).
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
@@ -91,9 +91,10 @@
 // reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
 // (PresentX, SuspendX, ResumeX) will show up; the sibling-layer measurement puts PresentX at queue slot 30 or 32
 // and SignalX at 23 or 25 by runtime layout (docs/d3d12_xs_console_abi.md §4, unverified here). The proxy detects
-// the layout from a fence reaching slot 16/17, forwards SignalX as PC Signal, routes PresentX to the presentation
-// core under LEONIDA_VULKAN_DEVICE and answers the remaining console-only queue methods S_OK (frame pacing flows
-// through them) without forwarding, and that
+// the layout from a fence reaching slot 16/17, forwards SignalX as PC Signal, routes PresentX (slot 30, 32 in the
+// newer layout, or LEONIDA_XS_PRESENT_X_SLOT) to an attached presentation handler or else to the device's own
+// presentation core under LEONIDA_VULKAN_DEVICE, and answers the remaining console-only queue methods S_OK (frame
+// pacing flows through them) without forwarding, and that
 // the console keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
 // unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
 // CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
@@ -131,6 +132,18 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool co
 
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);
+
+// The host path of D3D12XboxCreateDevice (BL-2, docs/d3d12_xs_surface.md): the PC D3D12CreateDevice (`create`)
+// asked for kHostDeviceFloor, the lowest feature level D3D12 creates a device at. It is a minimum, so asking for it
+// refuses no adapter the title can run on and still gives the device its highest level, which FEATURE_LEVELS then
+// reports. A null `create`, or S_OK with no device, is E_NOTIMPL / E_FAIL; `*out` is null on failure.
+constexpr D3D_FEATURE_LEVEL kHostDeviceFloor = D3D_FEATURE_LEVEL_11_0;
+using HostCreateDeviceFn = HRESULT(WINAPI*)(IUnknown* adapter, D3D_FEATURE_LEVEL minimum, REFIID riid, void** out);
+HRESULT create_host_device(HostCreateDeviceFn create, IUnknown* adapter, ID3D12Device** out);
+
+// The highest of 11_0, 11_1, 12_0, 12_1 and 12_2 `device` reports through D3D12_FEATURE_FEATURE_LEVELS, or 0 when
+// the query fails.
+D3D_FEATURE_LEVEL max_feature_level(ID3D12Device* device);
 
 // IDXGIDevice1 on the device. A GDKX title asks its device for IDXGIDevice1, then GetAdapter and EnumOutputs(0),
 // to find the output it gives SetFrameIntervalX (docs/d3d12_vulkan.md section 4.5). The proxy answers IDXGIObject,
@@ -205,6 +218,25 @@ using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12
                                                 REFIID riid, void** out);
 void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
 
+// Presentation wiring: connects device frame-event slots (78/79/80/81: SetFrameIntervalX, ScheduleFrameEventX,
+// WaitFrameEventX, GetFrameStatisticsX; 81 is LEONIDA_XS_FRAME_STATISTICS_SLOT) and queue presentation slots (PresentX
+// at 30, at 32 once the newer queue layout is detected, or at LEONIDA_XS_PRESENT_X_SLOT; SuspendX and ResumeX are
+// routed only when LEONIDA_XS_SUSPEND_X_SLOT /
+// LEONIDA_XS_RESUME_X_SLOT are set) to an external presenter such as rt::d3d12::XboxPresentation without coupling
+// d3d12_xs_device to Vulkan headers. Passing nullptr detaches the handler and restores the default mock/fallback
+// behavior.
+struct PresentationHandler {
+    void* context = nullptr;
+    HRESULT (*set_frame_interval)(void* context, IUnknown* output, UINT interval_us, UINT latency, UINT flags) = nullptr;
+    HRESULT (*schedule_frame_event)(void* context, UINT event, UINT offset_us, UINT flags) = nullptr;
+    HRESULT (*wait_frame_event)(void* context, UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token) = nullptr;
+    HRESULT (*get_frame_statistics)(void* context, std::uint64_t token, UINT type_mask, UINT* count, void* out) = nullptr;
+    HRESULT (*present_x)(void* context, UINT plane_count, const void* planes, const void* params) = nullptr;
+    HRESULT (*suspend_x)(void* context, UINT flags) = nullptr;
+    HRESULT (*resume_x)(void* context) = nullptr;
+};
+bool set_presentation_handler(void* device, const PresentationHandler* handler);
+
 // The device proxy's frame-token source (PresentX paces with the token source the device hands out), or null for
 // an object that is not a device proxy.
 std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device);
@@ -216,6 +248,12 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 // 74, 76, 86, 101, 108 and 127. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap
 // proxy, and device slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
+
+// Whether a return address is in an image the guest loader mapped, i.e. the call comes from the title. Device slot 61
+// is CreateSamplerX for such a caller and the PC ID3D12Device5::CreateMetaCommand for any other; with no check
+// installed every caller is a host one. D3D12XboxCreateDevice installs rt::shims::mapped_image_base.
+using ConsoleCaller = bool (*)(std::uint64_t address);
+void set_console_caller(ConsoleCaller classify);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
 // (no reference added), or null when the pointer is not such a proxy.
@@ -299,11 +337,11 @@ inline constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot <= 59) return slot - 4;           // PC chain, shifted +4
     if (slot == 60) return 58;                 // EndEvent (no console SetMarker/BeginEvent)
     if (slot == 61) return 59;                 // ExecuteIndirect (Package)
-    // CopyTextureRegionX -> CopyTextureRegion. In the newer console layout; in the older one the tail sits two slots
-    // earlier (list_tail_slot_name), and 85 is another method. The retail title has not been seen calling 85.
-    if (slot == 85) return 16;
+    // Slot 85 is CopyTextureRegionX in the newer console layout; in the older one the tail sits two slots earlier
+    // (list_tail_slot_name), and 85 is another method. The retail title has not been seen calling 85.
+    if (slot == 85) return 16;                 // CopyTextureRegionX -> CopyTextureRegion
+    if (slot == 139) return 10;                // Reset(allocator, pso), as the retail title calls it (measured, Pipodi)
     if (slot == 146) return 80;                // D3D12_BARRIER_GROUP (Package; PC GCL7)
-    if (slot == 139) return 10;                // Reset(allocator, pso): measured on the retail title (Pipodi)
     return kListNotForwarded;
 }
 

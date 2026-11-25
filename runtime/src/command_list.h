@@ -414,6 +414,15 @@ struct DrawViews {
     std::uint32_t render_target_count = 8;
 };
 
+// Shared across draws that keep the same multi-viewport / multi-scissor state (null for the common 1-viewport case).
+struct DrawViewports {
+    static constexpr std::uint32_t max_count = 16;
+    std::array<Viewport, max_count> viewports{};
+    std::uint32_t viewport_count = 0;
+    std::array<Rect, max_count> scissors{};
+    std::uint32_t scissor_count = 0;
+};
+
 // DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:
 // D3D12 reads render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the
 // list's state at the draw. resource 0 marks an unbound render-target slot or no depth buffer. A mesh draw
@@ -440,6 +449,7 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     bool mesh = false;
+    std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -692,7 +702,7 @@ public:
     }
 
     // LayoutAfter UNDEFINED is legal: the subresources' contents are no longer needed, as before their memory is
-    // aliased (the console title ends a depth buffer's use this way; WARP closes such a list,
+    // aliased (the retail title ends a depth buffer's use this way, #984; WARP closes such a list,
     // d3d12_close_parity_test). Replay keeps the image's Vulkan layout and orders the accesses only.
     bool barrier(const TextureBarrier& barrier) {
         if (!barrier.resource || !valid_sync(barrier.sync_before, barrier.sync_after)) return false;

@@ -221,7 +221,7 @@ inline int decode(BitReader& in, const Huffman& h) {
 }
 
 inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
-                          const Huffman& distances, std::size_t limit, bool bulk = false) {
+                          const Huffman& distances, std::size_t limit, bool bulk = true) {
     static constexpr std::int16_t length_base[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
                                                      31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
     static constexpr std::int16_t length_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
@@ -247,25 +247,24 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
         if (d < 0 || d >= 30) return ZlibError::data;
         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
         if (in.failed() || distance > out.size()) return ZlibError::data;
-        if (out.size() + length > limit) return ZlibError::limit;
-        const std::size_t from = out.size() - distance;
+        if (out.size() > limit || length > limit - out.size()) return ZlibError::limit;
+        const std::size_t start = out.size();
         if (!bulk) {
-            for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
+            for (std::size_t i = 0; i < length; ++i) out.push_back(out[start - distance + i]);
             continue;
         }
-        const auto end = out.size();
-        out.resize(end + length);
-        auto* dest = out.data() + end;
+        out.resize(start + length);
+        auto* dest = out.data() + start;
         if (distance == 1) {
-            std::memset(dest, out[from], length);
+            std::fill_n(dest, length, dest[-1]);
         } else {
-            // Copy one period, then double the completed prefix. Each memcpy is disjoint.
-            auto copied = (std::min)(distance, length);
-            std::memcpy(dest, out.data() + from, copied);
+            // Overlapping matches repeat their first distance bytes. Each copy reads only completed output.
+            std::size_t copied = std::min(distance, length);
+            std::memcpy(dest, dest - distance, copied);
             while (copied < length) {
-                const auto n = (std::min)(copied, length - copied);
-                std::memcpy(dest + copied, dest, n);
-                copied += n;
+                const auto count = std::min(copied, length - copied);
+                std::memcpy(dest + copied, dest, count);
+                copied += count;
             }
         }
     }
@@ -279,7 +278,7 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
 // dictionary), `data` for the deflate data or a missing trailer, `checksum` for an Adler-32 mismatch, `limit` for
 // output beyond `limit`. Bytes after the Adler-32 trailer are not read.
 inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint8_t>& out,
-                         std::size_t limit = std::size_t(1) << 30, ZlibError* why = nullptr, bool bulk = false) {
+                         std::size_t limit = std::size_t(1) << 30, ZlibError* why = nullptr, bool bulk = true) {
     out.clear();
     const auto fail = [why](ZlibError reason) {
         if (why) *why = reason;
@@ -303,7 +302,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 if (!reader.byte(x)) return fail(ZlibError::data);
             const unsigned length = b[0] | (b[1] << 8), complement = b[2] | (b[3] << 8);
             if (length != (~complement & 0xffff)) return fail(ZlibError::data);
-            if (out.size() + length > limit) return fail(ZlibError::limit);
+            if (out.size() > limit || length > limit - out.size()) return fail(ZlibError::limit);
             for (unsigned i = 0; i < length; ++i) {
                 std::uint8_t x;
                 if (!reader.byte(x)) return fail(ZlibError::data);
@@ -368,15 +367,19 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
     }
     // Adler-32, big-endian, after the deflate data's last whole byte.
     const std::size_t at = 2 + reader.position();
-    if (at + 4 > in.size()) return fail(ZlibError::data);
+    if (at > in.size() || in.size() - at < 4) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
     if (bulk) {
-        // Worst-case sums of 5552 bytes fit in uint32_t between modulo operations.
-        for (size_t pos = 0; pos < out.size();) {
-            const auto end = pos + (std::min)(size_t(5552), out.size() - pos);
-            while (pos < end) { a += out[pos++]; b += a; }
+        // At most 5,552 bytes of 0xff fit in both 32-bit accumulators between reductions.
+        for (std::span<const std::uint8_t> tail(out); !tail.empty();) {
+            const auto block = tail.first(std::min<std::size_t>(tail.size(), 5552));
+            for (const auto x : block) {
+                a += x;
+                b += a;
+            }
             a %= 65521;
             b %= 65521;
+            tail = tail.subspan(block.size());
         }
     } else {
         for (const std::uint8_t x : out) {
@@ -1195,9 +1198,20 @@ private:
             if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
                 for (const auto& [key, val] : fh->object) {
                     if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;
-                    char* end = nullptr;
-                    const unsigned long param = std::strtoul(key.c_str(), &end, 10);
-                    if (!end || *end != '\0') continue;
+                    std::uint64_t param = 0;
+                    bool ok = true;
+                    for (const char c : key) {
+                        if (c < '0' || c > '9') {
+                            ok = false;
+                            break;
+                        }
+                        param = param * 10u + std::uint64_t(c - '0');
+                        if (param > UINT32_MAX) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) continue;
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
                 }
             }

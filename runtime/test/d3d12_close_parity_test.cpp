@@ -225,9 +225,9 @@ std::vector<Case> cases() {
         {"barrier type 7", false, match,
          CALLS(D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE(7); e.list->ResourceBarrier(1, &b))},
         // Enhanced barriers (ID3D12GraphicsCommandList7::Barrier). LayoutAfter UNDEFINED says the contents are no
-        // longer needed; the console title ends a depth buffer's use that way (sync DEPTH_STENCIL -> NONE, access
-        // DEPTH_STENCIL_WRITE -> NO_ACCESS), and until 2026-11-24 the layer failed the list's Close for it. The WARP
-        // column of these four rows was measured on Windows 11 26340.
+        // longer needed; the retail title ends a depth buffer's use that way (sync DEPTH_STENCIL -> NONE, access
+        // DEPTH_STENCIL_WRITE -> NO_ACCESS), and the layer failed the list's Close for it. The WARP column of these
+        // four rows was measured on Windows 11 26340 (#984), not on the build the header names.
         {"Barrier: depth DEPTH_STENCIL_WRITE -> COPY_SOURCE", true, match,
          [](Env& e) {
              return texture_barrier(e, e.depth.p, D3D12_BARRIER_SYNC_DEPTH_STENCIL, D3D12_BARRIER_SYNC_COPY,

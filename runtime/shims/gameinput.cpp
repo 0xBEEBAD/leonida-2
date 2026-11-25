@@ -47,6 +47,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "gameinput.h"
@@ -1865,8 +1866,8 @@ void update_keyboard_pad() {
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
     int lx = 0, ly = 0;
     bool aim = false, fire = false;
-    // Out of focus every button, stick and trigger is released, so a key held while switching windows does not stay
-    // pressed, and the cursor is read afresh on return, so moving it in another window does not swing the stick.
+    // Focus gates physical keyboard and mouse input. Read the cursor afresh on return to avoid a jump.
+    // Scripted presses still run while the window is unfocused.
     const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
     if (active) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
@@ -1914,23 +1915,35 @@ void update_keyboard_pad() {
             {"up", SDL_GAMEPAD_BUTTON_DPAD_UP},     {"down", SDL_GAMEPAD_BUTTON_DPAD_DOWN},
             {"left", SDL_GAMEPAD_BUTTON_DPAD_LEFT}, {"right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT}};
         const std::string text = env("LEONIDA_INPUT_SCRIPT");
-        for (size_t at = 0; at < text.size();) {
-            const size_t end = std::min(text.find(',', at), text.size());
+        if (text.empty()) return out;
+        constexpr char whitespace[] = " \t\r\n\f\v";
+        size_t items = 0;
+        for (size_t at = 0, end; at <= text.size(); at = end + 1) {
+            ++items;
+            end = std::min(text.find(',', at), text.size());
             const std::string item = text.substr(at, end - at);
+            const size_t first = item.find_first_not_of(whitespace);
             const size_t sep = item.find('@');
-            if (sep != std::string::npos) {
-                const double when = std::atof(item.c_str() + sep + 1);
-                const auto name = item.substr(0, sep);
-                if (name == "rsup" || name == "rsdown")
-                    out.push_back({SDL_GAMEPAD_BUTTON_INVALID, when, name == "rsup" ? -kStickFull : kStickFull});
-                else
-                    for (const auto& n : names)
-                        if (name == n.first) out.push_back({n.second, when});
+            if (sep == std::string::npos || first >= sep) continue;
+            const char* time = item.c_str() + sep + 1;
+            char* tail;
+            const double seconds = std::strtod(time, &tail);
+            if (tail == time || !std::isfinite(seconds) || seconds < 0 ||
+                item.find_first_not_of(whitespace, tail - item.c_str()) != std::string::npos) continue;
+            if (item.compare(first, sep - first, "rsup") == 0 || item.compare(first, sep - first, "rsdown") == 0) {
+                const bool up = item.compare(first, sep - first, "rsup") == 0;
+                out.push_back({SDL_GAMEPAD_BUTTON_INVALID, seconds, up ? -kStickFull : kStickFull});
+                continue;
             }
-            at = end + 1;
+            for (const auto& [name, button] : names) {
+                if (item.compare(first, sep - first, name) == 0) {
+                    out.push_back({button, seconds});
+                    break;
+                }
+            }
         }
-        if (!out.empty())
-            std::fprintf(stderr, "[rt] gameinput: LEONIDA_INPUT_SCRIPT: %zu scripted press(es)\n", out.size());
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_INPUT_SCRIPT: %zu scripted press(es), %zu rejected\n",
+                     out.size(), items - out.size());
         return out;
     }();
     if (!script.empty()) {

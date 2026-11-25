@@ -1,9 +1,10 @@
-; tfe status VGPR on image_load (SHADER-1266): the status follows the data VGPRs and is written on a texel fault
-; (RDNA2 ISA, MIMG TFE). The images here are fully resident, so each status VGPR keeps its seed. XOR each status
-; with its own seed, OR the differences, and add that word to the texel sum so either overwrite fails the check.
-; vk_store_test fills the r32 uint image with 100 + 8y + x and the r32 sint image with -2 (8y + x) before dispatch.
-; The RGBA8 image is stored as in cs_imgstore. Run: vk_store_test cs_imgload_tfe.spv load ->
-; sint = 100 - (8y + x), uint unchanged.
+; tfe status VGPR on image_load (SHADER-1266): cs_imgload with tfe on both loads. With tfe an MIMG read reserves one
+; more dword after its data, the fetch status, at vdata[data_count] (RDNA2 ISA, MIMG TFE/LWE). On a resident texel,
+; RDNA2 hardware leaves the status VGPR unchanged. The two status VGPRs are seeded with distinct values (v8 = 0x3e8,
+; v12 = 0x7d0) and independently checked via (v8 ^ 0x3e8) | (v12 ^ 0x7d0) before adding into v11, so zeroing or
+; modifying either status VGPR shifts every texel. vk_store_test fills the r32 uint image with 100 + 8y + x and the
+; r32 sint image with -2 (8y + x) before the dispatch; the rgba8 image is stored as in cs_imgstore.
+; Run: vk_store_test cs_imgload_tfe.spv load -> sint = 100 - (8y + x), uint unchanged.
 v_and_b32_e32 v1, 7, v0
 v_lshrrev_b32_e32 v2, 3, v0
 v_cvt_f32_u32_e32 v3, v1

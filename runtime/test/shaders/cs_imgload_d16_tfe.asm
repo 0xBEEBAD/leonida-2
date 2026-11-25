@@ -1,8 +1,10 @@
-; tfe status VGPR on a d16 image_load (SHADER-1266): a single component takes one VGPR, with the status word
-; following it. Both loads are fault-free, so the two status VGPRs retain their seeds, as in cs_imgload_tfe.
-; XOR each status with its seed, OR the differences, and add them to the unpacked texel sum. vk_store_test
-; load-d16 checks the same output as cs_imgload_d16, including its saturation row.
-; Suggested by @nnonno91, who ran the original companion through Vulkan on gfx1036 and an RTX 5090 in #8968.
+; tfe status VGPR on a d16 image_load (SHADER-1266): cs_imgload_d16 with tfe on both loads. Under d16 one
+; component fills one VGPR, and with tfe the fetch status follows it, so vdata is v[7:8] and v[11:12]. On a resident
+; texel, RDNA2 hardware leaves the status VGPR unchanged. The two status VGPRs are seeded with distinct values
+; (v8 = 0x3e8, v12 = 0x7d0) and independently checked via (v8 ^ 0x3e8) | (v12 ^ 0x7d0) before adding into v11, so
+; zeroing or modifying either status VGPR shifts every texel. The unpacking and the result are cs_imgload_d16's,
+; checked by vk_store_test load-d16 (including its saturation row). Suggested by @nnonno91, who ran the same
+; companion on gfx1036 and an RTX 5090 in #8968.
 v_and_b32_e32 v1, 7, v0
 v_lshrrev_b32_e32 v2, 3, v0
 v_cvt_f32_u32_e32 v3, v1

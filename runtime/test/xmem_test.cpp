@@ -134,6 +134,10 @@ void test_alloc(XMemAllocFn alloc, XMemFreeFn free_mem) {
 }
 
 void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
+    char saved_env[64]{};
+    const DWORD saved_n = GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", saved_env, sizeof(saved_env));
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", nullptr);
+
     alignas(64) uint8_t stats[64];
     std::memset(stats, 0xa5, sizeof(stats));
     // The pointer is the second argument: the first (0x20000001 here, as the FSR DLL passes it) must never be written
@@ -169,6 +173,31 @@ void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
         }
     }
     check(ok != FALSE && tail_untouched, "XMemGetWorkingSetStatistics leaves bytes 16..63 untouched");
+
+    // LEONIDA_TITLE_MEMORY_MB override and clamping (matches XSystemGetAppMemoryUsageLimit).
+    auto query_total = [&]() -> uint64_t {
+        alignas(64) uint8_t buf[64]{};
+        if (!get_stats(kMeasuredKind, buf)) return 0;
+        uint64_t out = 0;
+        std::memcpy(&out, buf, sizeof(out));
+        return out;
+    };
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "6144");
+    check(query_total() == 6144ULL * 1024ULL * 1024ULL,
+          "XMemGetWorkingSetStatistics honors LEONIDA_TITLE_MEMORY_MB=6144");
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "512");
+    check(query_total() == 2048ULL * 1024ULL * 1024ULL,
+          "XMemGetWorkingSetStatistics clamps LEONIDA_TITLE_MEMORY_MB below 2048 MiB");
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "131072");
+    check(query_total() == 65536ULL * 1024ULL * 1024ULL,
+          "XMemGetWorkingSetStatistics clamps LEONIDA_TITLE_MEMORY_MB above 65536 MiB");
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "invalid");
+    check(query_total() == total_memory,
+          "XMemGetWorkingSetStatistics ignores invalid LEONIDA_TITLE_MEMORY_MB");
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "-4096");
+    check(query_total() == total_memory,
+          "XMemGetWorkingSetStatistics ignores negative LEONIDA_TITLE_MEMORY_MB");
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", (saved_n > 0 && saved_n < sizeof(saved_env)) ? saved_env : nullptr);
 
     check(get_stats(kMeasuredKind, nullptr) == FALSE,
           "XMemGetWorkingSetStatistics(kind, nullptr) returns FALSE without crashing");
@@ -870,13 +899,13 @@ void test_write_combine_window(const PhysicalApi& api) {
     const bool mapped = api.map(window, 1, &page) == window;
     check(mapped, "a page maps into a window reserved with PAGE_WRITECOMBINE");
     if (mapped) {
-        // Queried after the first touch: the page is committed lazily, and an untouched view reads MEM_RESERVE
-        // with no protection on Windows.
-        fill_page(window, 0x77000000u);
+        // Physical pages are committed on first touch, so the view is written before it is queried.
+        *static_cast<volatile unsigned char*>(window) = 1;
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(window, &info, sizeof(info));
         check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
               "the page mapped there is a plain read-write view");
+        fill_page(window, 0x77000000u);
         check(page_holds(window, 0x77000000u), "the page in the write-combine window holds data");
     }
     check(api.map(window, 1, nullptr) == window, "unmap the write-combine window");

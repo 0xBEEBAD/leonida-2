@@ -110,7 +110,8 @@ int main() {
     CHECK(std::get<GlobalBarrier>(list.commands()[1]).sync_before == y::split);
     CHECK(std::get<BufferBarrier>(list.commands()[2]).resource == 7);
     CHECK(std::get<TextureBarrier>(list.commands()[3]).flags == texture_barrier_discard);
-    CHECK(std::get<TextureBarrier>(list.commands()[4]).layout_after == l::undefined);
+    CHECK(std::get<TextureBarrier>(list.commands()[4]).layout_before == l::depth_stencil_write &&
+          std::get<TextureBarrier>(list.commands()[4]).layout_after == l::undefined);
 
     // Copies: D3D12's own call rules (aligned footprints; degenerate boxes and DEFAULT-heap
     // CopyResource self-copies are accepted as no-ops and must not record Vulkan commands).

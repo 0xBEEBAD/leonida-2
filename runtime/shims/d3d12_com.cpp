@@ -420,12 +420,20 @@ public:
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!count) {
             viewport_ = {};
+            viewports_.fill({});
+            viewport_count_ = 0;
+            draw_viewports_stale_ = true;
             return;
         }
         if (!viewports || count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetViewports (more than one viewport; the first is used)");
-        const D3D12_VIEWPORT& v = viewports[0];
-        viewport_ = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        viewports_.fill({});
+        for (UINT i = 0; i < count; ++i) {
+            const D3D12_VIEWPORT& v = viewports[i];
+            viewports_[i] = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        }
+        viewport_count_ = count;
+        viewport_ = viewports_[0];
+        draw_viewports_stale_ = true;
     }
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
@@ -434,11 +442,25 @@ public:
         // With no scissor bound, the rasterizer clips every fragment, as on native D3D12.
         if (!count) {
             scissor_ = {};
+            scissors_.fill({});
+            scissor_count_ = 0;
+            draw_viewports_stale_ = true;
             return;
         }
         if (!rects) return;
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
-        scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
+        // WARP still closes a list after RSSetScissorRects(17) (d3d12_close_parity), so the call is not an error:
+        // the rectangles past the 16 a pipeline can have are dropped.
+        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
+            stub("ID3D12GraphicsCommandList::RSSetScissorRects(more than 16 rectangles; the first 16 are used)");
+            count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        }
+        scissors_.fill({});
+        for (UINT i = 0; i < count; ++i) {
+            scissors_[i] = {rects[i].left, rects[i].top, rects[i].right, rects[i].bottom};
+        }
+        scissor_count_ = count;
+        scissor_ = scissors_[0];
+        draw_viewports_stale_ = true;
     }
 
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
@@ -495,10 +517,11 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
+        draw.viewports = draw_viewports();
         check(list_.draw(std::move(draw)));
     }
 
@@ -891,6 +914,27 @@ public:
         } else if (count_buffer_offset != 0) {
             return check(false);
         }
+        // The record size is checked for every call: D3D12 rejects a signature whose stride cannot hold a record
+        // even when no command runs.
+        const UINT64 record_size =
+            kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
+            : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
+            : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+            : kind == leonida::IndirectKind::dispatch_mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
+            : 0;
+        if (!record_size || stride < record_size || stride % 4 != 0) return check(false);
+        // The argument range is the bytes the commands read: (max_command_count - 1) * stride + record_size, and
+        // nothing when max_command_count is 0. PC D3D12 runtimes do not agree here. Some bound max_command_count *
+        // stride and check the offset at a zero count; others (D3D12Core 10.0.26100.9818, WARP and NVIDIA alike)
+        // accept a last record that fits while its stride runs past the buffer, and any aligned offset at a zero
+        // count. The layer takes the wider rule: it is the one Vulkan's own indirect draws use, no byte outside the
+        // buffer is read, and refusing here drops the whole command list for a call a real runtime runs.
+        // d3d12_execute_indirect_validation_test lists the five cases the runtimes split on.
+        if (max_command_count) {
+            const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
+            if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
+                return check(false);
+        }
         if (kind == leonida::IndirectKind::dispatch_mesh) {
             // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
             // first such call says so. The list stays valid.
@@ -899,18 +943,6 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
                                      "nothing was recorded\n");
             return;
-        }
-        const UINT64 record_size =
-            kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
-            : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
-            : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
-            : 0;
-        if (!record_size || stride < record_size || stride % 4 != 0) return check(false);
-        // Native D3D12 checks through the last record, with no argument range to check at max_command_count == 0.
-        if (max_command_count) {
-            const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
-            if (argument_buffer_offset > arg_desc.Width || required > arg_desc.Width - argument_buffer_offset)
-                return check(false);
         }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
@@ -1375,6 +1407,12 @@ private:
     static constexpr std::uint64_t kRootViewBytes = 65536;
     leonida::Viewport viewport_{};
     leonida::Rect scissor_{};
+    std::array<leonida::Viewport, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports_{};
+    UINT viewport_count_ = 0;
+    std::array<leonida::Rect, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> scissors_{};
+    UINT scissor_count_ = 0;
+    std::shared_ptr<const leonida::DrawViewports> draw_viewports_;
+    bool draw_viewports_stale_ = true;
     std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets_{};
     UINT render_target_count_ = 0;
     // One block shared by every draw that keeps the same targets and buffers, rebuilt when either changes, so a
@@ -1481,6 +1519,12 @@ private:
         index_ = {};
         viewport_ = {};
         scissor_ = {};
+        viewports_.fill({});
+        viewport_count_ = 0;
+        scissors_.fill({});
+        scissor_count_ = 0;
+        draw_viewports_.reset();
+        draw_viewports_stale_ = true;
         render_targets_.fill({});
         render_target_count_ = 0;
         draw_views_stale_ = true;
@@ -1614,15 +1658,35 @@ private:
         return draw_views_;
     }
 
+    bool any_nonempty_viewport() const {
+        for (UINT i = 0; i < viewport_count_; ++i)
+            if (viewports_[i].width > 0.0f && viewports_[i].height > 0.0f) return true;
+        return false;
+    }
+
+    std::shared_ptr<const leonida::DrawViewports> draw_viewports() {
+        if (viewport_count_ <= 1 && scissor_count_ <= 1) return nullptr;
+        if (draw_viewports_stale_) {
+            auto block = std::make_shared<leonida::DrawViewports>();
+            block->viewports = viewports_;
+            block->viewport_count = viewport_count_;
+            block->scissors = scissors_;
+            block->scissor_count = scissor_count_;
+            draw_viewports_ = std::move(block);
+            draw_viewports_stale_ = false;
+        }
+        return draw_viewports_;
+    }
+
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         note_direct_heap_indexing(graphics_.layout);
-        // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
-        // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
+        // No viewport (never set, or unbound with RSSetViewports(0)) or every bound viewport empty: D3D12 rasterizes
+        // nothing, and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         {  // LOCAL DIAGNOSTIC: the state each draw is recorded with
             static std::atomic<std::uint64_t> draws{0}, skipped{0};
-            const bool skip = !(viewport_.width > 0) || !(viewport_.height > 0);
+            const bool skip = !any_nonempty_viewport();
             const std::uint64_t n = ++draws, k = skip ? ++skipped : skipped.load();
             if (n <= 8 || n % 1200 == 0)
                 std::fprintf(stderr, "[rt] present-probe: draw #%llu (%s; %llu skipped so far) pso %p rts %u rt0 0x%llx "
@@ -1699,10 +1763,11 @@ private:
                 }
             }
         }
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+        if (!any_nonempty_viewport()) return;
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
+        draw.viewports = draw_viewports();
         check(list_.draw(std::move(draw)));
     }
 };
@@ -1981,7 +2046,7 @@ public:
         for (const auto& command : list.commands().commands()) {
             const auto range = leonida::query_range(command);
             if (range.count && range.type == leonida::d3d12_query::timestamp &&
-                context_.query_heap_type(range.heap) == other)
+                (!timestamp_family_supported() || context_.query_heap_type(range.heap) == other))
                 return false;
         }
         return true;
@@ -2040,14 +2105,18 @@ public:
     }
 
     // Ticks per second of the timestamps EndQuery writes: one tick is timestampPeriod nanoseconds. Every D3D12
-    // queue of the device shares one VkQueue, so they share one frequency. E_FAIL when that queue has no
-    // timestamps (timestampValidBits 0), as D3D12 reports for a queue that does not support them.
+    // device has one timestamp period, but individual queue families may not write timestamps.
     HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* frequency) override {
         if (!frequency) return E_INVALIDARG;
         const double period = context_.timestamp_period();
-        if (!(period > 0)) return E_FAIL;
+        if (!(period > 0) || !timestamp_family_supported()) return E_FAIL;
         *frequency = static_cast<UINT64>(1e9 / period + 0.5);
         return S_OK;
+    }
+
+    bool timestamp_family_supported() const {
+        // The low-level queue factory also accepts caller-owned queues without a QueueClock.
+        return !clock_.get_device_proc || clock_.timestamp_valid_bits != 0;
     }
 
     // Queue labels, in order with the submissions around them.

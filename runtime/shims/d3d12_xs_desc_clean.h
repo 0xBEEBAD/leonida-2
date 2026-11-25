@@ -1,7 +1,9 @@
 // The PC form of a resource description the retail title builds for the console, for the Xbox-ABI device proxy.
 //
-// The title's D3D12_RESOURCE_DESC carries console layout words and flag bits the PC device cannot take
-// (docs/retail_boot_chain.md, #6982). The slot 25 cleaner returns a copy of the title's description.
+// The title's D3D12_RESOURCE_DESC carries console values the PC device cannot take: the layout word is 0x101 (tiled)
+// or 0x1 (row-major buffer), and the flags have bits above the PC ones set (docs/retail_boot_chain.md, #6982). Slot 76
+// replaces the layout word the same way before it forwards to CreateCommittedResource; slot 25 and the slot 127
+// stand-in need the same cleaning. The title's own description is never written: a caller gets a copy.
 #pragma once
 
 #include <windows.h>
@@ -19,6 +21,7 @@ constexpr std::uint32_t kPcResourceFlagsMask =
     D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY |
     D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
 
+// Not constexpr: 0x101 is outside the unfixed enum's value range, which clang-cl rejects in a constant expression.
 inline const auto kXboxTiledResourceLayout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
 
 // The console allows a depth-stencil texture to allow unordered access too (measured locally at a title's call sites:
