@@ -259,6 +259,9 @@ D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D1
 // no API call, so (1) every descriptor the layer writes for a title-backed slot is also stored at the title's address,
 // and (2) when a table is bound, what the title wrote at that table's address is carried into the real heap.
 // LEONIDA_DESC_MIRROR=0 turns both off.
+// Adapted from the patches descriptor-write-through (1) and descriptor-table-refresh (2) of
+// Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches at d9a0bc1b (author smg, as "Codex"), GPL-3.0: the functions
+// from here to local_mirror_table, DescriptorRange's stride and mapped fields and local_real_gpu_start.
 constexpr SIZE_T kLocalDescriptorBytes = 32;
 constexpr SIZE_T kLocalMirrorSlots = 64;
 

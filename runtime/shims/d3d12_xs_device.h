@@ -196,6 +196,8 @@ using ConsoleConstantView = bool (*)(ID3D12Device*, const D3D12_CONSTANT_BUFFER_
 void set_constant_view_provider(void* device, ConsoleConstantView provider);
 // Installed by the Vulkan backend before handing the device to callers. Reports whether the exact
 // CPU span belongs to the heap's live mapped allocation. PC descriptor handles may be opaque.
+// (From the patch descriptor-write-through of Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches at d9a0bc1b,
+// GPL-3.0.)
 using DescriptorMappingProvider = bool (*)(ID3D12DescriptorHeap* heap, SIZE_T start, SIZE_T bytes);
 void set_descriptor_mapping_provider(void* device, DescriptorMappingProvider provider);
 // Called before publishing an Xbox resource when the backend can implement its depth/stencil UAV views.

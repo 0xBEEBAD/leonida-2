@@ -456,6 +456,8 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
 // LEONIDA_GRAPHICS_STAGE_LAYOUT=0 keeps rt::rootsig::pack() (from s0, two dwords per address) for every graphics
 // signature instead of the console layout of the vertex, pixel and geometry stages described above.
+// (The switch between the two packings is from the patch graphics-root-layout of
+// Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches at d9a0bc1b, author smg as "Codex", GPL-3.0.)
 inline bool local_graphics_stage_layout() {
     static const bool on = [] { const char* v = std::getenv("LEONIDA_GRAPHICS_STAGE_LAYOUT"); return !(v && *v == '0'); }();
     return on;

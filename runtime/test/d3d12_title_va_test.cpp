@@ -553,6 +553,8 @@ int check_geometry_slab_tails(Context& c) {
 
 // Bind the same interior GPU handle first through a short graphics table, then a wide compute table.
 // Update its last CBV after Close and again before resubmitting the identical list.
+// (Adapted from the tests of the patches descriptor-table-refresh and descriptor-write-through of
+// Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches at d9a0bc1b, GPL-3.0.)
 int check_rebound_tables(Context& c, ID3D12RootSignature* narrow, bool mirror, bool api_copy) {
     constexpr UINT selected = 64;
     const auto alloc_backing = [](std::size_t n, std::uint64_t) -> void* {

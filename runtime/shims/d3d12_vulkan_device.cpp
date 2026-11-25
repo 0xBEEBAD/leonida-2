@@ -1058,6 +1058,10 @@ ShadowPagesPtr make_shadow_pages(const std::uint8_t* pages, std::uint8_t* shadow
 
 // The furthest range end is the span to refresh at submission. Sampler ranges use their full hardware
 // heap limit. Buffer-view translation retains its existing per-table budget.
+// The refresh of title-backed sampler tables (this count, the sampler entries of DeviceState::visible_heaps and the
+// sampler-heap case of scan_title_table) is adapted from the patch sampler-table-refresh of
+// Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches at d9a0bc1b (author smg, as "Codex"), GPL-3.0; the
+// descriptor mapping provider registered in set_device_outer is from its patch descriptor-write-through.
 constexpr std::uint32_t kViewScanLimit = 1024;
 std::uint32_t table_descriptor_count(const rt::rootsig::RootParameter& param) {
     if (param.type != rt::rootsig::ParamType::Table || param.ranges.empty()) return 0;

@@ -1595,6 +1595,8 @@ public:
     void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
 
     // Table VAs are offsets in this device's arena. Install its scanner before creating any queues.
+    // (The per-device scan is from the patch descriptor-table-refresh, part 2, of
+    // Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches at d9a0bc1b, GPL-3.0.)
     using TableScanner = std::function<void(std::uint64_t, std::uint32_t)>;
     void set_table_scanner(TableScanner scan) { table_scanner_ = std::move(scan); }
     void set_cpu_texture_publisher(std::function<bool()> f) { cpu_texture_publisher_ = std::move(f); }
