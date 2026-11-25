@@ -61,6 +61,14 @@ inline VkShaderStageFlagBits subgroup_stage_bit(std::string_view stage) {
     return VkShaderStageFlagBits(0);
 }
 
+// A wave64 VS/PS/GS that the translator's partition-invariance analysis (index.json `wave64_graphics`; docs/design.md,
+// "Wave64 graphics") puts in tier A or B: observable results do not change when the GPU cuts the wave into two 32-lane
+// halves, so the device's 32-wide size is exact for it. Tier C and entries without the analysis stay conservative.
+inline bool graphics_partition_invariant(const ShaderEntry& entry) {
+    if (entry.stage != "vs" && entry.stage != "ps" && entry.stage != "gs") return false;
+    return entry.wave64 && (entry.wave64_graphics == "A" || entry.wave64_graphics == "B");
+}
+
 enum class SubgroupOutcome {
     emulated,         // --wave64-emulate: exact on any size, nothing is required
     required,         // the stage asks for `size`
@@ -69,7 +77,6 @@ enum class SubgroupOutcome {
     unavailable,      // the wanted size cannot be had: the shader runs at another size and may be inexact
     unknown_stage,    // no Vulkan stage for this entry
     unknown_device,   // the device sizes were not queried (all zero): nothing is asked for
-    graphics_halves,  // wave64 VS/PS/GS classified for two 32-lane halves on a fixed-32 device
 };
 
 struct SubgroupRequest {
@@ -104,8 +111,7 @@ inline bool subgroup_workgroup_fits(const std::array<std::uint32_t, 3>& local_si
 //   - A device whose one and only subgroup size (min == max) is the wanted one needs nothing (`device_fixed`).
 //   - Where the size cannot be required (stage not listed, feature off) but the device default is the wanted size,
 //     the shader works as it is (`device_default`): nothing guarantees it, a driver may change its default.
-//   - On a fixed 32-wide device, a wave64 graphics shader classified as tier A or B runs in halves.
-//     Other size mismatches are `unavailable`.
+//     Otherwise the outcome is `unavailable`.
 inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const SubgroupSizeCaps& caps) {
     SubgroupRequest r;
     r.stage = subgroup_stage_bit(entry.stage);
@@ -138,11 +144,6 @@ inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const Subg
             r.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     } else if (caps.default_size == r.wanted) {
         r.outcome = SubgroupOutcome::device_default;
-    } else if (entry.wave64_graphics_halves && entry.wave64 && r.wanted == 64 &&
-               caps.min_size == 32 && caps.max_size == 32 &&
-               (r.stage == VK_SHADER_STAGE_VERTEX_BIT || r.stage == VK_SHADER_STAGE_FRAGMENT_BIT ||
-                r.stage == VK_SHADER_STAGE_GEOMETRY_BIT)) {
-        r.outcome = SubgroupOutcome::graphics_halves;
     } else {
         r.outcome = SubgroupOutcome::unavailable;
     }
