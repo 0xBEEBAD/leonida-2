@@ -1664,7 +1664,10 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
     // The title takes its frame tokens from device slot 80 (WaitFrameEventX), which numbers them from the device's
     // FrameTokenSource. The pacer refuses a token above the ones its source issued, so it must count from the same
     // source: with a pacer-owned one every PresentX after the first wait is refused with E_INVALIDARG (#7496, #7685).
-    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens);
+    // With LEONIDA_FRAME_PACING=1 the pacer also answers a zero-timeout origin wait with the newest passed origin
+    // (current_origin_poll), as the tree that paced these slots was measured; otherwise it is the pacer as it was.
+    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens,
+                                                                frame_pacing_enabled());
     // The title registers its interval and origin event before the first PresentX builds this.
     if (const std::uint32_t interval = device->frame_interval_us.load(std::memory_order_relaxed);
         interval && frame_pacing_enabled()) {
