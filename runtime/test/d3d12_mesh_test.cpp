@@ -139,7 +139,6 @@ int main(int argc, char** argv) {
 
     const auto device_info = [&](bool mesh) {
         rt::d3d12::VulkanDeviceInfo info{};
-        info.first_use_backend_pipelines=d.first_use_backend_pipelines;
         info.prepare_on_bind=d.prepare_on_bind;
         info.cold_graphics_compile=d.cold_graphics_compile;
         info.get_instance_proc = d.instance_proc;
