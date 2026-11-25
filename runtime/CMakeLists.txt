@@ -2438,8 +2438,11 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_xmem_placed COMMAND d3d12_xmem_placed_test)
     add_test(NAME xbox_linear_texture_map COMMAND d3d12_xmem_placed_test --linear-map)
     add_test(NAME xbox_linear_gpu_staging COMMAND d3d12_xmem_placed_test --linear-staging)
-    set_tests_properties(xbox_linear_gpu_staging PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
-    set_tests_properties(xbox_linear_texture_map PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    # Resource::Map asks the linear mapping of a slot 133 texture first only with LEONIDA_LINEAR_MAP_FIRST=1.
+    set_tests_properties(xbox_linear_gpu_staging PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+                         ENVIRONMENT "LEONIDA_LINEAR_MAP_FIRST=1")
+    set_tests_properties(xbox_linear_texture_map PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+                         ENVIRONMENT "LEONIDA_LINEAR_MAP_FIRST=1")
     set_tests_properties(d3d12_xmem_placed PROPERTIES SKIP_RETURN_CODE 77)
 
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.

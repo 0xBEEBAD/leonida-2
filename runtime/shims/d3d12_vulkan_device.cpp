@@ -5711,9 +5711,16 @@ public:
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
-        if (title_linear_ && data && image_) {
-            // A texture whose lease says its title memory is linear: mapped through its pinned pages. One that this
-            // cannot serve still answers with its placement address below.
+        // A texture whose lease says its title memory is linear (title_linear_) and that also has a placement
+        // address (slot 133; the video planes among them) has two answers. The placement address, with the title
+        // texture registry filling the image, is the one the retail boot ran through the intro movie and the story
+        // load on, so it is asked first. LEONIDA_LINEAR_MAP_FIRST=1 asks the linear mapping first instead (pinned
+        // pages, with a GPU-written texture read back into them); what that cannot serve still gets the address.
+        static const bool linear_first = [] {
+            const char* v = std::getenv("LEONIDA_LINEAR_MAP_FIRST");
+            return v && *v == '1';
+        }();
+        if (linear_first && title_linear_ && data && image_) {
             *data = nullptr;
             const HRESULT hr = map_title_texture(subresource, read, data);
             if (SUCCEEDED(hr) || !title_address_) return hr;
@@ -5725,6 +5732,10 @@ public:
             if (title_texture_ && !title_mapped_.exchange(true, std::memory_order_relaxed))
                 device_.title_texture_mapped(this, reinterpret_cast<std::uint64_t>(title_address_));
             return S_OK;
+        }
+        if (title_linear_ && data && image_) {  // a leased linear texture with no placement address
+            *data = nullptr;
+            return map_title_texture(subresource, read, data);
         }
         if (image_) {
             VkImageSubresourceRange range{};
