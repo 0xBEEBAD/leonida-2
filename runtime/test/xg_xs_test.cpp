@@ -779,9 +779,14 @@ int main() {
     check(slot<LayoutFn>(computer, 2)(computer, &l) == S_OK && l.size == 256 && l.alignment == 256,
           "explicit linear render target is one 256-byte row");
     slot<RefFn>(computer, 1)(computer);
-    void* none = nullptr;
+    // Without a mode, the render target is not this model's (it leaves the mode to XG's Z/R choice): the general layout
+    // model lays it out, as it does the other render targets above.
+    void* general = nullptr;
     d.layout = 0;
-    check(create(&d, &none) == E_NOTIMPL, "a render target without a mode still needs SW_64KB_R_X, which XG lacks");
+    Texture own{};
+    check(!build_texture(d, own), "a render target without a mode is not the explicit-mode model's");
+    check(create(&d, &general) == S_OK && general, "a render target without a mode uses the general layout model");
+    if (general) slot<RefFn>(general, 1)(general);
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
