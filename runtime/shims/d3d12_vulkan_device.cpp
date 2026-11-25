@@ -10004,10 +10004,6 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
 // A pipeline state, compute (create_compute) or graphics (create_graphics): each shader is found by the SHA-256 of
 // its FSSM program in the translator's index, and the FSSM blob is copied into the arena as the shader's code base.
 std::atomic<long> live_pipeline_state_count{0};  // live_pipeline_states()
-// set_pipeline_build_hook (tests): called on the building thread with the PSO, once a replay build is claimed and
-// before it calls the driver.
-std::mutex pipeline_build_hook_mutex;
-std::function<void(ID3D12PipelineState*)> pipeline_build_hook;
 
 // What the bindless set layout was made from, for a compute pipeline's journal name: a pipeline built against another
 // layout is another pipeline. Field by field, so padding never reaches the hash.
@@ -10447,12 +10443,6 @@ public:
     ~PipelineState() override {
         unregister();
         PipelineCompiler::instance().cancel(compile_owner());  // nothing left in practice (last_release)
-        {
-            // Builds replay asked for that were dropped with the PSO leave pipeline_wait's count of those in flight.
-            std::lock_guard lock(builds_mutex());
-            for (auto& [unbound, b] : builds_)
-                if (b.wanted) leonida::pipeline_wait::stats().building.fetch_sub(1, std::memory_order_relaxed);
-        }
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
@@ -11338,15 +11328,11 @@ public:
             // A cache-only create that the driver would have to compile stays null: the first draw builds it.
             if (!graphics_.pipeline && !(cache_only && compile_status == VK_PIPELINE_COMPILE_REQUIRED)) return E_FAIL;
         }  // lazy: graphics_.pipeline stays null and the first draw builds it as variant 0
-        // Replay asks through replay_get (prepare, never waiting on another thread's build) and replay_await (the
-        // submission's pre-pass, with no lock held): a null handle may mean the variant is still being built.
-        if (graphics_.pipeline) ready0_.store(graphics_.pipeline, std::memory_order_release);
-        graphics_.async_build = true;
+        graphics_.async_build = async_replay_compile();
         graphics_.variant = [this](std::uint32_t unbound) {
-            return replay_pipeline("draw", [&] { return replay_get(false, unbound); });
-        };
-        graphics_.await = [this](std::uint32_t unbound, std::int64_t until, bool* pending) {
-            return replay_await(false, unbound, until, pending);
+            return replay_pipeline("draw", [&] {
+                return graphics_.async_build ? queue_build(false, unbound) : variant(unbound, "draw");
+            });
         };
         graphics_.built = [this](std::uint32_t unbound) {
             std::unique_lock lock(variants_mutex_, std::try_to_lock);  // held: another thread is compiling one
@@ -11508,15 +11494,12 @@ public:
             };
             pipeline_.build_context = this;
         } else if (lazy_compute) {
-            // As for graphics: replay_get at prepare, replay_await in the submission's pre-pass; null may mean the
-            // pipeline is still being built, and the dispatch is skipped.
-            pipeline_.async_build = true;
+            pipeline_.async_build = async_replay_compile();
             pipeline_.build = [](void* self) {
                 auto* pso = static_cast<PipelineState*>(self);
-                return replay_pipeline("dispatch", [&] { return pso->replay_get(true, 0); });
-            };
-            pipeline_.await = [](void* self, std::int64_t until, bool* pending) {
-                return static_cast<PipelineState*>(self)->replay_await(true, 0, until, pending);
+                return replay_pipeline("dispatch", [&] {
+                    return pso->pipeline_.async_build ? pso->queue_build(true, 0) : pso->build_compute("dispatch");
+                });
             };
             pipeline_.build_context = this;
             pipeline_.built = [](void* self) {
@@ -11579,7 +11562,7 @@ private:
             return VK_NULL_HANDLE;
         }
         // LOCAL FIX (compile helper, d3d12_compile_helper.h): asynchronous builds and warm-ups only ask the helper and
-        // are deferred (build_claimed puts the variant back to idle, so its next use asks again). While the helper is
+        // are deferred (queue_build publishes nothing for them, so their next use asks again). While the helper is
         // still making the file this answers at once, without reading the module; a use asks with replay's priority.
         // Only replay's own and the warm-up's triggers may answer deferred: compute-create (LEONIDA_LAZY_COMPUTE=0) is
         // a create whose caller needs a pipeline now, so it waits for the file as a dispatch does in a strict replay
@@ -11657,239 +11640,71 @@ private:
         if (!queued) device_.next_checkpoint.store(now + 120000);  // refused after an exit stop, or out of memory
     }
 
-    // Replay's builds of this pipeline, by variant (compute: 0; graphics: the unbound mask of
-    // leonida::GraphicsPipeline::variant), under builds_mutex() with builds_changed(); no driver call holds the lock.
-    // A variant is idle until something asks for it, queued once a compile-worker job for it is (a warm-up, or one at
-    // replay's priority), running once a thread has claimed it (the worker, or a submitting thread that builds it in
-    // place), and done with its handle (null: it cannot be built). Exactly one thread builds each variant: a worker job
-    // that finds its variant claimed returns at once, so a replay never waits on variants_mutex_ behind a build.
-    struct Build {
-        enum State : std::uint8_t { idle, queued, running, done } state = idle;
-        bool demanded = false;  // a job at replay's priority (0) is queued: a warm-up queued by module size is not enough
-        bool wanted = false;    // replay asked for it before it was done: counted in pipeline_wait's "still building"
-        VkPipeline handle = VK_NULL_HANDLE;
-        unsigned long long skips = 0;  // draws or dispatches skipped while it was being built
-    };
-    static std::mutex& builds_mutex() {
-        static std::mutex mutex;
-        return mutex;
-    }
-    static std::condition_variable& builds_changed() {
-        static std::condition_variable changed;
-        return changed;
-    }
-
-    // A warm-up is speculative work at the large-compile gate: it waits behind the builds a submission needs.
-    VkPipeline build_variant(bool compute, std::uint32_t unbound, const char* trigger) {
-        return compute ? build_compute(trigger, std::strcmp(trigger, "warmup") ? Work::demand : Work::speculative)
-                       : variant(unbound, trigger);
-    }
-
-    // Takes the build for this thread unless another thread has it or it is done.
-    static bool claim_locked(Build& b) {
-        if (b.state == Build::running || b.state == Build::done) return false;
-        b.state = Build::running;
-        return true;
-    }
-
-    static void want_locked(Build& b) {
-        if (b.wanted || b.state == Build::done) return;
-        b.wanted = true;
-        leonida::pipeline_wait::stats().building.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // A claimed build's result, published for replay, and every waiter woken.
-    void finish_build(std::uint32_t unbound, VkPipeline built, bool compute) {
-        unsigned long long skipped = 0;
-        {
-            std::lock_guard lock(builds_mutex());
-            Build& b = builds_[unbound];
-            b.state = Build::done;
-            b.handle = built;
-            if (b.wanted) {
-                b.wanted = false;
-                leonida::pipeline_wait::stats().building.fetch_sub(1, std::memory_order_relaxed);
-            }
-            skipped = b.skips;
-            if (!unbound && built) ready0_.store(built, std::memory_order_release);
+    // Asynchronous builds (LEONIDA_ASYNC_PIPELINES=1): replay asks here at prepare, with the resource lock held. The
+    // handle once built; otherwise a compile-worker job is queued (once) and null answered, so the draw or dispatch is
+    // skipped and a later submission uses the pipeline. `warm_bytes`: a warm-up, queued by module size. `count_skip`:
+    // false for a request made at record time (request_early), which skips nothing.
+    VkPipeline queue_build(bool compute, std::uint32_t unbound, std::size_t warm_bytes = 0, bool count_skip = true) {
+        static std::mutex publication;  // ready handles only; no compiler call holds this lock
+        const bool warm = warm_bytes != 0;
+        // After an exit stop (stop_pipeline_compiles) nothing is queued: a warm-up or an early request is skipped,
+        // and a draw or dispatch builds in place, as without LEONIDA_ASYNC_PIPELINES, rather than waiting for a build
+        // that never comes.
+        if (PipelineCompiler::instance().closed()) {
+            if (warm || !count_skip) return VK_NULL_HANDLE;
+            return compute ? build_compute("dispatch") : variant(unbound, "draw");
         }
-        builds_changed().notify_all();
-        if (skipped && trace_pipeline_compile())
-            std::fprintf(stderr, "[rt] pipeline-deferred type=%s skipped=%llu ready=%d\n", compute ? "compute" : "graphics",
-                         skipped, int(built != VK_NULL_HANDLE));
-    }
-
-    // Builds the claimed variant on this thread and publishes it.
-    VkPipeline build_claimed(bool compute, std::uint32_t unbound, const char* trigger) {
-        VkPipeline built = VK_NULL_HANDLE;
-        try {
-            std::function<void(ID3D12PipelineState*)> hook;
-            {
-                std::lock_guard lock(pipeline_build_hook_mutex);
-                hook = pipeline_build_hook;
-            }
-            if (hook) hook(static_cast<ID3D12PipelineState*>(this));
-            built = build_variant(compute, unbound, trigger);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "[rt] pipeline build failed: %s\n", e.what());
-        } catch (...) {
-            std::fprintf(stderr, "[rt] pipeline build failed\n");  // still finished below, or waiters would never be
+        std::lock_guard lock(publication);
+        if (!warm) {
+            if (!requested_) requested_ = std::make_unique<Requests>();
+            auto [it, inserted] = requested_->try_emplace(unbound);
+            if (!it->second.handle && count_skip) ++it->second.skips;
+            if (!inserted) return it->second.handle;
         }
-        if (compute && helper_deferred_.exchange(false)) {
-            defer_build(unbound);
-            return VK_NULL_HANDLE;
-        }
-        finish_build(unbound, built, compute);
-        return built;
-    }
-
-    // The compile helper is making the variant's journal file (build_compute): not done, so its next use asks again.
-    // Waiters are not woken for it: a bounded wait ends at its deadline, an unlimited one looks again every 100 ms.
-    void defer_build(std::uint32_t unbound) {
-        std::lock_guard lock(builds_mutex());
-        Build& b = builds_[unbound];
-        b.state = Build::idle;
-        b.demanded = false;
-    }
-
-    // A compile-worker job for the variant at `priority` (0: replay asked for it; a module size: a warm-up). False when
-    // it could not be queued (refused after an exit stop, or out of memory). With builds_mutex() held.
-    bool queue_locked(Build& b, bool compute, std::uint32_t unbound, std::size_t priority) {
         bool queued = false;
         try {
-            const bool warm = priority != 0;
-            queued = PipelineCompiler::instance().submit(compile_owner(), &device_, priority, [this, compute, unbound, warm,
-                                                                                                priority] {
-                {
-                    std::lock_guard lock(builds_mutex());
-                    Build& b = builds_[unbound];
-                    if (warm && !b.demanded && b.state == Build::queued && warmup_waits_for_quiet(priority)) {
-                        b.state = Build::idle;  // left to its first use
-                        return;
+            queued = PipelineCompiler::instance().submit(compile_owner(), &device_, warm_bytes,
+                                                         [this, compute, warm, unbound, warm_bytes] {
+                // A big warm-up while the title submits is left to the pipeline's first use (warmup_waits_for_quiet).
+                if (warm && warmup_waits_for_quiet(warm_bytes)) return;
+                VkPipeline built{};
+                try {
+                    built = compute ? build_compute(warm ? "warmup" : "dispatch-worker",
+                                                    warm ? Work::speculative : Work::demand)
+                                    : variant(unbound, "draw-worker");
+                    // The compile helper is still making the journal file (build_compute): not built, so nothing is
+                    // published and the next use asks again.
+                    const bool deferred = compute && helper_deferred_.exchange(false);
+                    if (async_replay_compile()) {
+                        unsigned long long skipped = 0;
+                        {
+                            std::lock_guard publish(publication);
+                            if (!requested_) requested_ = std::make_unique<Requests>();
+                            if (deferred) {
+                                if (!warm) requested_->erase(unbound);
+                            } else {
+                                auto& entry = (*requested_)[unbound];
+                                if (!entry.handle) skipped = entry.skips;
+                                entry.handle = built;
+                            }
+                        }
+                        if (skipped && trace_pipeline_compile())
+                            std::fprintf(stderr, "[rt] pipeline-deferred type=%s skipped=%llu ready=%d\n",
+                                         compute ? "compute" : "graphics", skipped, int(built != VK_NULL_HANDLE));
                     }
-                    if (!claim_locked(b)) return;  // built, or being built by a submitting thread
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "[rt] pipeline compile worker failed: %s\n", e.what());
                 }
-                build_claimed(compute, unbound, compute ? (warm ? "warmup" : "dispatch-worker") : "draw-worker");
             }, !compute);  // a graphics build may also take the graphics worker
         } catch (...) {
         }
-        if (queued && b.state == Build::idle) b.state = Build::queued;
-        if (queued && !priority) b.demanded = true;
-        return queued;
-    }
-
-    // Asynchronous builds: the handle once built; otherwise makes sure a job at replay's priority is on its way and
-    // answers null, with `pending` false only when nothing is on its way (it could not be queued). builds_mutex() held.
-    VkPipeline request_locked(Build& b, bool compute, std::uint32_t unbound, bool& pending) {
-        pending = false;
-        if (b.state == Build::done) return b.handle;
-        pending = b.state == Build::running || (b.state == Build::queued && b.demanded) ||
-                  queue_locked(b, compute, unbound, 0);
-        if (pending) want_locked(b);
+        // Not queued (refused by a stop that came after the check above, or out of memory): no request stays
+        // recorded, so the next use asks again instead of waiting for a build that never comes.
+        if (!queued && !warm) requested_->erase(unbound);
         return VK_NULL_HANDLE;
     }
 
-    // The first skips of each still-building variant are named (32 in all), the rest only counted (pipeline_wait.h).
-    void note_skip(bool compute, std::uint32_t unbound, bool first) const {
-        leonida::pipeline_wait::count_skip(compute);
-        static std::atomic<unsigned> logged{0};
-        if (!first || logged.fetch_add(1, std::memory_order_relaxed) >= 32) return;
-        std::fprintf(stderr, "[rt] pipeline-wait: %s of %s pipeline %s (variant %u) skipped while it is being built, at "
-                             "t=%.3f s\n", compute ? "dispatches" : "draws", compute ? "compute" : "graphics",
-                     describe().c_str(), unbound, double(leonida::diagnostic_ms()) / 1000.0);
-    }
-
-    std::string describe() const {
-        if (compute_entry_) return compute_entry_->name;
-        std::string names;
-        for (const StageSource& source : sources_) {
-            if (!source.entry) continue;
-            if (!names.empty()) names += '+';
-            names += source.entry->name;
-        }
-        return names.empty() ? std::string("-") : names;
-    }
-
 public:
-    // Prepare's handle for the variant (ComputePipeline::build, GraphicsPipeline::variant), called with the context's
-    // resource lock held: never waits for a build another thread runs. Asynchronous builds (LEONIDA_ASYNC_PIPELINES=1)
-    // queue one at replay's priority and answer null; the draw or dispatch is skipped and counted. Otherwise a variant
-    // nobody has started is built here, as before (the submission's pre-pass, replay_await, normally did it with no
-    // lock held), and one running elsewhere (a warm-up) answers null. After an exit stop it is built here.
-    VkPipeline replay_get(bool compute, std::uint32_t unbound) {
-        if (!unbound)
-            if (const VkPipeline ready = ready0_.load(std::memory_order_acquire)) return ready;
-        bool build_here = false, pending = false, first = false;
-        VkPipeline handle = VK_NULL_HANDLE;
-        {
-            std::lock_guard lock(builds_mutex());
-            Build& b = builds_[unbound];
-            if (b.state == Build::done) return b.handle;
-            const bool async = async_replay_compile() && !PipelineCompiler::instance().closed();
-            if (!async && claim_locked(b)) {
-                build_here = true;
-            } else {
-                if (async) {
-                    handle = request_locked(b, compute, unbound, pending);
-                } else {
-                    pending = true;  // claimed by another thread
-                    want_locked(b);
-                }
-                if (pending) first = b.skips++ == 0;
-            }
-        }
-        if (build_here) return build_claimed(compute, unbound, compute ? "dispatch" : "draw");
-        if (pending) note_skip(compute, unbound, first);
-        return handle;
-    }
-
-    // The submission's pre-pass (ComputePipeline::await, GraphicsPipeline::await), with no lock of the replay layer
-    // held. `until` as in pipeline_wait.h: probe answers what is built and starts nothing; otherwise a variant nobody
-    // has started is queued at replay's priority (asynchronous builds) or built here, and one still in flight is
-    // waited for until `until`. `*pending`: the null answer means "not built yet" (false: built, or cannot be).
-    // An unlimited wait looks again every 100 ms, so a job dropped from the queue (an exit stop) cannot leave it
-    // waiting for a build nobody will run: after a stop the variant is built here.
-    VkPipeline replay_await(bool compute, std::uint32_t unbound, std::int64_t until, bool* pending_out) {
-        namespace wait = leonida::pipeline_wait;
-        const auto answer = [pending_out](VkPipeline handle, bool pending) {
-            if (pending_out) *pending_out = pending && !handle;
-            return handle;
-        };
-        if (!unbound)
-            if (const VkPipeline ready = ready0_.load(std::memory_order_acquire)) return answer(ready, false);
-        std::unique_lock lock(builds_mutex());
-        Build& b = builds_[unbound];  // a std::map node: the reference stays valid
-        for (;;) {
-            if (b.state == Build::done) return answer(b.handle, false);
-            if (until == wait::probe) return answer(VK_NULL_HANDLE, true);
-            const bool async = async_replay_compile() && !PipelineCompiler::instance().closed();
-            bool pending = false;
-            if (!async) {
-                if (claim_locked(b)) {
-                    lock.unlock();
-                    return answer(build_claimed(compute, unbound, compute ? "dispatch" : "draw"), false);
-                }
-                pending = true;  // claimed by another thread (a warm-up): waited for below
-                want_locked(b);
-            } else {
-                request_locked(b, compute, unbound, pending);
-            }
-            if (!pending) {
-                // Refused by an exit stop that came after the closed() check above: round again to build it here.
-                if (async && PipelineCompiler::instance().closed()) continue;
-                return answer(VK_NULL_HANDLE, false);
-            }
-            if (until <= wait::now_ns()) return answer(VK_NULL_HANDLE, true);
-            const auto done = [&] { return b.state == Build::done; };
-            const std::int64_t slice = until == wait::forever ? wait::now_ns() + 100000000 : until;
-            builds_changed().wait_until(lock, std::chrono::steady_clock::time_point(std::chrono::nanoseconds(slice)),
-                                        done);
-            if (b.state == Build::done) return answer(b.handle, false);
-            if (until != wait::forever && until <= wait::now_ns()) return answer(VK_NULL_HANDLE, true);
-            // An unlimited wait, still pending: ask again (after an exit stop the variant is built here).
-        }
-    }
-
     // Record time (SetPipelineState for compute, a draw for graphics, with the render-target slots it binds and
     // whether it binds a depth buffer): asynchronous builds start on the compile worker before the list is submitted.
     // Never waits; nothing to do when the variant is the last one asked for here.
@@ -11904,14 +11719,10 @@ public:
                 unbound |= leonida::GraphicsPipeline::unbound_depth;
             if (!unbound && graphics_.pipeline) return;
         } else if (!pipeline_.build || pipeline_.skipped) {
-            return;  // an eager pipeline has no build; a built lazy one is caught by ready0_ below
+            return;  // an eager pipeline has no build
         }
-        if (!unbound && ready0_.load(std::memory_order_relaxed)) return;
         if (early_.exchange(unbound + 1, std::memory_order_relaxed) == unbound + 1) return;
-        if (PipelineCompiler::instance().closed()) return;
-        std::lock_guard lock(builds_mutex());
-        bool pending = false;
-        request_locked(builds_[unbound], !is_graphics_, unbound, pending);
+        queue_build(!is_graphics_, unbound, 0, false);
     }
 
 private:
@@ -11930,7 +11741,7 @@ private:
         }();
         if (!limit || bytes <= limit || !leonida::pipeline_wait::title_submitting()) return false;
         if (compile_helper::wanted(bytes)) return false;  // the helper compiles it, in its own process
-        if (leonida::pipeline_wait::stats().warmups_left.fetch_add(1, std::memory_order_relaxed) == 0) {
+        if (leonida::pipeline_wait::warmups_left().fetch_add(1, std::memory_order_relaxed) == 0) {
             static std::atomic<bool> logged{false};
             if (!logged.exchange(true))
                 std::fprintf(stderr, "[rt] d3d12: compute warm-ups over %zu KiB are left to their first use while the "
@@ -11938,14 +11749,6 @@ private:
                              limit >> 10, double(leonida::diagnostic_ms()) / 1000.0);
         }
         return true;
-    }
-
-    // A warm-up of the compute pipeline on the compile worker, queued by module size, unless something asked already.
-    void queue_warmup(std::size_t bytes) {
-        if (PipelineCompiler::instance().closed()) return;
-        std::lock_guard lock(builds_mutex());
-        Build& b = builds_[0];
-        if (b.state == Build::idle) queue_locked(b, true, 0, bytes);
     }
 
     static void warmup_enqueue(PipelineState* pso, std::size_t bytes) {
@@ -11959,7 +11762,7 @@ private:
             wchar_t v[2]{};
             return !(GetEnvironmentVariableW(L"LEONIDA_COMPUTE_WARMUP", v, 2) == 1 && v[0] == L'0');
         }();
-        if (on && bytes && bytes <= max_bytes) pso->queue_warmup(bytes);
+        if (on && bytes && bytes <= max_bytes) pso->queue_build(true, 0, bytes);
     }
 
     // What a graphics pipeline is made from, so variants can be built at draw time.
@@ -12284,10 +12087,11 @@ private:
     unsigned rgba4_mask_ = 0;  // graphics: the B4G4R4A4 targets stored as RGBA8 that the pixel shader is quantised for
     bool dual_source_ = false; // graphics: a SRC1 blend factor; the pixel shader's SV_Target1 is Location 0, Index 1
     std::vector<StageSource> sources_;
-    std::map<std::uint32_t, Build> builds_;          // under builds_mutex()
-    std::atomic<VkPipeline> ready0_{VK_NULL_HANDLE};  // variant 0 once built: read without the lock
+    struct Request { VkPipeline handle{}; unsigned long long skips = 0; };
+    using Requests = std::map<std::uint32_t, Request>;
+    std::unique_ptr<Requests> requested_;
     // Compile helper (build_compute, under variants_mutex_): the journal file asked for and not there yet; whether
-    // the helper gave up on this pipeline (it is then built here); a build just deferred (read by build_claimed).
+    // the helper gave up on this pipeline (it is then built here); a build just deferred (read by queue_build).
     std::filesystem::path helper_file_;
     bool helper_refused_ = false;
     std::atomic<bool> helper_deferred_{false};
@@ -19890,9 +19694,6 @@ bool save_pipeline_caches_at_exit(unsigned wait_ms) {
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    // An unset LEONIDA_PIPELINE_WAIT_MS: a bounded wait (then a skip) only where builds are asynchronous; without them
-    // a submission waits for every build, as before, but with no lock held (src/pipeline_wait.h).
-    leonida::pipeline_wait::default_submission_ms().store(async_replay_compile() ? 24 : -1);
     auto* device = new Device(info);
     if (!device->ok()) {
         device->Release();
@@ -20024,11 +19825,6 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     auto* p=PipelineState::from<PipelineState>(pipeline);
     return p && p->resolve_type(true) ? p->id() : 0;
-}
-
-void set_pipeline_build_hook(std::function<void(ID3D12PipelineState*)> hook) {
-    std::lock_guard lock(pipeline_build_hook_mutex);
-    pipeline_build_hook = std::move(hook);
 }
 
 void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound) {
@@ -21446,7 +21242,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      chosen.limits.maxPushConstantsSize);
     }
 
-    leonida::pipeline_wait::default_submission_ms().store(async_replay_compile() ? 24 : -1);  // as create_vulkan_device
     auto* device = new Device(info);
     device->own(owned);  // destroyed with the device from here on, even on failure
     if (!device->ok()) {

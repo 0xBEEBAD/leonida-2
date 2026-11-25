@@ -24,7 +24,7 @@ enum Phase : unsigned {
     shadows,    // slot-133 shadow buffers and title windows (ShadowPages::refresh)
     geometry,   // GeometryViews::refresh
     textures,   // Device::refresh_title_textures
-    pipelines,  // VulkanQueue::await_pipelines: asking for and waiting on pipelines still being built (pipeline_wait.h)
+    pipelines,  // no longer timed (the pre-pass that waited for pipelines is gone); kept for the column order
     replay,     // the rest of execute_now: preparing, recording and submitting the lists
     kCount
 };

@@ -2569,73 +2569,26 @@ Pipeline creation:
   they take 18.5 s and peak 202 MiB over. Not measured: other drivers, and the title. Tested by `big_compile_gate`,
   `replay_pipeline_compiles` and `d3d12_big_compute`.
 
-**Pipelines still being built** (`runtime/src/pipeline_wait.h`, `PipelineState::replay_await` / `replay_get` in
-`runtime/shims/d3d12_vulkan_device.cpp`). Lazy pipelines are built at first use, and on the 4070 Ti (NVIDIA 630.20)
-a large compute pipeline takes the driver 3-10 s, some 37 s. Replay used to build or wait for them inside
-`VulkanQueue::execute_now`'s prepare, holding `resource_mutex_` shared across the wait. A minidump of a native boot
-just past the story load showed the cost: the submitting thread waited 9.5 s for a compute pipeline the warm-up
-thread was building, a title thread creating a texture queued for the exclusive lock behind it, and every
-submission behind that; per-submission replay time went 0.5 s, 2.8 s, 6 s, then submissions stopped.
+**Pipelines still being built** (`PipelineState::queue_build` in `runtime/shims/d3d12_vulkan_device.cpp`). Lazy
+pipelines are built at first use, and on the 4070 Ti (NVIDIA 630.20) a large compute pipeline takes the driver 3-10 s,
+some 37 s. A submission builds the ones it needs through `PipelineCompiles` and `PipelineWorkers` (above), with
+`resource_mutex_` released while they compile and the large ones within the memory budget of `LargeModuleGate`.
+#2098 had a second path here, a pre-pass in `VulkanQueue::execute` that built them one after another on the
+submitting thread; at the maintainers' decision it was replaced by this one when #2098 was merged.
 
-- **The pre-pass.** `VulkanQueue::execute` first collects, under a short shared `resource_mutex_` (only registry
-  lookups and a probe of each PSO's state), the pipelines the lists' `Dispatch`, `ExecuteIndirect` (dispatch) and
-  `Draw` commands need that are not built: each compute PSO once, each graphics PSO once per variant (the mask of
-  formatted slots the draw leaves unbound, `unbound_slots`, the same mask `prepare_draw` builds with). With the lock
-  released it asks for each of them, then waits for the ones still being built. No lock of the replay layer is held
-  while it waits; the PSOs stay alive because the lists hold them. Its time is the `pipes` column of the
-  `[rt] submit phases` line.
-- **Budget.** `LEONIDA_PIPELINE_WAIT_MS` caps one submission's waiting, in all; 0 never waits, -1 waits for every
-  build (the old behaviour, without the lock). Unset, it is 24 with `LEONIDA_ASYNC_PIPELINES=1` and -1 without, so
-  the default mode never skips. The budget bounds waits for builds other threads run; a build the submitting thread
-  runs itself (synchronous mode) takes as long as it takes. `LEONIDA_PIPELINE_WAIT_FRAME_MS` (default 100, -1 off) caps
-  all submitting threads together between two presents (or per second without presents): a frame of many submissions
-  does not wait the per-submission budget each time.
-- **Skip.** Prepare (`ComputePipeline::build`, `GraphicsPipeline::variant`) never waits for a build another thread
-  runs: a pipeline still in flight answers null, and the draw or dispatch is dropped as an unresolvable one is (a draw
-  emits nothing, not even its rendering scope; a dispatch, direct or indirect, binds and dispatches nothing). The
-  list's barriers, copies, clears, queries and descriptor binding all replay as recorded, so GPU state stays
-  consistent; what the skipped work would have written keeps its old contents. The build goes on, and a later
-  submission uses it. A skipped dispatch can lose a one-time update; a title whose progress waits on one keeps
-  waiting until the pipeline exists (then it runs), so a longer budget trades seconds of stall for fewer skips.
-- **Who builds.** Each PSO variant has one state (idle, queued, running, done) under one mutex that no driver call
-  holds, and exactly one thread claims each build: a worker job that finds its variant claimed returns at once, so
-  nothing waits on a PSO's `variants_mutex_` behind a build. With `LEONIDA_ASYNC_PIPELINES=1` replay queues builds on
-  the compile worker at replay's priority (ahead of warm-ups), and does so at record time already: at
-  `SetPipelineState` for compute and at each draw for graphics, with the variant its bound targets give
-  (`request_pipeline_build`). Without it, the submitting thread builds a pipeline nobody has started in the pre-pass
-  (no lock held), and waits for one a warm-up is building (at most the budget, if one is set). After an exit stop
-  builds run in place; an unlimited wait looks again every 100 ms, so a queued job the stop dropped cannot leave it
-  waiting. A pipeline that cannot be built is not waited for again; its draws and dispatches are dropped (logged when
-  the build fails) where the list used to fail as a whole in synchronous mode; strict replay still fails it.
-  Builds keep the compile gate (`DriverTurn`, `SubmitMutex::CompileTurn`): a submission still waits at the gate for a
-  create already in the driver.
-- **Warm-ups while the title submits.** That gate wait is what a long build costs the title, whoever asked for it: a
-  native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and past the story load the
-  worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s each) against 25 such
-  builds a dispatch asked for. So a warm-up of a module over `LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES` of SPIR-V
-  (default 128 KiB; 0: no limit) is not started while the title submits (a submission in the last second); the
-  pipeline is built at its first use instead. Smaller warm-ups, and every warm-up before the first submission, run
-  as before.
-- **Log.** Every 10 s while anything happened: `[rt] pipeline waits t=..s: in 10.0 s N pipelines waited for (T ms in
-  all, L not built in time), D draws and C dispatches skipped, B pipelines still building; budget ...`. The first 32
-  skipped pipelines are named once each (`[rt] pipeline-wait: ... skipped while it is being built`).
-- **Measured** (native boots of the story load, RTX 4070 Ti, NVIDIA 630.20, `LEONIDA_RT_AS=off`). Before: within
-  30 s of the loading screen ending the replay phase went from under 10 ms to 265 ms (max 26 s), 2.8 s and 6 s per
-  submission, and submissions stopped. With asynchronous builds: submissions kept 20-30/s (replay 4-6 ms) through the
-  end of the loading screen; in the 17 s after it 744 dispatches and 42 draws were skipped and 8 pipelines waited
-  for (172 ms in all). Three builds that missed the pipeline cache then took 4-10.5 s each, and the submissions
-  behind them waited at the compile gate (145 waits, 30 s in all, longest 10.5 s): the gate wait, not replay, is now
-  what a cold build costs. That boot then lost the device to a GPU hang in a compute dispatch (fault addresses of the
-  instruction-pointer kind, no invalid access); whether dispatches skipped before it fed it is open. Synchronous:
-  34-40 submissions/s at 7-8 ms replay up to the end of the loading screen; past it, the boots ended in a title
-  crash seen in many boots without this change (a memset into reserved, uncommitted memory) or the early device
-  loss at 25-37 s (`vkQueueSubmit` 10 s in the driver with no pipeline create in it).
-- **Test:** `d3d12_pipeline_wait_test async|sync` (ctest `d3d12_pipeline_wait_async`, `..._sync`) holds a build in
-  flight with a hook (`set_pipeline_build_hook`): with a 50 ms budget the submission returns within the budget and
-  its dispatch is skipped while the list's copies run; the next submission, once the build is let go, runs it; a 2 s
-  budget waits for a build let go 200 ms in and runs it; with -1 another thread creates and maps a buffer at once
-  while a submission waits; 0 skips without waiting; an exit stop during an unlimited wait builds in place
-  instead of waiting for a dropped job. RTX 4070 Ti, NVIDIA 630.20.
+- **Asynchronous builds** (`LEONIDA_ASYNC_PIPELINES=1`). Prepare asks `queue_build`, which answers the handle once
+  built and otherwise queues one compile-worker job at replay's priority and answers null: the draw or dispatch is
+  skipped, the list's other commands replay as recorded, and a later submission uses the pipeline. The job also starts
+  at record time already: at `SetPipelineState` for compute and at each draw for graphics, with the variant its bound
+  targets give (`request_pipeline_build`). A compute build the compile helper is still making (`LEONIDA_COMPILE_HELPER`)
+  publishes nothing, so its next use asks again.
+- **Warm-ups while the title submits.** A compute warm-up holds the compile gate for its whole create, and every
+  submission waits behind it: a native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and
+  past the story load the worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s
+  each) against 25 such builds a dispatch asked for. So a warm-up of a module over
+  `LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES` of SPIR-V (default 128 KiB; 0: no limit) is not started while the title
+  submits (a submission in the last second, `src/pipeline_wait.h`); the pipeline is built at its first use instead.
+  Smaller warm-ups, and every warm-up before the first submission, run as before.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.

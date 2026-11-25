@@ -3754,15 +3754,6 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_compile_teardown_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compile_teardown COMMAND d3d12_compile_teardown_test)
       set_tests_properties(d3d12_compile_teardown PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
-      # Bounded waits for pipelines still being built (src/pipeline_wait.h), with asynchronous builds and without.
-      add_executable(d3d12_pipeline_wait_test test/d3d12_pipeline_wait_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_CS})
-      target_link_libraries(d3d12_pipeline_wait_test PRIVATE gta6rt_d3d12_com)
-      target_compile_definitions(d3d12_pipeline_wait_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
-      target_compile_options(d3d12_pipeline_wait_test PRIVATE /W4 /permissive- /utf-8)
-      add_test(NAME d3d12_pipeline_wait_async COMMAND d3d12_pipeline_wait_test async)
-      add_test(NAME d3d12_pipeline_wait_sync COMMAND d3d12_pipeline_wait_test sync)
-      set_tests_properties(d3d12_pipeline_wait_async d3d12_pipeline_wait_sync PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
       # A buffer at the title's own VA (device slot 133) read by the same shader through a root view and a V#.
       add_executable(d3d12_title_va_test test/d3d12_title_va_test.cpp shims/d3d12_xs_device.cpp
                      test/xmem_geometry_aliases_stub.cpp ${LEONIDA_TEST_CS})

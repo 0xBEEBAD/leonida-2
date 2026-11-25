@@ -674,7 +674,6 @@ private:
         }
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
         ++frame_index_;
-        pipeline_wait::note_present();  // a new frame's budget for waits on pipelines still being built
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {

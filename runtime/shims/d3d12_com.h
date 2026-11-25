@@ -561,13 +561,10 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // Record time, for LEONIDA_ASYNC_PIPELINES=1: starts the pipeline's build on the compile worker before the list is
-// submitted, without waiting (src/pipeline_wait.h). `id` is what compute_pipeline_id or graphics_pipeline_id gave (0:
+// submitted, without waiting (PipelineState::queue_build). `id` is what compute_pipeline_id or graphics_pipeline_id gave (0:
 // nothing). Compute: at SetPipelineState; graphics: at each draw, with the render-target slots it binds (bit per slot)
 // and whether it binds a depth buffer.
 void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound);
-// Tests: `hook` runs on the thread that builds a pipeline for replay (the compile worker, or a submitting thread
-// building in place), with the PSO, before the driver is called; a hook that blocks holds that build in flight.
-void set_pipeline_build_hook(std::function<void(ID3D12PipelineState*)> hook);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 // PSOs of any Vulkan device not yet deleted, counting one whose deletion waits for its running build (tests).

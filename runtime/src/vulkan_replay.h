@@ -48,7 +48,6 @@
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_indirect_clamp.h"
 #include "xdxr_build.h"
-#include "pipeline_wait.h"
 
 #include <algorithm>
 #include <array>
@@ -874,11 +873,6 @@ struct ComputePipeline {
     // first use is always built where prepare() meets it. Not used with async_build. See PipelineCompiles.
     VkPipeline (*built)(void*) = nullptr;
     bool large = false;        // PipelineCompiles limits how many of these compile at once
-    // With `build`: the submission's pre-pass (await_pipelines) asks for the pipeline and waits for it with no lock of
-    // the replay layer held, up to `until_ns` (pipeline_wait.h: probe, no_wait, a steady-clock time, forever). The
-    // handle, or null with `*pending` saying whether it is still to be built (false: it cannot be). Null: the pre-pass
-    // leaves the pipeline to `build`.
-    VkPipeline (*await)(void* context, std::int64_t until_ns, bool* pending) = nullptr;
     bool skipped = false;      // never built on request (LEONIDA_SKIP_COMPUTE): its dispatches are dropped
     std::uint64_t estimate = 0;  // large: the bytes of memory its compile is expected to take
 };
@@ -912,26 +906,11 @@ struct GraphicsPipeline {
     // ComputePipeline::built.
     std::function<VkPipeline(std::uint32_t flags)> built;
     bool large = false;  // as ComputePipeline::large
-    // As ComputePipeline::await, for the variant with the `unbound` slots (unbound_slots). Null: left to `variant`.
-    std::function<VkPipeline(std::uint32_t unbound, std::int64_t until_ns, bool* pending)> await;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     bool async_build = false;
     bool nonunit_vertex_divisor = false;  // an actual instance divisor > 1, not a zero-stride emulation
     std::uint64_t estimate = 0;  // as ComputePipeline::estimate
 };
-
-// The slots a draw leaves unbound that `pipeline` has a format for: the variant prepare_draw builds the draw with
-// (GraphicsPipeline::variant). A render target or depth buffer that does not resolve drops the draw instead.
-inline std::uint32_t unbound_slots(const Draw& draw, const GraphicsPipeline& pipeline) {
-    std::uint32_t unbound = 0;
-    const std::uint32_t bound = draw.views ? draw.views->render_target_count : 0;
-    for (std::size_t slot = 0; slot < pipeline.color_formats.size() && slot < 8; ++slot)
-        if (pipeline.color_formats[slot] != VK_FORMAT_UNDEFINED &&
-            !(slot < bound && draw.views->render_targets[slot].resource))
-            unbound |= 1u << slot;
-    if (pipeline.depth_format != VK_FORMAT_UNDEFINED && !draw.depth.resource) unbound |= GraphicsPipeline::unbound_depth;
-    return unbound;
-}
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
 struct ShaderUserData {
@@ -2815,7 +2794,6 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
 
     // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
     // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
-    // The same mask as unbound_slots, which the submission's pre-pass asked for (await_pipelines).
     std::uint32_t unbound = 0;
     if (pipeline->rectangle_variant_topology && draw.topology == pipeline->rectangle_variant_topology)
         unbound |= GraphicsPipeline::rectangle_stage;
@@ -3388,114 +3366,6 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
         }
     }
     return false;
-}
-
-// A pipeline a submission needs that may still be in the making (ComputePipeline::await / GraphicsPipeline::await),
-// once per pipeline and variant: collected by collect_pipeline_awaits with the caller's resource lock held (the
-// lookups read the registry), waited for by await_pipelines after it is released. The pipeline states stay alive
-// meanwhile: the command lists that name them hold them (D3D12 lets them go only once the call has returned).
-struct PipelineAwait {
-    std::uintptr_t id = 0;
-    std::uint32_t unbound = 0;
-    VkPipeline (*compute)(void*, std::int64_t, bool*) = nullptr;
-    void* context = nullptr;
-    std::function<VkPipeline(std::uint32_t, std::int64_t, bool*)> graphics;
-    VkPipeline handle = VK_NULL_HANDLE;
-    bool pending = true;  // not built yet (false once built, or known not to build)
-    void call(std::int64_t until) {
-        handle = compute ? compute(context, until, &pending) : graphics(unbound, until, &pending);
-        if (handle) pending = false;
-    }
-};
-
-// The pipelines `lists` draw and dispatch with that are not built yet: every one whose handle replay asks for at
-// prepare time (ComputePipeline::build, GraphicsPipeline::variant), probed without starting anything. `seen` is the
-// caller's scratch (not a thread_local: one with a destructor in gta6rt.exe adds TLS callbacks to the image, which
-// the loader's TLS index-0 move must not have, pe_loader.cpp reserve_tls_index0).
-inline void collect_pipeline_awaits(std::span<const CommandList* const> lists, const ReplayFunctions& vk,
-                                    std::vector<PipelineAwait>& out, std::unordered_set<std::uint64_t>& seen) {
-    out.clear();
-    seen.clear();
-    if (!vk.compute_pipeline && !vk.graphics_pipeline) return;
-    std::uint64_t last = ~0ull;
-    const auto first_time = [&](std::uintptr_t id, std::uint32_t unbound) {
-        const std::uint64_t key = std::uint64_t(id) ^ (std::uint64_t(unbound) << 52);
-        if (key == last) return false;
-        last = key;
-        return seen.insert(key).second;
-    };
-    const auto compute = [&](std::uintptr_t id) {
-        if (!id || !vk.compute_pipeline || !first_time(id, 0)) return;
-        const ComputePipeline* pipeline = vk.compute_pipeline(id);
-        if (!pipeline || pipeline->pipeline || pipeline->skipped || !pipeline->await) return;
-        bool pending = false;
-        if (pipeline->await(pipeline->build_context, pipeline_wait::probe, &pending) || !pending) return;
-        PipelineAwait& a = out.emplace_back();
-        a.id = id;
-        a.compute = pipeline->await;
-        a.context = pipeline->build_context;
-    };
-    for (const CommandList* list : lists) {
-        for (const auto& command : list->commands()) {
-            if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
-                compute(dispatch->pipeline);
-            } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
-                if (ind->kind == IndirectKind::dispatch) compute(ind->pipeline);
-            } else if (const auto* draw = draw_command(command).state) {  // direct and stateful indirect draws
-                if (!draw->pipeline || !vk.graphics_pipeline) continue;
-                const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw->pipeline);
-                if (!pipeline || !pipeline->await) continue;
-                const std::uint32_t unbound = unbound_slots(*draw, *pipeline);
-                if ((!unbound && pipeline->pipeline) || !first_time(draw->pipeline, unbound)) continue;
-                bool pending = false;
-                if (pipeline->await(unbound, pipeline_wait::probe, &pending) || !pending) continue;
-                PipelineAwait& a = out.emplace_back();
-                a.id = draw->pipeline;
-                a.unbound = unbound;
-                a.graphics = pipeline->await;
-            }
-        }
-    }
-}
-
-// Asks for every pipeline in `awaits` (a build each nobody has started: queued on the compile worker, or built here
-// when builds are not asynchronous), then waits for the ones still being built, together at most `budget_ns`
-// (negative: as long as they take) and what the frame's budget has left (pipeline_wait::take). Holds no lock while it
-// waits. The ones not built by then are skipped by replay. Returns how long it waited.
-inline std::int64_t await_pipelines(std::vector<PipelineAwait>& awaits, std::int64_t budget_ns) {
-    for (PipelineAwait& a : awaits) a.call(pipeline_wait::no_wait);
-    std::size_t pending = 0;
-    for (const PipelineAwait& a : awaits) pending += a.pending;
-    if (!pending || budget_ns == 0) return 0;
-    const pipeline_wait::Grant grant =
-        budget_ns < 0 ? pipeline_wait::Grant{pipeline_wait::forever, 0, false} : pipeline_wait::take(budget_ns);
-    if (grant.ns <= 0) return 0;
-    const std::int64_t start = pipeline_wait::now_ns();
-    const std::int64_t until = budget_ns < 0 ? pipeline_wait::forever : start + grant.ns;
-    auto& stats = pipeline_wait::stats();
-    for (PipelineAwait& a : awaits) {
-        if (!a.pending) continue;
-        if (until != pipeline_wait::forever && pipeline_wait::now_ns() >= until) {
-            stats.late.fetch_add(1, std::memory_order_relaxed);  // no time left for it
-            continue;
-        }
-        const std::int64_t began = pipeline_wait::now_ns();
-        a.call(until);
-        stats.waited.fetch_add(1, std::memory_order_relaxed);
-        stats.wait_ns.fetch_add(std::uint64_t(pipeline_wait::now_ns() - began), std::memory_order_relaxed);
-        if (a.pending) stats.late.fetch_add(1, std::memory_order_relaxed);
-    }
-    const std::int64_t waited = pipeline_wait::now_ns() - start;
-    if (grant.limited) pipeline_wait::give_back(grant, grant.ns - waited);
-    return waited;
-}
-
-// The budget for one submission (pipeline_wait.h): nanoseconds, negative for no limit. Strict replay waits for every
-// build, so nothing is skipped.
-inline std::int64_t pipeline_wait_budget_ns() {
-    if (strict_replay()) return -1;
-    const int ms = pipeline_wait::effective_submission_ms();
-    return ms < 0 ? -1 : std::int64_t(ms) * 1000000;
 }
 
 // Resolves and checks every command. Nothing is written to a command buffer.

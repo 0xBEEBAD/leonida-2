@@ -30,6 +30,7 @@
 #include "resource_tiling.h"
 #include "pipeline_profile.h"
 #include "submit_phases.h"
+#include "pipeline_wait.h"
 #include "title_va_alias.h"
 #include "xdxr_build.h"
 
@@ -2715,27 +2716,6 @@ public:
         return bind_tiles(dst, target->second, changes);
     }
 
-    // The pipelines the lists' draws and dispatches need that are not built yet are asked for (queued on the compile
-    // worker, or built here when builds are not asynchronous) and waited for at most the budget (pipeline_wait.h),
-    // holding none of our locks: a build that takes seconds no longer holds resource_mutex_ (shared) across its wait,
-    // where a title thread creating a resource queued behind it for the exclusive lock and every submission behind
-    // that. What is still being built after the wait is skipped by prepare and used by a later submission.
-    void await_pipelines(std::span<const CommandList* const> lists) {
-        const submit_phases::Scope timed(submit_phases::pipelines);
-        pipeline_wait::note_submission();
-        // The queue's scratch, kept for its capacity. Its own lock is a leaf: what runs under it takes resource_mutex_
-        // (shared, for the lookups), a PSO's build state lock and the compile worker's queue lock, none of which is
-        // held by anything that takes this one.
-        std::lock_guard scratch(awaits_mutex_);
-        {
-            std::shared_lock lock(context_.resource_mutex_);  // the registry lookups; no build or wait under it
-            collect_pipeline_awaits(lists, context_.replay_, awaits_, await_seen_);
-        }
-        if (!awaits_.empty()) leonida::await_pipelines(awaits_, pipeline_wait_budget_ns());
-        awaits_.clear();  // the captured callbacks go before the lists' pipeline states may
-        pipeline_wait::maybe_report([] { return submit_phases::process_age(); });
-    }
-
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
     // the layout tracker as it was. Pending Wait()s are attached to this submission. When one of them (or an
     // earlier held operation) waits for a fence value no Signal has been submitted for, the lists are copied and
@@ -2748,7 +2728,7 @@ public:
     using PinFn = std::function<std::shared_ptr<void>()>;
 
     ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
-        await_pipelines(lists);  // before any lock of ours: prepare then never waits for a pipeline build
+        pipeline_wait::note_submission();  // big compute warm-ups are left to their first use while the title submits
         auto* diagnostics = context_.device_fault();
         const auto execute_call = diagnostics ? diagnostics->next_execute_call() : 0;
         if (async_on()) {  // copied and queued: the worker replays it (a failure is reported as a held one's)
@@ -2909,9 +2889,6 @@ private:
     std::vector<KhrInstanceStage> khr_stage_pool_;
     std::vector<KhrAsQueryPool> khr_as_query_pool_;
     std::vector<TitleVaAliases::Mapping> xdxr_ranges_;  // stage_xdxr_table's snapshot, kept for its capacity
-    std::mutex awaits_mutex_;                            // await_pipelines' scratch (not thread_local, see there)
-    std::vector<PipelineAwait> awaits_;
-    std::unordered_set<std::uint64_t> await_seen_;
 
     void destroy_khr_stages(std::vector<KhrInstanceStage>& stages) {
         for (const auto& stage : stages) {
