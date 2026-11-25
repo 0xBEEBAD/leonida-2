@@ -136,6 +136,27 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(ins.mnem, "shr")
         self.assertEqual(ins.ops[1], ("i", 4, 1))
 
+    def test_shift_zero_count_flags(self):
+        # Shifts and rotates with immediate count 0 (or masked to 0) affect no flags in x86
+        for hexcode in ("c1 e0 00", "c1 e8 00", "c1 f8 00", "c1 c0 00", "c1 c8 00"):
+            ins = self.one(asm(hexcode))
+            self.assertEqual(ins.flags_w, "")
+            self.assertEqual(ins.flags_r, "")
+
+        # 32-bit shift masked with 0x1f: count 32 -> 0
+        ins = self.one(asm("c1 e0 20"))
+        self.assertEqual(ins.flags_w, "")
+
+        # 64-bit shift masked with 0x3f: count 64 -> 0
+        ins = self.one(asm("48 c1 e0 40"))
+        self.assertEqual(ins.flags_w, "")
+
+        # Non-zero counts write flags
+        ins = self.one(asm("c1 e0 01"))
+        self.assertEqual(ins.flags_w, "NZCP")
+        ins = self.one(asm("d3 e0"))
+        self.assertEqual(ins.flags_w, "NZCP")
+
     def test_prefixes(self):
         ins = self.one(asm("66 b8 34 12"))      # mov ax,0x1234
         self.assertEqual(ins.ops, (("r", 0, 2, False), ("i", 0x1234, 2)))
@@ -147,6 +168,49 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(ins.rep, "f2")
         ins = self.one(asm("f3 0f 1e fa"))      # endbr64 (decoded, no crash)
         self.assertEqual(ins.size, 4)
+
+
+class ShiftCarryAnalysisTests(unittest.TestCase):
+    def test_imm_shift_zero_preserves_reaching_producer(self):
+        # cmp r8d, 2; shl eax, 0; setc dl; ret
+        code = asm("41 83 f8 02", "c1 e0 00", "0f 92 c2", "c3")
+        insns = list(x.disasm(code, 0x1000))
+        tr = x.FunctionTranslator(insns)
+        tr.translate()
+        setc_ins = next(i for i in insns if i.mnem == "setcc")
+        self.assertEqual(tr.arm_path[setc_ins.addr].mnem, "cmp")
+
+    def test_var_shift_sub_kind_producer_inversion(self):
+        # cmp r8d, 2; mov cl, 0; shl eax, cl; setc dl; ret
+        code = asm("41 83 f8 02", "b1 00", "d3 e0", "0f 92 c2", "c3")
+        insns = list(x.disasm(code, 0x1000))
+        tr = x.FunctionTranslator(insns)
+        tr.translate()
+        shl_ins = next(i for i in insns if i.mnem == "shl")
+        self.assertEqual(tr.shift_prev_c[shl_ins.addr].mnem, "cmp")
+        # eor x17, x17, #0x20000000 flips bit 29 of NZCV
+        self.assertIn(0xd2630231, tr.asm.words)
+
+    def test_var_shift_add_kind_producer_no_inversion(self):
+        # add eax, 1; mov cl, 0; shl eax, cl; setc dl; ret
+        code = asm("83 c0 01", "b1 00", "d3 e0", "0f 92 c2", "c3")
+        insns = list(x.disasm(code, 0x1000))
+        tr = x.FunctionTranslator(insns)
+        tr.translate()
+        shl_ins = next(i for i in insns if i.mnem == "shl")
+        self.assertEqual(tr.shift_prev_c[shl_ins.addr].mnem, "add")
+        self.assertNotIn(0xd2630231, tr.asm.words)
+
+    def test_var_shift_block_start_loads_ctx_eflags(self):
+        # shl eax, cl; setc dl; ret
+        code = asm("d3 e0", "0f 92 c2", "c3")
+        insns = list(x.disasm(code, 0x1000))
+        tr = x.FunctionTranslator(insns)
+        tr.translate()
+        shl_ins = next(i for i in insns if i.mnem == "shl")
+        self.assertIsNone(tr.shift_prev_c[shl_ins.addr])
+        # ldur x3, [x19, #0] (CTX_EFLAGS)
+        self.assertIn(0xf8400383, tr.asm.words)
 
 
 def run(code):
@@ -432,6 +496,31 @@ class ExecTests(unittest.TestCase):
             "bf 2a 00 00 00",       # mov edi,42
             "c3"))
         self.assertEqual(r, 42)
+
+    def test_shift_zero_count_carry_cmp_imm(self):
+        # cmp r8d, 2; shl eax, 0; setc dl; movzx edi, dl; ret
+        # r8d = 1 < 2 -> borrow (CF=1) -> dl=1
+        r1, _ = run(asm("41 b8 01 00 00 00", "41 83 f8 02", "c1 e0 00", "0f 92 c2", "0f b6 fa", "c3"))
+        self.assertEqual(r1, 1)
+
+        # r8d = 3 >= 2 -> no borrow (CF=0) -> dl=0
+        r0, _ = run(asm("41 b8 03 00 00 00", "41 83 f8 02", "c1 e0 00", "0f 92 c2", "0f b6 fa", "c3"))
+        self.assertEqual(r0, 0)
+
+    def test_shift_zero_count_carry_cmp_cl(self):
+        # cmp r8d, 2; mov cl, 0; shl eax, cl; setc dl; movzx edi, dl; ret
+        # r8d = 1 < 2 -> borrow (CF=1) -> dl=1
+        r1, _ = run(asm("41 b8 01 00 00 00", "41 83 f8 02", "b1 00", "d3 e0", "0f 92 c2", "0f b6 fa", "c3"))
+        self.assertEqual(r1, 1)
+
+        # r8d = 3 >= 2 -> no borrow (CF=0) -> dl=0
+        r0, _ = run(asm("41 b8 03 00 00 00", "41 83 f8 02", "b1 00", "d3 e0", "0f 92 c2", "0f b6 fa", "c3"))
+        self.assertEqual(r0, 0)
+
+    def test_shift_nonzero_count_carry_cl(self):
+        # mov eax, 0x80000000; mov cl, 1; shl eax, cl; setc dl; movzx edi, dl; ret -> CF=1
+        r, _ = run(asm("b8 00 00 00 80", "b1 01", "d3 e0", "0f 92 c2", "0f b6 fa", "c3"))
+        self.assertEqual(r, 1)
 
 
 if __name__ == "__main__":
