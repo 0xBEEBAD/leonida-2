@@ -3,6 +3,7 @@ import argparse
 from collections import Counter, defaultdict
 import json
 import re
+import sys
 
 
 def census(lines, from_file=None):
@@ -83,10 +84,14 @@ def census(lines, from_file=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except AttributeError:
+        pass
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace")
     parser.add_argument("--from-file", metavar="SUBSTRING",
                         help="start with the first matching source path, then include all queues and files")
     args = parser.parse_args()
-    with open(args.trace, errors="replace") as stream:
+    with open(args.trace, encoding="utf-8", errors="replace") as stream:
         print(json.dumps(census(stream, args.from_file), indent=2, sort_keys=True))

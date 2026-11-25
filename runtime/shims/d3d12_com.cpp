@@ -2100,10 +2100,14 @@ public:
             for (const GraphicsCommandList* list : graphics)
                 for (const auto& [table, descriptors] : list->tables())
                     tables[table] = std::max(tables[table], descriptors);
-            for (const auto& [table, descriptors] : tables) {  // LOCAL DIAGNOSTIC (fsdraw): poke experiment
-                const std::uint64_t origin = leonida::fsdraw::table_origin(table);
-                if (origin != table)
-                    leonida::fsdraw::poke_cb(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(origin)));
+            // LOCAL DIAGNOSTIC (fsdraw): poke experiment, LEONIDA_FSDRAW_POKE_CB=1
+            if (leonida::fsdraw::poke_enabled()) {
+                for (const auto& [table, descriptors] : tables) {
+                    const std::uint64_t origin = leonida::fsdraw::table_origin(table);
+                    if (origin != table)
+                        leonida::fsdraw::poke_cb(
+                            reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(origin)));
+                }
             }
             // LOCAL DIAGNOSTIC (fsdraw): what the bound tables hold when the lists are submitted
             if (leonida::local_diagnostics()) {
