@@ -1679,10 +1679,26 @@ private:
         return !(v && std::string_view(v) == "0");
     }
 
+    // Direct and indirect dispatches. Putting the resource heap first and the sampler heap next is a hypothesis
+    // with partial evidence (docs/d3d12_vulkan.md section 3.4, tools/compute_heap_layout_census.py). A heap with no
+    // inline user-data dword left is reported once per heap kind and the explicit arguments are kept.
     std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> compute_user_data() const {
+        note_direct_heap_indexing(compute_.layout);
         static const bool enabled = direct_heaps_enabled("LEONIDA_COMPUTE_DIRECT_HEAPS");
         if (!enabled) return compute_.data;
-        return with_direct_heaps(compute_, compute_.layout->compute_arguments_end);
+        const RootArgumentLayout& layout = *compute_.layout;
+        const bool resource = layout.flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+        const bool sampler = layout.flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        const std::uint32_t end = layout.compute_arguments_end;
+        if ((resource || sampler) && end == rt::rootsig::kNoSgpr) {
+            note_once("compute direct heaps: not supplied, the root arguments spill (no measured slot)");
+        } else {
+            if (resource && end >= rt::rootsig::kMaxUserSgprs)
+                note_once("compute root arguments leave no inline SGPR for the resource heap");
+            if (sampler && end + (resource ? 1u : 0u) >= rt::rootsig::kMaxUserSgprs)
+                note_once("compute root arguments leave no inline SGPR for the sampler heap");
+        }
+        return with_direct_heaps(compute_, end);
     }
 
     // Graphics: vertex, pixel and geometry shaders share one user-data block and the s8 layout, so the heaps after
@@ -1749,7 +1765,6 @@ private:
                 std::fputc('\n', stderr);
             }
         }
-        note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
     }
 

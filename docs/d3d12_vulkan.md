@@ -1744,8 +1744,19 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    include PS_NoStripImmutableTable at s11 and VS_TransformD at s12. Their shader inputs establish the
    destination dwords. The explicit graphics layouts and ordering for signatures with spills still need
    independent root-signature evidence.
+   **Inline compute layout (integration #984).** Run
+   `python -I tools/compute_heap_layout_census.py <carve>/disasm` on each compute carve. Of 5,450 indexed compute
+   entries, 2,959 advertise direct indexing and none of those embeds its root signature. Adding
+   `--group fspx_compute --dispatch-log <dispatch-log>` joined seven resource-indexing entries to independently
+   recorded layouts. In all seven, a dynamically indexed resource descriptor used the first SGPR after the explicit
+   arguments. There were zero mismatches and zero cases without room **among those seven**. For the remaining
+   2,952 entries the layout is unknown. These are entries across carves, which can contain the same program.
+   No sampler-indexing entry had a matched layout. Putting the resource heap first when both flags are set, then the
+   sampler in the next dword, remains a hypothesis. D3D-329's adjacent SGPR examples alone do not establish it.
    The runtime snapshots the bound resource and sampler heap pointers in that order after the explicit
-   arguments for direct and indirect compute dispatches with an inline signature. Set
+   arguments for direct and indirect compute dispatches with an inline signature. An unbound heap contributes
+   zero, and rebinding affects later commands. A heap that cannot fit in the inline user data is reported once,
+   and a signature whose compute arguments spill gets nothing written (logged once). Set
    `LEONIDA_COMPUTE_DIRECT_HEAPS=0` to restore the previous compute arguments.
    Draws do the same in the graphics layout (`pack_stage(Stage::Pixel)`, from s8, one dword per table): the
    resource heap's 32-bit shader VA goes in the dword after the explicit arguments, then the sampler heap's, each
