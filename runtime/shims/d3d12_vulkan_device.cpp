@@ -47,6 +47,7 @@
 #include "../src/submit_phases.h"
 #include "../src/pipeline_cache_store.h"
 #include "../src/large_module_gate.h"
+#include "../src/dev_status.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/console_texture_layout.h"
@@ -9281,6 +9282,7 @@ private:
         VkPipeline built = VK_NULL_HANDLE;
         CompileTrace trace;
         trace.begin(pipeline_info, device_.info.pipeline_creation_feedback, trigger, entry->name.c_str(), 0, bytes, cache_key_);
+        const leonida::dev_status::Build dev_build(entry->name.c_str());
         const leonida::pipeline_profile::DriverCall profile("cs", trigger, entry->name.c_str());
         const VkResult created = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &built);
         profile.finish(int(created));
@@ -9592,6 +9594,7 @@ private:
         }
         CompileTrace trace;
         trace.begin(info, device_.info.pipeline_creation_feedback, trigger, profile_shaders_.c_str(), unbound, bytes, cache_key_);
+        const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
         const auto result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info, nullptr, &pipeline);
