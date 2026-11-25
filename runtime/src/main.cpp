@@ -24,6 +24,7 @@
 #include <exception>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -261,11 +262,16 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI title_set_unhandled_exception_filter(
 static LONG WINAPI save_caches_on_fatal_exception(EXCEPTION_POINTERS* info) {
     const DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
     if (code != EXCEPTION_STACK_OVERFLOW) {
-        std::fprintf(stderr, "[rt] unhandled exception 0x%08lx: writing the session pipeline cache before the "
-                             "process ends\n", static_cast<unsigned long>(code));
-        rt::d3d12::stop_pipeline_compiles(kExitCompileWaitMs);
-        rt::d3d12::save_pipeline_caches_at_exit(kExitCacheWaitMs);
-        std::fflush(stderr);
+        // Several title threads can fault at once (measured: eight within a second). The first writes; the others
+        // wait here for it, so none of them reaches the title's filter, which may end the process, mid-write.
+        static std::once_flag once;
+        std::call_once(once, [code] {
+            std::fprintf(stderr, "[rt] unhandled exception 0x%08lx: writing the session pipeline cache before the "
+                                 "process ends\n", static_cast<unsigned long>(code));
+            rt::d3d12::stop_pipeline_compiles(kExitCompileWaitMs);
+            rt::d3d12::save_pipeline_caches_at_exit(kExitCacheWaitMs);
+            std::fflush(stderr);
+        });
     }
     if (auto* title = reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(
             InterlockedCompareExchangePointer(&title_fatal_filter, nullptr, nullptr)))
