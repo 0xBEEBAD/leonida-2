@@ -2358,7 +2358,8 @@ Pipeline creation:
   merges into the offline seed. `LEONIDA_DIRECT_SESSION_CACHE=0` also uses a merge when only the session exists.
   The files must match the Vulkan vendor, device and pipeline-cache UUID. Vulkan supplies an opaque snapshot.
   Replacing part of the previous file would corrupt it.
-  `LEONIDA_PIPELINE_CACHE_BYTES` caps session writes (256 MiB by default, zero disables the session file).
+  `LEONIDA_PIPELINE_CACHE_BYTES` caps session writes, at a checkpoint or at teardown (4 GiB by default, zero disables
+  the session file).
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching
   compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
   It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.

@@ -1423,9 +1423,8 @@ bool startup_cache_checkpoints_enabled() {
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
                                  bool checkpoint = false) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
-    auto limit = pipeline_cache_save_limit();
-    // The output is an opaque Vulkan blob. A prefix is not an incremental cache.
-    if (checkpoint) limit = (std::min)(limit, std::size_t{512} << 20);
+    // The output is an opaque Vulkan blob. A prefix is not an incremental cache, so past the limit nothing is written.
+    const auto limit = pipeline_cache_save_limit();
     if (!limit) return;
     const auto start = compile_us();
     std::size_t size = 0;
