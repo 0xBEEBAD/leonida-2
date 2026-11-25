@@ -5716,16 +5716,15 @@ public:
         // A texture whose lease says its title memory is linear (title_linear_) and that also has a placement
         // address (slot 133; the video planes among them) has two answers. The placement address, with the title
         // texture registry filling the image, is the one the retail boot ran through the intro movie and the story
-        // load on, so it is asked first. LEONIDA_LINEAR_MAP_FIRST=1 asks the linear mapping first instead (pinned
-        // pages, with a GPU-written texture read back into them); what that cannot serve still gets the address.
+        // load on, so it is asked first. LEONIDA_LINEAR_MAP_FIRST=1 gives such a texture the linear mapping instead
+        // (pinned pages, with a GPU-written texture read back into them), and its refusal when the pages are gone.
         static const bool linear_first = [] {
             const char* v = std::getenv("LEONIDA_LINEAR_MAP_FIRST");
             return v && *v == '1';
         }();
         if (linear_first && title_linear_ && data && image_) {
             *data = nullptr;
-            const HRESULT hr = map_title_texture(subresource, read, data);
-            if (SUCCEEDED(hr) || !title_address_) return hr;
+            return map_title_texture(subresource, read, data);
         }
         if (image_ && title_address_) {  // place_at_title_address: the console answers with the texture's memory
             if (data) *data = title_address_;
