@@ -314,6 +314,10 @@ headers). Measured on 1.0.2.1 over all 5,680 distinct blobs, which the 25,471 gr
 - **Integer targets:** a target with a `UINT` or `SINT` format never blends, as the colour block bypasses blending
   there and D3D12 refuses a PSO that asks for it. One library pipeline enables `MAX` on an `R8_UINT` target beside
   two others.
+- **Stand-in targets:** where `B4G4R4A4_UNORM` is not renderable, the Vulkan layer draws it into an RGBA8 stand-in
+  and refuses blending there (`E_NOTIMPL`, the output is quantized before it). The factory then turns blending off on
+  those targets only, and on every target if that is still refused, instead of leaving the pipeline to the PC
+  description path. On an RTX 4070 Laptop that is the same library pipeline (the first one the title creates).
 - **Kept on the defaults:** the 1,937 records that blend with the dual-source `SRC1` factors, because the translator
   declares no second pixel-shader output. A blob of another shape, or a target with a factor this path does not
   take, keeps the whole pipeline on the defaults and is logged.
