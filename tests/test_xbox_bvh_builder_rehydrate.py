@@ -62,6 +62,7 @@ class XboxBvhBuilderRehydrateTest(unittest.TestCase):
         self.assertIn("rehydrate(builder, list.p, 0, nullptr, nullptr) == S_OK", test_content)
         self.assertIn("rehydrate(builder, list.p, 1, &source_only_desc, &source) == E_NOTIMPL", test_content)
         self.assertIn("rehydrate(builder, list.p, 1, &empty_desc, nullptr) == S_OK", test_content)
+        self.assertIn("rehydrate(builder, list.p, 1, &zero_scratch_desc, &source) == S_OK", test_content)
 
 
 if __name__ == "__main__":

@@ -373,7 +373,7 @@ int main(int argc, char** argv) {
     list->CopyBufferRegion(compacted_rb.p, 0, compacted.p, 0, post[0]);
     if (!submit()) return fail("the compaction did not complete");
 
-    // ---- RehydrateRaytracingAccelerationStructureBatched2X: rebuilds or deserializes ----
+    // ---- RehydrateRaytracingAccelerationStructureBatched2X: rebuilds from geometry ----
     Ref<ID3D12Resource> rehydrated_as, rehydrated_rb;
     if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, blas_info.ResultDataMaxSizeInBytes, as_state, uav,
                            rehydrated_as.put())) ||
@@ -403,6 +403,11 @@ int main(int argc, char** argv) {
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC empty_desc{};
     check(rehydrate(builder, list.p, 1, &empty_desc, nullptr) == S_OK,
           "RehydrateRaytracingAccelerationStructureBatched2X logs and skips empty structure");
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC zero_scratch_desc = rehydrate_desc;
+    zero_scratch_desc.ScratchAccelerationStructureData = 0;
+    check(rehydrate(builder, list.p, 1, &zero_scratch_desc, &source) == S_OK,
+          "RehydrateRaytracingAccelerationStructureBatched2X supplies scratch when ScratchAccelerationStructureData == 0");
 
     check(rehydrate(builder, list.p, 1, &rehydrate_desc, &source) == S_OK,
           "RehydrateRaytracingAccelerationStructureBatched2X rebuilds BLAS and returns S_OK");

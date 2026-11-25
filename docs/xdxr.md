@@ -141,12 +141,14 @@ static reference, reached through a table (#7516), so 2 of them are calls of ano
   the DLL would refuse is skipped with a log line. The offline-statistics postbuild type (`0x10`, §4) is one of
   those.
 - **Rehydration (`RehydrateRaytracingAccelerationStructureBatched2X`):** Rebuilds each structure on the GPU from
-  the source geometry its description carries ([bvh.md](bvh.md) §4a). What the 4th parameter
-  (`const UINT64* source_data`, mangling `PEB_K`) conveys is a **hypothesis**: it points to the array of source
-  buffer addresses for offline dehydrated console streams (e.g. `SourceAccelerationStructureData` or rehydration inputs).
+  the source geometry its description carries ([bvh.md](bvh.md) §4a), in the leaf frame `compressionParams` gives.
+  What the 4th parameter (`const UINT64* source_data`, mangling `PEB_K`) conveys is a **hypothesis**: it points to
+  the array of source buffer addresses for offline dehydrated console streams (e.g. rehydration inputs).
   When geometry is provided (`NumDescs > 0`), the shim issues `BuildRaytracingAccelerationStructure` to construct
-  traversable GPU BVH nodes. When `source_data` is supplied without geometry, the shim logs once and refuses with
-  `E_NOTIMPL`: offline console dehydrated streams cannot be directly deserialized by PC Vulkan/D3D12 drivers
+  traversable GPU BVH nodes. The title passes `ScratchAccelerationStructureData = 0` (measured in §6), so the shim
+  supplies its own scratch buffer sized via `GetRaytracingAccelerationStructurePrebuildInfo` to avoid command list
+  rejection. When `source_data` is supplied without geometry, the shim logs once and refuses with `E_NOTIMPL`:
+  offline console dehydrated streams cannot be directly deserialized by PC Vulkan/D3D12 drivers
   ([bvh.md](bvh.md) §4/§4a). Empty structures (`NumDescs == 0` without source) are logged and skipped.
 
 `xbox_bvh_builder_test` calls every export through the shim registry, the way the title's imports bind, and
