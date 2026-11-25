@@ -52,6 +52,7 @@
 #include "../src/resource_detile.h"
 #include "../src/console_texture_layout.h"
 #include "../src/shader_library.h"
+#include "../src/shadow_keep.h"
 #include "../src/dstorage_trace.h"
 #include "../src/title_page_watch.h"
 #include "../src/guarded_copy.h"
@@ -335,6 +336,7 @@ public:
         last_ = (end_ + kPage - 1) & ~(kPage - 1);
         state_.assign((last_ - first_) / kPage, 0);
         idle_.assign(state_.size(), 0);
+        sums_.assign(state_.size() * kPieces, 0);
         cover_.assign(state_.size(), 1);
         targets_.push_back({begin_, end_, shadow});
         index_targets();
@@ -511,6 +513,7 @@ public:
                     if (state_[i] & kZero) continue;
                     const auto [offset, bytes] = span_of(i, i + 1);
                     zero_targets(offset, bytes);
+                    leonida::shadow_keep::forget(sums_.data(), first_, begin_ + offset, begin_ + offset + bytes);
                     if (!zeroed_.empty() && zeroed_.back().offset + zeroed_.back().bytes == offset)
                         zeroed_.back().bytes += bytes;
                     else
@@ -564,12 +567,15 @@ public:
         // The copies run without the lock: a write that faults meanwhile is let through and copied next time.
         std::size_t copied = 0;
         for (const Job& job : jobs_)
-            for_each_target(begin_ + job.offset, begin_ + job.offset + job.bytes,
-                            [&](const Target& t, std::uintptr_t from, std::uintptr_t to) {
-                                copy_run(t.shadow + (from - t.begin), reinterpret_cast<const std::uint8_t*>(from),
-                                         to - from, job.streaming);
-                                copied += to - from;
-                            });
+            if (keep_gpu_writes())
+                copied += copy_changed(job);
+            else
+                for_each_target(begin_ + job.offset, begin_ + job.offset + job.bytes,
+                                [&](const Target& t, std::uintptr_t from, std::uintptr_t to) {
+                                    copy_run(t.shadow + (from - t.begin), reinterpret_cast<const std::uint8_t*>(from),
+                                             to - from, job.streaming);
+                                    copied += to - from;
+                                });
         refresh_queries_ = queries;
         return copied;
     }
@@ -583,12 +589,14 @@ public:
             const std::size_t n = (first_ - first) / kPage;
             state_.insert(state_.begin(), n, std::uint8_t(0));
             idle_.insert(idle_.begin(), n, std::uint8_t(0));
+            sums_.insert(sums_.begin(), n * kPieces, std::uint64_t(0));
             cover_.insert(cover_.begin(), n, 0u);
             first_ = first;
         }
         if (last > last_) {
             state_.resize((last - first_) / kPage, 0);
             idle_.resize(state_.size(), 0);
+            sums_.resize(state_.size() * kPieces, 0);
             cover_.resize(state_.size(), 0);
             last_ = last;
         }
@@ -608,6 +616,8 @@ public:
             state_[at + i] |= other.state_[i];
             cover_[at + i] += other.cover_[i];
             idle_[at + i] = other.idle_[i];
+            std::copy_n(other.sums_.begin() + std::ptrdiff_t(i * kPieces), kPieces,
+                        sums_.begin() + std::ptrdiff_t((at + i) * kPieces));
         }
         targets_.insert(targets_.end(), other.targets_.begin(), other.targets_.end());
         if (other.map_generation_ != map_generation_) map_generation_ = ~std::uint64_t(0);
@@ -944,6 +954,40 @@ private:
         jobs_.push_back({offset, bytes, streaming});
     }
 
+    // LEONIDA_SHADOW_KEEP (on; 0: every job copied whole, as before): a job's bytes reach the copies only where they
+    // differ from those copied last (src/shadow_keep.h), so a shader's write into a copy of pages copied without a
+    // sign that the title wrote them stays until the title changes those bytes.
+    // shortcut: a title that rewrites the same bytes to reset a GPU-written value is not seen; needs a real write
+    // signal (a write-back to the title's pages) then.
+    static bool keep_gpu_writes() {
+        static const bool on = [] {
+            char value[2] = {};
+            std::size_t length = 0;
+            return getenv_s(&length, value, sizeof(value), "LEONIDA_SHADOW_KEEP") != 0 || length == 0 ||
+                   value[0] != '0';
+        }();
+        return on;
+    }
+    static constexpr std::size_t kPieces = kPage / leonida::shadow_keep::kPiece;
+    std::size_t copy_changed(const Job& job) {
+        std::size_t copied = 0;
+        alignas(64) std::uint8_t page[kPage];
+        for (std::size_t at = job.offset, end = job.offset + job.bytes; at < end;) {
+            const std::uintptr_t va = begin_ + at;
+            const std::size_t n = std::min<std::size_t>(end - at, kPage - (va & (kPage - 1)));
+            copy_run(page, reinterpret_cast<const std::uint8_t*>(va), n, job.streaming);
+            leonida::shadow_keep::copy_changed(
+                page, va, n, sums_.data(), first_, [&](std::uintptr_t a, std::uintptr_t b, const std::uint8_t* source) {
+                    for_each_target(a, b, [&](const Target& t, std::uintptr_t from, std::uintptr_t to) {
+                        std::memcpy(t.shadow + (from - t.begin), source + (from - a), to - from);
+                        copied += to - from;
+                    });
+                });
+            at += n;
+        }
+        return copied;
+    }
+
     // The targets sorted by start, the bytes they hold, and reach_[k], the furthest end among targets_[0..k]: the
     // targets over [from, to) are found from the first whose reach passes `from`.
     void index_targets() {
@@ -1056,6 +1100,7 @@ private:
     std::uint64_t reader_ = 0;
     std::size_t watched_pages_ = 0, hot_pages_ = 0;  // covered pages write-watched, and hot
     Vector<std::uint8_t> idle_;  // per 4 KiB page: refreshes a hot page went without a write (kCool)
+    Vector<std::uint64_t> sums_;  // per 256-byte piece from first_: sum of the bytes copied last, 0: not known
     bool runs_stale_ = false;         // a page became hot or cold: watch_runs_ is rebuilt at the next refresh
     std::uint64_t refresh_asks_ = 0;
     std::uint64_t refresh_written_ = 0;

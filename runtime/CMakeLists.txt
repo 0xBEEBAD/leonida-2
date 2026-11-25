@@ -4503,6 +4503,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(console_heap_vsharp_slots_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME console_heap_vsharp_slots COMMAND console_heap_vsharp_slots_test)
+    # A slot-133 shadow keeps a GPU write until the title's bytes under it change (src/shadow_keep.h).
+    add_executable(shadow_keep_test test/shadow_keep_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(shadow_keep_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME shadow_keep COMMAND shadow_keep_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
