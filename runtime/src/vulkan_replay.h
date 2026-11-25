@@ -60,6 +60,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <type_traits>
 #include <unordered_map>
@@ -868,8 +869,9 @@ struct ComputePipeline {
     // What `build` would return when it is built already and nobody is building it, else null; builds nothing. Null: a
     // first use is always built where prepare() meets it. Not used with async_build. See PipelineCompiles.
     VkPipeline (*built)(void*) = nullptr;
-    bool large = false;        // compiled one after another with the other large ones (PipelineCompiles)
+    bool large = false;        // PipelineCompiles limits how many of these compile at once
     bool skipped = false;      // never built on request (LEONIDA_SKIP_COMPUTE): its dispatches are dropped
+    std::uint64_t estimate = 0;  // large: the bytes of memory its compile is expected to take
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -903,6 +905,7 @@ struct GraphicsPipeline {
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     bool async_build = false;
     bool nonunit_vertex_divisor = false;  // an actual instance divisor > 1, not a zero-stride emulation
+    std::uint64_t estimate = 0;  // as ComputePipeline::estimate
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -1000,7 +1003,7 @@ public:
         User user;
     };
     // A compile takes the driver some hundred bytes of memory for each byte of SPIR-V (docs/pipeline_check.md): graphics
-    // pipelines of this much or more are `large`.
+    // pipelines of this much or more are `large`. For compute pipelines the D3D12 layer decides.
     static constexpr std::uint64_t large_spirv_bytes = 1u << 20;
 
     Ticket add(const GraphicsPipeline& pipeline, std::uint32_t flags) {
@@ -1009,6 +1012,9 @@ public:
     Ticket add(const ComputePipeline& pipeline, User user) { return add({nullptr, &pipeline, 0}, user); }
 
     bool empty() const { return jobs_.empty(); }
+    bool any_large() const {
+        return std::any_of(jobs_.begin(), jobs_.end(), [](const Job& job) { return is_large(job); });
+    }
     std::size_t size() const { return jobs_.size(); }
     VkPipeline built(Ticket ticket) const { return jobs_[ticket - 1].built; }
     const std::vector<Use>& uses() const { return uses_; }  // in the order of the commands
@@ -1030,26 +1036,64 @@ public:
         return lookup(job.graphics, job.compute, job.flags, unused);
     }
 
-    // Compiles all of them through run(count, job) (PipelineWorkers::run): the large ones one after another, as without
-    // workers, beside the others. Jobs already attempted in `prior` reuse that outcome without re-invoking build().
+    // Compiles all of them through run(count, job) (PipelineWorkers::run). The large ones share budget() bytes of memory:
+    // the largest first, as many at once as their estimates fit, one at least; while the next one does not fit, the
+    // others are compiled first. No budget, or 0: the large ones one after another, as without workers, beside the others.
     template<typename Run>
-    void build(Run&& run, const PipelineCompiles* prior = nullptr) {
+    void build(Run&& run, const std::function<std::uint64_t()>& read_budget = {},
+               const PipelineCompiles* prior = nullptr) {
         std::vector<std::size_t> single, large;
         for (std::size_t i = 0; i < jobs_.size(); ++i) {
             if (prior && prior->lookup(jobs_[i].graphics, jobs_[i].compute, jobs_[i].flags, jobs_[i].built)) continue;
             (is_large(jobs_[i]) ? large : single).push_back(i);
         }
         if (single.empty() && large.empty()) return;
+        // The first jobs of the run are lanes, which take large ones until none is left: no more of them than there are
+        // large ones that fit the budget together (the smallest), so that no thread waits here for room in vain.
+        std::size_t lanes = large.empty() ? 0 : 1;
+        const std::uint64_t budget = lanes && read_budget ? read_budget() : 0;
+        if (budget) {
+            std::stable_sort(large.begin(), large.end(), [this](std::size_t a, std::size_t b) {
+                return estimate(jobs_[a]) > estimate(jobs_[b]);
+            });
+            std::uint64_t sum = estimate(jobs_[large.back()]);
+            while (lanes < large.size() && (sum += estimate(jobs_[large[large.size() - 1 - lanes]])) <= budget) ++lanes;
+        }
         const auto compile = [this](std::size_t i) {
             Job& job = jobs_[i];
             job.built = job.graphics ? job.graphics->variant(job.flags) : job.compute->build(job.compute->build_context);
         };
-        const std::size_t chain = large.empty() ? 0 : 1;  // the large ones are one unit, the first
-        run(chain + single.size(), [&](std::size_t i) {
-            if (i >= chain)
-                compile(single[i - chain]);
-            else
-                for (const std::size_t each : large) compile(each);
+        std::mutex mutex;  // guards the four below
+        std::size_t next_single = 0, next_large = 0, compiling = 0;
+        std::uint64_t reserved = 0;  // the estimates of the large ones compiling
+        run(lanes + single.size(), [&](std::size_t i) {
+            std::unique_lock lock(mutex);
+            if (i >= lanes) {
+                if (next_single == single.size()) return;  // a lane has taken it
+                const std::size_t index = single[next_single++];
+                lock.unlock();
+                compile(index);
+                return;
+            }
+            while (next_large < large.size()) {
+                const std::uint64_t need = estimate(jobs_[large[next_large]]);
+                const bool fits = !compiling || reserved + need <= budget;
+                if (!fits && next_single < single.size()) {
+                    const std::size_t index = single[next_single++];
+                    lock.unlock();
+                    compile(index);
+                    lock.lock();
+                    continue;
+                }
+                const std::size_t index = large[next_large++];
+                ++compiling;
+                reserved += need;
+                lock.unlock();
+                compile(index);
+                lock.lock();
+                --compiling;
+                reserved -= need;
+            }
         });
     }
 
@@ -1081,6 +1125,9 @@ private:
         VkPipeline built = VK_NULL_HANDLE;
     };
     static bool is_large(const Job& job) { return job.graphics ? job.graphics->large : job.compute->large; }
+    static std::uint64_t estimate(const Job& job) {
+        return job.graphics ? job.graphics->estimate : job.compute->estimate;
+    }
     Ticket add(const Job& job, User user) {
         const void* const pipeline = job.graphics ? static_cast<const void*>(job.graphics) : job.compute;
         const auto [it, added] = tickets_.try_emplace({pipeline, job.flags}, Ticket(jobs_.size() + 1));
@@ -3014,9 +3061,10 @@ inline ReplayResult finish_compiled_pipelines(const PipelineCompiles& compiles, 
 // have returned had they built each pipeline themselves.
 template<typename Run>
 ReplayResult build_pipelines(PipelineCompiles& compiles, std::span<PreparedList> lists, ReplayResult result,
-                             Run&& run, const PipelineCompiles* prior = nullptr) {
+                             Run&& run, const std::function<std::uint64_t()>& budget = {},
+                             const PipelineCompiles* prior = nullptr) {
     if (compiles.empty()) return result;
-    compiles.build(run, prior);
+    compiles.build(run, budget, prior);
     return finish_compiled_pipelines(compiles, lists, result, prior);
 }
 

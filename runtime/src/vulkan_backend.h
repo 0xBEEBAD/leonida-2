@@ -1572,6 +1572,14 @@ public:
         std::unique_lock lock(pipeline_mutex_);
         pipeline_workers_.swap(workers);
     }
+    // For the large pipelines of a submission: the memory they may use while they compile together
+    // (PipelineCompiles::build), and what is kept while they do (LargeModuleGate::Demand). None (the default): they compile
+    // one after another.
+    void set_large_compiles(std::function<std::uint64_t()> budget, std::function<std::shared_ptr<void>()> demand) {
+        std::unique_lock lock(pipeline_mutex_);
+        large_compile_budget_ = std::move(budget);
+        large_compile_demand_ = std::move(demand);
+    }
     PipelineWorkers::Stats pipeline_worker_stats() {
         std::shared_lock lock(pipeline_mutex_);
         return pipeline_workers_ ? pipeline_workers_->stats() : PipelineWorkers::Stats{};
@@ -2189,6 +2197,8 @@ private:
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unique_ptr<PipelineWorkers> pipeline_workers_;
+    std::function<std::uint64_t()> large_compile_budget_;
+    std::function<std::shared_ptr<void>()> large_compile_demand_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
@@ -3168,10 +3178,13 @@ private:
                 recycle_khr_as_queries(khr_guard.as_queries);
                 geometry.clear();
 
+                std::shared_ptr<void> demand;
+                if (context_.large_compile_demand_ && compiles.any_large()) demand = context_.large_compile_demand_();
                 if (context_.pipeline_workers_)
-                    compiles.build(run_compiles);
+                    compiles.build(run_compiles, context_.large_compile_budget_);
                 else
                     compiles.build_serial();
+                demand.reset();
                 const ReplayResult compile_result = check_compiled_pipelines(compiles, prepare_result);
                 if (compile_result != ReplayResult::success) return compile_result;
                 prior_compiles = std::move(compiles);
@@ -3181,7 +3194,7 @@ private:
             const PipelineCompiles* prior = has_prior_compiles ? &prior_compiles : nullptr;
             prepare_result = context_.pipeline_workers_
                                  ? build_pipelines(compiles, std::span(prepared).first(lists.size()), prepare_result,
-                                                   run_compiles, prior)
+                                                   run_compiles, context_.large_compile_budget_, prior)
                                  : build_pipelines_serial(compiles, std::span(prepared).first(lists.size()),
                                                           prepare_result, prior);
             replay.compiles = nullptr;
