@@ -1392,6 +1392,8 @@ if(BUILD_TESTING)
   add_test(NAME shader_library COMMAND shader_library_test)
   add_executable(native_pso_blend_test test/native_pso_blend_test.cpp)
   add_test(NAME native_pso_blend COMMAND native_pso_blend_test)
+  add_executable(native_pso_depth_test test/native_pso_depth_test.cpp)
+  add_test(NAME native_pso_depth COMMAND native_pso_depth_test)
   if(WIN32)
     # The slot 57 factory retries only a pipeline that blends a B4G4R4A4 stand-in target (d3d12.h types).
     add_executable(native_pso_fallback_test test/native_pso_fallback_test.cpp)
