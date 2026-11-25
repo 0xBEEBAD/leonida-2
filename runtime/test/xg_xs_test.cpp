@@ -298,6 +298,94 @@ void test_bijection_and_round_trip() {
     }
 }
 
+// Two models lay the console's textures out in this tree: xg_xs_layout.h, which the XG computer answers the title
+// with and the D3D12 layer's title-texture registry reads back with, and console_texture_layout.h, which the linear
+// and tiled uploads read with. A texture both lay out must have one size and one address per element, or one side
+// reads at offsets the other did not write. So for each such texture: the sizes are equal, each mip has the same
+// extent in elements, and what the first model tiles the second detiles to the same rows, for every mip and slice.
+void test_models_agree() {
+    struct Case {
+        uint32_t width, height, array, mips;
+        DXGI_FORMAT format;
+        uint32_t mode;
+    };
+    const DXGI_FORMAT formats[] = {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                   DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                   DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC3_UNORM};
+    const uint32_t modes[] = {kLinear, k4kbS, k64kbS, k64kbD};
+    struct Shape {
+        uint32_t width, height, array, mips;
+    };
+    const Shape shapes[] = {{1, 1, 1, 1},    {4, 4, 1, 3},      {16, 16, 1, 1},  {64, 64, 1, 7},   {100, 60, 1, 7},
+                            {256, 128, 1, 9}, {250, 175, 3, 8}, {512, 512, 1, 10}, {1024, 64, 2, 1}, {33, 1000, 1, 4}};
+    unsigned compared = 0, only_one = 0;
+    std::vector<uint8_t> tiled, source, back;
+    std::vector<uint64_t> columns;
+    for (const DXGI_FORMAT format : formats) {
+        for (const uint32_t mode : modes) {
+            for (const Shape& s : shapes) {
+                const Format f = format_info(uint32_t(format));
+                ResourceDesc d{kTexture2D, 0, s.width, s.height, uint16_t(s.array), uint16_t(s.mips),
+                               uint32_t(format), 1, 0, mode == kLinear ? 1u : (kSwizzled | mode), 0};
+                Texture t;
+                const bool first = build_texture(d, t);
+                ct::Desc p;
+                p.width = s.width;
+                p.height = s.height;
+                p.depth = s.array;
+                p.mips = s.mips;
+                p.element_bytes = f.bytes;
+                p.block = f.side;
+                p.swizzle = mode;
+                const auto l = ct::Layout::make(p);
+                const bool second = l && l->addressable();
+                char what[160];
+                std::snprintf(what, sizeof(what), "both models agree: %ux%u array %u mips %u format %u mode %u",
+                              s.width, s.height, s.array, s.mips, unsigned(format), mode);
+                if (!first || !second) {
+                    only_one += first != second;
+                    continue;
+                }
+                ++compared;
+                const char* differs = nullptr;
+                if (t.layout.size != l->size) differs = "size";
+                if (!differs && t.layout.mips != l->mips.size()) differs = "mip count";
+                if (!differs) tiled.assign(size_t(t.layout.size), uint8_t{0});
+                for (uint32_t level = 0; !differs && level < s.mips; ++level) {
+                    const auto& a = t.layout.plane[0].mips[level];
+                    const auto& b = l->mips[level];
+                    if (a.width_elements != b.width || a.height_elements != b.height) {
+                        differs = "mip extent";
+                        break;
+                    }
+                    const uint32_t pitch = a.width_elements * f.bytes;
+                    for (uint32_t slice = 0; !differs && slice < s.array; ++slice) {
+                        source.resize(size_t(pitch) * a.height_elements);
+                        for (size_t i = 0; i < source.size(); ++i)
+                            source[i] = uint8_t(i * 131 + (i >> 8) * 7 + level * 17 + slice * 29 + 1);
+                        copy_elements<true>(t, level, slice, source.data(), tiled.data(), pitch, 0, columns);
+                        back.assign(source.size(), uint8_t{0});
+                        const auto copied = l->walk(tiled.size(), level, slice, back.size(), pitch, 0,
+                                                    [&](size_t from, size_t to, size_t bytes) {
+                                                        std::memcpy(back.data() + to, tiled.data() + from, bytes);
+                                                    });
+                        if (copied != ct::Error::ok) differs = "the second model refuses the copy";
+                        else if (back != source) differs = "element addresses";
+                    }
+                }
+                if (differs) {
+                    std::printf("     %s: %s differ (sizes %llu and %llu)\n", what, differs,
+                                static_cast<unsigned long long>(t.layout.size),
+                                static_cast<unsigned long long>(l->size));
+                }
+                check(!differs, what);
+            }
+        }
+    }
+    std::printf("     %u textures laid out by both models, %u by one of them only\n", compared, only_one);
+    check(compared >= 200, "both models lay out most of the list, so the comparison is not empty");
+}
+
 }  // namespace
 
 int main() {
@@ -404,6 +492,7 @@ int main() {
 
     test_layout_model();
     test_bijection_and_round_trip();
+    test_models_agree();
 
     ResourceDesc d{3, 0, 256, 128, 1, 1, DXGI_FORMAT_R8_UNORM, 1, 0, 0, 0};
     check(suggest(&d, 0, &d.layout) == S_OK && d.layout == 0x105, "2D SRV selects SW_4KB_S with aliased output");
