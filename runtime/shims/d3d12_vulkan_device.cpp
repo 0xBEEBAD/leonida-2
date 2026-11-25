@@ -2452,6 +2452,7 @@ struct DeviceState {
         // import
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint64_t pin = 0;  // the imported pages' leonida::kernel_writes pin while `memory` lives
         std::size_t scan_at = 0;  // the next slot the T# scan reads
         // copy
         bool identity = false;
@@ -2666,6 +2667,7 @@ struct DeviceState {
         const auto fail = [&] {
             if (heap.buffer) vk.vkDestroyBuffer(info.device, heap.buffer, nullptr);
             if (heap.memory) vk.vkFreeMemory(info.device, heap.memory, nullptr);
+            leonida::kernel_writes::release(std::exchange(heap.pin, 0));
             heap.buffer = VK_NULL_HANDLE;
             heap.memory = VK_NULL_HANDLE;
             return false;
@@ -2683,6 +2685,7 @@ struct DeviceState {
         import.pHostPointer = const_cast<char*>(pages);
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        heap.pin = leonida::kernel_writes::hold(pages, std::size_t(heap.bytes));  // as create_host_buffer's
         for (const VkMemoryPropertyFlags want :
              {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
               VkMemoryPropertyFlags(0)}) {
@@ -2805,6 +2808,7 @@ struct DeviceState {
             context->wait_retire_ticket(context->submitted_retire_ticket());
             context->vk.vkDestroyBuffer(info.device, heap->buffer, nullptr);
             context->vk.vkFreeMemory(info.device, heap->memory, nullptr);
+            leonida::kernel_writes::release(std::exchange(heap->pin, 0));
         } else {
             arena_release(heap->shader_va, heap->bytes, arena_descriptor_heap);
         }
@@ -4569,6 +4573,7 @@ public:
                 vk.vkFreeMemory(device_.info.device, memory_, nullptr);
                 device_.host_imports.fetch_sub(1, std::memory_order_relaxed);
             }
+            leonida::kernel_writes::release(std::exchange(host_pin_, 0));
             buffer_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
         }
@@ -4865,6 +4870,7 @@ public:
                 vk.vkFreeMemory(device_.info.device, memory_, nullptr);
                 device_.host_imports.fetch_sub(1, std::memory_order_relaxed);
             }
+            leonida::kernel_writes::release(std::exchange(host_pin_, 0));
             buffer_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
             buffer_va_ = gpu_va_ = 0;
@@ -4886,6 +4892,10 @@ public:
         import.pHostPointer = base_address;
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        // The imported pages are pinned before the import and until its memory is freed, so the shadow trackers
+        // and the geometry watch never make them read-only meanwhile (leonida::kernel_writes::hold). Taken first,
+        // so no guard lands between the writability check above and the import.
+        host_pin_ = leonida::kernel_writes::hold(base_address, std::size_t(bytes));
         // Host-visible and coherent first, as the caller's pages are; then any type both the import and the
         // buffer take.
         for (const VkMemoryPropertyFlags want :
@@ -6154,6 +6164,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
+    std::uint64_t host_pin_ = 0;  // create_host_buffer: the pages' leonida::kernel_writes pin while memory_ lives
     std::uint8_t* shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
     bool aliased_ = false;            // va_ is in leonida::title_va_aliases(), reached at title_alias_
     std::uint64_t title_alias_ = 0;
