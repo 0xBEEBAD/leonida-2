@@ -2072,7 +2072,9 @@ struct DeviceState {
     // slot-133 buffer (a per-frame constant ring, #8862 section 3.5) gets a copy of the 64 KiB-aligned pages it
     // covers, refreshed before every submission like a slot-133 shadow, and the address of that copy. Windows are
     // kept until the device goes (the ring comes round to the same pages), up to LEONIDA_TITLE_WINDOWS_MB (64 MiB
-    // by default); past that, or with the arena full, the address is left as it was and counted.
+    // by default). Past that, or with the arena full, the address names the scratch window instead: zero-filled
+    // arena pages reserved with the first window, shared by every such address. The title's raw VA would name
+    // nothing of the device's, and one read of it loses the device (#1537); the scratch costs a wrong result.
     struct TitleWindow {
         std::uint64_t start;
         std::uint64_t shader_va;
@@ -2085,6 +2087,15 @@ struct DeviceState {
     std::atomic<std::size_t> title_window_count{0};  // title_windows.size(), read without the mutex
     std::uint64_t title_window_bytes = 0;
     std::uint64_t title_window_cap = 64ull << 20;
+    static constexpr std::uint64_t kTitleScratchBytes = kTitleWindowMax + kTitleWindowAlign;  // any window's size
+    std::uint64_t title_scratch = UINT64_MAX;  // arena offset of the scratch window; UINT64_MAX: none yet
+    bool title_scratch_tried = false;
+    // Under title_window_mutex. The scratch window for `va`, whose window would start at `start`; false: no scratch.
+    bool title_scratch_va(std::uint64_t va, std::uint64_t start, std::uint64_t& out) {
+        if (title_scratch == UINT64_MAX) return false;
+        out = title_scratch + (va - start);
+        return true;
+    }
 
     rt::d3d12::GeometryViews geometry;
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {
@@ -2152,10 +2163,28 @@ struct DeviceState {
         end = std::min(end, hi);
         if (end <= va) return true;
         const std::uint64_t size = end - start;
+        if (!title_scratch_tried) {
+            // Reserved with the first window, while the arena has room; never refreshed (no title pages behind it).
+            title_scratch_tried = true;
+            VkDeviceSize scratch = 0;
+            if (arena_allocate(kTitleScratchBytes, kTitleWindowAlign, scratch, arena_buffer)) {
+                std::memset(arena.mapped + scratch, 0, std::size_t(kTitleScratchBytes));
+                title_scratch = scratch;
+            } else {
+                log_once("GPU address arena full: no scratch window for title memory past the window cap; KiB:",
+                         int(kTitleScratchBytes >> 10));
+            }
+        }
         if (title_window_bytes + size > title_window_cap) {
-            log_once("title memory named by a shader address is past LEONIDA_TITLE_WINDOWS_MB, left untranslated; "
-                     "MiB copied so far:",
-                     int(title_window_bytes >> 20));
+            if (title_scratch_va(va, start, out)) {
+                log_once("title memory named by a shader address is past LEONIDA_TITLE_WINDOWS_MB, given the zeroed "
+                         "scratch window (raise LEONIDA_TITLE_WINDOWS_MB); MiB copied so far:",
+                         int(title_window_bytes >> 20));
+            } else {
+                log_once("title memory named by a shader address is past LEONIDA_TITLE_WINDOWS_MB, left untranslated; "
+                         "MiB copied so far:",
+                         int(title_window_bytes >> 20));
+            }
             return true;
         }
         VkDeviceSize offset = 0;
@@ -2163,7 +2192,10 @@ struct DeviceState {
         if (arena_allocate(size, kTitleWindowAlign, offset, arena_buffer)) {
             mapped = arena.mapped + offset;
         } else if (!stream_windows || !external_windows.allocate(*this, size, offset, mapped)) {
-            log_once("GPU address arena full (raise LEONIDA_ARENA_MB): title memory left untranslated; window KiB:",
+            log_once(title_scratch_va(va, start, out)
+                         ? "GPU address arena full (raise LEONIDA_ARENA_MB): title memory given the zeroed scratch "
+                           "window; window KiB:"
+                         : "GPU address arena full (raise LEONIDA_ARENA_MB): title memory left untranslated; window KiB:",
                      int(std::min<std::uint64_t>(size >> 10, INT_MAX)));
             return true;
         }

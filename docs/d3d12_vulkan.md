@@ -1617,7 +1617,11 @@ The copies:
 - Any **other address in the title's memory** gets a window: the 64 KiB-aligned pages it covers, clipped to the
   title's range, copied into the arena now and before every submission, through the same shadow refresh as slot 133
   (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
-  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that
+  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). Past the cap, or with no room for a window, the address names the
+  **scratch window** instead: 16 MiB + 64 KiB of zero-filled arena reserved with the first window, shared by every
+  such address and never refreshed, so a shader reads zeros (or what another such shader wrote) and the run goes on
+  with a wrong result. The title's raw VA names nothing of the device's: on an RTX 5080 one read of it lost the
+  device at the world start (#1537). Without arena room for the scratch the raw VA is kept (logged once). A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
