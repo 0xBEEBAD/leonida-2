@@ -165,9 +165,10 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
     operand sets, and the forms that stay refused); the 89 words of the real programs are not re-run here, because
     that needs the package's DLL.
     When a listing lacks that pass, the translator decodes the same exact form from the original bytes on a gap
-    in the listing (`rdna2spirv.skipped_form`); other undecodable words keep the reachable-code check. LLVM can
-    also print the default high-half selector for an inline integer second source. If that selector is the only
-    changed bit, the translator preserves the stored low-half replication.
+    in the listing (`rdna2spirv.skipped_form`); other undecodable words keep the reachable-code check. A
+    `v_dot4_i32_i8` that llvm-mc decodes but prints with the default `op_sel`/`op_sel_hi` (for example an inline
+    integer second source whose low half is replicated) takes the stored fields from the blob when they are the
+    only difference (`rdna2spirv.dot4_op_sel_fields`, docs/design.md "Signed-byte dot products").
 
 ## Kind 7: records
 
