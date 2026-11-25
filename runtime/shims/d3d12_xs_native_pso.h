@@ -34,7 +34,8 @@ namespace np = leonida::native_pso;
 
 // The blend state of blob A's colour-target registers (RT-SLOT57-BLEND-STATE). Without it, or for a target this path
 // cannot express (np::d3d12_blend), every target keeps blending off and writes every component, as before.
-inline void fill_blend_state(const np::FixedState& s, D3D12_BLEND_DESC& out) {
+// Blending off and every component written on every target: the factory's state before blob A was read.
+inline void default_blend_state(D3D12_BLEND_DESC& out) {
     for (auto& rt : out.RenderTarget) {
         rt = {};
         rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
@@ -45,6 +46,10 @@ inline void fill_blend_state(const np::FixedState& s, D3D12_BLEND_DESC& out) {
     }
     out.AlphaToCoverageEnable = FALSE;
     out.IndependentBlendEnable = FALSE;
+}
+
+inline void fill_blend_state(const np::FixedState& s, D3D12_BLEND_DESC& out) {
+    default_blend_state(out);
     const auto targets = s.blend ? np::d3d12_blend(*s.blend, s.rt_count, s.rtv_formats) : std::nullopt;
     if (!targets) {
         static std::atomic<int> logged{0};
@@ -224,7 +229,36 @@ public:
                 else if (stage.shader->stage == "gs") pc.GS = view;
                 else mesh = view;  // plan() admits only VS/PS/GS or MS/PS.
             }
-            return create_pipeline(pc, mesh, code);
+            HRESULT hr = create_pipeline(pc, mesh, code);
+            // The decoded blend state can ask for something this device's layer does not do: blending a B4G4R4A4 target
+            // that is an RGBA8 stand-in, which the layer refuses (E_NOTIMPL) because the stand-in quantizes the shader
+            // output before blending. Turn blending off on those targets first, then on all of them (the state before
+            // blob A was read), rather than leave the pipeline to the PC description path.
+            if (hr == E_NOTIMPL && plan.state.blend) {
+                bool changed = false;
+                for (unsigned i = 0; i < pc.NumRenderTargets; ++i)
+                    if (pc.RTVFormats[i] == DXGI_FORMAT_B4G4R4A4_UNORM && pc.BlendState.RenderTarget[i].BlendEnable) {
+                        pc.BlendState.RenderTarget[i].BlendEnable = FALSE;
+                        pc.BlendState.IndependentBlendEnable = TRUE;
+                        changed = true;
+                    }
+                if (changed) hr = create_pipeline(pc, mesh, code);
+                const char* how = "on its B4G4R4A4 targets";
+                if (hr == E_NOTIMPL) {
+                    D3D12_BLEND_DESC decoded = pc.BlendState;
+                    default_blend_state(pc.BlendState);
+                    if (std::memcmp(&decoded, &pc.BlendState, sizeof(decoded)) != 0) {
+                        hr = create_pipeline(pc, mesh, code);
+                        how = "on every target";
+                        changed = true;
+                    }
+                }
+                static std::atomic<int> logged{0};
+                if (changed && logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                    std::fprintf(stderr, "[rt] d3d12_xs: slot 57: the device refused this pipeline's blend state, so it "
+                                         "was built with blending off %s (0x%08x)\n", how, static_cast<unsigned>(hr));
+            }
+            return hr;
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
         } catch (const std::exception&) {
