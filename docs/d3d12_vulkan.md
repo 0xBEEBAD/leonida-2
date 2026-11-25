@@ -2369,7 +2369,12 @@ Pipeline creation:
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
-  The runtime writes its own `pipeline_cache.session.bin` on device teardown. A compatible session file
+  The runtime writes its own `pipeline_cache.session.bin` on device teardown, and, since a title never releases its
+  device, when `gta6rt` ends with the device alive: at the run's exit, at a console close and from an
+  unhandled-exception filter (a fault in the title or its DLLs, the int3 after a device loss). The title's own
+  `SetUnhandledExceptionFilter` is served by the runtime, which keeps its filter first and passes the exception on.
+  That exit write (`save_pipeline_caches_at_exit`, `shims/d3d12_compile_exit.h`) waits 1 s for a build still running
+  on a title thread, then writes the pipelines finished so far, with 3 s for the write itself. A compatible session file
   initializes the live cache directly if there is no offline seed. With both files present the session cache
   merges into the offline seed. `LEONIDA_DIRECT_SESSION_CACHE=0` also uses a merge when only the session exists.
   The files must match the Vulkan vendor, device and pipeline-cache UUID. Vulkan supplies an opaque snapshot.
