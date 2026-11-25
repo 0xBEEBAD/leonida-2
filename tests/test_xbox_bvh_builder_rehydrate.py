@@ -2,8 +2,10 @@
 
 Verifies that runtime/shims/xbox_bvh_builder.cpp implements
 XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X,
-validates arguments (null list, null descs, count=0), builds or deserializes
-structures via ID3D12GraphicsCommandList4, and registers the mangled export.
+validates arguments (null list, null descs, count=0), rebuilds
+structures from geometry via ID3D12GraphicsCommandList4, refuses
+source-only dehydrated console streams without geometry (docs/bvh.md §4/§4a),
+and registers the mangled export.
 Synthetic test only; no retail game data or GPU required.
 """
 import re
@@ -25,9 +27,6 @@ class XboxBvhBuilderRehydrateTest(unittest.TestCase):
         self.assertIsNotNone(m, "builder_rehydrate_batched2x must be defined in xbox_bvh_builder.cpp")
         body = m.group(1)
 
-        # Must not be a stub returning E_NOTIMPL
-        self.assertNotIn("return E_NOTIMPL;", body, "builder_rehydrate_batched2x must not return E_NOTIMPL")
-
         # Must return S_OK on empty count
         self.assertIn("if (count == 0) return S_OK;", body)
 
@@ -35,12 +34,15 @@ class XboxBvhBuilderRehydrateTest(unittest.TestCase):
         self.assertIn("if (!descs) return E_INVALIDARG;", body)
         self.assertIn("if (!list) return E_INVALIDARG;", body)
 
-        # Must convert to list4 and call Build or Copy
+        # Must convert to list4 and call BuildRaytracingAccelerationStructure for geometry
         self.assertIn("ID3D12GraphicsCommandList4* list4 = list4_of(list);", body)
         self.assertIn("BuildRaytracingAccelerationStructure", body)
-        self.assertIn("D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE", body)
 
-        # Must release list4 and return S_OK
+        # Must refuse source-only dehydrated streams without geometry (docs/bvh.md §4/§4a)
+        self.assertIn("E_NOTIMPL", body)
+        self.assertIn("docs/bvh.md", body)
+
+        # Must release list4 and return S_OK on success
         self.assertIn("list4->Release();", body)
         self.assertIn("return S_OK;", body)
 
@@ -58,6 +60,8 @@ class XboxBvhBuilderRehydrateTest(unittest.TestCase):
         self.assertIn("rehydrate(builder, list.p, 1, &rehydrate_desc, &source) == S_OK", test_content)
         self.assertIn("rehydrate(builder, nullptr, 1, &rehydrate_desc, &source) == E_INVALIDARG", test_content)
         self.assertIn("rehydrate(builder, list.p, 0, nullptr, nullptr) == S_OK", test_content)
+        self.assertIn("rehydrate(builder, list.p, 1, &source_only_desc, &source) == E_NOTIMPL", test_content)
+        self.assertIn("rehydrate(builder, list.p, 1, &empty_desc, nullptr) == S_OK", test_content)
 
 
 if __name__ == "__main__":

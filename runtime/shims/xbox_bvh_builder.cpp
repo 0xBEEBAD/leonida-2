@@ -29,8 +29,9 @@
 //     shim must not throw into the title, so an element the DLL would reject is logged and skipped instead. The one
 //     rule a correct title meets every time is kept: the offline-statistics postbuild type (0x10) is never written.
 //   - Rehydration: RehydrateRaytracingAccelerationStructureBatched2X rebuilds each structure from the source
-//     geometry its description carries (BuildRaytracingAccelerationStructure) or deserializes from the source buffer
-//     (CopyRaytracingAccelerationStructure with DESERIALIZE) and returns S_OK.
+//     geometry its description carries (BuildRaytracingAccelerationStructure) (docs/bvh.md §4a). The GPU cannot
+//     read offline dehydrated console streams directly (docs/bvh.md §4/§4a), so source-only streams without geometry
+//     are refused with E_NOTIMPL.
 //
 // The builder object belongs to the title, which allocates it with a size this file doesn't know, so nothing is
 // written into it: what the shim keeps (the device, the Morton option) lives in a table keyed by its address.
@@ -229,7 +230,7 @@ void builder_copy(void*, void* list, UINT64 dest, UINT64 source, D3D12_RAYTRACIN
 
 // ?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_
 // BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z -> HRESULT.
-// Rebuilds or deserializes each acceleration structure on the command list.
+// Rebuilds each acceleration structure from geometry on the command list.
 HRESULT builder_rehydrate_batched2x(void*, void* list, UINT count,
                                     const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* descs,
                                     const UINT64* source_data) {
@@ -250,12 +251,23 @@ HRESULT builder_rehydrate_batched2x(void*, void* list, UINT count,
         }
         if (build.Inputs.NumDescs > 0 && (build.Inputs.pGeometryDescs || build.Inputs.InstanceDescs)) {
             list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
-        } else if (src && build.DestAccelerationStructureData) {
-            list4->CopyRaytracingAccelerationStructure(
-                build.DestAccelerationStructureData, src,
-                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE);
+        } else if (src) {
+            // docs/bvh.md §4/§4a: the rehydrate source is a dehydrated console stream (element chunks,
+            // level table, box overrides), not a D3D12 serialized blob. On the XDXR path, a DESERIALIZE
+            // copy is replayed as a byte clone, so the destination would hold dehydrated bytes the GPU
+            // traversal shaders cannot read. Rehydration requires geometry reconstruction (docs/bvh.md §4a);
+            // refusing source-only rehydration without geometry.
+            static std::atomic<bool> s_source_only_logged{false};
+            log_once(s_source_only_logged,
+                     "RehydrateRaytracingAccelerationStructureBatched2X: source-only dehydrated stream without "
+                     "geometry cannot be deserialized as a D3D12 BLAS (docs/bvh.md §4/§4a); refusing element");
+            list4->Release();
+            return E_NOTIMPL;
         } else {
-            list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+            static std::atomic<bool> s_empty_logged{false};
+            log_once(s_empty_logged,
+                     "RehydrateRaytracingAccelerationStructureBatched2X: element %u has NumDescs == 0 with no geometry; "
+                     "skipping empty structure", i);
         }
     }
     list4->Release();

@@ -132,7 +132,7 @@ static reference, reached through a table (#7516), so 2 of them are calls of ano
 | `GetRaytracingAccelerationStructurePrebuildInfo(INPUTS*, XDXR_STREAM_DESC*, PREBUILD_INFO*)` | 3 | the layer's sizes |
 | `BuildRaytracingAccelerationStructureBatched2X(GCL6*, UINT, BATCHED_DESC2*)` | 6 (8) | one layer build per element (§1), with its postbuild descriptions |
 | `CopyRaytracingAccelerationStructure(GCL4*, dest, source, mode)` | 2 | the layer's copy |
-| `RehydrateRaytracingAccelerationStructureBatched2X(GCL8*, UINT, BUILD_DESC*, UINT64*)` | 4 | builds each structure from source geometry or deserializes from source buffer |
+| `RehydrateRaytracingAccelerationStructureBatched2X(GCL8*, UINT, BUILD_DESC*, UINT64*)` | 4 | rebuilds each structure from source geometry; refuses source-only stream without geometry |
 
 **Where it differs from the DLL:**
 - **Stream records (§3):** they tune the console builder's heuristics, so they are ignored (logged once). The result
@@ -140,8 +140,14 @@ static reference, reached through a table (#7516), so 2 of them are calls of ano
 - **Validation errors:** the DLL throws them as C++ exceptions. A shim must not throw into the title, so an element
   the DLL would refuse is skipped with a log line. The offline-statistics postbuild type (`0x10`, §4) is one of
   those.
-- **Rehydration** rebuilds each structure on the GPU from the source geometry its description
-  carries ([bvh.md](bvh.md) §4a) or deserializes it from the source buffer, returning S_OK.
+- **Rehydration (`RehydrateRaytracingAccelerationStructureBatched2X`):** Rebuilds each structure on the GPU from
+  the source geometry its description carries ([bvh.md](bvh.md) §4a). What the 4th parameter
+  (`const UINT64* source_data`, mangling `PEB_K`) conveys is a **hypothesis**: it points to the array of source
+  buffer addresses for offline dehydrated console streams (e.g. `SourceAccelerationStructureData` or rehydration inputs).
+  When geometry is provided (`NumDescs > 0`), the shim issues `BuildRaytracingAccelerationStructure` to construct
+  traversable GPU BVH nodes. When `source_data` is supplied without geometry, the shim logs once and refuses with
+  `E_NOTIMPL`: offline console dehydrated streams cannot be directly deserialized by PC Vulkan/D3D12 drivers
+  ([bvh.md](bvh.md) §4/§4a). Empty structures (`NumDescs == 0` without source) are logged and skipped.
 
 `xbox_bvh_builder_test` calls every export through the shim registry, the way the title's imports bind, and
 `xdxr_bvh.py check-build` checks the BLAS, TLAS and compacted BLAS it builds (ctest `xbox_bvh_builder_check`).

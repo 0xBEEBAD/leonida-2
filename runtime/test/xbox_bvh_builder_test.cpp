@@ -394,6 +394,16 @@ int main(int argc, char** argv) {
           "RehydrateRaytracingAccelerationStructureBatched2X rejects null descs");
     check(rehydrate(builder, list.p, 0, nullptr, nullptr) == S_OK,
           "RehydrateRaytracingAccelerationStructureBatched2X with count 0 returns S_OK");
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC source_only_desc{};
+    source_only_desc.DestAccelerationStructureData = rehydrated_as->GetGPUVirtualAddress();
+    check(rehydrate(builder, list.p, 1, &source_only_desc, &source) == E_NOTIMPL,
+          "RehydrateRaytracingAccelerationStructureBatched2X refuses source-only stream without geometry");
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC empty_desc{};
+    check(rehydrate(builder, list.p, 1, &empty_desc, nullptr) == S_OK,
+          "RehydrateRaytracingAccelerationStructureBatched2X logs and skips empty structure");
+
     check(rehydrate(builder, list.p, 1, &rehydrate_desc, &source) == S_OK,
           "RehydrateRaytracingAccelerationStructureBatched2X rebuilds BLAS and returns S_OK");
     list->ResourceBarrier(1, &barrier);
