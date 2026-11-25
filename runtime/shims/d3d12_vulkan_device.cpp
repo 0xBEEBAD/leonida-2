@@ -10848,6 +10848,15 @@ std::timed_mutex exit_cache_mutex;
 std::vector<DeviceState*> exit_cache_devices;
 std::atomic<bool> exit_cache_saved{false};
 
+// VK_EXT_memory_budget read from a device's info: the reader a device publishes for the title HUD and the dev overlay
+// (src/memory_figures.h), and vulkan_vram_budget. Not available without the extension.
+leonida::VramBudget read_vram_budget(const VulkanDeviceInfo& info) {
+    if (!info.memory_budget || !info.get_instance_proc || !info.instance) return {};
+    const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties2"));
+    return leonida::query_vram_budget(get, info.physical);
+}
+
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
     PFN_vkDestroyDevice destroy_device = nullptr;
@@ -10878,6 +10887,11 @@ public:
             std::lock_guard lock(exit_cache_mutex);
             exit_cache_devices.push_back(&state_);
         }
+        // The GPU memory figure of the title HUD and the dev overlay: the newest device with VK_EXT_memory_budget.
+        if (info.memory_budget)
+            leonida::memory_figures::publish_vram_reader(
+                [](const void* context) { return read_vram_budget(static_cast<const DeviceState*>(context)->info); },
+                &state_);
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -11733,6 +11747,7 @@ public:
     }
 
     ~Device() override {
+        leonida::memory_figures::withdraw_vram_reader(&state_);  // waits for a read of this device in progress
         {
             // Before anything goes: an exit save in progress finishes with this device first.
             std::lock_guard lock(exit_cache_mutex);
@@ -17381,10 +17396,7 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
 
 leonida::VramBudget vulkan_vram_budget(ID3D12Device* device) {
     const VulkanDeviceInfo* info = vulkan_device_info(device);
-    if (!info || !info->memory_budget || !info->get_instance_proc || !info->instance) return {};
-    const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
-        info->get_instance_proc(info->instance, "vkGetPhysicalDeviceMemoryProperties2"));
-    return leonida::query_vram_budget(get, info->physical);
+    return info ? read_vram_budget(*info) : leonida::VramBudget{};
 }
 
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device) {

@@ -1,8 +1,9 @@
 // rt::d3d12::vulkan_vram_budget on the standalone Vulkan-backed device: the GPU memory in use and the budget the
 // title HUD shows (shims/title_hud.h), from VK_EXT_memory_budget. The device enables the extension exactly when the
 // GPU has it; then, with a 64 MiB default-heap buffer alive, the device-local budget and the usage are non-zero.
-// Without the extension the figure is not available, and the test skips (77) after checking that. Also skips without
-// a Vulkan GPU. No shaders or game data.
+// The device publishes that figure for the HUD and the dev overlay (src/memory_figures.h) and withdraws it when it
+// is released. Without the extension the figure is not available, and the test skips (77) after checking that.
+// Also skips without a Vulkan GPU. No shaders or game data.
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -60,8 +61,10 @@ int main() {
     // Enabled exactly when the GPU has it.
     const bool supported = physical_has_memory_budget(*info);
     EXPECT(info->memory_budget == supported);
+    // What the title HUD and the dev overlay show (src/memory_figures.h): this device's figure once it has one.
+    EXPECT(leonida::memory_figures::latest_vram().available == supported);
     if (!supported) {
-        EXPECT(!rt::d3d12::vulkan_vram_budget(device.p).available);  // the HUD shows "n/a"
+        EXPECT(!rt::d3d12::vulkan_vram_budget(device.p).available);  // the HUD and the overlay show "n/a"
         std::printf("SKIP: the GPU has no VK_EXT_memory_budget; the figure is not available\n");
         return 77;
     }
@@ -85,6 +88,16 @@ int main() {
     EXPECT(after.available);
     EXPECT(after.local_budget > 0);
     EXPECT(after.local_usage + after.shared_usage > 0);
-    std::printf("d3d12_vram_budget: VK_EXT_memory_budget enabled; usage and budget read from the device\n");
+    const leonida::VramBudget published = leonida::memory_figures::latest_vram();
+    EXPECT(published.available && published.local_budget > 0);  // may be the read before the buffer: cached
+
+    // A released device withdraws its figure: nothing reads a device that is gone.
+    buffer.p->Release();
+    buffer.p = nullptr;
+    device.p->Release();
+    device.p = nullptr;
+    EXPECT(!leonida::memory_figures::latest_vram().available);
+    std::printf("d3d12_vram_budget: VK_EXT_memory_budget enabled; usage and budget read from the device and published"
+                " while it lives\n");
     return 0;
 }

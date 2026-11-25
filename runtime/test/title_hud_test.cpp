@@ -3,6 +3,7 @@
 // summed, DXGI's as the fallback, "n/a" where neither has one, and the private bytes Wine reports. A real Win32
 // window and made-up budgets; no GPU needed (d3d12_vram_budget_test reads a real device's).
 #include "title_hud.h"
+#include "../src/vulkan_memory_budget.h"
 
 #include <windows.h>
 
@@ -40,11 +41,12 @@ static void pump(DWORD ms, rt::d3d12_xs::TitleHud* present) {
 
 constexpr std::uint64_t kGiB = 1ull << 30;
 
-// The memory figures without a window: VK_EXT_memory_budget's heaps summed, DXGI's answer, the private bytes, and
-// the text for each, "n/a" where there is no figure. Made-up values, so it is the same on every host.
+// The memory figures without a window: VK_EXT_memory_budget's heaps summed, DXGI's answer as the fallback, and this
+// process's own private bytes. Made-up values except the last. The text and the private-bytes choice are
+// src/memory_figures.h's, shared with the dev overlay; dev_overlay_test checks them.
 static int check_figures() {
     using rt::d3d12_xs::TitleHud;
-    wchar_t text[96];
+    namespace mf = leonida::memory_figures;
 
     // Two device-local heaps (VRAM and a BAR window) and system memory.
     VkPhysicalDeviceMemoryProperties heaps{};
@@ -65,15 +67,12 @@ static int check_figures() {
     CHECK(summed.available);
     CHECK(summed.local_usage == 3 * kGiB + kGiB / 2 && summed.local_budget == 16 * kGiB);
     CHECK(summed.shared_usage == kGiB / 2);
-    TitleHud::format_vram(text, 96, summed);
-    CHECK(std::wstring(text) == L"VRAM 3.5/16.0 GB +0.5 shared");
+    CHECK(mf::vram_text(summed) == "VRAM 3.5/16.0 GB +0.5 shared");
 
     // A device that reports no budget for its device-local heaps has no figure, not a 0.
     const VkPhysicalDeviceMemoryBudgetPropertiesEXT empty{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     CHECK(!leonida::sum_vram_budget(heaps, empty).available);
-    TitleHud::format_vram(text, 96, leonida::VramBudget{});
-    CHECK(std::wstring(text) == L"VRAM n/a");
 
     // DXGI: Wine's QueryVideoMemoryInfo answers S_OK with no usage, which is not a figure; Windows' is.
     DXGI_QUERY_VIDEO_MEMORY_INFO local{}, non_local{};
@@ -85,28 +84,13 @@ static int check_figures() {
     CHECK(dxgi.available && dxgi.local_usage == 2 * kGiB && dxgi.local_budget == 24 * kGiB &&
           dxgi.shared_usage == kGiB);
 
-    // The private bytes: Wine fills PagefileUsage and leaves PrivateUsage 0; Windows fills both with the same value.
-    PROCESS_MEMORY_COUNTERS_EX counters{};
-    counters.WorkingSetSize = kGiB;
-    TitleHud::format_ram(text, 96, &counters);
-    CHECK(std::wstring(text) == L"RAM n/a (ws 1.0)");
-    counters.PagefileUsage = 5 * kGiB / 2;
-    CHECK(TitleHud::private_bytes(counters) == 5 * kGiB / 2);
-    TitleHud::format_ram(text, 96, &counters);
-    CHECK(std::wstring(text) == L"RAM 2.5 GB (ws 1.0)");
-    counters.PrivateUsage = 5 * kGiB / 2;
-    CHECK(TitleHud::private_bytes(counters) == 5 * kGiB / 2);
-    TitleHud::format_ram(text, 96, nullptr);
-    CHECK(std::wstring(text) == L"RAM n/a");
-
-    // This process's own counters: its private bytes are never 0, on Windows or under Wine.
-    PROCESS_MEMORY_COUNTERS_EX own{};
-    own.cb = sizeof own;
-    CHECK(GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&own), sizeof own));
+    // This process's own counters: its private bytes are never 0, on Windows or under Wine (where only PagefileUsage
+    // is filled).
+    const mf::ProcessMemory own = mf::process_memory();
     std::fprintf(stderr, "own counters: PrivateUsage %llu, PagefileUsage %llu, WorkingSetSize %llu\n",
-                 (unsigned long long)own.PrivateUsage, (unsigned long long)own.PagefileUsage,
-                 (unsigned long long)own.WorkingSetSize);
-    CHECK(TitleHud::private_bytes(own) > 0);
+                 (unsigned long long)own.private_usage, (unsigned long long)own.pagefile_usage,
+                 (unsigned long long)own.working_set);
+    CHECK(own.read && mf::private_bytes(own) > 0);
     return 0;
 }
 
@@ -163,6 +147,28 @@ int main() {
         std::fwprintf(stderr, L"title: %ls\n", text.c_str());
         CHECK(text.find(L"| VRAM 3.5/20.0 GB +0.5 shared |") != std::wstring::npos);
         CHECK(reads.load() >= 1 && reads.load() <= 3);  // 1.3 s at one refresh per 500 ms
+    }
+    {
+        // No source of its own: the HUD shows what a device published (src/memory_figures.h), the figure the dev
+        // overlay shows as well.
+        static const int device = 0;
+        leonida::memory_figures::publish_vram_reader(
+            [](const void*) {
+                leonida::VramBudget fake;
+                fake.available = true;
+                fake.local_usage = 5 * kGiB;
+                fake.local_budget = 12 * kGiB;
+                return fake;
+            },
+            &device);
+        {
+            rt::d3d12_xs::TitleHud hud(window);
+            pump(700, &hud);
+            const std::wstring text = title_of(window);
+            std::fwprintf(stderr, L"title: %ls\n", text.c_str());
+            CHECK(text.find(L"| VRAM 5.0/12.0 GB +0.0 shared |") != std::wstring::npos);
+        }
+        leonida::memory_figures::withdraw_vram_reader(&device);
     }
     {
         // A source with no figure (a device without VK_EXT_memory_budget): DXGI's figure where it has one (Windows),

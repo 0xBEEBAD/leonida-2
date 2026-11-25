@@ -1741,10 +1741,7 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
         std::fprintf(stderr, "[rt] d3d12_xs: frame interval %u us replayed (0x%08lx), origin event (0x%08lx)\n",
                      interval, static_cast<unsigned long>(set), static_cast<unsigned long>(armed));
     }
-    // The device outlives the HUD: proxy_release destroys the present state before it releases `real`.
-    if (TitleHud::enabled())
-        state->hud = std::make_unique<TitleHud>(
-            target, [real = device->real] { return rt::d3d12::vulkan_vram_budget(real); });
+    if (TitleHud::enabled()) state->hud = std::make_unique<TitleHud>(target);
     if (splash_only) device->present_state = pending.release();
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p: %s, client area %ldx%ld)\n",
                  static_cast<void*>(target),
