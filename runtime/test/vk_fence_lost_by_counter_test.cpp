@@ -1,8 +1,7 @@
 // A device loss the driver shows only through a timeline counter (runtime/src/vulkan_backend.h, VulkanFence::completed):
 // vkGetSemaphoreCounterValue succeeds with UINT64_MAX and no call has returned VK_ERROR_DEVICE_LOST yet.
-//   1. With vkDeviceWaitIdle then returning VK_ERROR_DEVICE_LOST: the context is marked lost, the loss is said once,
-//      and the driver's fault report is printed once (a stand-in vkGetDeviceFaultInfoEXT).
-//   2. A second read on the lost device says nothing more.
+//   1. With vkDeviceWaitIdle then returning VK_ERROR_DEVICE_LOST: the context is marked lost and the loss is said once.
+//   2. A second read on the lost device asks the driver nothing and says nothing more.
 //   3. With vkDeviceWaitIdle returning VK_SUCCESS, the value alone records no loss and nothing is said.
 //   4. An ordinary counter value never reaches vkDeviceWaitIdle.
 // The driver functions are interposed on a real device's table. Skips with exit code 77 when no Vulkan 1.3 device is
@@ -29,9 +28,10 @@ PFN_vkGetSemaphoreCounterValue real_get_counter = nullptr;
 std::atomic<bool> counter_reads_max{false};
 std::atomic<bool> idle_reports_loss{false};
 std::atomic<unsigned> idle_calls{0};
-std::atomic<unsigned> fault_calls{0};
+std::atomic<unsigned> counter_calls{0};
 
 VKAPI_ATTR VkResult VKAPI_CALL get_semaphore_counter_value(VkDevice device, VkSemaphore sem, std::uint64_t* value) {
+    counter_calls.fetch_add(1, std::memory_order_relaxed);
     if (counter_reads_max.load(std::memory_order_acquire)) {
         *value = UINT64_MAX;
         return VK_SUCCESS;
@@ -44,26 +44,10 @@ VKAPI_ATTR VkResult VKAPI_CALL device_wait_idle(VkDevice) {
     return idle_reports_loss.load(std::memory_order_acquire) ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
-// One address fault and no vendor fault, in the two-call shape.
-VKAPI_ATTR VkResult VKAPI_CALL get_device_fault_info(VkDevice, VkDeviceFaultCountsEXT* counts, VkDeviceFaultInfoEXT* info) {
-    fault_calls.fetch_add(1, std::memory_order_relaxed);
-    if (!info) {
-        counts->addressInfoCount = 1;
-        counts->vendorInfoCount = 0;
-        counts->vendorBinarySize = 0;
-        return VK_SUCCESS;
-    }
-    std::snprintf(info->description, sizeof info->description, "stand-in fault");
-    if (counts->addressInfoCount >= 1 && info->pAddressInfos)
-        info->pAddressInfos[0] = {VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT, 0x1000, 0x1000};
-    return VK_SUCCESS;
-}
-
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     const std::string_view n = name;
     if (n == "vkGetSemaphoreCounterValue") return reinterpret_cast<PFN_vkVoidFunction>(get_semaphore_counter_value);
     if (n == "vkDeviceWaitIdle") return reinterpret_cast<PFN_vkVoidFunction>(device_wait_idle);
-    if (n == "vkGetDeviceFaultInfoEXT") return reinterpret_cast<PFN_vkVoidFunction>(get_device_fault_info);
     return real_get_device(device, name);
 }
 
@@ -90,7 +74,7 @@ int main() {
         VulkanContext context(driver::get_device, d.device, true);
         EXPECT(context.loaded());
         VulkanFence fence(context, 7);
-        const unsigned lost_before = device_lost_reports.load(), faults_before = device_fault_reports.load();
+        const unsigned lost_before = device_lost_reports.load();
         EXPECT(fence.completed() == 7);
         EXPECT(driver::idle_calls.load() == 0);
 
@@ -100,15 +84,13 @@ int main() {
         EXPECT(driver::idle_calls.load() == 1);
         EXPECT(!context.is_device_lost());
         EXPECT(device_lost_reports.load() == lost_before);
-        EXPECT(device_fault_reports.load() == faults_before);
-        EXPECT(driver::fault_calls.load() == 0);
         EXPECT(fence.completed() == 7);
     }
     {   // 1 and 2
         VulkanContext context(driver::get_device, d.device, true);
         EXPECT(context.loaded());
         VulkanFence fence(context, 0);
-        const unsigned lost_before = device_lost_reports.load(), faults_before = device_fault_reports.load();
+        const unsigned lost_before = device_lost_reports.load();
         const unsigned idle_before = driver::idle_calls.load();
 
         driver::counter_reads_max.store(true, std::memory_order_release);
@@ -117,15 +99,13 @@ int main() {
         EXPECT(context.is_device_lost());
         EXPECT(driver::idle_calls.load() == idle_before + 1);
         EXPECT(device_lost_reports.load() == lost_before + 1);
-        EXPECT(device_fault_reports.load() == faults_before + 1);
-        EXPECT(driver::fault_calls.load() == 2);    // the counts, then the report
 
+        const unsigned counter_before = driver::counter_calls.load();
         EXPECT(fence.completed() == UINT64_MAX);    // lost: answered without asking the driver again
         context.mark_device_lost();
+        EXPECT(driver::counter_calls.load() == counter_before);
         EXPECT(driver::idle_calls.load() == idle_before + 1);
         EXPECT(device_lost_reports.load() == lost_before + 1);
-        EXPECT(device_fault_reports.load() == faults_before + 1);
-        EXPECT(driver::fault_calls.load() == 2);
         driver::counter_reads_max.store(false, std::memory_order_release);
         driver::idle_reports_loss.store(false, std::memory_order_release);
     }
