@@ -986,7 +986,8 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
 // rt::xmem::copy_page_mappings_fn (xmem.h), for the console queue's CopyPageMappingsBatchX: each destination page gets
 // a view of the physical page mapped at its source page, so both addresses are one memory, as two XMemMapPhysicalPages
 // calls with the same page make them. Every source page is looked up before any destination page changes, so a source
-// range that overlaps the destination maps what was there before the call.
+// range that overlaps the destination maps what was there before the call. A destination in a GPU-only range is mapped
+// at its paired CPU range too (title_gpu_views), and a source page missing at a GPU-only address is looked up there.
 bool copy_page_mappings(void* destination, const void* source, uint64_t pages, bool repeat_first) {
     const uintptr_t to = reinterpret_cast<uintptr_t>(destination);
     const uintptr_t from = reinterpret_cast<uintptr_t>(source);
@@ -1001,9 +1002,14 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
         return false;
     }
     const std::lock_guard lock(g_phys_mutex);
+    // The destination is usually a GPU-only reservation, which the D3D12 layer reads at its paired CPU view
+    // (title_gpu_views::to_cpu); that view gets the same pages, or it would stay reserved and never readable.
+    const uintptr_t cpu_to = leonida::title_gpu_views::to_cpu(to, pages * kPhysicalPageSize);
+    const Window* const cpu_window = cpu_to != to ? find_window(cpu_to, pages * kPhysicalPageSize) : nullptr;
     if (!source) {
         for (uint64_t i = 0; i < pages; ++i) {
             if (!unmap_page(to + i * kPhysicalPageSize)) return false;
+            if (cpu_window && !unmap_page(cpu_to + i * kPhysicalPageSize)) return false;
         }
         return true;
     }
@@ -1014,12 +1020,20 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     }
     std::vector<uint64_t> found(static_cast<size_t>(pages), 0);
     for (uint64_t i = 0; i < pages; ++i) {
-        const auto it = g_mapped.find(from + (repeat_first ? 0 : i) * kPhysicalPageSize);
+        const uintptr_t src_va = from + (repeat_first ? 0 : i) * kPhysicalPageSize;
+        auto it = g_mapped.find(src_va);
+        if (it == g_mapped.end()) {  // a GPU-only source whose pages were mapped at its CPU view
+            const uintptr_t cpu_src = leonida::title_gpu_views::to_cpu(src_va, kPhysicalPageSize);
+            if (cpu_src != src_va) it = g_mapped.find(cpu_src);
+        }
         if (it != g_mapped.end()) found[static_cast<size_t>(i)] = it->second;
     }
     const DWORD protect = view_protect(*window);
+    const DWORD cpu_protect = cpu_window ? view_protect(*cpu_window) : 0;
     for (uint64_t i = 0; i < pages; ++i) {
-        if (!map_page(to + i * kPhysicalPageSize, found[static_cast<size_t>(i)], protect)) return false;
+        const uint64_t page = found[static_cast<size_t>(i)];
+        if (!map_page(to + i * kPhysicalPageSize, page, protect)) return false;
+        if (cpu_window && !map_page(cpu_to + i * kPhysicalPageSize, page, cpu_protect)) return false;
     }
     return true;
 }
