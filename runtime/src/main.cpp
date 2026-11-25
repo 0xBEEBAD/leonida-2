@@ -149,6 +149,7 @@ void start_title_peek(std::uint8_t* base) {
 #include "mods.h"
 #include "pe_loader.h"
 #include "thread_stacks.h"
+#include "dev_overlay.h"
 #include "thread_sampler.h"
 #include "title_page_watch.h"
 #include "title_geometry_watch.h"
@@ -561,6 +562,7 @@ int wmain(int argc, wchar_t** argv) {
         std::fflush(stdout);
         keep_title_watchdog_kicked(main_module.base);
         start_title_peek(main_module.base);
+        leonida::dev_overlay::start();  // LEONIDA_DEV_OVERLAY=1
         leonida::thread_sampler::start(main_module.base, main_module.size);  // LEONIDA_SAMPLE_MS (diagnostic)
 #ifdef LEONIDA_VULKAN_DEVICE
         SetConsoleCtrlHandler(&stop_compiles_on_console_exit, TRUE);

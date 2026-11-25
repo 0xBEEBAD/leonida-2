@@ -129,6 +129,12 @@ Useful switches:
   - the time since the first present.
 
   A thread of its own sets the text with `SendMessageTimeout`, so a busy window thread never holds a present.
+* `LEONIDA_DEV_OVERLAY=1` (Windows) shows what the runtime is doing in a small click-through window over the top left
+  corner of the title's window, while that window is in front (`runtime/src/dev_overlay.h`): frames and submissions a
+  second, where a submission's CPU time goes, the phase that is running now and for how long, pipeline builds in
+  flight, indirect draws emitted and skipped, cores, memory. The figures cover the last two seconds. It has its own
+  thread, so it also counts while the title presents nothing, and it is in no capture. `LEONIDA_TITLE_HUD` shows frame
+  times and compile times in the title bar instead; both can be on.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
