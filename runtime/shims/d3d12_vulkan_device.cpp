@@ -613,7 +613,22 @@ struct DeviceState {
         return pipeline_cache_handle;
     }
 
-    QueueClock clock;  // what every queue's GetClockCalibration uses
+    QueueClock clock;  // device-wide calibration entry points
+    std::vector<std::uint32_t> timestamp_bits;
+
+    QueueClock clock_for(std::uint32_t family) const {
+        QueueClock result = clock;
+        result.timestamp_valid_bits = leonida::queue_family_timestamp_bits(timestamp_bits, family);
+        return result;
+    }
+
+    bool copy_timestamps_supported() const {
+        // Copy queues can fall back to a graphics queue when their own pool is busy.
+        const bool has_copy_pool = !info.command_queues.empty() && !info.copy_queues.empty();
+        const auto dedicated_copy = has_copy_pool ? std::optional{info.copy_family} : std::nullopt;
+        return context->timestamp_period() > 0 && leonida::copy_queue_timestamp_families_supported(
+            timestamp_bits, info.queue_family, dedicated_copy);
+    }
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
     // is supported, so R9G9B9E5_SHAREDEXP UAV textures are backed by R32_UINT with separate storage/sampled views.
@@ -5010,13 +5025,16 @@ public:
         switch (desc.Type) {
         case h::occlusion: info.queryType = VK_QUERY_TYPE_OCCLUSION; break;
         case h::timestamp:
-        case h::copy_queue_timestamp:
-            if (!(device_.context->timestamp_period() > 0)) {
+        case h::copy_queue_timestamp: {
+            const bool supported = desc.Type == D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP
+                                       ? device_.copy_timestamps_supported() : device_.context->timestamp_period() > 0;
+            if (!supported) {
                 log_once("timestamp query heap: the queue writes no timestamps; type", desc.Type);
                 return E_NOTIMPL;
             }
             info.queryType = VK_QUERY_TYPE_TIMESTAMP;
             break;
+        }
         case h::so_statistics:
             // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
             // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
@@ -5273,6 +5291,14 @@ public:
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
         queue_families(info.physical, &family_count, families.data());
+        state_.timestamp_bits.reserve(family_count);
+        for (std::uint32_t i = 0; i < family_count; ++i) {
+            // Timestamp writes alone can work on a transfer-only family. Resetting the query and resolving it
+            // with vkCmdCopyQueryPoolResults require a graphics- or compute-capable family as well.
+            const auto& family = families[i];
+            const bool can_resolve = (family.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0;
+            state_.timestamp_bits.push_back(can_resolve ? family.timestampValidBits : 0);
+        }
         if (info.queue_family < family_count) {
             const auto& family = families[info.queue_family];
             if (family.timestampValidBits)
@@ -5780,7 +5806,7 @@ public:
         if (state_.info.command_queues.empty())
             return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
                                                                      state_.info.queue_family, *desc, riid, out,
-                                                                     identity(), state_.clock));
+                                                                     identity(), state_.clock_for(state_.info.queue_family)));
         // A VkQueue of the type's own family first, then the graphics family; shared when every one is in use.
         const bool compute = desc->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
         const bool copy = desc->Type == D3D12_COMMAND_LIST_TYPE_COPY;
@@ -5812,7 +5838,7 @@ public:
         const VkQueue queue = own_pool ? own_queues[slot] : state_.info.command_queues[slot];
         const std::uint32_t family = own_pool ? own_family : state_.info.queue_family;
         return d3d12_trace::result(method, create_command_queue(*state_.context, queue, family, *desc, riid, out,
-                                                                 identity(), state_.clock, std::move(lease)));
+                                                                 identity(), state_.clock_for(family), std::move(lease)));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
@@ -7744,7 +7770,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3*>(data);
             *opts = {};
-            opts->CopyQueueTimestampQueriesSupported = FALSE;
+            opts->CopyQueueTimestampQueriesSupported = state_.copy_timestamps_supported();
             // Only typeless resources set VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
             opts->CastingFullyTypedFormatSupported = FALSE;
             opts->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
@@ -8681,16 +8707,6 @@ private:
         if (!state_.luid.LowPart && !state_.luid.HighPart) log_once("the Vulkan driver reports no device LUID;", 0);
 
         state_.clock.get_device_proc = get_device;
-        const auto families_of = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
-            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
-        if (families_of) {
-            std::uint32_t count = 0;
-            families_of(info.physical, &count, nullptr);
-            std::vector<VkQueueFamilyProperties> families(count);
-            families_of(info.physical, &count, families.data());
-            if (info.queue_family < count)
-                state_.clock.timestamp_valid_bits = families[info.queue_family].timestampValidBits;
-        }
         if (!info.calibrated_timestamps) return;
         // The KHR names first; the EXT ones are aliases with the same signatures.
         auto domains_of = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
