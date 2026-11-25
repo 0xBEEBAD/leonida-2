@@ -293,6 +293,39 @@ int main() {
             std::fprintf(stderr, "no VK_FORMAT_A8_UNORM_KHR image was created for the A8 render targets\n");
             ++failures;
         }
+        // 1D and 3D (RT-A8-DIMENSIONS): only a 2D render target is A8-backed, so a 1D or 3D A8_UNORM texture is an
+        // R8_UNORM image on this device too and never one side of a mixed-backing copy; a 1D render target is
+        // refused rather than made in either backing.
+        {
+            const unsigned a8_before = a8_images;
+            const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC one_d = plain, three_d = plain, one_d_target = target;
+            one_d.Dimension = one_d_target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+            one_d.Width = one_d_target.Width = 128;
+            one_d.Height = one_d_target.Height = 1;
+            three_d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            three_d.Width = three_d.Height = 8;
+            three_d.DepthOrArraySize = 4;
+            Ref<ID3D12Resource> r1, r3, rt1;
+            const bool made = SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &one_d,
+                                                                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                        IID_PPV_ARGS(&r1.p))) &&
+                              SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &three_d,
+                                                                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                        IID_PPV_ARGS(&r3.p)));
+            const bool refused = FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE,
+                                                                        &one_d_target, D3D12_RESOURCE_STATE_COMMON,
+                                                                        nullptr, IID_PPV_ARGS(&rt1.p))) &&
+                                 !rt1.p;
+            if (!made || !refused || a8_images != a8_before) {
+                std::fprintf(stderr, "1D/3D A8_UNORM: created %d, 1D render target refused %d, %u A8 images\n",
+                             int(made), int(refused), a8_images - a8_before);
+                ++failures;
+            } else {
+                std::printf("1D/3D A8_UNORM textures are R8_UNORM images next to A8 render targets; a 1D render "
+                            "target is refused\n");
+            }
+        }
     } else {
         std::printf("A8 render targets: not on this device, only the fallback below runs\n");
     }
