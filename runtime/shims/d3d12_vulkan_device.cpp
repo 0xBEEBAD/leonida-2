@@ -2081,6 +2081,7 @@ struct DeviceState {
     bool heavy_stop = false;                                      // under heavy_mutex
     std::thread heavy_writer;                                     // started at the first slow build
     std::atomic<std::uint64_t> heavy_compiles{0}, heavy_hits{0};
+    std::atomic<bool> heavy_changed{false};  // a build went into the heavy cache since it was loaded
 
     VkPipelineCache heavy_cache() {
         std::call_once(heavy_cache_once, [this] {
@@ -2092,6 +2093,7 @@ struct DeviceState {
 
     // A build past the offline cache took `took_ms`: a slow one schedules a write.
     void note_heavy_build(ULONGLONG took_ms) {
+        heavy_changed = true;
         if (took_ms < heavy_pipeline_cache_ms()) {
             ++heavy_hits;
             return;
@@ -2123,15 +2125,18 @@ struct DeviceState {
                 heavy_wake.wait_for(lock, std::chrono::milliseconds(heavy_schedule.due_ms() - now));
                 continue;
             }
+            const std::uint64_t generation = heavy_schedule.generation();
             lock.unlock();
             save_heavy_pipeline_cache(context->vk, info.device, heavy_cache_handle, heavy_compiles.load(),
                                       heavy_hits.load());
             lock.lock();
-            heavy_schedule.written(now);
+            heavy_schedule.written(generation, now);
         }
     }
 
-    // At device teardown, with no build running: stop the writer and write what is still unwritten.
+    // At device teardown, with no build running: stop the writer and write the cache if any build went into it.
+    // Fast builds never schedule a write, so this is where they are kept: without an offline seed every build is
+    // a miss, and these are the builds pipeline_cache.session.bin used to keep.
     void finish_heavy_cache() {
         {
             std::lock_guard lock(heavy_mutex);
@@ -2140,7 +2145,7 @@ struct DeviceState {
         heavy_wake.notify_all();
         if (heavy_writer.joinable()) heavy_writer.join();
         if (!heavy_cache_handle) return;
-        if (heavy_schedule.dirty() && !active_compiles.load())
+        if (heavy_changed.load() && !active_compiles.load())
             save_heavy_pipeline_cache(context->vk, info.device, heavy_cache_handle, heavy_compiles.load(),
                                       heavy_hits.load());
         context->vk.vkDestroyPipelineCache(info.device, heavy_cache_handle, nullptr);

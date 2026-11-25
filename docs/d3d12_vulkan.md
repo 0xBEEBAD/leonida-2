@@ -2368,8 +2368,9 @@ Pipeline creation:
   A build that takes at least `LEONIDA_HEAVY_PIPELINE_CACHE_MS` (500 by default) marks the heavy cache for writing.
   A thread of its own writes it whole: 3 s after the newest slow build, and no later than 20 s after the first unwritten
   one, through the same staging file and rename as the session cache. A crash therefore loses at most the last 20 s
-  of slow builds, and the next launch starts with the rest. The thread stops and writes what is left at device
-  teardown. `LEONIDA_HEAVY_PIPELINE_CACHE_MS=0` turns the heavy cache off, and with it the
+  of slow builds, and the next launch starts with the rest. At device teardown the thread stops, and the cache is
+  written if any build went into it. Fast builds are kept that way: without an offline seed every build is a miss,
+  so they no longer reach `pipeline_cache.session.bin`. `LEONIDA_HEAVY_PIPELINE_CACHE_MS=0` turns the heavy cache off, and with it the
   `pipelineCreationCacheControl` feature unless `LEONIDA_PIPELINE_COMPILE=cache-only` asks for it. A cache-only create
   (`cache-only`) is left as it is.
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching

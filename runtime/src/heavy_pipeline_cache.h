@@ -50,6 +50,7 @@ public:
         if (!dirty_) first_ = now_ms;
         dirty_ = true;
         last_ = now_ms;
+        ++generation_;
     }
     bool dirty() const { return dirty_; }
     // The time to write at; only meaningful while dirty.
@@ -58,16 +59,18 @@ public:
         return settled < latest ? settled : latest;
     }
     bool due(std::uint64_t now_ms) const { return dirty_ && now_ms >= due_ms(); }
-    // A write started at `started_ms` took the cache as it was then: a heavy compile noted later than that keeps
-    // the cache dirty for the next write.
-    void written(std::uint64_t started_ms) {
-        if (last_ <= started_ms) dirty_ = false;
+    // Taken when a write starts; the write covers every heavy compile noted up to then.
+    std::uint64_t generation() const { return generation_; }
+    // A write that started at `generation` and `started_ms` is done. A heavy compile noted after it started, even in
+    // the same millisecond tick, keeps the cache dirty for the next write, due as if it were first noted then.
+    void written(std::uint64_t generation, std::uint64_t started_ms) {
+        if (generation_ == generation) dirty_ = false;
         else first_ = started_ms;
     }
 
 private:
     bool dirty_ = false;
-    std::uint64_t first_ = 0, last_ = 0;
+    std::uint64_t first_ = 0, last_ = 0, generation_ = 0;
 };
 
 }  // namespace leonida::heavy_pipeline_cache

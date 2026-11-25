@@ -36,7 +36,7 @@ static int test_schedule() {
     // One heavy compile: written once it has settled.
     s.note_heavy(1000);
     CHECK(s.dirty() && !s.due(1000 + S::settle_ms - 1) && s.due(1000 + S::settle_ms));
-    s.written(1000 + S::settle_ms);
+    s.written(s.generation(), 1000 + S::settle_ms);
     CHECK(!s.dirty());
     // A burst, one compile a second for a minute: the write does not wait for the burst to end.
     S burst;
@@ -44,7 +44,7 @@ static int test_schedule() {
         burst.note_heavy(t);
         if (burst.due(t)) {
             CHECK(t - 10'000 >= S::max_delay_ms);  // first write no later than max_delay after the first compile
-            burst.written(t);
+            burst.written(burst.generation(), t);
             break;
         }
     }
@@ -53,10 +53,19 @@ static int test_schedule() {
     S racing;
     racing.note_heavy(5000);
     const std::uint64_t start = 5000 + S::settle_ms;
+    const std::uint64_t taken = racing.generation();
     racing.note_heavy(start + 10);  // during the write
-    racing.written(start);
+    racing.written(taken, start);
     CHECK(racing.dirty());
     CHECK(racing.due(start + 10 + S::settle_ms));
+    // The same, inside one tick of a coarse clock: the compile noted at the write's own start time is still kept.
+    S tick;
+    tick.note_heavy(9000);
+    const std::uint64_t at = 9000 + S::settle_ms;
+    const std::uint64_t before = tick.generation();
+    tick.note_heavy(at);
+    tick.written(before, at);
+    CHECK(tick.dirty());
     return 0;
 }
 
