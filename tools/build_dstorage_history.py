@@ -215,11 +215,11 @@ def build(game, output, trainer, base_history=None, json_out=None, if_needed=Fal
             docs = {calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in fits.items()}
         extend_missing(docs, fit_slices(pools))
         history = temp/"history.json"
-        history.write_text(json.dumps(docs))
+        history.write_text(json.dumps(docs), encoding="utf-8", newline="\n")
         if not trainer:
             # Cross-built PE helpers cannot run directly on Unix. Build the same small host tool locally.
             tables = temp/"bcpack_tables.inc"
-            with tables.open("w") as f:
+            with tables.open("w", encoding="utf-8", newline="\n") as f:
                 pack.generate(f)
             if os.name == "nt":
                 trainer = temp/"bcpack_history_train.exe"
@@ -235,10 +235,10 @@ def build(game, output, trainer, base_history=None, json_out=None, if_needed=Fal
         ix7 = sum(bool(v) for row in docs["bc7"]["historyIndexBits"] for v in row)
         print(f"Available predictors: BC6H endpoints {ep6}/256, indices {ix6}/256; "
               f"BC7 endpoint fields {ep7}/6144, index fields {ix7}/8192.", flush=True)
-        history.write_text(json.dumps(docs))
+        history.write_text(json.dumps(docs), encoding="utf-8", newline="\n")
         pack.write_profile(str(history), temp/"history.bcph")
         signature += ":" + hashlib.sha256((temp/"history.bcph").read_bytes()).hexdigest()
-        (temp/"signature").write_text(signature)
+        (temp/"signature").write_text(signature, encoding="utf-8", newline="\n")
         (temp/"history.bcph").replace(output)
         (temp/"signature").replace(stamp)
         if json_out:
