@@ -248,6 +248,15 @@ static BOOL WINAPI stop_compiles_on_console_exit(DWORD event) {
 // left alone apart from that write; the exception then goes on as before (the previous filter, or Windows' own
 // handling), so the exit code is the exception's. Not for a stack overflow: no stack is left to write with.
 static LPTOP_LEVEL_EXCEPTION_FILTER previous_fatal_filter = nullptr;
+// The retail title installs a filter of its own (SetUnhandledExceptionFilter from api-ms-win-core-errorhandling),
+// which replaced this one and ended the process without it (measured: a title fault at 354 s wrote nothing). Its
+// call is served here instead: this filter stays installed and hands the exception to the title's, as Windows would.
+static void* volatile title_fatal_filter = nullptr;
+
+static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI title_set_unhandled_exception_filter(LPTOP_LEVEL_EXCEPTION_FILTER filter) {
+    return reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(
+        InterlockedExchangePointer(&title_fatal_filter, reinterpret_cast<void*>(filter)));
+}
 
 static LONG WINAPI save_caches_on_fatal_exception(EXCEPTION_POINTERS* info) {
     const DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
@@ -258,6 +267,9 @@ static LONG WINAPI save_caches_on_fatal_exception(EXCEPTION_POINTERS* info) {
         rt::d3d12::save_pipeline_caches_at_exit(kExitCacheWaitMs);
         std::fflush(stderr);
     }
+    if (auto* title = reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(
+            InterlockedCompareExchangePointer(&title_fatal_filter, nullptr, nullptr)))
+        return title(info);
     return previous_fatal_filter ? previous_fatal_filter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -368,6 +380,13 @@ int wmain(int argc, wchar_t** argv) {
     rt::fs::configure(game_dir, overlay_dir);
 #ifdef LEONIDA_VULKAN_DEVICE
     if (run) {
+        // Before the image is loaded, so its import binds here (save_caches_on_fatal_exception).
+        const rt::shims::Entry filter_imports[] = {
+            {"api-ms-win-core-errorhandling-l1-1-0.dll", "SetUnhandledExceptionFilter",
+             reinterpret_cast<void*>(&title_set_unhandled_exception_filter)},
+            {"kernel32.dll", "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&title_set_unhandled_exception_filter)},
+        };
+        rt::shims::Table{filter_imports, std::size(filter_imports)};
         rt::package_splash::configure(game_dir);
         if (rt::package_splash::configured()) {
             const rt::shims::Entry window_imports[] = {
