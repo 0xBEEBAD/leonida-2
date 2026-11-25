@@ -49,6 +49,7 @@
 #include "../src/submit_phases.h"
 #include "../src/pipeline_cache_store.h"
 #include "../src/pipeline_cache_journal.h"
+#include "../src/large_module_gate.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/console_texture_layout.h"
@@ -1580,14 +1581,39 @@ bool console_format_stand_ins() {
     return on;
 }
 
-// A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Compute modules
-// over 128 KiB compile one at a time (LEONIDA_SERIAL_BIG_COMPILES=0: as many as are asked for).
-bool serial_big_compile(std::size_t spirv_bytes) {
-    static const bool serial = [] {
+// A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Large are
+// compute modules over 128 KiB and graphics pipelines of PipelineCompiles::large_spirv_bytes or more. They compile side by
+// side while their estimates fit the memory that is free (big_compile_gate). LEONIDA_SERIAL_BIG_COMPILES=1: one at a time,
+// as before there was a budget (graphics: one after another in each submission). 0: as many as are asked for.
+enum class BigCompiles { budget, serial, unlimited };
+BigCompiles big_compiles() {
+    static const BigCompiles mode = [] {
         wchar_t v[2]{};
-        return !(GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2) == 1 && v[0] == L'0');
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2);
+        if (n == 0) return BigCompiles::budget;
+        return n == 1 && v[0] == L'0' ? BigCompiles::unlimited : BigCompiles::serial;
     }();
-    return serial && spirv_bytes > 128 * 1024;
+    return mode;
+}
+bool big_compute(std::size_t spirv_bytes) { return spirv_bytes > 128 * 1024; }
+
+// Where large compiles wait for memory: one for the process, as the memory is the machine's. Never destroyed: static
+// destruction must not race the compile worker.
+leonida::LargeModuleGate& big_compile_gate() {
+    static auto* const gate = [] {
+        char text[32]{};
+        std::size_t length = 0;
+        const bool present = getenv_s(&length, text, "LEONIDA_BIG_COMPILE_BUDGET_MB") == 0 && length > 1;
+        const auto setting = leonida::large_compile_budget(present ? text : "");
+        if (!setting.valid)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_BIG_COMPILE_BUDGET_MB=%s is not a number; not used\n", text);
+        auto budget = [fixed = setting.fixed] { return fixed ? *fixed : leonida::large_compile_budget_bytes(); };
+        std::fprintf(stderr, "[rt] d3d12: large pipelines compile side by side within %llu MiB (%s)\n",
+                     static_cast<unsigned long long>(budget() >> 20),
+                     setting.fixed ? "LEONIDA_BIG_COMPILE_BUDGET_MB" : "3/4 of the memory free now");
+        return new leonida::LargeModuleGate(std::move(budget));
+    }();
+    return *gate;
 }
 
 bool startup_cache_checkpoints_enabled() {
@@ -2094,12 +2120,68 @@ bool console_heap_shadow_enabled() {
 // What a T# the title wrote itself into a console descriptor heap came to (bind_title_image, after Resource).
 // not_tsharp: words with an image TYPE that do not decode as a T#: data, not a descriptor (the retail heap's last
 // 27 MiB are also the slot-133 pool, whose buffers sit there; T14 in ref/GAP-ANALYSIS-2.md).
-enum class TitleImage { known, bound, unknown, refused, not_tsharp };
+// TitleImage is defined in d3d12_com.h.
 class Resource;
 struct DeviceState;
 // `why`, when given, says what refused a T#: the first refusals are logged with their words (scan_console_slots).
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why = nullptr);
 struct TitleTexture;  // a texture the title keeps in its own memory (TitleTexture, after Resource)
+
+// The first refused T#s of each reason, with where they sit in the heap and their words, and counts of the
+// distinct slots refused overall and per reason (a slot is scanned again every pass over the heap).
+struct UnboundTsharpTracker {
+    std::mutex mutex;
+    std::set<std::size_t> total_slots;
+    std::map<std::string, std::set<std::size_t>> slots_by_reason;
+    std::map<std::string, std::uint64_t> counts_by_reason;
+    std::map<std::string, unsigned> logged;
+    std::uint64_t total_refusals = 0;
+
+    void note(std::uint64_t heap_va, std::size_t offset, const leonida::gfx10::ImageWords& words, const char* why) {
+        std::lock_guard lock(mutex);
+        const std::string reason = why ? why : "?";
+        ++total_refusals;
+        ++counts_by_reason[reason];
+        if (total_slots.size() >= 262144) return;  // enough to say how many
+        const bool fresh_overall = total_slots.insert(offset).second;
+        const bool fresh_reason = slots_by_reason[reason].insert(offset).second;
+        unsigned& n = logged[reason];
+        if ((!fresh_overall && !fresh_reason) || n >= 6) return;
+        ++n;
+        std::fprintf(stderr,
+                     "[rt] d3d12: unbound T# in console heap 0x%llx at +0x%zx (%zu distinct slots so far, %zu for '%s'): %s: "
+                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     static_cast<unsigned long long>(heap_va), offset, total_slots.size(),
+                     slots_by_reason[reason].size(), reason.c_str(), reason.c_str(), words[0],
+                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    }
+
+    UnboundTsharpStats stats() {
+        std::lock_guard lock(mutex);
+        UnboundTsharpStats s;
+        s.total_distinct_slots = total_slots.size();
+        s.total_refusals = total_refusals;
+        for (const auto& [reason, slots] : slots_by_reason) {
+            s.by_reason[reason].distinct_slots = slots.size();
+            s.by_reason[reason].total_refusals = counts_by_reason[reason];
+        }
+        return s;
+    }
+
+    void reset() {
+        std::lock_guard lock(mutex);
+        total_slots.clear();
+        slots_by_reason.clear();
+        counts_by_reason.clear();
+        logged.clear();
+        total_refusals = 0;
+    }
+};
+
+UnboundTsharpTracker& unbound_tsharp_tracker() {
+    static UnboundTsharpTracker tracker;
+    return tracker;
+}
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 class Resource;
@@ -3649,6 +3731,7 @@ struct DeviceState {
         // Since the last log line.
         std::uint64_t copied = 0, vsharps = 0, unbacked = 0, retried = 0;
         std::uint64_t images[5] = {};  // by TitleImage
+        std::map<std::string, std::uint64_t> refused_reasons;
         double ms = 0, pages_ms = 0, fix_ms = 0, retry_ms = 0;  // ms: all; the others its parts
         // Changed slots by class (before the fix budget), since the last log line: all-zero, V# pair, T#, other
         // words; V# halves whose 16 bytes were seen before (a direct-mapped memo of 65536 keys, so a lower bound of
@@ -3766,18 +3849,25 @@ struct DeviceState {
         } else {
             leonida::gfx10::ImageWords words;
             std::memcpy(words.data(), w, sizeof(words));
-            const char* why = nullptr;
-            const TitleImage result =
-                leonida::gfx10::is_image(words) ? bind_title_image(*this, words, &why) : TitleImage::not_tsharp;
-            ++heap.images[unsigned(result)];
-            settled = result != TitleImage::unknown && result != TitleImage::refused;
-            if (result == TitleImage::unknown || result == TitleImage::refused)
-                note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
-            // Neither a buffer V# (TYPE is not 0) nor a T# the layer can decode: data the title keeps in the slot.
-            // No image is found by these words (the bindless lookup misses, as for a null T#), but a shader that
-            // takes the slot as a V# (an index from data, or one past what the title filled) adds heap_base to
-            // words that name nothing: in the GPU copy the slot is null, and left to retry_console_slots.
-            if (result == TitleImage::not_tsharp) std::memset(w, 0, 16);
+            if (leonida::gfx10::is_image(words)) {
+                const char* why = nullptr;
+                const TitleImage result = bind_title_image(*this, words, &why);
+                if (result == TitleImage::unknown || result == TitleImage::refused) {
+                    note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
+                    if (result == TitleImage::refused)
+                        ++heap.refused_reasons[why ? why : "?"];
+                }
+                ++heap.images[unsigned(result)];
+                settled = result != TitleImage::unknown && result != TitleImage::refused;
+                if (result == TitleImage::not_tsharp) std::memset(w, 0, 16);
+            } else {
+                // Neither a buffer V# (TYPE is not 0) nor a T# the layer can decode: data the title keeps in the slot.
+                // No image is found by these words (the bindless lookup misses, as for a null T#), but a shader that
+                // takes the slot as a V# (an index from data, or one past what the title filled) adds heap_base to
+                // words that name nothing: in the GPU copy the slot is null, and left to retry_console_slots.
+                ++heap.images[unsigned(TitleImage::not_tsharp)];
+                std::memset(w, 0, 16);
+            }
         }
         if (empty) heap.empty_slots.insert(std::uint32_t(slot));
         else if (!heap.empty_slots.empty()) heap.empty_slots.erase(std::uint32_t(slot));
@@ -3931,24 +4021,9 @@ struct DeviceState {
         heap.retried += visited;
     }
 
-    // The first refused T#s of each reason, with where they sit in the heap and their words, and a count of the
-    // distinct slots refused (a slot is scanned again every pass over the heap).
     void note_refused_tsharp(ConsoleHeap& heap, std::size_t offset, const leonida::gfx10::ImageWords& words,
                              const char* why) {
-        static std::mutex mutex;
-        static std::map<std::string, unsigned> logged;
-        static std::set<std::size_t> slots;
-        std::lock_guard lock(mutex);
-        if (slots.size() >= 262144) return;  // enough to say how many
-        const bool fresh = slots.insert(offset).second;
-        unsigned& n = logged[why ? why : "?"];
-        if (!fresh || n >= 6) return;
-        ++n;
-        std::fprintf(stderr,
-                     "[rt] d3d12: unbound T# in console heap 0x%llx at +0x%zx (%zu distinct slots so far): %s: "
-                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
-                     static_cast<unsigned long long>(heap.console_va), offset, slots.size(), why ? why : "?", words[0],
-                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        unbound_tsharp_tracker().note(heap.console_va, offset, words, why);
     }
 
     void refresh_console_heap(ConsoleHeap& heap) {  // console_heap_mutex held
@@ -4132,6 +4207,13 @@ struct DeviceState {
                 heap->rescan_ms = 0;
             }
             if (heap->gpu >= 0) log_console_heap_gpu(*heap, count);
+            std::string refused_breakdown;
+            for (const auto& [reason, count] : heap->refused_reasons)
+                refused_breakdown += (refused_breakdown.empty() ? "" : "; ") + reason + " " + std::to_string(count);
+            if (!refused_breakdown.empty())
+                std::fprintf(stderr, "[rt] d3d12: console descriptor heap 0x%llx unbound T#s by reason: %s\n",
+                             static_cast<unsigned long long>(heap->console_va), refused_breakdown.c_str());
+            heap->refused_reasons.clear();
             heap->copied = heap->vsharps = heap->unbacked = heap->retried = heap->deferred_fixes = 0;
             for (auto& n : heap->images) n = 0;
             heap->ms = heap->pages_ms = heap->fix_ms = heap->retry_ms = 0;
@@ -4887,8 +4969,10 @@ struct DeviceState {
         }
         const char* why = nullptr;
         const TitleImage result = bind_title_image(*this, words, &why);
-        if (result == TitleImage::unknown || result == TitleImage::refused)
+        if (result == TitleImage::unknown || result == TitleImage::refused) {
             note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
+            if (result == TitleImage::refused) ++heap.refused_reasons[why ? why : "?"];
+        }
         ++heap.images[unsigned(result)];
         if (result == TitleImage::not_tsharp) return 2;
         return result != TitleImage::unknown && result != TitleImage::refused ? 1 : 0;
@@ -6461,12 +6545,10 @@ struct DeviceState {
             }
         }
         view_info.components = g::vulkan_swizzle(swizzle, channels_format);
-        // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
-        view_info.subresourceRange = {
-            VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
-                               : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                                                       : VK_IMAGE_ASPECT_COLOR_BIT),
-            image.first_mip, image.mip_count, image.first_layer, image.layer_count};
+        view_info.subresourceRange = g::vulkan_subresource_range(
+            image, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                            : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                                   : VK_IMAGE_ASPECT_COLOR_BIT);
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (sampled) {
             const VkResult result = vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled);
@@ -10114,7 +10196,7 @@ struct ComputeBuild {
 struct ComputeBuildOptions {
     const char* trigger = "dispatch";       // what asked: dispatch, warmup, dispatch-worker, precompile...
     const std::string* cache_key = nullptr;  // the title's PSO description key, for the compile trace
-    bool serialize_big = true;               // modules over 128 KiB one at a time (LEONIDA_SERIAL_BIG_COMPILES=0: no)
+    bool serialize_big = true;               // LEONIDA_SERIAL_BIG_COMPILES=1: modules over 128 KiB one at a time
     bool skip_journaled = false;             // precompile: leave a pipeline whose journal file exists alone
     bool use_helper = true;                  // LEONIDA_COMPILE_HELPER: a missing journal file comes from the helper
     bool helper_wait = true;                 // wait for the helper's file (false: ask, and answer deferred)
@@ -10146,12 +10228,9 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     const leonida::ShaderLibrary* library = device.library();
     const leonida::ShaderEntry* entry = &compute_entry;
     if (!library) return out;
-    // The driver's compiler needs hundreds of MiB per very large module; several at once exhausted host memory.
-    // Modules over 128 KiB compile one at a time (LEONIDA_SERIAL_BIG_COMPILES=0: as many as are asked for).
-    static const bool serial_big = [] {
-        wchar_t v[2]{};
-        return !(GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2) == 1 && v[0] == L'0');
-    }();
+    // The driver's compiler needs hundreds of MiB per very large module; several at once exhausted host memory. By
+    // default large modules share a memory budget (big_compile_gate, taken by the caller before any PSO lock: see
+    // PipelineState::enter_build); LEONIDA_SERIAL_BIG_COMPILES=1 compiles them one at a time here instead.
     static std::mutex big_compile;
     std::unique_lock<std::mutex> big_lock(big_compile, std::defer_lock);  // taken below, only for a compile here
     auto words = library->spirv(*entry);
@@ -10241,7 +10320,8 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         }
     }
     // Only a compile here is serialized: a pipeline from its journal file takes milliseconds.
-    if (!journal.has_file_data() && options.serialize_big && serial_big && bytes > 128 * 1024) big_lock.lock();
+    if (!journal.has_file_data() && options.serialize_big && big_compiles() == BigCompiles::serial && big_compute(bytes))
+        big_lock.lock();
     const bool ask_shared = journal.enabled() && !journal.has_file_data() && shared && device.pipeline_cache_seeded &&
                             device.info.pipeline_cache_control && device.journal_ask_shared.load();
 
@@ -11274,7 +11354,9 @@ public:
             const auto it = variants_.find(unbound);
             return it == variants_.end() ? VkPipeline(VK_NULL_HANDLE) : it->second;
         };
-        graphics_.large = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes;
+        graphics_.large = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes &&
+                          big_compiles() != BigCompiles::unlimited;
+        graphics_.estimate = leonida::large_module_estimate(spirv_bytes);
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -11403,6 +11485,7 @@ public:
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         compute_entry_ = entry;
         stage_bytes_ = spirv_bytes;
+        pipeline_.estimate = leonida::large_module_estimate(spirv_bytes);
         // The title creates hundreds of compute pipelines from job threads during startup and one of its init tasks
         // waits for all of them; some modules (wave64-emulated ray-tracing resolves, 4 MiB of SPIR-V) take the driver
         // minutes each. So the Vulkan pipeline is built on first use (build_compute): at the first dispatch that names
@@ -11441,7 +11524,7 @@ public:
                 std::unique_lock lock(pso->variants_mutex_, std::try_to_lock);  // held: another thread is compiling it
                 return lock.owns_lock() ? pso->pipeline_.pipeline : VkPipeline(VK_NULL_HANDLE);
             };
-            pipeline_.large = serial_big_compile(spirv_bytes);
+            pipeline_.large = big_compute(spirv_bytes) && big_compiles() != BigCompiles::unlimited;
         } else if (!build_compute("compute-create")) {
             return E_FAIL;
         }
@@ -11462,11 +11545,33 @@ public:
     }
 
 private:
+    using Work = leonida::LargeModuleGate::Work;
+
+    // Locks the PSO (`lock`, on variants_mutex_) for a build and, with an `estimate`, takes the build's place at the gate. A
+    // thread that waits for its place holds no PSO's lock, and one that has its place waits for none: another thread may be
+    // building that PSO, with a place of its own. Returns without a place when the PSO is `built` already.
+    template<typename Built>
+    leonida::LargeModuleGate::Ticket enter_build(std::unique_lock<std::mutex>& lock, std::uint64_t estimate, Work work,
+                                                 Built&& built) {
+        for (;;) {
+            lock.lock();
+            if (!estimate || built()) return {};
+            lock.unlock();
+            leonida::LargeModuleGate::Ticket place(big_compile_gate(), estimate, work);
+            if (lock.try_lock()) return place;
+        }
+    }
+
     // The compute pipeline, built once: by create_compute (LEONIDA_LAZY_COMPUTE=0), by the first dispatch that names
     // it (the replay layer calls ComputePipeline::build) or by the warm-up thread. Null when it cannot be built; the
     // failure is logged and not retried.
-    VkPipeline build_compute(const char* trigger) {
-        std::lock_guard lock(variants_mutex_);
+    VkPipeline build_compute(const char* trigger, Work work = Work::demand) {
+        // A large module's place at the compile gate is taken before the PSO's lock (enter_build): a thread that waits
+        // for memory holds no PSO lock.
+        std::unique_lock lock(variants_mutex_, std::defer_lock);
+        const bool budgeted = big_compute(stage_bytes_) && big_compiles() == BigCompiles::budget;
+        auto place = enter_build(lock, budgeted ? pipeline_.estimate : 0, work,
+                                 [this] { return pipeline_.pipeline || compute_failed_; });
         if (pipeline_.pipeline || compute_failed_) return pipeline_.pipeline;
         const leonida::ShaderEntry* entry = compute_entry_;
         if (!device_.library() || !entry) {
@@ -11574,8 +11679,10 @@ private:
         return changed;
     }
 
+    // A warm-up is speculative work at the large-compile gate: it waits behind the builds a submission needs.
     VkPipeline build_variant(bool compute, std::uint32_t unbound, const char* trigger) {
-        return compute ? build_compute(trigger) : variant(unbound, trigger);
+        return compute ? build_compute(trigger, std::strcmp(trigger, "warmup") ? Work::demand : Work::speculative)
+                       : variant(unbound, trigger);
     }
 
     // Takes the build for this thread unless another thread has it or it is done.
@@ -12140,7 +12247,10 @@ private:
 
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound, const char* trigger) {
-        std::lock_guard lock(variants_mutex_);
+        std::unique_lock lock(variants_mutex_, std::defer_lock);
+        const bool budgeted = graphics_.large && big_compiles() == BigCompiles::budget;
+        const auto place = enter_build(lock, budgeted ? graphics_.estimate : 0, Work::demand,
+                                       [&] { return variants_.contains(unbound); });
         if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
         const VkPipeline pipeline = build(unbound, trigger);
         if (!pipeline) {
@@ -12873,6 +12983,8 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         std::lock_guard lock(device.descriptor_mutex);
         if (!device.bindless) return refuse("no bindless set");
         if (device.image_entries.count(words)) return TitleImage::known;
+        if (g::has_hardware_volume_uav_slice_offset(words, image))
+            return refuse("a title-written 3D UAV with a slice offset is not supported");
         auto found = device.images_by_address.find(image.address);
         // Memory of the texture stream pool has two addresses, the CPU view's and the GPU-only alias the title hands
         // to the GPU (title_gpu_views): a T# naming either finds a texture registered under the other.
@@ -12886,7 +12998,10 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
             const auto alias = leonida::title_gpu_views::other_view(image.address);
             if (auto* candidate = device.gpu_placements.find(image.address, alias, matches)) owner = candidate;
         }
-        if (!owner) return TitleImage::unknown;
+        if (!owner) {
+            if (why) *why = "no texture at T# address";
+            return TitleImage::unknown;
+        }
         const Resource& r = *owner;
         image.address = r.image_address();  // release this key with its actual owner
         const D3D12_RESOURCE_DESC& d = r.desc();
@@ -12902,10 +13017,10 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         if (!r.descriptor_image()) return refuse("the texture has no image");
         if (!type_fits) return refuse("T# type or samples do not fit the texture");
         if (!msaa && image.first_mip + image.mip_count > d.MipLevels) return refuse("T# names mips the texture lacks");
+        if (image.type == g::ImageType::cube && !(r.format() && layers >= 6))
+            return refuse("cube T# on fewer than six layers");
         if (!volume && image.first_layer + image.layer_count > layers)
             return refuse("T# names layers the texture lacks");
-        if (image.type == g::ImageType::cube && !(r.format() && image.layer_count >= 6))
-            return refuse("cube T# on fewer than six layers");
         const bool storage = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !msaa &&
                              r.aspects() == VK_IMAGE_ASPECT_COLOR_BIT;
         if (!device.bind_image_locked(words, image, r.descriptor_image(), r.format(), r.aspects(), storage,
@@ -13560,6 +13675,10 @@ public:
                              threads.count);
             if (threads.count)
                 state_.context->set_pipeline_workers(std::make_unique<leonida::PipelineWorkers>(threads.count));
+            if (big_compiles() == BigCompiles::budget)
+                state_.context->set_large_compiles(
+                    [] { return big_compile_gate().budget(); },
+                    [] { return std::make_shared<leonida::LargeModuleGate::Demand>(big_compile_gate()); });
         }
         leonida::title_va_aliases().set_hooks(
             &state_,
@@ -14338,6 +14457,7 @@ public:
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    DeviceState& state() { return state_; }
     const DeviceState& state() const { return state_; }
     HRESULT create_native_graphics(const leonida::native_pso::GraphicsDesc& desc, REFIID iid, void** out) {
         const auto* shaders = state_.library();
@@ -21879,6 +21999,38 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
     return d->create_console_descriptor_heap(desc, console_address, console_size, riid, out);
+}
+
+UnboundTsharpStats unbound_tsharp_stats() {
+    return unbound_tsharp_tracker().stats();
+}
+
+void reset_unbound_tsharp_stats() {
+    unbound_tsharp_tracker().reset();
+}
+
+void note_refused_tsharp_for_test(std::uint64_t heap_va, std::size_t offset,
+                                  const std::array<std::uint32_t, 8>& words, const char* why) {
+    leonida::gfx10::ImageWords w;
+    std::memcpy(w.data(), words.data(), sizeof(w));
+    unbound_tsharp_tracker().note(heap_va, offset, w, why);
+}
+
+TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uint32_t, 8>& words,
+                                 const char** why) {
+    if (!device) return TitleImage::not_tsharp;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return TitleImage::not_tsharp;
+    leonida::gfx10::ImageWords w;
+    std::memcpy(w.data(), words.data(), sizeof(w));
+    return bind_title_image(d->state(), w, why);
+}
+
+std::uint64_t resource_image_address(ID3D12Resource* resource) {
+    if (!resource) return 0;
+    const Resource* r = Resource::from<Resource>(resource);
+    return r ? r->image_address() : 0;
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
