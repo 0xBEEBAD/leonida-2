@@ -321,9 +321,11 @@ headers). Measured on 1.0.2.1 over all 5,680 distinct blobs, which the 25,471 gr
   pipeline that blends a `B4G4R4A4` target is retried: `E_NOTIMPL` also stands for refusals unrelated to blending (a
   rect list without its geometry stage, mesh limits, `FullyCovered`, a dual-source output that does not fit
   `Location 0, Index 1`), and those keep the blend the title asked for.
-- **Kept on the defaults:** the 1,937 records that blend with the dual-source `SRC1` factors, because the translator
-  declares no second pixel-shader output. A blob of another shape, or a target with a factor this path does not
-  take, keeps the whole pipeline on the defaults and is logged.
+- **Dual-source:** the 1,937 records that blend with `SRC1` factors get them as `D3D12_BLEND_SRC1_*`. The Vulkan
+  layer then moves the pixel shader's `SV_Target1` from `Location 1` to `Location 0, Index 1`
+  (`runtime/src/dual_source_fragment.h`, RT-DUAL-SOURCE-BLEND).
+- **Kept on the defaults:** a blob of another shape, or a target with a factor or function this path does not take,
+  keeps the whole pipeline on the defaults and is logged.
 
 ## Translation status
 
