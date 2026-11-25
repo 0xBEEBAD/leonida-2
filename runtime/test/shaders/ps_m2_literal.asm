@@ -2,11 +2,10 @@
 ; shaders do (docs/design.md, Literal samplers): CLAMP_LAST_TEXEL on all axes, bilinear min/mag, point mip, MAX_LOD
 ; 12. No heap slot names this S#, so the layer registers it when a pipeline uses the shader; otherwise the shader's
 ; hash lookup finds the fallback sampler. Run: d3d12_m2_textured_test.
-;   s[0:1] = console VA of the SRV table's first slot (the T#).   attr0.xy = (u, v).   mrt0 = the sampled texel.
+;   s8 = console VA of the SRV table's first slot (the T#; the console's graphics layout, one dword per table from
+;   s8), moved to s[0:1] with the high dword 0.   attr0.xy = (u, v).   mrt0 = the sampled texel.
 ; fssm-at: 0x10
 ; fssm-data: 0x324d5350 0x4c544c20
-; Console root layout (D3D-448): root arguments from s8, a descriptor table is one dword (its 32-bit VA; the heaps
-; live below 4 GiB, so the high half is 0). The first lines rebuild the registers the program below was written for.
 s_mov_b32 s0, s8
 s_mov_b32 s1, 0
 s_load_dwordx8 s[8:15], s[0:1], 0x0

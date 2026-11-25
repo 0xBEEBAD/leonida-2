@@ -11,7 +11,6 @@
 #pragma once
 
 #include <array>
-#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -133,11 +132,12 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //   - vertex/pixel/geometry s8 and mesh s16: from the corpus census (lowest pointer SGPR per stage) and one live
 //     retail frame (a VS and PS reading their tables at s8, s9, s10; issue #14, comment 7131556366); no serialized
 //     signature confirms them yet, and visibility is not modelled (every parameter takes its place in every stage).
-//     The graphics bind point uses Stage::Vertex; a mesh shader reads the same dwords through its translator-side
-//     window (docs/d3d12_vulkan.md section 3.5).
+//     The graphics bind point uses Stage::Pixel (s8, as vertex and geometry); a mesh shader reads the same dwords
+//     through its translator-side window (docs/d3d12_vulkan.md section 3.5).
 // A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
-// every parameter after it. pack_stage refuses such a signature by default; Spill::block (graphics) lays the inline
-// part out and leaves the rest in that block, which no graphics shader reads.
+// every parameter after it. For compute that packed spill array (1 dword per 32-bit constant, 2 per root descriptor,
+// 1 per descriptor table, no alignment padding) is modelled in StagePackResult; non-compute stages still refuse spills
+// because their spill pointer SGPR is unmeasured.
 enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
 
 [[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
@@ -168,29 +168,24 @@ enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, 
 }
 
 constexpr uint32_t kNoSgpr = 0xFFFFFFFFu;
+constexpr uint32_t kNoSpill = 0xFFFFFFFFu;
 
 struct StagePackResult {
     bool ok = false;
-    std::string error;            // set when !ok; names the refusing parameter
+    std::string error;                 // set when !ok; names the refusing parameter
     Stage stage = Stage::Compute;
-    uint32_t base = 0;            // stage_base(stage)
-    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused,
-                                       // and for a parameter in the argument block under Spill::block)
-    uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
-    uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
-    size_t first_spilled = SIZE_MAX;  // Spill::block: the first parameter in the argument block, if any
-    uint32_t spilled_dwords = 0;      // and the console-layout dwords from it on
+    uint32_t base = 0;                 // stage_base(stage)
+    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when spilled or refused)
+    std::vector<uint32_t> spill_dword; // per parameter: dword offset in s[0:1] spill array (kNoSpill when inline)
+    uint32_t end_sgpr = 0;             // one past the last inline SGPR used: the RSRC2 USER_SGPR count
+    uint32_t spill_dwords = 0;         // total dwords in the packed spill array (0 when nothing spills)
+    uint32_t d3d12_cost = 0;           // cost against the 64-dword D3D12 limit
 };
 
-// What a parameter that does not fit becomes. refuse: the signature is refused (the default; the compute block's
-// layout is ROOT-SIG-SPILL-MODEL's). block: it and every later parameter go to the argument block behind s[0:1], as
-// on the console, and take no SGPR (kNoSgpr); the ones before keep their inline SGPRs. For graphics no VS, PS or GS
-// reads s[0:1] as an address (tools/root_spill_census.py on 1.0.2.1), so nothing a draw reads is in that block.
-enum class Spill : uint32_t { refuse = 0, block = 1 };
-
-// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
-// constant parameter of 0 values or the 64-dword cost limit, and, under Spill::refuse, on any parameter that spills.
-[[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage, Spill spill = Spill::refuse);
+// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, an
+// unknown parameter type, a constant parameter of 0 values, or the 64-dword cost limit. Compute spills any trailing
+// parameters from the first one that does not fit whole into spill_dword; non-compute stages refuse any spill.
+[[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
 
 // D3D12 cost of one parameter against the 64-dword limit.
 [[nodiscard]] constexpr uint32_t param_cost(ParamType type, uint32_t num_values) noexcept {
