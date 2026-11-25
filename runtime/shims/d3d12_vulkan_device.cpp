@@ -5711,6 +5711,13 @@ public:
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
+        if (title_linear_ && data && image_) {
+            // A texture whose lease says its title memory is linear: mapped through its pinned pages. One that this
+            // cannot serve still answers with its placement address below.
+            *data = nullptr;
+            const HRESULT hr = map_title_texture(subresource, read, data);
+            if (SUCCEEDED(hr) || !title_address_) return hr;
+        }
         if (image_ && title_address_) {  // place_at_title_address: the console answers with the texture's memory
             if (data) *data = title_address_;
             // From now on the CPU may write its texels whenever it likes (video planes are mapped once): the
@@ -5718,10 +5725,6 @@ public:
             if (title_texture_ && !title_mapped_.exchange(true, std::memory_order_relaxed))
                 device_.title_texture_mapped(this, reinterpret_cast<std::uint64_t>(title_address_));
             return S_OK;
-        }
-        if (title_linear_ && data && image_) {
-            *data = nullptr;
-            return map_title_texture(subresource, read, data);
         }
         if (image_) {
             VkImageSubresourceRange range{};
@@ -7333,6 +7336,7 @@ public:
         // again, the same way, and drops them once the pipeline exists.
         lazy_ = lazy_graphics_pipelines();
         depth24_bias_ = depth24_bias;
+        rgba4_mask_ = packed_color_mask;
         // A stage that declares a storage image or buffer it may write needs a device feature outside compute
         // (src/spirv_stores.h). Without it the pipeline would be created all the same and break
         // VUID-RuntimeSpirv-NonWritable-06340 / -06341, so the PSO is refused here with the stage named.
@@ -8313,6 +8317,10 @@ private:
                 why = source.entry->name + ".spv is missing or not SPIR-V";
                 return false;
             }
+            if (source.slot == 2 && rgba4_mask_ && !leonida::rgba4::quantize(words[i], rgba4_mask_)) {
+                why = source.entry->name + " could not be quantised for a B4G4R4A4 target stored as RGBA8";
+                return false;
+            }
             if (source.slot == 0) vs = i;
             if (source.slot == 2) ps = i;
         }
@@ -8374,6 +8382,7 @@ private:
     bool lazy_ = false;       // graphics: built at the first draw (lazy_graphics_pipelines)
     bool f16_linked_ = false; // graphics: the VS and PS words had their f16 halves linked
     leonida::Depth24Bias depth24_bias_{};
+    unsigned rgba4_mask_ = 0;  // graphics: the B4G4R4A4 targets stored as RGBA8 that the pixel shader is quantised for
     std::vector<StageSource> sources_;
     struct Request { VkPipeline handle{}; unsigned long long skips = 0; };
     using Requests = std::map<std::uint32_t, Request>;
@@ -8383,7 +8392,6 @@ private:
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
     VkShaderModule module_ = VK_NULL_HANDLE;
-    std::mutex compute_compile_mutex_;
     std::vector<leonida::GraphicsShaderModules::Reference> modules_;
     leonida::GraphicsShaderModules::Reference rectangle_vertex_;
     VkShaderModule rectangle_module_ = VK_NULL_HANDLE;
@@ -12598,7 +12606,7 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         if (counter_va) {
             g::Buffer counter_buffer{};
-            counter_buffer.address = vsharp_address(counter_va + view.CounterOffsetInBytes, 4);
+            counter_buffer.address = vsharp_address(counter_va, 4);
             counter_buffer.num_records = 4;
             counter_buffer.oob_select = g::OobSelect::raw;
             const g::BufferWords counter_words = g::encode(counter_buffer);
@@ -13264,6 +13272,7 @@ public:
                         }();
                         texture->place_at_title_address(address, distinct && gpu_written);
                         register_title_texture(texture, reinterpret_cast<std::uint64_t>(address));
+                        texture->set_title_address(reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address));
                     }
                     made->Release();
                 }
@@ -16173,6 +16182,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         return std::any_of(extensions.begin(), extensions.end(),
                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
     };
+    info.depth_range_unrestricted = has_device_extension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     const char* sliced_name = VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME;
     VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT sliced{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
@@ -16188,7 +16198,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
 
     // The pixel-shader extensions translated shaders can declare (VulkanDeviceInfo::fragment_shader_barycentric and
     // the two after it). Each is queried, and enabled with its feature where the GPU has it.
-    info.depth_range_unrestricted = has_device_extension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     if (has_device_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {

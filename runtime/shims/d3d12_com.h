@@ -454,11 +454,10 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 //     pipelines still see their arguments 8 dwords early (D3D-448);
 //   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
-// LEONIDA_GRAPHICS_STAGE_LAYOUT=1 lays graphics root arguments out as the console does for the
-// vertex, pixel and geometry stages (rt::rootsig::pack_stage: from s8, a descriptor table in one dword) instead of
-// from s0 with two dwords per address.
+// LEONIDA_GRAPHICS_STAGE_LAYOUT=0 keeps rt::rootsig::pack() (from s0, two dwords per address) for every graphics
+// signature instead of the console layout of the vertex, pixel and geometry stages described above.
 inline bool local_graphics_stage_layout() {
-    static const bool on = [] { const char* v = std::getenv("LEONIDA_GRAPHICS_STAGE_LAYOUT"); return v && *v == '1'; }();
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_GRAPHICS_STAGE_LAYOUT"); return !(v && *v == '0'); }();
     return on;
 }
 
