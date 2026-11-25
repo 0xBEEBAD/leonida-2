@@ -292,7 +292,7 @@ class RunnerTest(unittest.TestCase):
                 "class T(unittest.TestCase):\n"
                 "    def test_run(self):\n"
                 "        with open(r'{marker}', 'w') as f: f.write('1')\n"
-                "        time.sleep(5)\n"
+                "        time.sleep(10)\n"
             )
             files = {
                 f"test_{i}.py": mod_template.format(marker=os.path.join(marker_dir, f"m_{i}.txt"))
@@ -302,7 +302,7 @@ class RunnerTest(unittest.TestCase):
 
             def trigger():
                 start = time.monotonic()
-                while time.monotonic() - start < 5:
+                while time.monotonic() - start < 8:
                     if len(os.listdir(marker_dir)) >= 2:
                         break
                     time.sleep(0.05)
@@ -322,7 +322,7 @@ class RunnerTest(unittest.TestCase):
             self.assertNotIn("4 files,", out.getvalue())
             started = os.listdir(marker_dir)
             self.assertEqual(len(started), 2, f"Expected 2 started modules, got {started}")
-            self.assertLess(elapsed, 4.0)
+            self.assertLess(elapsed, 5.0)
 
     def test_serial_interrupt_returns_130_and_prints_interrupted(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as marker_dir:
@@ -332,13 +332,13 @@ class RunnerTest(unittest.TestCase):
                 "class T(unittest.TestCase):\n"
                 f"    def test_run(self):\n"
                 f"        with open(r'{marker}', 'w') as f: f.write('1')\n"
-                "        time.sleep(5)\n"
+                "        time.sleep(10)\n"
             )
             suite(tmp, {"test_serial_hang.py": content})
 
             def trigger():
                 start = time.monotonic()
-                while time.monotonic() - start < 5:
+                while time.monotonic() - start < 8:
                     if os.path.exists(marker):
                         break
                     time.sleep(0.05)
@@ -354,7 +354,7 @@ class RunnerTest(unittest.TestCase):
 
             self.assertEqual(code, 130)
             self.assertIn("interrupted", err.getvalue())
-            self.assertLess(elapsed, 4.0)
+            self.assertLess(elapsed, 5.0)
 
     def test_terminate_active_processes_kills_registered_processes(self):
         cmd = [sys.executable, "-c", "import time; time.sleep(10)"]

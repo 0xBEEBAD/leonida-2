@@ -56,6 +56,21 @@ def _unregister_process(proc):
         _active_processes.discard(proc)
 
 
+def _kill_process_tree(proc):
+    if proc is None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def _terminate_active_processes():
     with _processes_lock:
         procs = list(_active_processes)
@@ -65,10 +80,7 @@ def _terminate_active_processes():
         except OSError:
             pass
     for p in procs:
-        try:
-            p.kill()
-        except OSError:
-            pass
+        _kill_process_tree(p)
         try:
             p.wait(timeout=0.2)
         except (subprocess.TimeoutExpired, OSError):
@@ -153,10 +165,7 @@ def run_module(directory, module, verbose, timeout=None):
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            _kill_process_tree(proc)
             stdout, stderr = proc.communicate()
             # TimeoutExpired retains bytes even when text=True.
             parts = [chunk.decode(locale.getpreferredencoding(False), errors="replace") if isinstance(chunk, bytes)
@@ -164,10 +173,7 @@ def run_module(directory, module, verbose, timeout=None):
             out = "".join(parts)
             return 1, 0, out + f"\nTIMED OUT after {timeout:g} s: {module}\n"
         except BaseException:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            _kill_process_tree(proc)
             try:
                 proc.wait(timeout=0.5)
             except (subprocess.TimeoutExpired, OSError):
@@ -213,17 +219,11 @@ def main(argv=None):
                     if a.timeout is not None and time.monotonic() - start_time >= a.timeout:
                         raise
         except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            _kill_process_tree(proc)
             print(f"TIMED OUT after {a.timeout:g} s: unittest discover in {directory}", file=sys.stderr)
             return 1
         except KeyboardInterrupt:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            _kill_process_tree(proc)
             try:
                 proc.wait(timeout=0.5)
             except (subprocess.TimeoutExpired, OSError):
@@ -231,10 +231,7 @@ def main(argv=None):
             print("interrupted", file=sys.stderr)
             return 130
         except BaseException:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            _kill_process_tree(proc)
             raise
         finally:
             _unregister_process(proc)
