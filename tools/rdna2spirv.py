@@ -17174,28 +17174,6 @@ VOP3_TWO_DESTS = frozenset({
 })
 
 
-def widen_wave64_valu_masks(insns):
-    """Older llvm-mc listings use wave32 spellings for wave-size-dependent VALU predicates.
-    A wave64 compare or carry writes two SGPRs. CNDMASK and carry-in read both.
-    Scalar data operands (including explicit vcc_lo and exec_lo) keep their original width.
-    """
-    for ins in insns:
-        op, args = base_op(ins["op"]), ins["args"]
-        if op.startswith("v_cmp_") and len(args) == 3:
-            masks = (args[0],)
-        elif op in VOP3_TWO_DESTS and len(args) >= 4:
-            masks = (args[1], args[4]) if op.endswith("_ci_u32") and len(args) == 5 else (args[1],)
-        elif op == "v_cndmask_b32" and len(args) == 4:
-            masks = (args[3],)
-        else:
-            continue
-        for arg in masks:
-            if arg["k"] == "sgpr":
-                arg["n"] = 2
-            elif arg.get("t") in ("vcc_lo", "exec_lo"):
-                arg["t"] = arg["t"][:-3]
-
-
 def same_encoding(raw, printed, op, operand_count):
     """True if the bytes in the blob are the instruction LLVM printed. Exact match, except for fields the
     hardware ignores that LLVM re-encodes with its default: VOP3P op_sel_hi[2] (bit 14) on two-source packed
