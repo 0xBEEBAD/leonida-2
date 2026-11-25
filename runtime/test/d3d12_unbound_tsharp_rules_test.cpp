@@ -217,7 +217,7 @@ int main() {
                   "excessive layers explains layers mismatch");
         }
 
-        // Case 3b: Cube T# on fewer than six layers (layer_count = 4 < 6) -> refuse cube
+        // Case 3b: Cube T# on texture with fewer than six layers (desc.DepthOrArraySize = 4 < 6) -> refuse cube
         {
             g::Image img{};
             img.address = addr;
@@ -226,7 +226,7 @@ int main() {
             img.width = 64;
             img.height = 64;
             img.first_layer = 0;
-            img.layer_count = 4;  // cube needs at least 6
+            img.layer_count = 6;  // cube needs at least 6 faces, but texture only has 4 layers
             img.mip_count = 1;
             const auto words = g::encode(img);
 
@@ -287,6 +287,7 @@ int main() {
         desc.MipLevels = 1;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = 4;  // 4x MSAA
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
         Ref<ID3D12Resource> res_msaa;
