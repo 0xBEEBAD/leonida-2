@@ -545,6 +545,78 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(parsed[3]["args"][1]["k"], "fimm")
         self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
 
+    def test_mimg_addr_data_and_rsrc_widths_match_llvm(self):
+        # Hand-encoded GFX10/GFX1030 MIMG vectors covering LLVM AMDGPU::getAddrSizeMIMGOp,
+        # atomic TFE/cmpswap VDATA widths, and non-BVH r128 8-SGPR resource descriptors.
+        cases = (
+            # BVH with a16 (8 VGPRs for bvh32, 9 for bvh64)
+            ("019f98f109040140", "image_bvh_intersect_ray v[4:7], v[9:16], s[4:7] a16"),
+            ("059f98f1322703402e1711100f151400",
+             "image_bvh_intersect_ray v[39:42], [v50, v46, v23, v17, v16, v15, v21, v20], s[12:15] a16"),
+            ("019f9cf109040140", "image_bvh64_intersect_ray v[4:7], v[9:17], s[4:7] a16"),
+            # image_msaa_load must not misread `_load` as `_l`
+            ("010f00f005010200", "image_msaa_load v[1:4], v5, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_1D"),
+            ("090100f001050280", "image_msaa_load v5, v[1:2], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D d16"),
+            ("3b0100f0cc0e0a000b0e1300",
+             "image_msaa_load v14, [v204, v11, v14, v19], s[40:47] dmask:0x1 dim:SQ_RSRC_IMG_2D_MSAA_ARRAY"),
+            # *_mip_pck / *_mip_pck_sgn include the mip VGPR; non-BVH r128 keeps 8 SGPRs
+            ("000110f001050200", "image_load_mip_pck v5, v[1:2], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_1D"),
+            ("089f14f008100100",
+             "image_load_mip_pck_sgn v[16:19], v[8:10], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D unorm r128"),
+            ("00812cf002fc0300", "image_store_mip_pck v252, v[2:3], s[12:19] dmask:0x1 dim:SQ_RSRC_IMG_1D r128"),
+            # image_sample_*cd* coarse derivatives (and c_cd)
+            ("080fa0f100004040", "image_sample_cd v[0:3], v[0:4], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D a16"),
+            ("2c0fa8f108102503090a0b0c0d0e0f10",
+             "image_sample_c_cd v[16:19], [v8, v9, v10, v11, v12, v13, v14, v15], s[20:27], s[100:103] "
+             "dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY"),
+            ("160fb4f108102503090a0b0c0d0e0f1011121314",
+             "image_sample_cd_cl_o v[16:19], [v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18], "
+             "s[20:27], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+            # _g16 packed derivatives (alignTo<2>(grad_coords)) + _cl/_o before _g16
+            ("150f88f0000040000203050607080000",
+             "image_sample_d_g16 v[0:3], [v0, v2, v3, v5, v6, v7, v8], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+            ("0d0facf0000040000103050607000000",
+             "image_sample_c_d_cl_g16 v[0:3], [v0, v1, v3, v5, v6, v7], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            ("010facf100004000",
+             "image_sample_c_cd_cl_g16 v[0:3], v[0:4], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_1D"),
+            # Odd-coord a16 packing of (coords + cl/lod/mip): 1D + cl packs into 1 VGPR
+            ("000f8cf000004040", "image_sample_d_cl v[0:3], v[0:2], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_1D a16"),
+            ("000facf000004040", "image_sample_c_d_cl v[0:3], v[0:3], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_1D a16"),
+            # image_atomic_* with tfe and cmpswap with dmask:0x1
+            ("003140f0c0040700",
+             "image_atomic_cmpswap v[4:5], v192, s[28:35] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm glc"),
+            ("000145f001050200", "image_atomic_add v[5:6], v1, s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_1D tfe"),
+            ("000341f001050200", "image_atomic_cmpswap v[5:7], v1, s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_1D tfe"),
+            ("000f41f001050200", "image_atomic_cmpswap v[5:9], v1, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_1D tfe"),
+        )
+        for hexcode, asm in cases:
+            with self.subTest(hexcode=hexcode, asm=asm):
+                raw = bytes.fromhex(hexcode)
+                dec = rdna2_decode.decode_bytes(raw)
+                self.assertEqual(dec["invalid"], 0)
+                (ins,) = dec["insns"]
+                expected = shader_ir.parse_line(asm)
+                for field in ("op", "args"):
+                    self.assertEqual(ins[field], expected[field])
+                self.assertEqual(sorted(ins["mods"]), sorted(expected["mods"]))
+                text, bad = rdna2_decode.disasm_bytes(raw)
+                self.assertEqual(bad, 0)
+                reparsed = shader_ir.parse_line(text.strip())
+                self.assertEqual(reparsed["op"], expected["op"])
+                self.assertEqual(reparsed["args"], expected["args"])
+                self.assertEqual(sorted(reparsed["mods"]), sorted(expected["mods"]))
+
+        # Edge-case addr/data counts not covered by individual encodings above
+        # (_MIMG_DIM_COORDS: dim=1 -> 2D (2 coords), dim=2 -> 3D (3 coords)):
+        # _by2/_by4 must not trigger bias; _mip_by2/_mip_pck4 add mip; image_get_lod honors a16; fcmpswap+tfe.
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_load_by2", 1, False), 2)        # 2D
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_store_by4", 2, False), 3)       # 3D
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_load_mip_by2", 1, False), 3)    # 2D + mip
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_store_mip_pck4", 2, True), 2)   # (3D + mip) a16
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_get_lod", 1, True), 1)          # 2D a16
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_get_lod", 2, True), 2)          # 3D a16
+        self.assertEqual(rdna2_decode._mimg_data_count("image_atomic_fcmpswap", 1, False, True), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
