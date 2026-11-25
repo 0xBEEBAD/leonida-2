@@ -7356,22 +7356,22 @@ class Gen:
             raise Unsupported("DPP operands")
         # A VOPC compare in DPP form (docs/design.md, "DPP on a VOPC compare"): src0 comes through the same lane
         # selection and the result is a mask bit, not a VGPR. Only the forms where every lane writes its bit are
-        # taken: what a lane that DPP leaves unwritten does to its VCC bit is not measured.
+        # taken: what a lane that DPP leaves unwritten does to its VCC bit is not measured. v_cmpx writes EXEC instead
+        # and prints no destination, so its src0 is the first operand (SHADER-VOPCX-DPP).
         compare = base_op(ins["op"]).startswith("v_cmp")
+        first = 0 if base_op(ins["op"]).startswith("v_cmpx") else 1
         if compare:
-            if base_op(ins["op"]).startswith("v_cmpx"):
-                raise Unsupported("DPP on v_cmpx")
-            if len(args) != 3:
+            if len(args) != first + 2:
                 raise Unsupported("DPP compare operands")
             if row_mask != 0xF or bank_mask != 0xF or not (dpp8 is not None or bound):
                 raise Unsupported("DPP compare with lanes that keep their mask bit")
         elif args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
-        if args[1].get("n", 1) != 1:
+        if args[first].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
-        if args[1].get("sext"):
+        if args[first].get("sext"):
             raise Unsupported("DPP sext")
-        src = args[1]
+        src = args[first]
         raw_src = dict(src)
         raw_src.pop("neg", None)
         raw_src.pop("abs", None)
@@ -7552,10 +7552,10 @@ class Gen:
         else:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
-        args[1] = {"k": "ssa", "v": src0}
+        args[first] = {"k": "ssa", "v": src0}
         if compare:
             # Every lane is enabled and an invalid source reads 0 (checked above), so the compare's own EXEC guard
-            # is the only one: the mask write is the plain compare's.
+            # is the only one: the mask write is the plain compare's (for v_cmpx, EXEC's).
             return self._insn({**ins, "args": args})
         previous = self.dpp_guard
         self.dpp_guard = write
