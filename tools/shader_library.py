@@ -20,19 +20,22 @@ with the same 36-byte hash prologue as an FSPX program, so the programs are writ
 and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json). A compute program also gets its
 record's state blob as fspx/<name>.state, as fspx_unpack.py writes kind 0: the runtime finds a program the executable
 passes to Xbox device slot 67 by the SHA-256 of both (docs/fspx.md, "Build and run-time lookup"). In the 1.0.2.1
-library every compute program has exactly one state blob (2,684 programs, 2,693 records).
+library every compute program has exactly one state blob (2,684 programs, 2,693 records). A program that compute
+records use with different state blobs is written once per distinct state, so that each pair of keys has its entry:
+the first state under the program's name, each further one as <name>_state_<blob index>.
 
 Usage:
-    python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms | --compute-hashes FILE] [--disasm]
-                                [--mcpu gfx1013] [--jobs N]
+    python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms | --compute-hashes FILE]
+                                [--disasm] [--mcpu gfx1013] [--jobs N]
     python -I shader_library.py <shaders.rpf> --save library.bin       # the reassembled file, nothing else
 
 DIR/library.json gets the header, both pipeline tables (stage -> program name) and the per-program stage. Programs
 are named lib_<stage>_<index>. The output is game data and must stay in the user's work folder.
 
-For slot 67, extract with --stages cs or --compute-hashes (one kind-6 SHA-256 per line) into a fresh DIR.
-The .state sidecars are the original kind-0 bytes and distinguish variants of the same program.
-Translate DIR/disasm with rdna2spirv.py into <spirv>/fspx_compute. Use --wave64-emulate for 32-lane devices.
+--compute-hashes FILE writes only the compute programs whose code has one of the SHA-256 digests listed in FILE (the
+fspx_code_sha256 of the translation index; whitespace-separated), with every state they are used with. A digest no
+compute program has is an error.
+Translate DIR/disasm with rdna2spirv.py into <spirv>/fspx_compute; use --wave64-emulate for 32-lane devices.
 """
 import argparse
 import hashlib
@@ -264,18 +267,35 @@ def program_name(i: int, stages) -> str:
 
 
 def compute_variants(b: bytes, lib: dict, names: dict):
-    """Keep each distinct dispatch state of the same program, with a stable name for every pipeline record."""
+    """({program: {state bytes: name}}, {(program, state blob index): name}) over the compute records.
+
+    The run time finds a slot-67 program by its code and its state, so a program that records use with different
+    state blobs needs an entry for each. The first state met keeps the program's name and each further distinct one
+    gets <name>_state_<blob index>; records whose blobs hold the same bytes share a name, and a record without a
+    state names the program itself."""
     variants, by_record = {}, {}
     for rec in lib["compute"]:
         i, state_id = rec["program"], rec["state"]
         if i is None:
             continue
-        state = blob(b, lib, state_id) if state_id is not None else None
         states = variants.setdefault(i, {})
+        if state_id is None:
+            by_record[i, None] = names[i]
+            continue
+        state = blob(b, lib, state_id)
         if state not in states:
             states[state] = names[i] if not states else f"{names[i]}_state_{state_id}"
         by_record[i, state_id] = states[state]
     return variants, by_record
+
+
+def read_hashes(path: str) -> set:
+    """The SHA-256 digests of a --compute-hashes file, lower case. ValueError when it has none or another word."""
+    with open(path, encoding="utf-8") as f:
+        hashes = set(f.read().lower().split())
+    if not hashes or not all(re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes):
+        raise ValueError("expected one or more SHA-256 digests of 64 hex digits")
+    return hashes
 
 
 def main(argv=None) -> int:
@@ -287,7 +307,7 @@ def main(argv=None) -> int:
     select.add_argument("--stages", default="cs,ps,vs,ms",
                         help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
     select.add_argument("--compute-hashes", metavar="FILE",
-                        help="extract only compute programs with these kind-6 SHA-256 hashes, one per line")
+                        help="write only the compute programs whose code has one of the SHA-256 digests in FILE")
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
@@ -305,12 +325,9 @@ def main(argv=None) -> int:
         if not a.out:
             ap.error("--compute-hashes needs --out")
         try:
-            with open(a.compute_hashes, encoding="utf-8") as f:
-                hashes = set(f.read().lower().split())
-        except (OSError, UnicodeError) as error:
-            ap.error(f"cannot read --compute-hashes: {error}")
-        if not hashes or any(not re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes):
-            ap.error("--compute-hashes needs at least one SHA-256 digest")
+            hashes = read_hashes(a.compute_hashes)
+        except (OSError, ValueError) as error:
+            ap.error(f"cannot read --compute-hashes {a.compute_hashes}: {getattr(error, 'strerror', None) or error}")
     with open(a.src, "rb") as f:
         head = f.read(4)
         f.seek(0)
@@ -336,17 +353,25 @@ def main(argv=None) -> int:
     summary_path = os.path.join(a.out, "library.json")
     index_path = os.path.join(a.out, "index.json")
     names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
+    variants, compute_names = compute_variants(b, lib, names)
     want = None if a.stages == "all" else set(a.stages.split(","))
     if hashes is not None:
         want = {"cs"}
-    variants, compute_names = compute_variants(b, lib, names)
     selected = [i for i in names if want is None or lib["stage"].get(i, set()) & want]
     if hashes is not None:
-        matching = {i: hashlib.sha256(program(b, lib, i)).hexdigest() for i in selected}
-        selected = [i for i in selected if matching[i] in hashes]
-        missing = hashes - {matching[i] for i in selected}
+        code_hash = {i: hashlib.sha256(program(b, lib, i)).hexdigest() for i in selected}
+        selected = [i for i in selected if code_hash[i] in hashes]
+        missing = hashes - {code_hash[i] for i in selected}
         if missing:
-            raise LibraryError(f"{len(missing)} requested compute code hashes not found in the pipeline library")
+            raise LibraryError(f"{len(missing)} of the {len(hashes)} --compute-hashes digests match no compute "
+                               f"program of the library, first {min(missing)}")
+
+    def selected_programs():
+        """(program, name, state bytes or None): one per program, and one more per further state of a compute one."""
+        for i in selected:
+            for state, name in (variants.get(i) or {None: names[i]}).items():
+                yield i, name, state
+
     carve_errors = []
     sources = carve_digests(a.carve, errors=carve_errors) if a.carve else None
 
@@ -364,16 +389,15 @@ def main(argv=None) -> int:
         yield from (fspx_dir, summary_path, index_path)
         if disasm_dir:
             yield disasm_dir
-        for i in selected:
-            for name in variants.get(i, {None: names[i]}).values():
-                yield os.path.join(fspx_dir, name + ".code")
-                yield os.path.join(fspx_dir, name + ".json")
-                # Extraction writes the compute state or removes a stale sidecar at this path.
-                yield os.path.join(fspx_dir, name + ".state")
-                if sources is not None and carved_sources(i):
-                    yield os.path.join(a.out, name + ".dxbc")
-                if disasm_dir and code_range(program(b, lib, i))[1]:
-                    yield os.path.join(disasm_dir, name + ".s")
+        for i, name, _ in selected_programs():
+            yield os.path.join(fspx_dir, name + ".code")
+            yield os.path.join(fspx_dir, name + ".json")
+            # Extraction writes the compute state or removes a stale sidecar at this path.
+            yield os.path.join(fspx_dir, name + ".state")
+            if sources is not None and carved_sources(i):
+                yield os.path.join(a.out, name + ".dxbc")
+            if disasm_dir and code_range(program(b, lib, i))[1]:
+                yield os.path.join(disasm_dir, name + ".s")
 
     if a.save:
         for path in extraction_paths():
@@ -389,10 +413,8 @@ def main(argv=None) -> int:
         with open(a.save, "wb") as f:
             f.write(b)
     index, written, work = [], 0, []
-    programs = ((i, name, state) for i in selected
-                for state, name in variants.get(i, {None: names[i]}).items())
-    for i, name, state in programs:
-        stages = lib["stage"].get(i, set())
+    for i, name, state in selected_programs():
+        stages = lib["stage"].get(i)
         st = "+".join(sorted(stages)) if stages else "unused"
         code = program(b, lib, i)
         start, end = code_range(code)
@@ -433,7 +455,7 @@ def main(argv=None) -> int:
 
     def one(job):
         entry, name, code, start, end = job
-        asm, invalid, err = disasm.disasm(code, a.mcpu, wave32=entry.get("wave32", True))
+        asm, invalid, err = disasm.disasm(code, a.mcpu, wave32=entry.get("wave32", True), compute=True)
         entry["invalid_words"] = invalid
         with open(os.path.join(disasm_dir, name + ".s"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
@@ -453,8 +475,8 @@ def main(argv=None) -> int:
         "layout": lib["layout"],
         "graphics": [{"hash": g["hash"], "state": g["state"], "input_layout": g["input_layout"],
                       "stages": named(g["stages"])} for g in lib["graphics"]],
-        "compute": [{"hash": c["hash"], "state": c["state"], "program": compute_names.get((c["program"], c["state"]))}
-                    for c in lib["compute"]],
+        "compute": [{"hash": c["hash"], "state": c["state"],
+                     "program": compute_names.get((c["program"], c["state"]))} for c in lib["compute"]],
     }
     with open(summary_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=1)

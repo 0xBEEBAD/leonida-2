@@ -154,7 +154,9 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
   reads (`native_blob`, `cs_dispatch_state`). A compute program also gets `fspx/<name>.state`, its record's state
   blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; in the 1.0.2.1 `shaders.rpf` library,
   every compute program has one distinct state-blob index across `library.json`'s `compute` table (2,684 programs,
-  2,693 records). It also writes `index.json` with each program's stage, and
+  2,693 records). A program that records use with different state blobs is written once per distinct state, the
+  first under its name and each further one as `<name>_state_<blob index>`, so each pair of keys has an entry
+  (the library measured above has no such program). It also writes `index.json` with each program's stage, and
   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
   `lib_<stage>_<index>`.
 * `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
@@ -163,6 +165,8 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
   interface.
 * `--save` writes the reassembled library. A saved file is also accepted as input.
 * `--stages` limits the output to some stages.
+* `--compute-hashes FILE` instead writes only the compute programs whose code has one of the SHA-256 digests listed
+  in `FILE` (`fspx_code_sha256`), with every state they are used with. A digest no compute program has is an error.
 
 The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
@@ -222,9 +226,16 @@ What stops the rest, by the translator's message:
   run into `vcc` (SGPRs 106 and 107): `s_load_dwordx8`/`x4`/`x16` writing `s[100:107]`, `s[104:107]` or
   `s[92:107]`, and image instructions whose resource is `s[100:107]`. In the compute programs alone that is 37,952
   SMEM, 22,248 MIMG and 2,298 MUBUF words. The same words with the register field one tuple lower decode; with
-  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. A decoder
-  fallback for these encodings would cover most of the remaining programs. The translator already reads
-  `[s100,...,vcc_lo,vcc_hi]` lists (design.md *Scalar/buffer memory*).
+  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. The translator
+  now decodes these words from the blob with `rdna2_decode` (`restore_vcc_tuples`) and reads them as the
+  `[s100,...,vcc_lo,vcc_hi]` lists it already takes (design.md *Scalar/buffer memory*); synthetic cases are in
+  `tests/semantic/test_vcc_tuple_fallback.py`. The junk llvm-mc prints at such a word's second dword is often longer
+  than that dword (an 8-byte `exp`, say) and swallows the instruction after the tuple too, so the words after a restored
+  instruction are decoded from the blob until the stream is back at one llvm-mc printed. A word llvm-mc itself rejected
+  is not taken for swallowed code and stays refused. They are decoded for the program's own wave size: in wave64 a
+  swallowed VOP3 compare writes an SGPR pair. The table above was measured before both changes. Measured since,
+  over the 2,684 compute programs (llvm-mc 21.1.8): 1,816 translate with the tuples alone and 2,567 with the swallowed
+  instructions, all of which pass `spirv-val`; the modules of the 1,816 are byte-identical.
 * **443: an instruction llvm-mc prints with another encoding than the blob's** (`v_fma_mix*`, `v_interp_p2_f16`):
   the existing `check_printed_encodings` refusal.
 * **90 CS: "CS thread-group-size SGPR"**: RSRC2 `TG_SIZE_EN`, which no FSSM compute shader sets.
