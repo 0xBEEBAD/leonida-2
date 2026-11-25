@@ -3870,11 +3870,19 @@ bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, 
             })) {
             result = hr_to_u64(hr);
         } else {
-            // No presenter: no statistics yet (S_FALSE with a zero count, the "not available yet" answer in
-            // docs/d3d12_vulkan.md), and never the PC slot 81 (ID3D12Device13::OpenExistingHeapFromAddress1).
+            // No presenter: nothing to report, as a success with a zero count. That is the answer the retail boot was
+            // measured with (it ran through the story load on it); S_FALSE, the "not available yet" answer of the
+            // public samples (docs/d3d12_vulkan.md), has not been through a retail run. A null count, or a count
+            // above zero with no array to fill, is E_POINTER. Never the PC slot 81
+            // (ID3D12Device13::OpenExistingHeapFromAddress1).
             log_xbox_route_once(slot, "GetFrameStatisticsX", a1, a2, a3, a4, a5);
-            if (auto* count = reinterpret_cast<UINT*>(a3)) *count = 0;
-            result = hr_to_u64(S_FALSE);
+            auto* count = reinterpret_cast<UINT*>(a3);
+            if (!count || (*count > 0 && !a4)) {
+                result = hr_to_u64(E_POINTER);
+            } else {
+                *count = 0;
+                result = hr_to_u64(S_OK);
+            }
         }
     } else if (slot == routes.queue_x) {
         log_xbox_route_once(slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);

@@ -2048,7 +2048,16 @@ int run_env_slots(bool valid, bool on_slot74 = false, bool on_slot70 = false) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        EXPECT(hr_of(raw(device, 81, 0, 0, 0, 0)) == S_FALSE);  // the default GetFrameStatisticsX slot, unattached
+        // The default GetFrameStatisticsX slot, unattached: a zero count and S_OK; a null count, or a count with no
+        // array, is E_POINTER.
+        UINT stats = 0;
+        EXPECT(hr_of(raw(device, 81, 0, 0, word(&stats), 0)) == S_OK && stats == 0 && mock->calls[81] == 0);
+        EXPECT(hr_of(raw(device, 81, 0, 0, 0, 0)) == E_POINTER);
+        stats = 2;
+        EXPECT(hr_of(raw(device, 81, 0, 0, word(&stats), 0)) == E_POINTER && stats == 2);
+        std::uint8_t stats_out[2 * 0x38] = {};
+        EXPECT(hr_of(raw(device, 81, 0, 0, word(&stats), word(stats_out))) == S_OK && stats == 0 &&
+               mock->calls[81] == 0);
         // Slot 71 is the Xbox placed-UAV view of the title's own memory (d19339b07), not a PC slot: the proxy
         // handles it before the PC vtable, so the PC slot 71 (CreateSamplerFeedbackUnorderedAccessView) is never
         // reached and the mock records nothing.
@@ -3655,8 +3664,13 @@ int check_presentation_wiring() {
 
     // Detached, the beyond-PC queue slots fall back to the console tail and the presenter is not called again.
     EXPECT(xs::set_presentation_handler(device, nullptr));
-    UINT none = 7;  // unattached GetFrameStatisticsX: no statistics yet, never the PC slot 81
-    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), 0)) == S_FALSE && none == 0 && p.stats_calls == 1);
+    // Unattached GetFrameStatisticsX: no statistics yet (S_OK and a zero count), never the PC slot 81.
+    UINT none = 7;
+    std::uint8_t none_out[7 * 0x38] = {};
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), word(none_out))) == S_OK && none == 0 && p.stats_calls == 1);
+    none = 7;
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), 0)) == E_POINTER && none == 7 && p.stats_calls == 1);
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, 0, 0)) == E_POINTER && p.stats_calls == 1);
     EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) != E_NOTIMPL && p.present_calls == 1);
 
     EXPECT(release(queue) == 0);

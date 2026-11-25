@@ -51,8 +51,9 @@
 //   slots 78/79/80/81  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX, GetFrameStatisticsX. A presentation
 //             attached with set_presentation_handler (below) answers them; without one a per-device token state
 //             machine does, before the PC vtable is indexed: WaitFrameEventX returns at once with a fresh non-zero
-//             token and GetFrameStatisticsX reports no statistics (S_FALSE, a zero count). Slots 80/81 are outside
-//             a PC ID3D12Device11 table, so they are checked before the beyond-table refusal.
+//             token and GetFrameStatisticsX reports no statistics (S_OK and a zero count, the answer the retail boot
+//             was measured with; E_POINTER for a null count or for a count above zero with no array). Slots 80/81 are
+//             outside a PC ID3D12Device11 table, so they are checked before the beyond-table refusal.
 //   slot 86   CreatePipelineState(desc, riid, out) -> PC ID3D12Device2::CreatePipelineState (PC slot 47).
 //   slot 101  CreateStateObject(desc, riid, out) -> PC ID3D12Device5::CreateStateObject (PC slot 62, displaced on
 //             Xbox by compute-PSO slot 62).
