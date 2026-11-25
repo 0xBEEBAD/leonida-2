@@ -1291,15 +1291,16 @@ if(BUILD_TESTING)
     add_test(NAME xs_proxy_mock_env_slots_70 COMMAND xs_proxy_mock_test --env-slots-70)
     add_test(NAME xs_proxy_mock_env_slots_74 COMMAND xs_proxy_mock_test --env-slots-74)
   endif()
-  add_executable(pso_stream_test
-    test/pso_stream_test.cpp
-    shims/d3d12_xs_pso_stream.cpp
-  )
-  target_include_directories(pso_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
-  target_compile_definitions(pso_stream_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(pso_stream_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(pso_stream_test PRIVATE /OPT:NOREF)
-  if(TARGET pso_stream_test)
+  # Reads d3d12.h and takes MSVC options, so only where the Windows runtime is built.
+  if(TARGET gta6rt)
+    add_executable(pso_stream_test
+      test/pso_stream_test.cpp
+      shims/d3d12_xs_pso_stream.cpp
+    )
+    target_include_directories(pso_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    target_compile_definitions(pso_stream_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pso_stream_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(pso_stream_test PRIVATE /OPT:NOREF)
     add_test(NAME pso_stream COMMAND pso_stream_test)
   endif()
 
