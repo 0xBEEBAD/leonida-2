@@ -15,9 +15,9 @@ Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated):
             "r32 sint (sint view): 64 bad, texel(5,3) = 2071" — the signature
             of #31 (Radeon 780M), the same two fixtures that fail on the
             RTX 3080 Ti (#280) and in the Intel MTL entry above. Not a new
-            failure; the translator half of #31 is being re-landed as
-            SHADER-1266 (claimed in the coordination issue; #98 closed
-            unmerged).
+            failure; this record predates #892 (the SHADER-1266 tfe fixture
+            correction), and the two tfe fixtures cs_imgload_tfe and
+            cs_imgload_d16_tfe pass on #892+.
 Skipped:    native: 31 skips "no 64-wide compute subgroup on this device",
             1 skip "no 64-wide subgroup on this device", 1 skip "this device
             cannot require a 64-wide fragment subgroup: subgroup 32..32"
