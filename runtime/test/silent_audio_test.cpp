@@ -9,6 +9,7 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <propsys.h>
+#include <spatialaudioclient.h>
 
 #include <cstdio>
 #include <cstring>
@@ -538,6 +539,147 @@ void test_polled_stream_drains() {
     c->Release();
 }
 
+// ---- the spatial stream ---------------------------------------------------------------------------------------
+
+void test_spatial_stream() {
+    IMMDeviceEnumerator* e = serve(nullptr, REGDB_E_CLASSNOTREG, sa::Mode::Auto, nullptr);
+    IMMDevice* d = nullptr;
+    if (!e || FAILED(e->GetDefaultAudioEndpoint(eRender, eConsole, &d)) || !d) {
+        check(false, "silent device for the spatial tests");
+        return;
+    }
+    e->Release();
+    ISpatialAudioClient2* c2 = nullptr;
+    check(d->Activate(__uuidof(ISpatialAudioClient2), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&c2)) == S_OK && c2,
+          "Activate(ISpatialAudioClient2)");
+    if (c2) c2->Release();
+    ISpatialAudioClient* c = nullptr;
+    check(d->Activate(__uuidof(ISpatialAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&c)) == S_OK && c,
+          "Activate(ISpatialAudioClient)");
+    d->Release();
+    if (!c) return;
+
+    AudioObjectType mask = AudioObjectType_None;
+    UINT32 dynamic = 99;
+    check(c->GetNativeStaticObjectTypeMask(&mask) == S_OK && static_cast<uint32_t>(mask) == 0x1FE,
+          "the native static objects are the 7.1 bed");
+    check(c->GetMaxDynamicObjectCount(&dynamic) == S_OK && dynamic == 0, "no dynamic objects");
+    float x = 0, y = 0, z = 0;
+    check(c->GetStaticObjectPosition(AudioObjectType_FrontLeft, &x, &y, &z) == S_OK && x < 0 && z < 0,
+          "front left is to the left and in front");
+    IAudioFormatEnumerator* formats = nullptr;
+    WAVEFORMATEX* format = nullptr;
+    UINT32 count = 0;
+    check(c->GetSupportedAudioObjectFormatEnumerator(&formats) == S_OK && formats &&
+              formats->GetCount(&count) == S_OK && count == 1 && formats->GetFormat(0, &format) == S_OK && format &&
+              format->nChannels == 1 && format->nSamplesPerSec == 48000 && format->wBitsPerSample == 32 &&
+              format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT,
+          "one object format: mono 48 kHz float");
+    if (!format) return;
+    check(c->IsAudioObjectFormatSupported(format) == S_OK, "IsAudioObjectFormatSupported(its format)");
+    WAVEFORMATEX stereo{WAVE_FORMAT_IEEE_FLOAT, 2, 48000, 48000 * 8, 8, 32, 0};
+    check(c->IsAudioObjectFormatSupported(&stereo) == AUDCLNT_E_UNSUPPORTED_FORMAT, "a stereo object is refused");
+    UINT32 frames = 0;
+    check(c->GetMaxFrameCount(format, &frames) == S_OK && frames == 480, "GetMaxFrameCount: 480 (10 ms)");
+    check(c->IsSpatialAudioStreamAvailable(__uuidof(ISpatialAudioObjectRenderStream), nullptr) == S_OK,
+          "the object render stream is available");
+
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    SpatialAudioObjectRenderStreamActivationParams params{};
+    params.ObjectFormat = format;
+    params.StaticObjectTypeMask =
+        static_cast<AudioObjectType>(AudioObjectType_FrontLeft | AudioObjectType_FrontRight | AudioObjectType_LowFrequency);
+    params.Category = AudioCategory_GameEffects;
+    params.EventHandle = event;
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    pv.vt = VT_BLOB;
+    pv.blob.cbSize = sizeof params;
+    pv.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
+    ISpatialAudioObjectRenderStream* stream = nullptr;
+    params.EventHandle = nullptr;
+    check(c->ActivateSpatialAudioStream(&pv, __uuidof(ISpatialAudioObjectRenderStream),
+                                        reinterpret_cast<void**>(&stream)) == E_INVALIDARG && !stream,
+          "a stream without an event handle is refused");
+    params.EventHandle = event;
+    check(c->ActivateSpatialAudioStream(&pv, __uuidof(ISpatialAudioObjectRenderStream),
+                                        reinterpret_cast<void**>(&stream)) == S_OK && stream,
+          "ActivateSpatialAudioStream(FL | FR | LFE, event)");
+    formats->Release();
+    c->Release();
+    if (!stream) return;
+
+    UINT32 available = 99;
+    check(stream->BeginUpdatingAudioObjects(&available, &frames) == S_OK && available == 0 && frames == 480,
+          "BeginUpdatingAudioObjects: 480 frames, no dynamic objects");
+    check(stream->BeginUpdatingAudioObjects(&available, &frames) == SPTLAUDCLNT_E_OUT_OF_ORDER,
+          "a second Begin is out of order");
+    ISpatialAudioObject* fl = nullptr;
+    ISpatialAudioObject* fr = nullptr;
+    ISpatialAudioObject* other = nullptr;
+    check(stream->ActivateSpatialAudioObject(AudioObjectType_FrontLeft, &fl) == S_OK && fl, "activate front left");
+    check(stream->ActivateSpatialAudioObject(AudioObjectType_FrontRight, &fr) == S_OK && fr, "activate front right");
+    check(stream->ActivateSpatialAudioObject(AudioObjectType_FrontLeft, &other) == SPTLAUDCLNT_E_OBJECT_ALREADY_ACTIVE,
+          "front left twice is refused");
+    check(stream->ActivateSpatialAudioObject(AudioObjectType_BackLeft, &other) ==
+              SPTLAUDCLNT_E_STATIC_OBJECT_NOT_AVAILABLE,
+          "a type outside the stream's mask is refused");
+    check(stream->ActivateSpatialAudioObject(AudioObjectType_Dynamic, &other) == SPTLAUDCLNT_E_NO_MORE_OBJECTS,
+          "no dynamic object");
+    check(stream->EndUpdatingAudioObjects() == S_OK, "EndUpdatingAudioObjects");
+    check(stream->EndUpdatingAudioObjects() == SPTLAUDCLNT_E_OUT_OF_ORDER, "a second End is out of order");
+    if (!fl || !fr) return;
+    BYTE* buffer = nullptr;
+    UINT32 length = 0;
+    check(fl->GetBuffer(&buffer, &length) == SPTLAUDCLNT_E_OUT_OF_ORDER, "GetBuffer outside an update");
+
+    check(stream->Start() == S_OK, "Start");
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    int passes = 0;
+    bool buffers_ok = true;
+    for (int i = 0; i < 10; ++i) {
+        if (WaitForSingleObject(event, 500) != WAIT_OBJECT_0) break;
+        if (FAILED(stream->BeginUpdatingAudioObjects(&available, &frames))) break;
+        for (ISpatialAudioObject* o : {fl, fr}) {
+            buffer = nullptr;
+            length = 0;
+            if (FAILED(o->GetBuffer(&buffer, &length)) || !buffer || length != frames * 4) buffers_ok = false;
+            else std::memset(buffer, 0, length);
+            o->SetVolume(0.5f);
+            o->SetPosition(0.0f, 0.0f, -1.0f);
+        }
+        if (i == 9) fr->SetEndOfStream(0);
+        if (SUCCEEDED(stream->EndUpdatingAudioObjects())) ++passes;
+    }
+    QueryPerformanceCounter(&t1);
+    const double seconds = static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(f.QuadPart);
+    std::printf("  spatial: %d passes in %.1f ms\n", passes, seconds * 1000.0);
+    check(passes == 10, "the spatial event is signalled every pass while running");
+    check(seconds > 0.04 && seconds < 2.0, "the passes come at about real time (10 in 40 ms .. 2 s)");
+    check(buffers_ok, "every object gets a 480-frame mono float buffer in each pass");
+    BOOL active = TRUE;
+    check(fr->IsActive(&active) == S_OK && !active, "an object is inactive after the pass it ended in");
+    check(fl->IsActive(&active) == S_OK && active, "the other object stays active");
+    check(stream->Reset() == SPTLAUDCLNT_E_STREAM_NOT_STOPPED, "Reset while running is refused");
+    check(stream->Stop() == S_OK, "Stop");
+    while (WaitForSingleObject(event, 0) == WAIT_OBJECT_0) {
+    }
+    check(WaitForSingleObject(event, 60) == WAIT_TIMEOUT, "no spatial event after Stop");
+    check(stream->Reset() == S_OK, "Reset");
+    fr->Release();
+    if (SUCCEEDED(stream->BeginUpdatingAudioObjects(&available, &frames))) {
+        check(stream->ActivateSpatialAudioObject(AudioObjectType_FrontRight, &other) == S_OK && other,
+              "an ended type can be activated again");
+        if (other) other->Release();
+        stream->EndUpdatingAudioObjects();
+    }
+    fl->Release();
+    check(stream->Release() == 0, "the stream is released last");
+    CloseHandle(event);
+}
+
 // ---- through CoCreateInstance ---------------------------------------------------------------------------------
 
 using CoCreateInstFn = HRESULT(WINAPI*)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
@@ -579,6 +721,7 @@ int main() {
     test_no_host_enumerator();
     test_render_stream();
     test_polled_stream_drains();
+    test_spatial_stream();
     test_co_create_instance_forced();
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

@@ -4,8 +4,9 @@
 // endpoint, GetDefaultAudioEndpoint(eRender, ...) fails with 0x80070490 (ERROR_NOT_FOUND); the title's device start
 // then leaks its own output-device lock and its audio engine never mixes, so the boot stops. A console always has an
 // output, so the title only meets that path off-console. The enumerator served here answers render questions with a
-// device of its own when the host has none (or always, with LEONIDA_AUDIO=silent): an IAudioClient whose clock
-// consumes frames in real time and signals the stream's event every period. It never opens a host audio device.
+// device of its own when the host has none (or always, with LEONIDA_AUDIO=silent): an ISpatialAudioClient (what the
+// title activates) and an IAudioClient, whose streams consume frames in real time and signal their event every
+// period. It never opens a host audio device.
 // Capture questions keep the host's answer.
 #pragma once
 

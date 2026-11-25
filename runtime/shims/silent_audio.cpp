@@ -1,5 +1,5 @@
 // The silent output endpoint (silent_audio.h): IMMDeviceEnumerator, IMMDevice, IPropertyStore, IAudioClient3 and its
-// services, all in-process. Nothing here opens a host audio device; the samples a title writes go to a scratch buffer.
+// services, and ISpatialAudioClient2 with its object render stream, all in-process. Nothing here opens a host audio device; the samples a title writes go to a scratch buffer.
 //
 // No function-local statics or thread_local here: like com_shim.cpp, this runs on threads the title made.
 #include "silent_audio.h"
@@ -11,6 +11,7 @@
 #include <audioclient.h>
 #include <propidl.h>
 #include <propsys.h>
+#include <spatialaudioclient.h>
 
 #include <cstdio>
 #include <cstring>
@@ -167,6 +168,62 @@ protected:
 
 private:
     LONG refs_ = 1;
+};
+
+// Calls `tick(context)` every period on its own thread, on a fixed schedule so a late wake-up does not push the
+// next ones back, until stop() (or destruction).
+class PeriodicThread {
+public:
+    using Tick = void (*)(void*);
+    ~PeriodicThread() { stop(); }
+    bool start(int64_t period_hns, Tick tick, void* context) {
+        if (thread_) return true;
+        period_hns_ = period_hns;
+        tick_ = tick;
+        context_ = context;
+        stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        thread_ = stop_ ? CreateThread(nullptr, 64 * 1024, &PeriodicThread::run, this, 0, nullptr) : nullptr;
+        return thread_ != nullptr;
+    }
+    void stop() {
+        if (thread_) {
+            SetEvent(stop_);
+            WaitForSingleObject(thread_, INFINITE);
+            CloseHandle(thread_);
+            thread_ = nullptr;
+        }
+        if (stop_) CloseHandle(stop_);
+        stop_ = nullptr;
+    }
+
+private:
+    static DWORD WINAPI run(void* self) {
+        auto* t = static_cast<PeriodicThread*>(self);
+        const DWORD period_ms = static_cast<DWORD>((t->period_hns_ + 9999) / 10000);
+        const int64_t f = qpc_frequency();
+        const int64_t step = t->period_hns_ * f / 10000000;
+        int64_t next = qpc_now() + step;
+        for (;;) {
+            const int64_t now = qpc_now();
+            DWORD wait = 0;
+            if (next > now) {
+                wait = static_cast<DWORD>((next - now) * 1000 / f);
+                if (wait > period_ms) wait = period_ms;
+            }
+            if (WaitForSingleObject(t->stop_, wait) != WAIT_TIMEOUT) break;
+            if (qpc_now() < next) continue;
+            next += step;
+            if (next < qpc_now()) next = qpc_now() + step;
+            t->tick_(t->context_);
+        }
+        return 0;
+    }
+
+    int64_t period_hns_ = kDefaultPeriodHns;
+    Tick tick_ = nullptr;
+    void* context_ = nullptr;
+    HANDLE stop_ = nullptr;
+    HANDLE thread_ = nullptr;
 };
 
 // ---- IAudioClient3 --------------------------------------------------------------------------------------------
@@ -368,14 +425,7 @@ private:
         SRWLOCK& s_;
     };
 
-    ~AudioClient() override {
-        if (thread_) {
-            SetEvent(stop_);
-            WaitForSingleObject(thread_, INFINITE);
-            CloseHandle(thread_);
-        }
-        if (stop_) CloseHandle(stop_);
-    }
+    ~AudioClient() override { clock_.stop(); }
 
     bool answers(REFIID riid) const override {
         return IsEqualIID(riid, __uuidof(IAudioClient)) || IsEqualIID(riid, __uuidof(IAudioClient2)) ||
@@ -402,11 +452,7 @@ private:
         scratch_.assign(static_cast<size_t>(buffer_frames_) * block_, 0);
         for (float& v : channel_volume_) v = 1.0f;
         event_mode_ = (flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) != 0;
-        if (event_mode_) {
-            stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            thread_ = stop_ ? CreateThread(nullptr, 64 * 1024, &AudioClient::clock_thread, this, 0, nullptr) : nullptr;
-            if (!thread_) return E_OUTOFMEMORY;
-        }
+        if (event_mode_ && !clock_.start(period_hns_, &AudioClient::tick, this)) return E_OUTOFMEMORY;
         initialized_ = true;
         if (InterlockedExchange(&g_stream_logged, 1) == 0) {
             std::fprintf(stderr, "[rt] audio: silent stream: %u ch, %u Hz, %u-byte frames, %u-frame buffer, %s\n",
@@ -432,38 +478,16 @@ private:
         }
     }
 
-    void tick() {
+    static void tick(void* self) {
+        auto* c = static_cast<AudioClient*>(self);
         HANDLE signal = nullptr;
         {
-            Lock l(lock_);
-            if (!running_) return;
-            advance(qpc_now());
-            signal = event_;
+            Lock l(c->lock_);
+            if (!c->running_) return;
+            c->advance(qpc_now());
+            signal = c->event_;
         }
         if (signal) SetEvent(signal);
-    }
-
-    static DWORD WINAPI clock_thread(void* self) {
-        auto* c = static_cast<AudioClient*>(self);
-        const DWORD period_ms = static_cast<DWORD>((c->period_hns_ + 9999) / 10000);
-        // A fixed schedule, so a late wake-up does not push the next ones back.
-        const int64_t f = qpc_frequency();
-        const int64_t step = c->period_hns_ * f / 10000000;
-        int64_t next = qpc_now() + step;
-        for (;;) {
-            const int64_t now = qpc_now();
-            DWORD wait = 0;
-            if (next > now) {
-                wait = static_cast<DWORD>((next - now) * 1000 / f);
-                if (wait > period_ms) wait = period_ms;
-            }
-            if (WaitForSingleObject(c->stop_, wait) != WAIT_TIMEOUT) break;
-            if (qpc_now() < next) continue;
-            next += step;
-            if (next < qpc_now()) next = qpc_now() + step;
-            c->tick();
-        }
-        return 0;
     }
 
     static inline LONG g_stream_logged = 0;
@@ -481,8 +505,7 @@ private:
     REFERENCE_TIME period_hns_ = kDefaultPeriodHns;
     std::vector<BYTE> scratch_;
     HANDLE event_ = nullptr;  // the title's; not owned
-    HANDLE stop_ = nullptr;
-    HANDLE thread_ = nullptr;
+    PeriodicThread clock_;
     uint64_t written_ = 0;
     uint64_t played_ = 0;
     uint64_t played_at_anchor_ = 0;
@@ -610,6 +633,343 @@ HRESULT AudioClient::GetService(REFIID riid, void** ppv) {
     return hr;
 }
 
+// ---- ISpatialAudioClient2 -------------------------------------------------------------------------------------
+//
+// A spatial endpoint with a 7.1 bed (the static objects of the mix format) and no dynamic objects, as an endpoint
+// with no spatial sound format (Windows Sonic, Dolby Atmos) turned on. Objects are mono 48 kHz float; one pass is
+// 10 ms (480 frames), and the stream's event is signalled every pass while it runs.
+
+constexpr uint32_t kBedMask = AudioObjectType_FrontLeft | AudioObjectType_FrontRight | AudioObjectType_FrontCenter |
+                              AudioObjectType_LowFrequency | AudioObjectType_SideLeft | AudioObjectType_SideRight |
+                              AudioObjectType_BackLeft | AudioObjectType_BackRight;
+constexpr uint32_t kStaticTypes = 0xFFFFE;  // FrontLeft .. StereoRight
+constexpr uint32_t kObjectFrames = kSampleRate / 100;
+
+void object_format(WAVEFORMATEX* f) {
+    *f = WAVEFORMATEX{WAVE_FORMAT_IEEE_FLOAT, 1, kSampleRate, kSampleRate * 4, 4, 32, 0};
+}
+
+bool is_object_format(const WAVEFORMATEX* f) {
+    return f && f->nChannels == 1 && f->nSamplesPerSec == kSampleRate && f->wBitsPerSample == 32 &&
+           f->nBlockAlign == 4 && is_float(f);
+}
+
+bool one_type(uint32_t t) { return t != 0 && (t & (t - 1)) == 0; }
+
+class FormatEnumerator final : public Unknown<IAudioFormatEnumerator> {
+public:
+    FormatEnumerator() { object_format(&format_); }
+    HRESULT STDMETHODCALLTYPE GetCount(UINT32* count) override {
+        if (!count) return E_POINTER;
+        *count = 1;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetFormat(UINT32 index, WAVEFORMATEX** format) override {
+        if (!format) return E_POINTER;
+        *format = nullptr;
+        if (index != 0) return E_INVALIDARG;
+        *format = &format_;  // owned by the enumerator, as the system's is
+        return S_OK;
+    }
+
+private:
+    WAVEFORMATEX format_{};
+};
+
+class SpatialStream;
+
+class SpatialObject final : public Unknown<ISpatialAudioObject> {
+public:
+    SpatialObject(SpatialStream* stream, uint32_t type);
+    HRESULT STDMETHODCALLTYPE GetBuffer(BYTE** buffer, UINT32* length) override;
+    HRESULT STDMETHODCALLTYPE SetEndOfStream(UINT32 frames) override;
+    HRESULT STDMETHODCALLTYPE IsActive(BOOL* active) override {
+        if (!active) return E_POINTER;
+        *active = InterlockedCompareExchange(&active_, 0, 0) ? TRUE : FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetAudioObjectType(AudioObjectType* type) override {
+        if (!type) return E_POINTER;
+        *type = static_cast<AudioObjectType>(type_);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetPosition(float, float, float) override { return S_OK; }  // nothing is rendered
+    HRESULT STDMETHODCALLTYPE SetVolume(float volume) override {
+        return volume >= 0.0f && volume <= 1.0f ? S_OK : E_INVALIDARG;
+    }
+    // The stream ends the object at the end of the pass it called SetEndOfStream in.
+    void make_inactive() { InterlockedExchange(&active_, 0); }
+    // True once: whoever takes the type frees it in the stream.
+    bool take_type() { return InterlockedExchange(&type_held_, 0) != 0; }
+    uint32_t type() const { return type_; }
+
+private:
+    ~SpatialObject() override;
+    SpatialStream* stream_;
+    uint32_t type_;
+    LONG active_ = 1;
+    LONG type_held_ = 1;
+    LONG ending_ = 0;
+};
+
+class SpatialStream final : public Unknown<ISpatialAudioObjectRenderStream> {
+public:
+    SpatialStream(HANDLE event, uint32_t mask) : event_(event), mask_(mask) {
+        scratch_.assign(static_cast<size_t>(kObjectFrames) * 4, 0);
+    }
+    bool start_clock() { return clock_.start(kDefaultPeriodHns, &SpatialStream::tick, this); }
+
+    HRESULT STDMETHODCALLTYPE GetAvailableDynamicObjectCount(UINT32* value) override {
+        if (!value) return E_POINTER;
+        *value = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetService(REFIID riid, void** service) override {
+        if (!service) return E_POINTER;
+        *service = nullptr;
+        log_missing_iid_once("ISpatialAudioObjectRenderStream::GetService", riid);
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Start() override {
+        {
+            Lock l(lock_);
+            if (running_) return S_OK;
+            running_ = true;
+        }
+        SetEvent(event_);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Stop() override {
+        Lock l(lock_);
+        running_ = false;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Reset() override {
+        Lock l(lock_);
+        return running_ ? SPTLAUDCLNT_E_STREAM_NOT_STOPPED : S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE BeginUpdatingAudioObjects(UINT32* available, UINT32* frames) override {
+        if (!available || !frames) return E_POINTER;
+        Lock l(lock_);
+        if (updating_) return SPTLAUDCLNT_E_OUT_OF_ORDER;
+        updating_ = true;
+        *available = 0;
+        *frames = kObjectFrames;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE EndUpdatingAudioObjects() override {
+        std::vector<SpatialObject*> ended;
+        {
+            Lock l(lock_);
+            if (!updating_) return SPTLAUDCLNT_E_OUT_OF_ORDER;
+            updating_ = false;
+            ended.swap(ending_);
+            for (SpatialObject* o : ended) {
+                o->make_inactive();
+                if (o->take_type()) active_types_ &= ~o->type();
+            }
+        }
+        for (SpatialObject* o : ended) o->Release();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE ActivateSpatialAudioObject(AudioObjectType type, ISpatialAudioObject** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        const uint32_t t = static_cast<uint32_t>(type);
+        if (t == AudioObjectType_Dynamic) return SPTLAUDCLNT_E_NO_MORE_OBJECTS;
+        if (!one_type(t) || (t & ~kStaticTypes)) return E_INVALIDARG;
+        {
+            Lock l(lock_);
+            if (!(mask_ & t)) return SPTLAUDCLNT_E_STATIC_OBJECT_NOT_AVAILABLE;
+            if (active_types_ & t) return SPTLAUDCLNT_E_OBJECT_ALREADY_ACTIVE;
+            active_types_ |= t;
+        }
+        auto* o = new (std::nothrow) SpatialObject(this, t);
+        if (!o) {
+            release_type(t);
+            return E_OUTOFMEMORY;
+        }
+        *object = o;
+        return S_OK;
+    }
+
+    // For the objects.
+    HRESULT buffer(BYTE** data, UINT32* length) {
+        Lock l(lock_);
+        if (!updating_) return SPTLAUDCLNT_E_OUT_OF_ORDER;
+        *data = scratch_.data();
+        *length = static_cast<UINT32>(scratch_.size());
+        return S_OK;
+    }
+    HRESULT end_of_stream(SpatialObject* o) {
+        Lock l(lock_);
+        if (!updating_) return SPTLAUDCLNT_E_OUT_OF_ORDER;
+        o->AddRef();
+        ending_.push_back(o);
+        return S_OK;
+    }
+    void release_type(uint32_t t) {
+        Lock l(lock_);
+        active_types_ &= ~t;
+    }
+
+private:
+    struct Lock {
+        explicit Lock(SRWLOCK& s) : s_(s) { AcquireSRWLockExclusive(&s_); }
+        ~Lock() { ReleaseSRWLockExclusive(&s_); }
+        SRWLOCK& s_;
+    };
+    ~SpatialStream() override { clock_.stop(); }  // ending_ is empty: each entry holds the stream
+    static void tick(void* self) {
+        auto* s = static_cast<SpatialStream*>(self);
+        bool running = false;
+        {
+            Lock l(s->lock_);
+            running = s->running_;
+        }
+        if (running) SetEvent(s->event_);
+    }
+
+    SRWLOCK lock_ = SRWLOCK_INIT;
+    HANDLE event_;  // the title's; not owned
+    uint32_t mask_;
+    uint32_t active_types_ = 0;
+    bool running_ = false;
+    bool updating_ = false;
+    std::vector<BYTE> scratch_;
+    std::vector<SpatialObject*> ending_;
+    PeriodicThread clock_;
+};
+
+SpatialObject::SpatialObject(SpatialStream* stream, uint32_t type) : stream_(stream), type_(type) {
+    stream_->AddRef();
+}
+SpatialObject::~SpatialObject() {
+    if (take_type()) stream_->release_type(type_);
+    stream_->Release();
+}
+HRESULT SpatialObject::GetBuffer(BYTE** buffer, UINT32* length) {
+    if (!buffer || !length) return E_POINTER;
+    *buffer = nullptr;
+    *length = 0;
+    if (!InterlockedCompareExchange(&active_, 0, 0)) return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    return stream_->buffer(buffer, length);
+}
+HRESULT SpatialObject::SetEndOfStream(UINT32) {
+    if (!InterlockedCompareExchange(&active_, 0, 0)) return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    if (InterlockedCompareExchange(&ending_, 1, 0) != 0) return S_OK;
+    const HRESULT hr = stream_->end_of_stream(this);
+    if (FAILED(hr)) InterlockedExchange(&ending_, 0);
+    return hr;
+}
+
+class SpatialClient final : public Unknown<ISpatialAudioClient2> {
+public:
+    HRESULT STDMETHODCALLTYPE GetStaticObjectPosition(AudioObjectType type, float* x, float* y, float* z) override {
+        if (!x || !y || !z) return E_POINTER;
+        // Unit directions: x right, y up, z back (the listener faces -z).
+        const float d = 0.70710678f;
+        float p[3]{};
+        switch (static_cast<uint32_t>(type)) {
+            case AudioObjectType_FrontLeft: p[0] = -d, p[2] = -d; break;
+            case AudioObjectType_FrontRight: p[0] = d, p[2] = -d; break;
+            case AudioObjectType_FrontCenter: p[2] = -1; break;
+            case AudioObjectType_LowFrequency: break;
+            case AudioObjectType_SideLeft: p[0] = -1; break;
+            case AudioObjectType_SideRight: p[0] = 1; break;
+            case AudioObjectType_BackLeft: p[0] = -d, p[2] = d; break;
+            case AudioObjectType_BackRight: p[0] = d, p[2] = d; break;
+            default: return E_INVALIDARG;
+        }
+        *x = p[0];
+        *y = p[1];
+        *z = p[2];
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetNativeStaticObjectTypeMask(AudioObjectType* mask) override {
+        if (!mask) return E_POINTER;
+        *mask = static_cast<AudioObjectType>(kBedMask);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetMaxDynamicObjectCount(UINT32* value) override {
+        if (!value) return E_POINTER;
+        *value = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetSupportedAudioObjectFormatEnumerator(IAudioFormatEnumerator** e) override {
+        if (!e) return E_POINTER;
+        *e = new (std::nothrow) FormatEnumerator();
+        return *e ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE GetMaxFrameCount(const WAVEFORMATEX* format, UINT32* frames) override {
+        if (!format || !frames) return E_POINTER;
+        if (!is_object_format(format)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+        *frames = kObjectFrames;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE IsAudioObjectFormatSupported(const WAVEFORMATEX* format) override {
+        if (!format) return E_POINTER;
+        return is_object_format(format) ? S_OK : AUDCLNT_E_UNSUPPORTED_FORMAT;
+    }
+    HRESULT STDMETHODCALLTYPE IsSpatialAudioStreamAvailable(REFIID stream, const PROPVARIANT*) override {
+        return IsEqualIID(stream, __uuidof(ISpatialAudioObjectRenderStream)) ? S_OK
+                                                                             : SPTLAUDCLNT_E_STREAM_NOT_AVAILABLE;
+    }
+    HRESULT STDMETHODCALLTYPE ActivateSpatialAudioStream(const PROPVARIANT* params, REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!params) return E_INVALIDARG;
+        if (!IsEqualIID(riid, __uuidof(ISpatialAudioObjectRenderStream))) {
+            log_missing_iid_once("ISpatialAudioClient::ActivateSpatialAudioStream", riid);
+            return E_NOINTERFACE;
+        }
+        if (params->vt != VT_BLOB || !params->blob.pBlobData ||
+            params->blob.cbSize < sizeof(SpatialAudioObjectRenderStreamActivationParams)) {
+            return E_INVALIDARG;
+        }
+        SpatialAudioObjectRenderStreamActivationParams p{};
+        std::memcpy(&p, params->blob.pBlobData, sizeof p);
+        if (!p.ObjectFormat || !p.EventHandle) return E_INVALIDARG;
+        if (!is_object_format(p.ObjectFormat)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+        const uint32_t mask = static_cast<uint32_t>(p.StaticObjectTypeMask);
+        if (mask & ~kStaticTypes) return E_INVALIDARG;  // AudioObjectType_Dynamic is not a static type
+        if (p.MinDynamicObjectCount > p.MaxDynamicObjectCount) return E_INVALIDARG;
+        // Dynamic objects asked for are granted as none available (GetAvailableDynamicObjectCount is 0), so a
+        // minimum above 0 is accepted rather than refused.
+        auto* s = new (std::nothrow) SpatialStream(p.EventHandle, mask);
+        if (!s) return E_OUTOFMEMORY;
+        if (!s->start_clock()) {
+            s->Release();
+            return E_OUTOFMEMORY;
+        }
+        if (InterlockedExchange(&g_spatial_logged, 1) == 0) {
+            std::fprintf(stderr,
+                         "[rt] audio: silent spatial stream: static objects 0x%x, dynamic objects %u..%u asked "
+                         "(0 available), %u frames a pass\n",
+                         mask, p.MinDynamicObjectCount, p.MaxDynamicObjectCount, kObjectFrames);
+        }
+        const HRESULT hr = s->QueryInterface(riid, out);
+        s->Release();
+        return hr;
+    }
+    // ISpatialAudioClient2
+    HRESULT STDMETHODCALLTYPE IsOffloadCapable(AUDIO_STREAM_CATEGORY, BOOL* capable) override {
+        if (!capable) return E_POINTER;
+        *capable = FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetMaxFrameCountForCategory(AUDIO_STREAM_CATEGORY, BOOL, const WAVEFORMATEX* format,
+                                                          UINT32* frames) override {
+        return GetMaxFrameCount(format, frames);
+    }
+
+private:
+    bool answers(REFIID riid) const override {
+        return IsEqualIID(riid, __uuidof(ISpatialAudioClient)) || IsEqualIID(riid, __uuidof(ISpatialAudioClient2));
+    }
+    static inline LONG g_spatial_logged = 0;
+};
+
 // ---- IPropertyStore -------------------------------------------------------------------------------------------
 
 class PropertyStore final : public Unknown<IPropertyStore> {
@@ -676,6 +1036,13 @@ public:
     HRESULT STDMETHODCALLTYPE Activate(REFIID riid, DWORD, PROPVARIANT*, void** ppv) override {
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
+        if (IsEqualIID(riid, __uuidof(ISpatialAudioClient)) || IsEqualIID(riid, __uuidof(ISpatialAudioClient2))) {
+            auto* spatial = new (std::nothrow) SpatialClient();
+            if (!spatial) return E_OUTOFMEMORY;
+            const HRESULT hr = spatial->QueryInterface(riid, ppv);
+            spatial->Release();
+            return hr;
+        }
         if (!IsEqualIID(riid, __uuidof(IAudioClient)) && !IsEqualIID(riid, __uuidof(IAudioClient2)) &&
             !IsEqualIID(riid, __uuidof(IAudioClient3))) {
             log_missing_iid_once("IMMDevice::Activate", riid);
