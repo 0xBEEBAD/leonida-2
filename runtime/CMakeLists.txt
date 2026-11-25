@@ -2463,8 +2463,12 @@ if(TARGET Vulkan::Headers)
                          PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     set_tests_properties(d3d12_big_compute_budget PROPERTIES ENVIRONMENT "LEONIDA_BIG_COMPILE_BUDGET_MB=260")
-    set_tests_properties(d3d12_big_compute_tight d3d12_big_compute_warmup PROPERTIES
-                         ENVIRONMENT "LEONIDA_BIG_COMPILE_BUDGET_MB=1")
+    set_tests_properties(d3d12_big_compute_tight PROPERTIES ENVIRONMENT "LEONIDA_BIG_COMPILE_BUDGET_MB=1")
+    # The warm-up thread builds every module after the submission here. Its 132 KiB modules are over the default
+    # LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES, which leaves big warm-ups to their first use while the title submits, so
+    # that limit is off for this test.
+    set_tests_properties(d3d12_big_compute_warmup PROPERTIES
+                         ENVIRONMENT "LEONIDA_BIG_COMPILE_BUDGET_MB=1;LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=0")
     set_tests_properties(d3d12_big_compute_eager PROPERTIES
                          ENVIRONMENT "LEONIDA_BIG_COMPILE_BUDGET_MB=1;LEONIDA_LAZY_COMPUTE=0")
     set_tests_properties(d3d12_big_compute_serial PROPERTIES  # neither of these two has a budget
