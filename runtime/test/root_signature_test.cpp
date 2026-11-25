@@ -421,24 +421,61 @@ int main() {
 
         // An empty signature is valid and uses nothing.
         const StagePackResult empty = pack_stage(RootSignature{}, Stage::Compute);
-        check(empty.ok && empty.first_sgpr.empty() && empty.end_sgpr == 4, "pack_stage: empty signature");
+        check(empty.ok && empty.first_sgpr.empty() && empty.spill_dword.empty() && empty.end_sgpr == 4 &&
+                  empty.spill_dwords == 0,
+              "pack_stage: empty signature");
     }
 
-    // pack_stage refuses a spill instead of truncating: compute has 28 SGPRs above s4, mesh 16 above s16.
+    // Compute spills parameters from the first one that does not fit whole from s4..s31 into the packed spill array
+    // (s[0:1]); non-compute stages still refuse spills. Compute budget is 28 inline SGPRs above s4, mesh 16 above s16.
     {
         RootSignature exact;
         exact.params = {consts(28)};
-        check(pack_stage(exact, Stage::Compute).ok, "pack_stage: 28 constants fill compute exactly");
+        const StagePackResult exact_r = pack_stage(exact, Stage::Compute);
+        check(exact_r.ok && exact_r.end_sgpr == 32 && exact_r.spill_dwords == 0 &&
+                  exact_r.spill_dword == std::vector<uint32_t>({kNoSpill}),
+              "pack_stage: 28 constants fill compute inline SGPRs with no spill");
+
         RootSignature over;
-        over.params = {consts(27), view()};  // the view would need s31..s32
+        over.params = {consts(27), view()};  // the view would need s31..s32, so it spills
         const StagePackResult r = pack_stage(over, Stage::Compute);
-        check(!r.ok && r.first_sgpr.empty() && r.error.find("root parameter 1") != std::string::npos &&
-                  r.error.find("spill") != std::string::npos,
-              "pack_stage: a parameter that does not fit whole is refused and named");
+        check(r.ok && r.first_sgpr == std::vector<uint32_t>({4, kNoSgpr}) &&
+                  r.spill_dword == std::vector<uint32_t>({kNoSpill, 0}) && r.end_sgpr == 31 && r.spill_dwords == 2,
+              "pack_stage: compute parameter that does not fit whole spills at offset 0");
+
         RootSignature fits_old;
-        fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, not 28 from s4
-        check(pack(fits_old).ok && !pack_stage(fits_old, Stage::Compute).ok,
-              "pack_stage: compute budget is 28, not 32");
+        fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, spills on compute from s4
+        const StagePackResult cs_fits = pack_stage(fits_old, Stage::Compute);
+        check(pack(fits_old).ok && cs_fits.ok && cs_fits.first_sgpr == std::vector<uint32_t>({kNoSgpr}) &&
+                  cs_fits.spill_dword == std::vector<uint32_t>({0}) && cs_fits.end_sgpr == 4 &&
+                  cs_fits.spill_dwords == 30,
+              "pack_stage: compute inline budget is 28 from s4; 30 constants spill all 30 dwords");
+
+        // Mixed spill without alignment padding: table (1), root view (2), constants (3) pack at 0, 1, 3.
+        RootSignature mixed_spill;
+        mixed_spill.params = {consts(26), view(), table(), view(), consts(3)};
+        const StagePackResult ms = pack_stage(mixed_spill, Stage::Compute);
+        check(ms.ok && ms.first_sgpr == std::vector<uint32_t>({4, 30, kNoSgpr, kNoSgpr, kNoSgpr}) &&
+                  ms.spill_dword == std::vector<uint32_t>({kNoSpill, kNoSpill, 0, 1, 3}) && ms.end_sgpr == 32 &&
+                  ms.spill_dwords == 6,
+              "pack_stage: compute spill packs mixed table, unaligned root view, and constants contiguously");
+
+        // Once one parameter spills, every subsequent parameter spills even if a later 1-dword table would fit in s31.
+        RootSignature monotonic;
+        monotonic.params = {consts(27), view(), table()};
+        const StagePackResult mr = pack_stage(monotonic, Stage::Compute);
+        check(mr.ok && mr.first_sgpr == std::vector<uint32_t>({4, kNoSgpr, kNoSgpr}) &&
+                  mr.spill_dword == std::vector<uint32_t>({kNoSpill, 0, 2}) && mr.end_sgpr == 31 &&
+                  mr.spill_dwords == 3,
+              "pack_stage: first spilling parameter sends every subsequent parameter to the spill array");
+
+        // 64-dword D3D12 cost still holds for spilling compute signatures.
+        RootSignature max64;
+        max64.params = {consts(64)};
+        const StagePackResult m64 = pack_stage(max64, Stage::Compute);
+        check(m64.ok && m64.end_sgpr == 4 && m64.spill_dwords == 64 && m64.d3d12_cost == 64,
+              "pack_stage: 64-dword spilled compute signature accepted");
+
         RootSignature tables;
         tables.params.assign(20, table());  // one dword each: compute s4..s23; pack() needs 40
         check(pack_stage(tables, Stage::Compute).ok && !pack(tables).ok,
@@ -446,35 +483,17 @@ int main() {
         tables.params.assign(16, table());  // fills mesh s16..s31 exactly
         check(pack_stage(tables, Stage::Mesh).ok, "pack_stage: 16 tables fill the mesh stage exactly");
         tables.params.push_back(table());
-        check(!pack_stage(tables, Stage::Mesh).ok, "pack_stage: a 17th table spills on mesh");
+        const StagePackResult mesh_spill = pack_stage(tables, Stage::Mesh);
+        check(!mesh_spill.ok && mesh_spill.first_sgpr.empty() &&
+                  mesh_spill.error.find("root parameter 16") != std::string::npos &&
+                  mesh_spill.error.find("spill") != std::string::npos,
+              "pack_stage: a 17th table still refuses to spill on mesh");
+        check(!pack_stage(over, Stage::Pixel).ok && !pack_stage(over, Stage::Vertex).ok,
+              "pack_stage: non-compute graphics stages still refuse spills");
     }
 
-    // Spill::block (graphics): the parameters that fit stay inline from s8; the first that does not, and every one
-    // after it even if it would fit, go to the argument block behind s[0:1] and take no SGPR, as on the console.
-    {
-        RootSignature sig;
-        sig.params = {table(), view(), consts(20), table(), consts(1)};  // s8, s9..s10, s11..s30, then s31 is free
-        const StagePackResult r = pack_stage(sig, Stage::Vertex, Spill::block);
-        check(r.ok && r.first_sgpr == std::vector<uint32_t>({8, 9, 11, 31, kNoSgpr}),
-              "pack_stage block: a table at s31 still fits, the constant after it spills");
-        check(r.first_spilled == 4 && r.spilled_dwords == 1 && r.end_sgpr == 32,
-              "pack_stage block: the first spilled parameter and its dwords");
-        RootSignature big;
-        big.params = {table(), consts(30), table()};  // the 30 constants cannot fit: they and the last table spill
-        const StagePackResult b = pack_stage(big, Stage::Vertex, Spill::block);
-        check(b.ok && b.first_sgpr == std::vector<uint32_t>({8, kNoSgpr, kNoSgpr}) && b.first_spilled == 1 &&
-                  b.spilled_dwords == 31 && b.end_sgpr == 9,
-              "pack_stage block: every parameter after the first spilled one spills, even one that would fit");
-        check(!pack_stage(big, Stage::Vertex).ok, "pack_stage: the default still refuses a spill");
-        RootSignature small;
-        small.params = {table(), consts(4)};
-        const StagePackResult fits = pack_stage(small, Stage::Vertex, Spill::block);
-        check(fits.ok && fits.first_spilled == SIZE_MAX && fits.spilled_dwords == 0,
-              "pack_stage block: nothing spills when everything fits");
-    }
-
-    // The graphics root window (D3D-448 follow-up): the graphics bind point lays a signature out once with
-    // Stage::Vertex, root dword k at push dword 8 + k. A vertex, pixel or geometry shader reads SGPR i from push
+    // The graphics root window (D3D-448-GRAPHICS): the graphics bind point lays a signature out once with
+    // Stage::Pixel, root dword k at push dword 8 + k. A vertex, pixel or geometry shader reads SGPR i from push
     // dword i, and a mesh shader its s16 + k from push dword 8 + k (tools/rdna2spirv.py, user_data_dword), so every
     // stage of a pipeline finds each parameter in the same dword. The mesh window holds 16 dwords, the others 24.
     {
@@ -517,14 +536,19 @@ int main() {
 
     // pack_stage keeps pack()'s validation.
     {
+        RootSignature invalid_sig;
+        RootParameter bad_param;
+        bad_param.type = static_cast<ParamType>(0xffffffffu);
+        invalid_sig.params = {bad_param};
+        check(!pack_stage(invalid_sig, Stage::Compute).ok, "pack_stage: invalid parameter enum rejected");
         RootSignature zero;
         zero.params = {consts(0)};
         check(!pack_stage(zero, Stage::Compute).ok, "pack_stage: zero-value constants rejected");
-        // Every parameter takes at least as many SGPRs as it costs, so the 32-SGPR budget refuses before the
-        // 64-dword cost limit can; an over-cost signature is refused all the same.
         RootSignature costly;
-        costly.params = {consts(40), consts(30)};
-        check(!pack_stage(costly, Stage::Compute).ok, "pack_stage: over-cost signature refused");
+        costly.params = {consts(32), consts(33)};
+        const StagePackResult costly_r = pack_stage(costly, Stage::Compute);
+        check(!costly_r.ok && costly_r.error.find("64-dword") != std::string::npos,
+              "pack_stage: over-cost signature refused even when compute spills");
         RootSignature many;
         many.params.assign(65, table());
         check(!pack_stage(many, Stage::Compute).ok, "pack_stage: more than 64 parameters rejected");
