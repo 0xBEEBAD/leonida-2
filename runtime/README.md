@@ -304,6 +304,47 @@ document names.
 | `LEONIDA_TITLE_MEMORY_MB` | unset | Caps the title memory limit (in MiB, clamped to `2048..65536`) reported by both `XSystemGetAppMemoryUsageLimit` (`xgameruntime.cpp`) and `XMemGetWorkingSetStatistics` (`xmem.cpp`). Useful on 16 GB RAM / low-VRAM hosts to prevent oversized title pools; invalid or non-positive values are ignored and fall back to the host memory report. |
 | `LEONIDA_STACKS` | unset | Comma-separated whole seconds after the title's entry point is called (e.g. `90,180`). At each time `--run` suspends every other thread in turn just long enough to copy its context and stack, then unwinds the copy (title frames through the unwind tables the loader registers) and prints to stderr `[rt] stacks t=<s> thread <tid> (<thread description, or start address>):` and up to 40 `#i module+0xRVA` frames, innermost first; a chain identical to an earlier thread's prints `same as thread <tid>`. |
 
+### Switches of the D3D12 layer for a retail boot
+
+Read once per process, by the Vulkan D3D12 layer (`shims/d3d12_vulkan_device.cpp`) unless the row names another file.
+"on" means the behaviour is the default and `0` turns it off; "unset" means it is off until the variable is set. The
+ones marked *diagnostic* only add log lines or exist to compare a run with and without a change; nothing needs them.
+
+| variable | default | what it changes |
+|---|---|---|
+| `LEONIDA_LAZY_PIPELINES` | on | Graphics pipelines are built at their first draw. `0` builds each at `CreatePipelineState`, as before; the title creates far more pipelines at startup than it draws with. |
+| `LEONIDA_LAZY_COMPUTE` | on | Compute pipelines are built at the first dispatch that names them, or earlier by the warm-up thread. `0` builds each at `CreateComputePipelineState`. |
+| `LEONIDA_COMPUTE_WARMUP_MAX_BYTES` | `1048576` | The largest SPIR-V module, in bytes, the background warm-up thread (`LEONIDA_COMPUTE_WARMUP`) builds ahead of its first dispatch. Larger modules wait for that dispatch. |
+| `LEONIDA_SERIAL_BIG_COMPILES` | on | Compute modules over 128 KiB of SPIR-V compile one at a time, because the driver's compiler needs hundreds of MiB for each. `0` lets them compile side by side. |
+| `LEONIDA_CONSOLE_FORMATS` | on | Texture descriptions the console accepts and a PC GPU may not (an R9G9B9E5 render target, an sRGB RGBA8 or BGRA8 texture with unordered access) get a host format that can do the job. `0` refuses them, as a PC D3D12 runtime does. |
+| `LEONIDA_CONSOLE_HEAP_SHADOW` | on | A console descriptor heap has a copy in the descriptor arena that the shaders read. `0` keeps its bytes in the title's memory only (the comparison for a run that misbehaves with the copy). |
+| `LEONIDA_IMPORT_BELOW_ARENA` | unset | `1` keeps a host-memory import that the driver put below the GPU address arena. By default such an import is not used and the shadow buffer in the arena answers, because a V# cannot name an address below the arena. |
+| `LEONIDA_ORDER_TEXTURE_UPLOADS` | on | A title texture in a host-transfer image is filled through the ordered host copy (`write_host_texture`). `0` fills it with `WriteToSubresource`. |
+| `LEONIDA_PLACED_IMAGE_KEYS` | on | A texture the title placed at its own address (device slot 133) and that the GPU writes keeps its own image address as its T# key. `0` re-keys it to the title address, like a texture the GPU does not write. |
+| `LEONIDA_PLACED_TEXTURE_UAV` | on | Device slot 71 writes an unordered-access view of a texture in the title's placed memory. `0` writes a null descriptor. |
+| `LEONIDA_REFRESH_MAPPED_TEXTURES` | on | A mapped slot-133 texture is refilled outside the fill budget, and its pages are committed before they are read. `0` treats it like any other title texture. |
+| `LEONIDA_TEXTURE_PAGE_CHECK` | on | The pages of a title texture are checked for being readable before they are hashed or copied. `0` checks only a texture whose check is already pending. |
+| `LEONIDA_TITLE_TEXTURE_PERIOD_MS` | `16` | The shortest time between two passes over the textures filled from the title's memory. |
+| `LEONIDA_TITLE_TEXTURE_CHECK_KB` | `4096` | How many KiB of those textures one pass hashes to find changed ones. |
+| `LEONIDA_TITLE_TEXTURE_FILL_MB` | `32` | How many MiB of changed textures one pass fills again; the rest waits for the next pass. |
+| `LEONIDA_TEXTURE_HASH_BUDGET_US` | `400` | Microseconds a pass may spend hashing before it stops at a texture boundary. `0` leaves the byte budget alone to bound it. |
+| `LEONIDA_TEXTURE_SWEEP_BUDGET_US` | `400` | Microseconds a pass may spend on residency checks and uploads between textures. |
+| `LEONIDA_TITLE_BUFFERS_MB` | `512` | The most memory, in MiB, of buffers made over the title's own memory for vertex and index views that name it. |
+| `LEONIDA_TITLE_BUFFER_COVERAGE` | on | Such a view counts as covered only when a known buffer spans all its bytes. `0` asks for the first byte only. |
+| `LEONIDA_SHADOW_FULL_WALK` | unset | *Diagnostic.* `1` queries every page of the title-memory shadows at every refresh, as before unchanged generations were skipped. |
+| `LEONIDA_STRICT_REPLAY` | unset | *Diagnostic.* `1` makes a draw or dispatch with an unresolvable resource fail its command list (`src/vulkan_replay.h`); by default it is dropped and logged. |
+| `LEONIDA_VOLUME_MIPS` | on | The XG layout of a 3D texture with mips or a block format is computed (`shims/xg_xs_layout.h`). `0` refuses it. |
+| `LEONIDA_TITLE_WATCHDOG` | unset | `1` leaves the title's own hang watchdog armed. By default `gta6rt --run` keeps it from firing while the game thread waits for the driver (`src/main.cpp`), and only in the build the watchdog was measured in. |
+| `LEONIDA_PEEK_SECONDS` | `10` | *Diagnostic.* The period of the `LEONIDA_PEEK` thread (`src/main.cpp`), which prints 8-byte values of the title's image. |
+| `LEONIDA_INPUT_LOG` | on | The GameInput shim logs every press in `LEONIDA_INPUT_SCRIPT`'s form (`name@seconds`), so a session played by hand can be replayed. `0` turns the lines off. |
+| `LEONIDA_LOG_ALLOCINFO` | unset | *Diagnostic.* `1` logs every device slot 25 call (`GetResourceAllocationInfo`) with its thread, description and sizes (`shims/d3d12_xs_device.cpp`). |
+| `LEONIDA_LOG_EXE_PIPELINES` | unset | *Diagnostic.* When set, one line per distinct graphics pipeline that uses a program translated from the executable's inline containers. |
+| `LEONIDA_MEM_PROBE_CACHE` | unset | *Diagnostic.* `1` adds the pipeline cache's size to the memory probe's report; the driver serializes the whole cache to answer. |
+| `LEONIDA_TEXTURE_PROBE` | unset | *Diagnostic.* Logs a `[rt] texture-probe` line for every shader resource view of a texture in the title's memory. |
+| `LEONIDA_CAPTURE_SOURCE` | unset | *Diagnostic.* With `LEONIDA_CAPTURE`, `1` also reads back the presented source texture itself (`src/vulkan_present.h`). |
+| `LEONIDA_XG_TRACE_FORMAT` | unset | *Diagnostic.* A DXGI format number: logs the first 256 XG layout computers of that format, whatever `LEONIDA_XG_TRACE`'s cap (`shims/xg_xs.cpp`). |
+| `LEONIDA_FSDRAW_POKE_CB` | unset | *Diagnostic, changes what is drawn.* An experiment of the full-screen draw probe (`src/fsdraw_probe.h`): writes a known colour into the constant buffer a bound table names, to prove the path from the table to the render target. |
+
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
 imports are unknown until it is available.
