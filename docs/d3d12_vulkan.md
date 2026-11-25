@@ -795,7 +795,7 @@ free-list links (`value = slot_index + 1`, ending at `0xFFFFFFFF`); 261 T# with 
 5,840 V# (3,024 with a null base, 2,816 with a sub-4-GiB arena base); 1,296 slots containing interleaved constant data
 (IEEE-754 floats); and zero bare 32-bit GPU addresses. Console descriptors do not store standalone 32-bit pointer words;
 buffer and image base addresses are packed into standard 48-bit V# and T# records conforming to the arena layout
-(`tests/test_descriptor_address_translation.py`); the literal S#s of shaders (`literal_samplers` in the index),
+(modeled by model-level reference contract suite `tests/test_descriptor_address_translation.py`); the literal S#s of shaders (`literal_samplers` in the index),
 which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
 pipeline creation comes with the shader index, #291);
 custom border colours without VK_EXT_custom_border_color, and minimum/maximum filters, anisotropy or mirror-once addressing without the Vulkan

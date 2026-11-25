@@ -85,7 +85,7 @@ your own copy or with a synthetic test before you build on it, and record the re
   261 T# with layer-assigned addresses above 4 GiB; 5,840 V# (3,024 with a null base, 2,816 with a sub-4-GiB base);
   1,296 slots of interleaved constant data; and **0 slots that are bare 32-bit GPU addresses**.
 - **Conclusion:** BL-4 hypothesis is not supported on this stack. Descriptors pack 48-bit addresses into V# / T# fields rather
-  than exposing bare 32-bit pointer words. Verified by synthetic contract suite `tests/test_descriptor_address_translation.py` (53 tests).
+  than exposing bare 32-bit pointer words. Characterized by model-level reference contract suite `tests/test_descriptor_address_translation.py` (53 tests modeling the documented arena bitfield partitioning and address extraction contracts).
 - **Record it in:** [d3d12_vulkan.md](d3d12_vulkan.md) §3.4 with the census breakdown.
 - **Needs:** none (census completed and verified).
 
