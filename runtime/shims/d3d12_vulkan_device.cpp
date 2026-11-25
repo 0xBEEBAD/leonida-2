@@ -1422,7 +1422,7 @@ bool startup_cache_checkpoints_enabled() {
 
 // Writes the session cache at a startup checkpoint or during device teardown. The size cap applies to either write.
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
-                                 bool checkpoint = false) {
+                                 bool checkpoint = false, const char* op = nullptr) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
     auto limit = pipeline_cache_save_limit();
     // The output is an opaque Vulkan blob. A prefix is not an incremental cache.
@@ -1453,7 +1453,7 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
                     written <= size && staging.publish(path, written);
     if (trace_pipeline_compile())
         std::fprintf(stderr, "[rt] pipeline-cache op=%s bytes=%zu query_us=%lld fill_us=%lld publish_us=%lld ok=%d result=%d\n",
-                     checkpoint ? "checkpoint" : "teardown", written, queried-start, filled-queried,
+                     op ? op : checkpoint ? "checkpoint" : "teardown", written, queried-start, filled-queried,
                      compile_us()-filled, int(ok), int(result));
     if (ok) std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
     else std::fprintf(stderr, "[rt] d3d12: pipeline cache snapshot incomplete (%d); previous session retained\n", int(result));
@@ -10663,6 +10663,14 @@ private:
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
+// The live devices whose session pipeline cache an ending process writes (save_pipeline_caches_at_exit). A title
+// never releases its device, so ~Device, the only other writer, does not run in a real boot: without this, a run that
+// ends (normally, at a console close or in a crash) keeps none of what it compiled. Timed, so a crash handler that
+// finds it held gives up instead of hanging the process.
+std::timed_mutex exit_cache_mutex;
+std::vector<DeviceState*> exit_cache_devices;
+std::atomic<bool> exit_cache_saved{false};
+
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
     PFN_vkDestroyDevice destroy_device = nullptr;
@@ -10689,6 +10697,10 @@ public:
         // worker still has a warm-up to run is one too high. The proxy's count waits for the pool.
         rt::d3d12_xs::set_reference_settler([] { PipelineCompiler::instance().wait_idle(); });
         state_.info = info;
+        {
+            std::lock_guard lock(exit_cache_mutex);
+            exit_cache_devices.push_back(&state_);
+        }
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -11539,6 +11551,11 @@ public:
     }
 
     ~Device() override {
+        {
+            // Before anything goes: an exit save in progress finishes with this device first.
+            std::lock_guard lock(exit_cache_mutex);
+            std::erase(exit_cache_devices, &state_);
+        }
         leonida::value_sink::clear_arena(&state_);  // first: it waits for a value write into the arena in progress
         raw_images_.clear();
         geometry_refresher_.reset();  // its refresh uses state_.geometry
@@ -16866,6 +16883,33 @@ bool stop_pipeline_compiles(unsigned wait_ms) {
         std::fprintf(stderr, "[rt] d3d12: a background pipeline build was still running after %u ms at exit\n",
                      wait_ms);
     return idle;
+}
+
+bool save_pipeline_caches_at_exit(unsigned wait_ms) {
+    if (exit_cache_saved.exchange(true)) return false;  // once: a crash during the normal exit's save does not redo it
+    std::unique_lock lock(exit_cache_mutex, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(wait_ms))) {
+        std::fprintf(stderr, "[rt] d3d12: device list busy for %u ms at exit; pipeline_cache.session.bin not written\n",
+                     wait_ms);
+        return false;
+    }
+    bool wrote = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    for (DeviceState* d : exit_cache_devices) {
+        if (!d->context || !d->pipeline_cache_handle) continue;
+        // A build that started on a title thread (not the compiler's, which stop_pipeline_compiles has stopped) is
+        // given until the deadline; past it the previous session file is kept, as at teardown.
+        while (d->active_compiles.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (const unsigned building = d->active_compiles.load()) {
+            std::fprintf(stderr, "[rt] d3d12: %u pipeline build(s) still running at exit; "
+                                 "pipeline_cache.session.bin not written\n", building);
+            continue;
+        }
+        save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false, "exit");
+        wrote = true;
+    }
+    return wrote;
 }
 
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out) {
