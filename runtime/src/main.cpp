@@ -197,7 +197,9 @@ bool configure_first_run_ui(const std::filesystem::path& package, std::filesyste
         {L"LEONIDA_D3D12", L"vulkan"}, {L"LEONIDA_ARENA_MB", L"2048"},
         {L"LEONIDA_GRAPHICS_STAGE_LAYOUT", L"1"}, {L"LEONIDA_PIPELINE_COMPILE", L"on-demand"},
         {L"LEONIDA_FRAME_PACING", L"1"},
-        {L"LEONIDA_KEYBOARD_PAD", L"always"},
+        // Focused, not always: keys typed into another window must not press anything on a consent page.
+        // Scripted presses (LEONIDA_INPUT_SCRIPT) still run while the window is unfocused.
+        {L"LEONIDA_KEYBOARD_PAD", L"1"},
     };
     for (const auto& setting : settings) {
         if (!set_default(setting.name, setting.value)) return false;
