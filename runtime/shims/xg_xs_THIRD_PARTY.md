@@ -15,7 +15,7 @@ also checked against [xbox-emulator, commit 410e01f][xbox-emulator],
 GPL-3.0, in `crates/compat/xg_xs/src/{computer,layout}.rs`.
 
 xcl (GPL-2.0-only) provided evidence about GFX10 mip ordering, compressed
-block units and the slot 10 contract. TuxBox (unlicensed) provided
+block units and the slot 10 contract. TuxBox (Apache-2.0) provided
 published differential coverage for tile shapes and mode selection.
 Both were references for behavior. The swizzle equations used here
 come from the original MIT-licensed AMD sources.
