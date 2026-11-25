@@ -4,7 +4,9 @@
 // PSO it returns (ID3D12Object private data, so the copy is freed with the PSO). Slot 55 takes a base PSO and up to
 // three state records; it patches a copy of the base stream and creates the new PSO through the same path.
 //
-// Record layout (TomBox's create_derived_pso_x, GPL-3.0): 0x14c bytes, a u32 tag, then the state payload at +4.
+// Record layout: 0x14c bytes, a u32 tag, then the state payload at +4.
+// Layout facts only, no code: omonkeyz/xbox-emulator crates/compat/d3d12_xs/src/device_wrap.rs (create_derived_pso_x; the
+// continuation of drycheetah84/TomBox), GPL-3.0-or-later.
 //   tag 0: D3D12_DEPTH_STENCIL_DESC (0x34) -> the DEPTH_STENCIL or DEPTH_STENCIL1 subobject (first 0x34 bytes)
 //   tag 1: D3D12_RASTERIZER_DESC (0x2c)
 //   tag 2: D3D12_BLEND_DESC (0x148)
