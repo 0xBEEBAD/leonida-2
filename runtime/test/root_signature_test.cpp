@@ -131,17 +131,20 @@ int main() {
         check(!r.ok && r.error.find("64-dword") != std::string::npos,
               "65 constants refused by cost limit");
     }
-    // 64 constants are within the cost limit, as on the host: only the unmodelled spill past 32 user dwords refuses
-    // them here, and that is what the error says.
+    // 64 constants are within the cost limit, as on the host: pack() and the graphics stages refuse them only for
+    // the spill past the user SGPRs, and that is what the error says; compute spills them whole.
     {
         RootSignature sig;
         sig.params = {consts(64)};
         const PackResult r = pack(sig);
         check(!r.ok && r.error.find("64-dword") == std::string::npos && r.error.find("spill") != std::string::npos,
               "64 constants pass the cost limit (refused only as a spill)");
+        const StagePackResult p = pack_stage(sig, Stage::Pixel);
+        check(!p.ok && p.error.find("64-dword") == std::string::npos && p.error.find("spill") != std::string::npos,
+              "pack_stage: 64 constants pass the cost limit for a pixel shader (refused only as a spill)");
         const StagePackResult c = pack_stage(sig, Stage::Compute);
-        check(!c.ok && c.error.find("64-dword") == std::string::npos && c.error.find("spill") != std::string::npos,
-              "pack_stage: 64 constants pass the cost limit (refused only as a spill)");
+        check(c.ok && c.d3d12_cost == 64 && c.spill_dword == std::vector<uint32_t>({0}) && c.spill_dwords == 64,
+              "pack_stage: 64 constants pass the cost limit for compute, spilled whole");
         sig.params = {consts(32), consts(0), consts(32)};
         check(pack(sig).error.find("spill") != std::string::npos, "32 + 0 + 32 constants cost 64, not more");
     }
