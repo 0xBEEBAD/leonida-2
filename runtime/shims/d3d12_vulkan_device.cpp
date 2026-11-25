@@ -17765,7 +17765,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_mesh_shader: mesh-shader PSOs are unsupported\n");
         if (!info.transform_feedback)
             std::fprintf(stderr,
-                         "[rt] d3d12: the GPU has no VK_EXT_transform_feedback: StreamOutput PSOs are unsupported\n");
+                         "[rt] d3d12: the GPU has no VK_EXT_transform_feedback: stream output is unsupported and "
+                         "SO_STATISTICS pools read zero\n");
         if (has_as && has_dho && has_rq && chosen12.bufferDeviceAddress) {
             as_features.pNext = &rq_features;
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
