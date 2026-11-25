@@ -3204,7 +3204,13 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         if constexpr (pc == kListNotForwarded) {
 #ifdef LEONIDA_VULKAN_DEVICE
             if constexpr (Slot == 71 || Slot == 72) {
-                if (leonida::label::enabled()) {
+                // One owner per write: a list the list values track lands its slot 71-74 writes itself, at the part's
+                // fence and with a D3D12 timestamp query for flags 1 and 2. The label path would store to the same
+                // address again from its own command-buffer completion and a Vulkan query, so a late label could
+                // rewind a rising counter or split a begin/end pair. It answers only for lists not tracked here
+                // (LEONIDA_LIST_VALUES=0, bundles).
+                if (leonida::label::enabled() && !self->track_values) {
+                    list_values::bump(list_values::counters().labels_handed);
                     const unsigned width = Slot == 71 ? 4u : 8u;
                     const unsigned clock = Slot == 72 ? ((a4 & 1) ? 1u : ((a4 & 2) ? 2u : 0u)) : 0u;
                     auto target = leonida::label::memory().capture(a1, width);
@@ -6488,7 +6494,7 @@ const char* list_tail_slot_name(unsigned slot, unsigned char console_layout) {
     X(waits_relayed) X(gates_held) X(gates_met) X(gates_timed_out) X(cuts) X(cuts_deferred) X(cut_failures)  \
     X(gates_short) X(demotions) X(late_met) X(bundle_ops) X(releases) X(release_us) X(release_us_max)        \
     X(pass_us_max) X(release_stalls) X(remaps_now) X(remaps_deferred) X(remaps_failed) X(remap_wait_us_max)    \
-    X(stamps_gpu) X(stamps_cpu)
+    X(stamps_gpu) X(stamps_cpu) X(labels_handed)
 
 ListValueStats list_value_stats() {
     const list_values::Counters& c = list_values::counters();

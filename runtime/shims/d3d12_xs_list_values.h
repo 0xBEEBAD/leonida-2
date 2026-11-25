@@ -169,6 +169,8 @@ struct Counters {
     std::atomic<std::uint64_t> remaps_now{0}, remaps_deferred{0}, remaps_failed{0}, remap_wait_us_max{0};
     // Timestamp writes (write64 flags 1 and 2) landed with the GPU's timestamp, and with the CPU clock at landing.
     std::atomic<std::uint64_t> stamps_gpu{0}, stamps_cpu{0};
+    // List slot 71/72 writes handed to the GPU-label path (LEONIDA_GPU_LABELS) of a list these values do not track.
+    std::atomic<std::uint64_t> labels_handed{0};
 };
 
 inline Counters& counters() {

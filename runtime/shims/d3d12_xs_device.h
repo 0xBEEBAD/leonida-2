@@ -475,6 +475,7 @@ struct ListValueStats {
     std::uint64_t release_stalls;                     // gate Signals still running after a second
     std::uint64_t remaps_now, remaps_deferred, remaps_failed, remap_wait_us_max;  // queue slot 31
     std::uint64_t stamps_gpu, stamps_cpu;  // write64 flags 1/2 landed with the GPU's timestamp, the CPU's clock
+    std::uint64_t labels_handed;           // slot 71/72 writes given to LEONIDA_GPU_LABELS (lists not tracked here)
 };
 ListValueStats list_value_stats();
 void reset_list_value_stats();

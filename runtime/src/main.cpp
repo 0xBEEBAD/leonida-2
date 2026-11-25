@@ -195,7 +195,7 @@ bool configure_first_run_ui(const std::filesystem::path& package, std::filesyste
     const struct { const wchar_t* name; const wchar_t* value; } settings[] = {
         {L"LEONIDA_D3D12", L"vulkan"}, {L"LEONIDA_ARENA_MB", L"2048"},
         {L"LEONIDA_GRAPHICS_STAGE_LAYOUT", L"1"}, {L"LEONIDA_PIPELINE_COMPILE", L"on-demand"},
-        {L"LEONIDA_GPU_LABELS", L"1"}, {L"LEONIDA_FRAME_PACING", L"1"},
+        {L"LEONIDA_FRAME_PACING", L"1"},
         {L"LEONIDA_KEYBOARD_PAD", L"always"},
     };
     for (const auto& setting : settings) {
