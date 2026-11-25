@@ -365,6 +365,7 @@ float sdr_white_nits_from_level(unsigned long level);
 // presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
 class WindowPresenter {
 public:
+    // `device` is kept alive while the presenter lives; null when the owner guarantees that itself.
     WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter);
     ~WindowPresenter();
     WindowPresenter(const WindowPresenter&) = delete;
@@ -414,7 +415,11 @@ private:
 bool device_has_swapchain_colorspace(ID3D12Device* device);
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
-std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
+// The presenter holds a reference on the device, or on the Xbox device proxy that is its outer identity, so it may
+// outlive the caller's reference. `hold_device` false takes none: for a presenter that the device proxy owns itself
+// and destroys before its device (the presentation gta6rt's proxy builds, d3d12_xs_device.cpp), where a reference
+// to the proxy would keep the proxy, the presenter and its window alive for good.
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window, bool hold_device = true);
 
 // Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read (docs section
 // 3.5). Built when a Vulkan device creates the root signature. A signature can be bound at either bind point, so it

@@ -14205,12 +14205,12 @@ BindlessRoom bindless_room(ID3D12Device* device) {
 
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
     : device_(device), presenter_(std::move(presenter)) {
-    device_->AddRef();
+    if (device_) device_->AddRef();
 }
 
 WindowPresenter::~WindowPresenter() {
     presenter_.reset();  // before the device it runs on
-    device_->Release();
+    if (device_) device_->Release();
 }
 
 namespace {
@@ -14312,7 +14312,7 @@ bool device_has_swapchain_colorspace(ID3D12Device* device) {
     return d && d->state().info.swapchain_colorspace;
 }
 
-std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window) {
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window, bool hold_device) {
     // A title holds the Xbox-ABI proxy, not the layer's device: look behind it, as the helpers above do.
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     Device* d = Device::from<Device>(real ? real : device);
@@ -14376,7 +14376,8 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
     }
-    auto window_presenter = std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
+    auto window_presenter =
+        std::make_unique<WindowPresenter>(hold_device ? d->holder() : nullptr, std::move(presenter));
     window_presenter->set_window(window);
     return window_presenter;
 }

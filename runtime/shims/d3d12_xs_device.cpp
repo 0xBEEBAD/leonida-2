@@ -1474,7 +1474,10 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
         if (!target) return state;
         GetClientRect(target, &client);
     }
-    auto presenter = rt::d3d12::create_window_presenter(device->real, target);
+    // No device reference for this presenter: the device's outer identity is this proxy, which owns the state, so
+    // a reference would be a cycle and the proxy, the presenter and the window would never go. The proxy destroys
+    // the state before it releases its device (proxy_release).
+    auto presenter = rt::d3d12::create_window_presenter(device->real, target, /*hold_device=*/false);
     if (!presenter) {
         if (splash_only) return nullptr;  // ordinary PresentX will still try
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
