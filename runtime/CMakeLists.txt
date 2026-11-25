@@ -3712,21 +3712,11 @@ if(TARGET Vulkan::Headers)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw.mesh
         COMMENT "Compiling the mesh test shader ms_draw.mesh"
         VERBATIM)
-      # The mesh test's signature is on the s0 fallback layout (see d3d12_mesh_test.cpp), so its pixel shader is
-      # ps_draw.frag reading the tint VA at s2:s3 instead of s10:s11.
-      set(LEONIDA_TEST_PS_S0 ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_draw_s0.spv)
-      add_custom_command(
-        OUTPUT ${LEONIDA_TEST_PS_S0}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -DROOT_BASE=0 -o ${LEONIDA_TEST_PS_S0}
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_draw.frag
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_draw.frag
-        COMMENT "Compiling the mesh test's pixel shader ps_draw.frag (s0 layout)"
-        VERBATIM)
       add_executable(d3d12_mesh_test test/d3d12_mesh_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_MS}
-                     ${LEONIDA_TEST_PS_S0} ${LEONIDA_TEST_VS_FULLSCREEN})
+                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_VS_FULLSCREEN})
       target_link_libraries(d3d12_mesh_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-                                 LEONIDA_TEST_MS_SPV="${LEONIDA_TEST_MS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS_S0}"
+                                 LEONIDA_TEST_MS_SPV="${LEONIDA_TEST_MS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
                                  LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
       target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)

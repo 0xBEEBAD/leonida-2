@@ -529,6 +529,11 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        // A mesh shader reads the root arguments from s16 through a 16-dword window (RootArgumentLayout::mesh_ok).
+        if (!graphics_.layout->mesh_ok) {
+            stub("DispatchMesh(root signature larger than a mesh shader's root window)");
+            return check(false);
+        }
         if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
@@ -1440,7 +1445,18 @@ private:
         if ((count && !data) || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
         const std::uint32_t first = first_dword(state, *p);
+        if (first == rt::rootsig::kNoSgpr) return spilled();
         for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
+    }
+
+    // A parameter in the spill array behind s[0:1] (a compute signature past s31: pack_stage gives it no SGPR, only a
+    // spill_dword): that array is not written yet, so its value is not stored; kNoSgpr plus an offset must never
+    // reach write(), where it would wrap round to s0.
+    static void spilled() {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "[rt] d3d12: root arguments in the spill array behind s[0:1] are not stored (the "
+                                 "array is not written yet)\n");
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
@@ -1466,6 +1482,7 @@ private:
                 tables_.emplace_back(va, p->table_descriptors);
         }
         const std::uint32_t first = first_dword(state, *p);
+        if (first == rt::rootsig::kNoSgpr) return spilled();
         write(state, first, std::uint32_t(va));
         // In the console layouts a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
         // live below 4 GiB); a root view keeps both halves. pack()'s graphics layout gives every address two dwords.
