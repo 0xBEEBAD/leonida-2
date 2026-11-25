@@ -98,7 +98,8 @@ Useful switches:
   `ROSETTA_ADVERTISE_AVX=1` instead). The game itself still needs AVX, so this is for the #UD emulation work (see
   [cpu_features.md](cpu_features.md#hosts-without-avx) for what works on a host without AVX).
 * `LEONIDA_SKIP_INT3=1` (with `--trace`) steps over each int3 in guest code and logs it once per address as an
-  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
+  `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on). It is
+  read when the trace opens.
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
