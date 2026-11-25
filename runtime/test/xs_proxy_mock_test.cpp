@@ -16,6 +16,7 @@
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
 #include "../src/d3d12_xs_frame_events.h"
+#include "../src/native_pso.h"
 
 #include <d3d12.h>
 #include <windows.h>
@@ -2534,6 +2535,82 @@ D3D12_RESOURCE_DESC target_desc(std::uint64_t width, UINT height, DXGI_FORMAT fo
     return d;
 }
 
+// ---- Device slot 57, the native graphics pipeline state: the factory first, the PC description as the fallback ----
+
+HRESULT g_factory_result = E_NOTIMPL;
+unsigned g_factory_calls = 0;
+ID3D12Device* g_factory_device = nullptr;
+const void* g_factory_root = nullptr;
+void* const kFactoryPipeline = reinterpret_cast<void*>(0x5757);
+
+HRESULT native_factory(ID3D12Device* real, const leonida::native_pso::GraphicsDesc& desc, REFIID, void** out) {
+    ++g_factory_calls;
+    g_factory_device = real;
+    g_factory_root = desc.root_signature;
+    if (SUCCEEDED(g_factory_result)) *out = kFactoryPipeline;
+    return g_factory_result;
+}
+
+// A description with no stage and no state blob: the fallback builds its PC description from defaults and hands it
+// to the device's CreateGraphicsPipelineState (PC slot 10), which the mock records.
+int check_slot57_native_graphics() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    const IID pipeline_iid = __uuidof(ID3D12PipelineState);
+    leonida::native_pso::GraphicsDesc desc{};
+    desc.root_signature = reinterpret_cast<const void*>(0x4004);
+    void* out = reinterpret_cast<void*>(0x1111);
+
+    // No factory: the PC description path, as before there was one.
+    EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == S_OK);
+    EXPECT(mock->calls[10] == 1 && mock->args[10][2] == word(&out) && mock->calls[57] == 0 && out == nullptr);
+
+    // A factory that cannot build the description (no catalogue, a stage it does not know) answers E_NOTIMPL: it was
+    // asked once, with the device behind the proxy and the description, and the PC description path then runs.
+    xs::set_device_native_graphics_factory(device, &native_factory);
+    g_factory_result = E_NOTIMPL;
+    out = reinterpret_cast<void*>(0x1111);
+    EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == S_OK);
+    EXPECT(g_factory_calls == 1 && g_factory_device == reinterpret_cast<ID3D12Device*>(mock) &&
+           g_factory_root == desc.root_signature);
+    EXPECT(mock->calls[10] == 2 && mock->args[10][2] == word(&out) && out == nullptr);
+
+    // A factory that builds it: its pipeline is the answer and the PC description path is not asked.
+    g_factory_result = S_OK;
+    out = nullptr;
+    EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == S_OK);
+    EXPECT(g_factory_calls == 2 && out == kFactoryPipeline && mock->calls[10] == 2);
+
+    // A refusal other than E_NOTIMPL is the title's answer; nothing falls back.
+    for (const HRESULT refusal : {E_INVALIDARG, E_OUTOFMEMORY, E_FAIL}) {
+        const unsigned asked = g_factory_calls;
+        g_factory_result = refusal;
+        out = reinterpret_cast<void*>(0x1111);
+        EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == refusal);
+        EXPECT(g_factory_calls == asked + 1 && out == nullptr && mock->calls[10] == 2);
+    }
+
+    // A description the proxy cannot read is refused before the factory sees it, and does not fall back either.
+    g_factory_result = S_OK;
+    void* reserved = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+    EXPECT(reserved);
+    const unsigned asked = g_factory_calls;
+    out = reinterpret_cast<void*>(0x1111);
+    EXPECT(hr_of(raw(device, 57, word(reserved), word(&pipeline_iid), word(&out))) == E_INVALIDARG);
+    EXPECT(g_factory_calls == asked && out == nullptr && mock->calls[10] == 2);
+    VirtualFree(reserved, 0, MEM_RELEASE);
+
+    // The factory removed again: back to the PC description path.
+    xs::set_device_native_graphics_factory(device, nullptr);
+    out = reinterpret_cast<void*>(0x1111);
+    EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == S_OK);
+    EXPECT(g_factory_calls == asked && mock->calls[10] == 3 && mock->calls[57] == 0);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    return 0;
+}
+
 int check_render_target_sizes() {
     Mock* mock = nullptr;
     void* device = make_device(mock, 0, true);
@@ -3828,7 +3905,7 @@ int main(int argc, char** argv) {
         check_signalx_detection() || check_list_tail_names() || check_console_command_list() ||
         check_custom_heap_properties() ||
         check_resource_allocation_info() || check_slot70() || check_slot70_raw_buffer() ||
-        check_committed_resource3_x() ||
+        check_slot57_native_graphics() || check_committed_resource3_x() ||
         check_descriptor_heap_hooks() ||
         check_render_target_sizes() ||
         check_allocation_descriptions_cleaned() ||
