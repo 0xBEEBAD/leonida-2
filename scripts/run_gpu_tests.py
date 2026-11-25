@@ -35,6 +35,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import cbv_modulate_test
+from check import salu_ext_test   # 38 scalar ALU ops on operands seeded through VKC_SGPRS
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import shift64_test   # dynamic 64-bit vector shifts and overlapping destinations
 from check import cmp_f64_test   # the 32 binary64 vector compares on memory-fed operands
@@ -1126,6 +1127,10 @@ def run_suite(a, work: str) -> int:
             vals = words[:len(USER_SGPRS_WORDS)] if words else []
             results.append((name,) + compute_result(rc, msg, rc == 0 and vals == USER_SGPRS_WORDS,
                                                     " ".join(hex(x) for x in vals) if vals else msg))
+        elif name == "cs_w32_salu_ext":
+            detail = salu_ext_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "80 words exact (73 results of 38 scalar ops and the untouched fill)"))
         elif name == "cs_f64_add":
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
             if rc == 77:   # Float64, or Int64 where the module declares both: quote whichever it names
