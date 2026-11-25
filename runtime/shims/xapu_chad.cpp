@@ -1,6 +1,6 @@
 // chad.dll: the console's audio DSP command queue. No PC has one, so this gives the title a connection whose calls
 // succeed and zeroed DSP status: nothing the title submits is processed. xapu.dll, the APU command queue, is in
-// xapu.cpp.
+// xapu_queue.cpp.
 //
 // Read from the executable's call sites (counts in docs/runtime_imports.md), statically, never run:
 //   XDspConnectWithMaximumStreamLimit(buffer, u32, u32, 0x80, 1, handle*)   1 site; success is a return of 0. The

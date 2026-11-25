@@ -52,11 +52,12 @@ turns such an address back into a pointer. That is an inference from the shapes;
 `XApuEnqueueCommand` and `XApuDequeueResult` share one handle global, which `XApuDisconnect` clears: a command queue
 with a result queue, connected once and torn down once. How `chad.dll`'s handle relates to it is not read.
 
-`runtime/shims/xapu.cpp` serves the five `xapu.dll` imports and `runtime/shims/xapu_chad.cpp` the five `chad.dll` ones.
+`runtime/shims/xapu_queue.cpp` serves the five `xapu.dll` imports and `runtime/shims/xapu_chad.cpp` the five
+`chad.dll` ones.
 The `xapu.dll` signatures, structure layouts, command kinds, option bits and error codes come from Marvisak/VIctory
 (<https://github.com/Marvisak/VIctory>, GPL-3.0-or-later, `crates/victory-hle/src/modules/apu.rs` at commit `ffe310e`),
 which runs the retail executable through these calls. Only the facts are used (see
-[related_projects.md](related_projects.md)); the top of `xapu.cpp` lists them. They agree with the shapes above:
+[related_projects.md](related_projects.md)); the top of `xapu_queue.cpp` lists them. They agree with the shapes above:
 
 | Shape measured here | What the layout says |
 |---|---|

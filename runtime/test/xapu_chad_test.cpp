@@ -1,5 +1,5 @@
-// Checks the registered xapu.dll and chad.dll shims (runtime/shims/xapu.cpp and runtime/shims/xapu_chad.cpp) in the
-// call shapes the executable uses and against the layouts xapu.cpp documents.
+// Checks the registered xapu.dll and chad.dll shims (runtime/shims/xapu_queue.cpp and runtime/shims/xapu_chad.cpp)
+// in the call shapes the executable uses and against the layouts xapu_queue.cpp documents.
 //
 // xapu.dll: the connection's limits and its zeroed memory, writable at the offsets the title reaches; one result per
 // accepted command, in command order, with its id echoed; the per-stream queue limit; the error codes, returned or in
