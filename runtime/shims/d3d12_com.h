@@ -217,6 +217,13 @@ struct VulkanDeviceInfo {
     // VK_EXT_mesh_shader's meshShaderQueries feature is enabled on `device`, so the clipping invocations of a mesh
     // segment come from a mesh-primitives query (D3D-MESH-CLIPPING-COUNTER). Without it they read 0.
     bool mesh_shader_queries = false;
+    // VK_EXT_transform_feedback with its transformFeedback feature is detected and enabled on `device` (D3D-302).
+    // Nothing uses it yet: a graphics PSO that declares StreamOutput is still refused and SOSetTargets is still not
+    // implemented. (#1630 adds the SO_STATISTICS query pools, which use it.)
+    bool transform_feedback = false;
+    // VK_EXT_transform_feedback's geometryStreams feature is enabled when the device offers it. Nothing rasterizes a
+    // StreamOutput RasterizedStream yet; it is here for the capture implementation that follows.
+    bool transform_feedback_geometry_streams = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
