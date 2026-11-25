@@ -433,8 +433,16 @@ int main() {
         EXPECT(built(s.psos[0]));
         s.release();
         EXPECT(!compiler.worker_running());
-        EXPECT(std::filesystem::exists(cache_dir / "pipeline_cache.session.bin"));
-        std::printf("cache: built in the background, session cache written at teardown, worker joined\n");
+        // llvmpipe keeps no pipelines in a VkPipelineCache (measured: vkGetPipelineCacheData returns the 32-byte
+        // header alone after the build), and the runtime writes no file of a bare header (save_session_pipeline_cache).
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2"))(d.physical, &properties);
+        const bool caches = driver.driverID != VK_DRIVER_ID_MESA_LLVMPIPE;
+        EXPECT(std::filesystem::exists(cache_dir / "pipeline_cache.session.bin") == caches);
+        std::printf("cache: built in the background, session cache %s at teardown, worker joined\n",
+                    caches ? "written" : "not written (the driver keeps no pipelines in its cache)");
     }
     // The driver may start threads of its own at the first pipeline build; count from here.
     const unsigned baseline = thread_count();
