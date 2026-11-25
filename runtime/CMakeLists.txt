@@ -2891,7 +2891,10 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
 
       # The console's rectangle and quad lists (src/rect_list_geometry.h), through the same translated vs_m15 / ps_m15.
-      add_executable(d3d12_rect_list_test test/d3d12_rect_list_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M15_FILES})
+      # The files are d3d12_translated_draw_test's: a second target that lists them runs the translation a second
+      # time, at once with the first under a parallel build, and each removes the folder the other is writing.
+      add_executable(d3d12_rect_list_test test/d3d12_rect_list_test.cpp shims/d3d12_xs_device.cpp)
+      add_dependencies(d3d12_rect_list_test d3d12_translated_draw_test)
       target_link_libraries(d3d12_rect_list_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_rect_list_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M15_DIR="${LEONIDA_M15_DIR}")
