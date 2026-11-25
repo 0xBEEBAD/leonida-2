@@ -10,6 +10,7 @@
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -193,9 +194,11 @@ int run(vktest::Device& vk, UINT width, UINT height, bool enhanced, Texture kind
         D3D12_RESOURCE_ALLOCATION_INFO xbox_size{};
         const auto get_size = reinterpret_cast<SizeFn>(d3d12test::slot(xbox.p, 25));
         CHECK(get_size(&xbox_size, xbox.p, 0, 1, &desc) == &xbox_size);
-        CHECK(xbox_size.SizeInBytes >= size.SizeInBytes && xbox_size.SizeInBytes != UINT64_MAX &&
-              xbox_size.Alignment >= size.Alignment);
-        size = xbox_size;
+        // The console's size of a depth-stencil target may be smaller than the PC device's (console_depth_stencil_size
+        // in d3d12_xs_alloc_size.h), so the guest range below takes the larger of the two.
+        CHECK(xbox_size.SizeInBytes && xbox_size.SizeInBytes != UINT64_MAX && xbox_size.Alignment);
+        size.SizeInBytes = std::max(size.SizeInBytes, xbox_size.SizeInBytes);
+        size.Alignment = std::max(size.Alignment, xbox_size.Alignment);
     }
     GuestAllocation guest;
     Ref<ID3D12Resource> texture, alias;
