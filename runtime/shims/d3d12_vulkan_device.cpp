@@ -13651,7 +13651,10 @@ public:
             }
             const phases::Scope timed(phases::textures);
             if (async_texture_refresh()) {
-                if (!t_in_title_textures) request_title_refresh();
+                if (!t_in_title_textures) {
+                    fill_first_mapped_textures();
+                    request_title_refresh();
+                }
             } else {
                 refresh_title_textures();
             }
@@ -15049,6 +15052,31 @@ private:
             f->thread = std::thread([this, f] { run_title_filler(*f); });
         });
     }
+    // LEONIDA_TEXTURE_REFRESH_ASYNC=1, before a submission: a mapped texture that has never been filled (a video plane
+    // the title maps, writes and draws right away) is filled here, on the submitting thread, so its first draw does not
+    // sample an empty image while the worker has not come to it yet. Everything else stays on the worker. Only when
+    // the registry is free: the worker may hold it for a fill that needs this queue, so waiting here could deadlock.
+    void fill_first_mapped_textures() {
+        std::unique_lock lock(state_.title_texture_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+        std::vector<std::shared_ptr<TitleTexture>> first;
+        for (const auto& [address, t] : state_.mapped_title_textures)
+            if (t->resource && !t->fills && !t->gpu_written && t->layout_known) first.push_back(t);
+        if (first.empty()) return;
+        {
+            const InTitleTextures inside;
+            for (const auto& t : first) {
+                // A fill can submit and retire an image (title_texture_gone): look each one up again.
+                const auto it = state_.title_textures.find(t->address);
+                if (it == state_.title_textures.end() || it->second != t || !t->resource || t->fills) continue;
+                fill_title_texture(*t, false);
+                if (t->stale) queue_title_fill(t->address);  // generic staging needs an outer fill (the worker's)
+            }
+        }
+        lock.unlock();
+        state_.drain_titles_gone();
+    }
+
     void request_title_refresh() {
         {
             // A busy queue can take the next submission's request. Dirty entries stay on the worker.
