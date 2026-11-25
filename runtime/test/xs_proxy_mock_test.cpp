@@ -873,7 +873,7 @@ int check_levels() {
             static std::uint32_t seen_layout = 0;
             const xs::PlacedAtVaHandler handler = [](ID3D12Device* real_device, void* va,
                                                      const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
-                                                     REFIID iid, void** out) -> HRESULT {
+                                                     REFIID iid, void** out, const D3D12_CLEAR_VALUE*) -> HRESULT {
                 seen_layout = layout;
                 seen_real = real_device;
                 seen_va = va;
@@ -922,7 +922,7 @@ int check_levels() {
                 return hook_result;
             };
             const xs::PlacedAtVaHandler handler = [](ID3D12Device*, void*, const D3D12_RESOURCE_DESC&, std::uint32_t,
-                                                     REFIID, void** out) -> HRESULT {
+                                                     REFIID, void** out, const D3D12_CLEAR_VALUE*) -> HRESULT {
                 handler_at = ++order;
                 *out = reinterpret_cast<void*>(0x1331);
                 return S_OK;
