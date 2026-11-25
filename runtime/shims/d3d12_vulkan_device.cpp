@@ -1876,10 +1876,6 @@ struct DeviceState {
     // SRVs and RTVs use), and its storage views write the UNORM bits unconverted, as the console does.
     bool rgba8_srgb_uav_emulated = false;
     bool bgra8_srgb_uav_emulated = false;
-    // True when the GPU cannot render to VK_FORMAT_A4R4G4B4_UNORM_PACK16 (it need only sample it): a B4G4R4A4_UNORM
-    // texture that allows render targets (the title makes a 1280x720 one) is then a B8G8R8A8_UNORM image, which has
-    // the same channel order, viewed in that format by everything; pipelines naming B4G4R4A4 as a target render in it.
-    bool b4g4r4a4_target_stand_in = false;
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
@@ -8810,13 +8806,11 @@ public:
                                               state_.color_attachment_usable(VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
                                               state_.storage_usable(VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
                                               state_.sampled_usable(VK_FORMAT_B10G11R11_UFLOAT_PACK32);
-            state_.b4g4r4a4_target_stand_in = !state_.color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16) &&
-                                              state_.color_attachment_usable(VK_FORMAT_B8G8R8A8_UNORM);
             std::fprintf(stderr,
-                         "[rt] d3d12: console format stand-ins: R9G9B9E5 target as R11G11B10F %d, B4G4R4A4 target as "
-                         "BGRA8 %d, sRGB UAV as UNORM rgba %d bgra %d\n",
-                         int(state_.r9g9b9e5_target_stand_in), int(state_.b4g4r4a4_target_stand_in),
-                         int(state_.rgba8_srgb_uav_emulated), int(state_.bgra8_srgb_uav_emulated));
+                         "[rt] d3d12: console format stand-ins: R9G9B9E5 target as R11G11B10F %d, sRGB UAV as UNORM "
+                         "rgba %d bgra %d\n",
+                         int(state_.r9g9b9e5_target_stand_in), int(state_.rgba8_srgb_uav_emulated),
+                         int(state_.bgra8_srgb_uav_emulated));
         }
         memory_properties(info.physical, &state_.memory);
         {
