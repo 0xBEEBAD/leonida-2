@@ -728,6 +728,12 @@ if(BUILD_TESTING)
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+  # The pool that compiles a submission's pipelines (runtime/src/pipeline_workers.h): pure stdlib.
+  add_executable(pipeline_workers_test test/pipeline_workers_test.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(pipeline_workers_test PRIVATE Threads::Threads)
+  add_test(NAME pipeline_workers COMMAND pipeline_workers_test)
+  set_tests_properties(pipeline_workers PROPERTIES TIMEOUT 120)
 
   # D3D-704's session-cache limit and header check: pure stdlib, no Vulkan headers.
   add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
