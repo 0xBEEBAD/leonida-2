@@ -2,7 +2,8 @@
 // (runtime/shims/xg_xs_layout.h and runtime/src/console_texture_layout.h). Synthetic textures only; no game files.
 //
 // Both exports are resolved through rt::shims::find, so this is the table the runtime installs. The cases of the
-// second model and their expected numbers are those of the project it is ported from (Marvisak/VIctory, GPL-3.0,
+// second model and their expected numbers are those of the project it is ported from (Marvisak/VIctory,
+// GPL-3.0-or-later, translated from Rust to C++ and changed for Leonida,
 // crates/victory-formats/src/texture.rs and crates/victory-hle/src/modules/xg.rs tests at d2a4bae1f): hand-checked
 // addresses, mip tail placement, a two-plane depth-stencil, and a bijection plus round trip over every element.
 #include <windows.h>

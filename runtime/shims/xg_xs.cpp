@@ -20,7 +20,8 @@
 //      so what the title is told here is what the layer reads back.
 //   2. runtime/src/console_texture_layout.h, for a description the first cannot lay out (targets, depth with stencil,
 //      the other swizzle modes, multisampling): namespace `port` below. Its methods, their arguments and the layout
-//      structure slot 2 fills are taken from Marvisak/VIctory (GPL-3.0), crates/victory-hle/src/modules/xg.rs at
+//      structure slot 2 fills are taken from Marvisak/VIctory (GPL-3.0-or-later; translated from Rust to C++ and
+//      changed for Leonida), crates/victory-hle/src/modules/xg.rs at
 //      commit d2a4bae1f, which serves the same title: 0 AddRef, 1 Release, 2 the layout, 6 an element's byte offset,
 //      8 a copy into and 9 a copy out of a subresource, 10 the 64 KiB tiling. They match the slots measured above.
 //      The layouts come from runtime/src/console_texture_layout.h, ported from the same project.

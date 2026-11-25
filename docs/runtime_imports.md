@@ -168,7 +168,7 @@ The game executable imports two functions from `xg_xs.dll`, the console's textur
 (4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). `runtime/shims/xg_xs.cpp` answers them
 from a model of the console's texture layouts, `runtime/src/console_texture_layout.h` (AMD addrlib's GFX10 rules for
 the linear, 256 B, 4 KiB and 64 KiB modes: block shapes, mip tails, the micro tile patterns, a separate stencil plane),
-ported with the computer's method table and layout structure from Marvisak/VIctory (GPL-3.0, `xg.rs` and `texture.rs`
+ported with the computer's method table and layout structure from Marvisak/VIctory (GPL-3.0-or-later, `xg.rs` and `texture.rs`
 at `d2a4bae1f`). `XGSuggestSwizzleMode` writes `0x100 | mode` (linear for 1D, `64KB_Z_X` for depth, `64KB_R_X` for
 render targets, else `4KB_S`); the computer fills the layout (slot 2), gives an element's offset (slot 6), copies a
 subresource into (slot 8) and out of (slot 9) tiled memory, and reports the 64 KiB tiling (slot 10). Not modelled:

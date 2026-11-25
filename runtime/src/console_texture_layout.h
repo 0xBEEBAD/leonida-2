@@ -2,7 +2,8 @@
 // starts, the address of each element, and copies between tiled memory and linear rows. Used by the xg_xs.dll shim
 // (runtime/shims/xg_xs.cpp), whose texture computer answers the title's layout and copy calls from it.
 //
-// Ported from Marvisak/VIctory (GPL-3.0), crates/victory-formats/src/texture.rs at commit d2a4bae1f, which follows
+// Ported from Marvisak/VIctory (GPL-3.0-or-later; translated from Rust to C++ and changed for Leonida),
+// crates/victory-formats/src/texture.rs at commit d2a4bae1f, which follows
 // AMD's address library (addrlib) as shipped in Mesa under src/amd/addrlib: block dimensions, mip placement and mip
 // tails from gfx10addrlib.cpp and addrlib2.cpp (ComputeSurfaceInfoMacroTiled, ComputeThinBlockDimension,
 // GetMipTailDim, GetMaxNumMipsInTail, HwlComputeSurfaceInfoLinear, ComputeSurfaceAddrFromCoordMacroTiled), and the
