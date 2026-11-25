@@ -3258,9 +3258,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     VkDeviceAddress indirect_list_budget = 0;
     std::size_t ordinary_active = 0, binary_active = 0, statistics_active_count = 0;
     bool overlaps = false, statistics_overlaps = false, statistics_active = false;
-    // SO_STATISTICS queries active in a pool, by heap and stream (D3D-302): two on one stream would break
-    // VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753, so prepare refuses them.
-    std::map<std::pair<QueryHeapId, std::uint32_t>, bool> so_active;
+    // Streams with an active SO_STATISTICS query in this list, one bit each (D3D-302). Two active transform-feedback
+    // queries on one stream break VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753 anywhere in the command buffer,
+    // whatever their pools, so prepare refuses a second Begin on an active stream.
+    std::uint32_t so_active = 0;
     out.wrote_readback = false;
     out.readback_src_stages = 0;
 
@@ -3801,16 +3802,18 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     // A real transform-feedback heap queries on a stream (D3D-302). Stream n runs only when the
                     // heap's pool covers it; then the indexed commands are required. Without a pool (the feature is
                     // off or has no transformFeedbackQueries) or past maxTransformFeedbackStreams it runs nothing
-                    // and resolves zero. Two overlapping queries on one stream cannot both be active in one pool
-                    // (VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753), so a second Begin is refused.
+                    // and resolves zero. Two overlapping queries on one stream cannot both be active in one command
+                    // buffer, even in two heaps (VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753), so a second Begin
+                    // is refused.
                     const std::uint32_t stream = range.type - d3d12_query::so_statistics_stream0;
                     if (heap->pool && stream < heap->streams) {
                         if (!so_queries) return unsupported_at(__LINE__);
-                        const auto key = std::make_pair(range.heap, stream);
+                        const std::uint32_t bit = 1u << stream;  // stream < heap->streams <= 4
                         if (begin) {
-                            if (!so_active.emplace(key, true).second) return ReplayResult::invalid_query;
+                            if (so_active & bit) return ReplayResult::invalid_query;
+                            so_active |= bit;
                         } else {
-                            so_active.erase(key);
+                            so_active &= ~bit;
                         }
                     }
                 } else {

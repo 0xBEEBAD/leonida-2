@@ -814,6 +814,36 @@ int main() {
             expect(prepare(list, resolve, indexed, prepared) == ReplayResult::success,
                    "overlapping SO_STATISTICS queries on different streams are fine");
         }
+        // The VUID holds per command buffer, not per pool: one stream in two heaps is refused too, while queries that
+        // take turns on that stream are fine.
+        QueryPool so2{handle<VkQueryPool>(9), d3d12_query_heap::so_statistics, 4, false,
+                      std::vector<bool>(4, false), {}, 4};
+        ReplayFunctions two_heaps = indexed;
+        two_heaps.query_pool = [&](QueryHeapId id) -> QueryPool* {
+            return id == 8 ? &so : id == 9 ? &so2 : nullptr;
+        };
+        {
+            CommandList list;
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0, heap 8");
+            expect(list.begin_query({9, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0, heap 9");
+            expect(list.end_query({9, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0, heap 9");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0, heap 8");
+            expect(list.close(), "close two-heap SO stream list");
+            PreparedList prepared;
+            expect(prepare(list, resolve, two_heaps, prepared) == ReplayResult::invalid_query,
+                   "overlapping SO_STATISTICS queries on one stream in two heaps are refused");
+        }
+        {
+            CommandList list;
+            expect(list.begin_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0, heap 8");
+            expect(list.end_query({8, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0, heap 8");
+            expect(list.begin_query({9, d3d12_query::so_statistics_stream0, 0}), "record SO begin stream 0, heap 9");
+            expect(list.end_query({9, d3d12_query::so_statistics_stream0, 0}), "record SO end stream 0, heap 9");
+            expect(list.close(), "close two-heap SO stream list in turn");
+            PreparedList prepared;
+            expect(prepare(list, resolve, two_heaps, prepared) == ReplayResult::success,
+                   "SO_STATISTICS queries on one stream in two heaps, one after the other, are fine");
+        }
         // A one-stream pool: stream 0 runs, stream 1 is zero-filled and emits nothing.
         so.streams = 1;
         {
