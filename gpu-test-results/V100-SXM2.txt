@@ -22,8 +22,8 @@ With --wave64-emulate, ms_w64x_ballot passes here; without emulation it is skipp
 
 Failed in all three full runs, reproduced once with --filter cs_imgstore_cube:
   cs_imgstore_cube: exit 1: r32 sint (sint view): 63 bad, texel(5,3) = 0
-It is not listed under docs/testing.md "Known problems". No open or closed issue with this name was found
-by title at the time of writing, so the failure needs its own issue linked from this record before it is merged.
+It is not listed under docs/testing.md "Known problems" and is tracked in
+https://github.com/ubiquitarianism/leonida/issues/1492 (opened before this record was merged).
 
 Skips are the documented ones (docs/testing.md): no 64-wide compute subgroup in the native run, no
 VK_EXT_mesh_shader without --mesh-compute, no VK_KHR_fragment_shader_barycentric without --bary-fallback, no
