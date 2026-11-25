@@ -15,7 +15,7 @@
 //
 // Layout measured by LooperSalty on 1.0.2.1 and implemented by enx in 5c175db90: 0x108 bytes, the root
 // signature at +0x00, pairs at +0x08 and +0x18, then seven blocks {code, size, records, size} at +0x28 + k * 0x20.
-// Measured by KkelebekK: pair 0 is state blob A (380-388 bytes: blend, raster,
+// Measured by KkelebekK: pair 0 is state blob A (380-520 bytes: blend, decode_state_a_blend; raster and
 // depth, not decoded), pair 1 is state blob B (80-188 bytes: formats and input layout, decode_state_b), and each
 // stage's records blob carries the source container's HASH digest after its 0x43 word (docs/fspx.md, kind 7).
 // The block index is not trusted as the stage: the stage comes from the translator's index entry of the container.
