@@ -104,6 +104,19 @@ void pipeline() {
     check(t && !(*t)[3].enable && (*t)[3].write_mask == 0xf, "targets past the pipeline's count keep the defaults");
     check(!np::d3d12_blend(r, 4), "one target this path cannot build keeps the whole pipeline on the defaults");
 
+    // A library pipeline writes R32_FLOAT, B4G4R4A4_UNORM and R8_UINT with MAX on every target (CB_BLEND 0xe1610161):
+    // the integer target keeps its write mask and does not blend, which D3D12 would refuse.
+    np::BlendRegisters mixed;
+    mixed.target_mask = 0xff1;
+    mixed.blend.fill(0xe1610161);
+    const auto m = np::d3d12_blend(mixed, 3, {41, 115, 62, 0, 0, 0, 0, 0});
+    check(m && (*m)[0].enable && (*m)[1].enable && !(*m)[2].enable && (*m)[2].write_mask == 0xf &&
+              (*m)[0].write_mask == 0x1,
+          "an integer target (R8_UINT) does not blend; the float and unorm ones do");
+    check(np::dxgi_integer_format(62) && np::dxgi_integer_format(43) && !np::dxgi_integer_format(41) &&
+              !np::dxgi_integer_format(28) && !np::dxgi_integer_format(115),
+          "R8_UINT and R32_SINT are integer formats; R32_FLOAT, R8G8B8A8_UNORM and B4G4R4A4_UNORM are not");
+
     // plan() reads blob A beside blob B. A description without stages is refused as unsupported, after both blobs.
     std::vector<std::uint8_t> b(np::kStateBHeader, 0);
     b[0x25] = 1;

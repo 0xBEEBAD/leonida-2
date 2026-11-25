@@ -242,12 +242,28 @@ inline std::optional<TargetBlend> d3d12_target_blend(std::uint32_t cb_blend, std
     return t;
 }
 
+// A DXGI_FORMAT with UINT or SINT channels. The colour block does not blend those (RDNA2 bypasses blending for integer
+// targets), and D3D12 refuses a PSO that enables blending on one.
+inline bool dxgi_integer_format(std::uint32_t f) {
+    switch (f) {
+        case 3: case 4: case 7: case 8: case 12: case 14: case 17: case 18: case 25: case 30: case 32: case 36:
+        case 38: case 42: case 43: case 50: case 52: case 57: case 59: case 62: case 64:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // The targets 0..count-1 of `r` in D3D12 terms, or empty when one of them cannot be expressed: the pipeline then keeps
-// the defaults (blending off, every component written) for all of its targets, as before blob A was read.
-inline std::optional<std::array<TargetBlend, 8>> d3d12_blend(const BlendRegisters& r, unsigned count) {
+// the defaults (blending off, every component written) for all of its targets, as before blob A was read. A target
+// with an integer format (`formats`, DXGI values) keeps its write mask and has blending off, as on the console.
+inline std::optional<std::array<TargetBlend, 8>> d3d12_blend(const BlendRegisters& r, unsigned count,
+                                                             const std::array<std::uint8_t, 8>& formats = {}) {
     std::array<TargetBlend, 8> out{};
     for (unsigned i = 0; i < count && i < out.size(); ++i) {
-        const auto t = d3d12_target_blend(r.blend[i], r.target_mask >> (4 * i));
+        const std::uint32_t mask = r.target_mask >> (4 * i);
+        const auto t = dxgi_integer_format(formats[i]) ? d3d12_target_blend(r.blend[i] & ~(1u << 30), mask)
+                                                       : d3d12_target_blend(r.blend[i], mask);
         if (!t) return std::nullopt;
         out[i] = *t;
     }

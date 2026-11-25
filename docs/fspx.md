@@ -311,6 +311,9 @@ headers). Measured on 1.0.2.1 over all 5,680 distinct blobs, which the 25,471 gr
   quads solid, artwork hard-edged and composited backgrounds black.
 - **With the decoded state:** the pages, the legal screens and the loading slideshow draw as on console (RTX 4070
   Laptop).
+- **Integer targets:** a target with a `UINT` or `SINT` format never blends, as the colour block bypasses blending
+  there and D3D12 refuses a PSO that asks for it. One library pipeline enables `MAX` on an `R8_UINT` target beside
+  two others.
 - **Kept on the defaults:** the 1,937 records that blend with the dual-source `SRC1` factors, because the translator
   declares no second pixel-shader output. A blob of another shape, or a target with a factor this path does not
   take, keeps the whole pipeline on the defaults and is logged.

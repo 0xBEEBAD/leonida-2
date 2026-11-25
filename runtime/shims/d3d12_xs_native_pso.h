@@ -45,7 +45,7 @@ inline void fill_blend_state(const np::FixedState& s, D3D12_BLEND_DESC& out) {
     }
     out.AlphaToCoverageEnable = FALSE;
     out.IndependentBlendEnable = FALSE;
-    const auto targets = s.blend ? np::d3d12_blend(*s.blend, s.rt_count) : std::nullopt;
+    const auto targets = s.blend ? np::d3d12_blend(*s.blend, s.rt_count, s.rtv_formats) : std::nullopt;
     if (!targets) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
