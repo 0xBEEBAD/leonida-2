@@ -2855,7 +2855,12 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   plane 1. For `R16_TYPELESS`, use `R16_UINT` on plane 0 to access the raw D16 bits. An array UAV selects a
   contiguous range of layers. The depth/stencil and shader-resource views continue to use the attachment image.
   Slot 133 keeps the guest address. Identical, live placements share their image and writable planes across
-  distinct COM objects. A partial overlap or incompatible reinterpretation is refused.
+  distinct COM objects. An incompatible reinterpretation at the same address is refused. A placement's extent is
+  the PC allocation size, which can exceed the title's own block (RADV sizes a large D16 target above it, so the
+  title's next block starts inside the range); a placement that starts inside another one therefore gets its own
+  image when both layouts are opaque, since D3D12 leaves an alias's contents undefined until reinitialized, and is
+  refused only for a non-opaque layout. Before this, the retail boot stopped on the title's assert while it created
+  its D16 depth targets on an RDNA2 iGPU under RADV. A refused depth placement is logged (no trace line covers it).
 - Legacy and enhanced texture transitions copy the selected planes and layers to or from their storage images.
   Fence-ordered graphics and compute queues can share UAV access. A dedicated compute family can perform
   the plane transfer itself when `VK_KHR_maintenance10` and the format's depth/stencil copy flags allow it.
