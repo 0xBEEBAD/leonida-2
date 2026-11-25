@@ -1842,6 +1842,10 @@ if(TARGET Vulkan::Headers)
   if(MSVC)
     target_compile_options(indirect_clamp_test PRIVATE /W4 /permissive- /utf-8)
   endif()
+  if(BUILD_TESTING)
+    add_test(NAME indirect_clamp COMMAND indirect_clamp_test)
+    set_tests_properties(indirect_clamp PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # OpFmaKHR width gate of vk_shader_fma.h (shaderFmaFloat32 / shaderFmaFloat64): no Vulkan instance, no GPU.
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
@@ -1906,7 +1910,9 @@ if(TARGET Vulkan::Headers)
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
     # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).
-    foreach(test vk_command_replay vk_predicated_copy vk_predicate_capture vk_queue indirect_clamp)
+    # indirect_clamp is registered next to its own add_executable above, where tests/test_ctest_registration.py
+    # can see it.
+    foreach(test vk_command_replay vk_predicated_copy vk_predicate_capture vk_queue)
       add_test(NAME ${test} COMMAND ${test}_test)
       set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
