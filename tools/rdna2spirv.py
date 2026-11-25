@@ -8094,11 +8094,14 @@ class Gen:
             # madak D = S0 * S1 + K, printed `vdst, src0, vsrc1, K`; madmk D = S0 * K + S1, printed
             # `vdst, src0, K, vsrc1`. In print order both are a[1] * a[2] + a[3]. Until 2026-11-21 madmk read
             # a[3] as the factor, so it computed S0 * S1 + K.
+            # Like v_mad_f32, literal MAD flushes operands, the rounded product and the final sum
+            # (Mesa ACO aco_ir.h, fp_denorm); host Vulkan denormal handling must not decide the result.
             x, y, z = (self.src_f(t) for t in a[1:4])
+            x, y, z = self.flush_f32(x), self.flush_f32(y), self.flush_f32(z)
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpFMul %float {x} {y}")
-            self.emit(f"{r} = OpFAdd %float {m} {z}")
-            self.dst(a[0], self.tou(r))
+            self.emit(f"{r} = OpFAdd %float {self.flush_f32(m)} {z}")
+            self.dst(a[0], self.tou(self.flush_f32(r)))
         elif op == "v_bfi_b32":
             mask = None if "sdwa_sel" in a[1] else self.imm_val(a[1])
             y, z = (self.src_u(t) for t in a[2:4])
