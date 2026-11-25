@@ -409,12 +409,30 @@ class StructuredBranchInterp:
 
         ip = 0
         steps = 0
+        current = previous = None  # the block being run and the one that branched to it, for OpPhi
         while ip < len(self.insns):
             steps += 1
             if steps > max_steps:
                 raise BranchExecutionLimitError(f"Step limit {max_steps} exceeded: possible infinite loop")
             res, op, a, _ = self.insns[ip]
-            if op in _IGNORED or op == "OpLabel":
+            if op == "OpLabel":
+                previous, current = current, res
+                ip += 1
+                continue
+            if op == "OpPhi":
+                # The block's phis read their incoming values together (tools/spirv_loop_guard.py adds them).
+                chosen = {}
+                while ip < len(self.insns) and self.insns[ip][1] == "OpPhi":
+                    phi_res, _, phi_args, _ = self.insns[ip]
+                    pairs = list(zip(phi_args[1::2], phi_args[2::2]))
+                    incoming = next((v for v, parent in pairs if parent == previous), None)
+                    if incoming is None:
+                        raise UnsupportedConstruct(f"OpPhi {phi_res} has no value for block {previous}")
+                    chosen[phi_res] = val(incoming)
+                    ip += 1
+                values.update(chosen)
+                continue
+            if op in _IGNORED:
                 ip += 1
                 continue
             if op in ("OpReturn", "OpFunctionEnd"):

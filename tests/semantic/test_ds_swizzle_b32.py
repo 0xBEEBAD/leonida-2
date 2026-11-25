@@ -760,14 +760,15 @@ class EmulationAndParsingTests(unittest.TestCase):
     """Structural SPIR-V checks for `--wave64-emulate`; unparsed offsets raise Unsupported."""
 
     def test_wave64_emulate_lowers_all_five_modes_via_x_buf_without_subgroup_ops(self):
+        # The last field is the 16-bit offset the swizzle() form assembles to, for the reference model.
         cases = [
-            ("quad", "swizzle(QUAD_PERM,3,2,1,0)", r"%cfffffffc\b"),
-            ("bitmask", 'swizzle(BITMASK_PERM,"10p0i")', r"%cffffffe5\b"),
-            ("swap", "swizzle(SWAP,16)", r"OpBitwiseXor %uint %\w+ %c10\b"),
-            ("reverse", "swizzle(REVERSE,32)", r"OpBitwiseXor %uint %\w+ %c1f\b"),
-            ("broadcast", "swizzle(BROADCAST,16,5)", r"%cfffffff0\b"),
+            ("quad", "swizzle(QUAD_PERM,3,2,1,0)", r"%cfffffffc\b", 0x801B),
+            ("bitmask", 'swizzle(BITMASK_PERM,"10p0i")', r"%cffffffe5\b", 0x0605),
+            ("swap", "swizzle(SWAP,16)", r"OpBitwiseXor %uint %\w+ %c10\b", 0x401F),
+            ("reverse", "swizzle(REVERSE,32)", r"OpBitwiseXor %uint %\w+ %c1f\b", 0x7C1F),
+            ("broadcast", "swizzle(BROADCAST,16,5)", r"%cfffffff0\b", 0x00B0),
         ]
-        for label, mod_str, expected_pat in cases:
+        for label, mod_str, expected_pat, offset16 in cases:
             with self.subTest(mode=label):
                 lines = [
                     "s_mov_b64 exec, -1",
@@ -784,13 +785,16 @@ class EmulationAndParsingTests(unittest.TestCase):
                 self.assertIn("%x_buf = OpVariable", spv)
                 self.assertGreaterEqual(spv.count("OpControlBarrier"), 2)
                 self.assertRegex(spv, expected_pat)
-                # spirv_mini_interp.py deliberately rejects the Workgroup-memory round loop.
-                with self.assertRaises(si.UnsupportedConstruct):
-                    si.run_workgroup(
-                        spv, 64, 32,
-                        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % 32},
-                        push_constants=VSHARP + [0] * 28, memory={},
-                    )
+                # spirv_mini_interp.py runs the Workgroup-memory round loop since it models OpSwitch: the 64 lanes
+                # match the reference model.
+                mem = _Heap()
+                si.run_workgroup(
+                    spv, 64, 32,
+                    inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % 32},
+                    push_constants=VSHARP + [0] * 28, memory=mem,
+                )
+                want = ref_swizzle([100 + i for i in range(64)], [0] * 64, offset16, (1 << 64) - 1)
+                self.assertEqual([mem.get(4 * k) for k in range(64)], want)
 
         # Wave32 shaders are unaffected by WAVE64_EMULATE = True.
         w32_lines = [

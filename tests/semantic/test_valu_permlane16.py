@@ -685,13 +685,16 @@ class EmulationAndFindingTests(unittest.TestCase):
             self.assertRegex(spv, r"OpBitFieldUExtract %uint %\w+ %\w+ %c4\b")
             self.assertIn("OpBitwiseAnd %uint %", spv)
             self.assertIn("%cfffffff0", spv)
-            # spirv_mini_interp.py deliberately rejects the emulated Workgroup/loop scheduler.
-            with self.assertRaises(si.UnsupportedConstruct):
-                si.run_workgroup(
-                    spv, 64, 32,
-                    inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % 32},
-                    push_constants=VSHARP + [0] * 28, memory={},
-                )
+            # spirv_mini_interp.py runs the emulated Workgroup/loop scheduler since it models OpSwitch: the 64 lanes
+            # match the reference model.
+            mem = _Heap()
+            si.run_workgroup(
+                spv, 64, 32,
+                inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % 32},
+                push_constants=VSHARP + [0] * 28, memory=mem,
+            )
+            want = ref_permlane(spv is spv_x16, [100 + i for i in range(64)], [0] * 64, ID_S1, ID_S2, (1 << 64) - 1)
+            self.assertEqual([mem.get(4 * k) for k in range(64)], want)
 
         # v_permlanex16_b32 XORs the masked half base with 16 (%c10); v_permlane16_b32 does not.
         xor16_pat = r"OpBitwiseAnd %uint %\w+ %cfffffff0\n\s*%\w+ = OpBitwiseXor %uint %\w+ %c10\b"
