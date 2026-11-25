@@ -2083,6 +2083,12 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
     if (!map && rt::xmem::copy_page_mappings_fn) map = &copy_page_mappings_default;
     if (!map || !count) return S_OK;
     if (!batches || flags) return E_INVALIDARG;
+    // Which implementation remaps, once: a boot's read-fault reports belong to that route's tests.
+    static std::atomic<bool> route_logged{false};
+    if (!route_logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: CopyPageMappingsBatchX remaps through %s\n",
+                     map == &copy_page_mappings_default ? "xmem's range callback (copy_page_mappings_fn)"
+                                                        : "the installed batch hook (set_copy_page_mappings_hook)");
     auto* queue = reinterpret_cast<ID3D12CommandQueue*>(self->real);
     if (list_values::enabled() && !self->values)
         self->values = list_values::QueueValues::create(self->device->real, queue);
