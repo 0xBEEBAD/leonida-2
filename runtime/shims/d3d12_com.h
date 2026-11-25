@@ -578,6 +578,14 @@ void set_global_realtime_privilege_override_for_test(int state);
 // not one of this module's command lists.
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
 
+// Makes `list` hold a reference to `object` until its next Reset or its release, as it holds the pipeline states it
+// names: for an object only the recording uses, such as a shim's own scratch buffer. A list is Reset once it has
+// been executed (or a held batch, src/queue_holds.h, keeps it pinned until it has run), and a resource released
+// after its submission is destroyed through the device's deferred queue once that submission has retired, so the
+// object outlives every GPU use the recording makes of it. False when `list` is not one of this module's command
+// lists or `object` is null.
+bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object);
+
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands);
