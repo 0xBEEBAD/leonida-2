@@ -3390,7 +3390,9 @@ struct DeviceState {
         if (desc.Format == DXGI_FORMAT_B4G4R4A4_UNORM && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
             !color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16) && color_attachment_usable(VK_FORMAT_R8G8B8A8_UNORM)) {
             log_once("B4G4R4A4_UNORM render targets unavailable natively, using RGBA8; format", desc.Format);
-            return Format{VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT};
+            Format backed{VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT};
+            backed.rgba4_render_fallback = true;  // clears are quantised to 4 bits a channel, as its draws are
+            return backed;
         }
         // An 8-bit sRGB UAV texture where the sRGB format has no storage support: the host runtime makes it (RTX 4090
         // and WARP; a retail title sizes a 2048x2048 R8G8B8A8_UNORM_SRGB render target with unordered access), but no

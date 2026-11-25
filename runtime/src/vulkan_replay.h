@@ -3286,7 +3286,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         !detail::stage_unaligned_tile(vk, p, image, fmt, upload))
                         return unsupported_at(__LINE__);
                 }
-                if(result==ReplayResult::success && image.rgba4_render_fallback) return ReplayResult::unsupported;
+                // A B4G4R4A4 target stored as RGBA8 moves 4-byte texels in a footprint copy, not packed 16-bit ones.
+                // The copy is made all the same, as the retail boot was measured with it;
+                // LEONIDA_RGBA4_COPY_REFUSE=1 refuses it instead.
+                static const bool refuse_rgba4_copy = [] {
+                    const char* v = std::getenv("LEONIDA_RGBA4_COPY_REFUSE");
+                    return v && *v == '1';
+                }();
+                if (result == ReplayResult::success && image.rgba4_render_fallback && refuse_rgba4_copy)
+                    return ReplayResult::unsupported;
                 if(result==ReplayResult::success && image.xbox_depth16_stencil8 && image.format!=VK_FORMAT_D16_UNORM_S8_UINT &&
                    !p.buffer_image_copies.empty() && p.buffer_image_copies[0].imageSubresource.aspectMask==VK_IMAGE_ASPECT_DEPTH_BIT) return ReplayResult::unsupported;
                 const bool depth24_footprint = result == ReplayResult::success && image.depth24_as_float &&
