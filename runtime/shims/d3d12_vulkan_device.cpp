@@ -26,6 +26,7 @@
 #include "d3d12_title_image_census.h"
 #include "d3d12_xs_native_pso.h"
 #include "dxgi_com.h"
+#include "xmem.h"  // rt::xmem::call_title_write: the console's value writes (list slots 71 and 72)
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -2181,6 +2182,23 @@ struct DeviceState {
                          static_cast<unsigned long long>(title_window_bytes >> 10));
         out = offset + (va - start);
         return true;
+    }
+
+    // The console's value writes (list slots 71 and 72): where the bytes land once the submission that carried
+    // them has completed on the GPU. A VA in the arena is a default-heap buffer: the arena is host-visible, so its
+    // host mapping holds the bytes the GPU reads. Every other VA is a page of the title's own memory, and a placed
+    // buffer imports those same pages, so the CPU's write is the GPU's read.
+    bool write_value_bytes(std::uint64_t va, const void* bytes, std::uint32_t size) {
+        if (!va || !size || !bytes) return false;
+        if (va < arena.size) {
+            if (!arena.mapped) return false;
+            // A sparse resource's memory is bound by the sparse pass, not by the arena's mapping.
+            if (context && context->is_sparse_va(va)) return false;
+            std::memcpy(arena.mapped + va, bytes, size);
+            return true;
+        }
+        // A page of the title's own memory that the xmem shim owns: the host's own copy of the physical page.
+        return rt::xmem::call_title_write(reinterpret_cast<const void*>(va), bytes, size);
     }
 
     struct ShaderVisibleHeap {
@@ -9750,6 +9768,14 @@ public:
         }
 #endif
         state_.context->set_depth_range_unrestricted(info.depth_range_unrestricted);
+        // The console's value writes (list slots 71 and 72): where the bytes land. The label path on main
+        // (src/vulkan_gpu_labels.h) writes a completed label into the title's memory; this sink is the runtime's
+        // own host-visible memory, the arena and the pages of the title's own memory the xmem shim owns.
+        leonida::label::set_value_sink(
+            [](void* device, std::uintptr_t address, const void* bytes, unsigned size) {
+                return static_cast<DeviceState*>(device)->write_value_bytes(address, bytes, size);
+            },
+            &state_);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -10214,6 +10240,11 @@ public:
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
+        // The GPU address arena is the console's address space: the title names it by offset, so the label path
+        // has to find it (src/gpu_label_memory.h). Its address space starts at 0.
+        if (arena.mapped)
+            leonida::label::memory().track(0, static_cast<std::uintptr_t>(arena.size),
+                                           reinterpret_cast<std::uintptr_t>(arena.mapped), true);
         arena.free[kArenaReserved] = arena.size - kArenaReserved;
         arena.peak_end = kArenaReserved;
         char log[4] = {};

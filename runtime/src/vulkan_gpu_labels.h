@@ -22,10 +22,24 @@
 #endif
 
 namespace leonida::label {
+
+// Where a completed label lands when the runtime's own host-visible memory is the target: the GPU address arena,
+// and the physical pages of the title's own memory that the xmem shim owns. The D3D12 device knows where those
+// bytes are and installs this sink; the label path writes the value through it.
+using ValueSink = bool (*)(void* context, std::uintptr_t address, const void* bytes, unsigned size);
+inline std::atomic<ValueSink> value_sink{nullptr};
+inline std::atomic<void*> value_sink_context{nullptr};
+inline void set_value_sink(ValueSink sink, void* context) {
+    value_sink_context.store(context, std::memory_order_relaxed);
+    value_sink.store(sink, std::memory_order_release);
+}
+
+// The console's value writes (list slots 71 and 72) are on: the retail title calls the two slots and waits for
+// the value to land, and a plain run is the case that matters. LEONIDA_GPU_LABELS=0 turns them off.
 inline bool enabled() {
     static const bool active = [] {
         const char *v = std::getenv("LEONIDA_GPU_LABELS");
-        return v && v[0] == '1';
+        return !(v && v[0] == '0');
     }();
     return active;
 }
@@ -37,6 +51,18 @@ inline bool enabled() {
 // (kernel_writes::begin_write), so the label reaches it and the layer copies the page again; a page that stays
 // read-only after that is the title's own doing and the label is dropped, as before. Called with no shadow lock held.
 inline bool store_value(const Target &target, std::uint64_t value) {
+    // The runtime's own host-visible memory: the GPU address arena, and the physical pages of the title's own
+    // memory that the xmem shim owns. The value is written little-endian, the way the console's x64 writes it: the
+    // low 'width' bytes of the word. A target the sink refuses - the title's own private pages - is left to the
+    // path below, which opens a read-only page the way a kernel write does.
+    if (ValueSink sink = value_sink.load(std::memory_order_acquire)) {
+        std::uint64_t word = value;
+        void* const context = value_sink_context.load(std::memory_order_relaxed);
+        if (memory().publish(target, [&](std::uintptr_t address, unsigned width, std::uintptr_t) {
+                return sink(context, address, &word, width);
+            }))
+            return true;
+    }
 #ifdef _WIN32
     return memory().publish(target, [&](std::uintptr_t address, unsigned width, std::uintptr_t allocation_base) {
         MEMORY_BASIC_INFORMATION mbi{};

@@ -58,6 +58,12 @@
 //             CreateCommandList(0, type, allocator, initialState). The type is the first word of the Xbox desc; there
 //             is no node-mask argument in the console call (public HLE; the PC six-argument form differs). An riid the
 //             proxy does not answer (the console's own list IID) is answered with the proxy.
+//   slots 71/72  Write32BitValueBottomOfPipeX and Write64BitValueBottomOfPipeX: the console's value writes. The
+//             list proxy records each write as a GPU completion label, and the value is written into the title's
+//             memory once the submission that carried the list has completed on the GPU (runtime/src/
+//             vulkan_gpu_labels.h). Slots 73/74 (Wait32BitValueX, Wait64BitValueX) stay no-ops: the word after a
+//             wait's arguments is a 32-bit 1 with garbage in the high bits, and taking it for the wait's mask makes
+//             every `>=` wait time out (docs/d3d12_command_objects.md).
 //   slots 78/79/80/81  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX, GetFrameStatisticsX. A presentation
 //             attached with set_presentation_handler (below) answers them; without one a per-device token state
 //             machine does, before the PC vtable is indexed: WaitFrameEventX returns at once with a fresh non-zero

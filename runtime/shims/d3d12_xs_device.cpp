@@ -2519,6 +2519,12 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     const unsigned width = Slot == 71 ? 4u : 8u;
                     const unsigned clock = Slot == 72 ? ((a4 & 1) ? 1u : ((a4 & 2) ? 2u : 0u)) : 0u;
                     auto target = leonida::label::memory().capture(a1, width);
+                    if (!target.owner.lock() && rt::xmem::label_target_fn) {
+                        // The pages the title maps are the title's memory too, and the xmem shim owns their page
+                        // tables (runtime/shims/xmem.h).
+                        leonida::label::Target mapped;
+                        if (rt::xmem::label_target_fn(a1, width, mapped)) target = std::move(mapped);
+                    }
                     if (target.owner.lock())
                         rt::d3d12::record_gpu_label(reinterpret_cast<ID3D12GraphicsCommandList*>(self->real),
                                                     {std::move(target), a2, clock});
