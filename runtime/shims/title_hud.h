@@ -1,6 +1,7 @@
 #pragma once
 // LEONIDA_TITLE_HUD=1 shows live counters in the title bar of the window the title presents in:
-//   frame rate and frame time from PresentX (average and worst frame of the last half second);
+//   frame rate and frame time from PresentX (average and worst frame of the last half second), or how long
+//   since the last frame when there was none;
 //   the process's private memory and its GPU memory (DXGI QueryVideoMemoryInfo, local and non-local segments);
 //   graphics and compute pipelines created, and the seconds spent in vkCreate*Pipelines in the last interval,
 //   which is where an inline compile shows up as a hitch (needs LEONIDA_MEM_PROBE, src/mem_probe.h; else "-");
@@ -119,9 +120,17 @@ private:
             const std::int64_t first = first_present_.load(std::memory_order_relaxed);
             const unsigned up = first ? unsigned((now.QuadPart - first) / frequency_.QuadPart) : 0;
 
+            // No present in this interval: how long since the last one, which tells a hang from a slow frame.
+            wchar_t frame[96];
+            const std::int64_t last_present = last_present_.load(std::memory_order_relaxed);
+            if (frames || !last_present)
+                std::swprintf(frame, 96, L"%.0f fps %.1f ms (worst %.0f)", fps, frame_ms, worst_ms);
+            else
+                std::swprintf(frame, 96, L"0 fps, no frame for %.1f s",
+                              double(now.QuadPart - last_present) / double(frequency_.QuadPart));
             wchar_t text[512];
-            std::swprintf(text, 512, L"Leonida | %.0f fps %.1f ms (worst %.0f) | %ls | %ls | %ls | %u:%02u", fps,
-                          frame_ms, worst_ms, memory, video, pipelines, up / 60, up % 60);
+            std::swprintf(text, 512, L"Leonida | %ls | %ls | %ls | %ls | %u:%02u", frame, memory, video, pipelines,
+                          up / 60, up % 60);
             DWORD_PTR ignored = 0;
             SendMessageTimeoutW(window_, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(text), SMTO_ABORTIFHUNG,
                                 interval_ms, &ignored);

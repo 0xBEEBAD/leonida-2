@@ -56,6 +56,12 @@ int main() {
         const int fps = _wtoi(text.c_str() + 10);
         CHECK(fps >= 10 && fps <= 120);  // a loose band: Sleep(16) on a loaded machine is not 60 Hz
 
+        // Presents stop while the window still pumps: the title says how long since the last frame.
+        pump(1300, nullptr);
+        const std::wstring stalled = title_of(window);
+        std::fwprintf(stderr, L"title: %ls\n", stalled.c_str());
+        CHECK(stalled.find(L"0 fps, no frame for ") != std::wstring::npos);
+
         // The window's thread stops pumping: the HUD's SendMessageTimeout gives up and the HUD thread is not stuck,
         // so the destructor below returns.
         Sleep(1200);
