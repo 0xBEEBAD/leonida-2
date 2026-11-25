@@ -5741,6 +5741,14 @@ public:
                      int(desc_.Width > INT_MAX ? INT_MAX : desc_.Width));
             return E_NOTIMPL;
         }
+        // A GPU-only range with pages of its own (title_gpu_views::independently_mapped): queue slot 31 remaps them
+        // there, and an import would keep the GPU on the old physical pages. The shadow, copied from the pages before
+        // every submission, follows the remap. Declined before anything is made, so nothing is left behind.
+        if (leonida::title_gpu_views::independently_mapped(start, desc_.Width)) {
+            log_once("a title-placed buffer over a GPU-only range slot 31 maps by itself is not imported, size",
+                     int(desc_.Width > INT_MAX ? INT_MAX : desc_.Width));
+            return E_NOTIMPL;
+        }
         // The whole imported range must be committed, possibly across several allocations (the retail buffer spans
         // three mapped windows); a page not committed yet (xmem commits on first touch) or a write-combined one (on
         // an RTX 5090 such an import succeeded but GPU reads returned wrong bytes, found in review) is not imported,

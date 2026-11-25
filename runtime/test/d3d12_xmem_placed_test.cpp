@@ -110,6 +110,9 @@ int queue_remap(ID3D12Device* real, ID3D12Device* proxy) {
     auto* cpu = window(PAGE_READWRITE);
     auto* dst = window(0x801);
     EXPECT(pool && cpu && dst && leonida::title_gpu_views::other_view(uintptr_t(dst)) == uintptr_t(cpu));
+    // xmem pairs dst with cpu as the legacy kind (read at the CPU view); this window is the kind slot 31 maps by itself.
+    EXPECT(leonida::title_gpu_views::to_cpu(uintptr_t(dst)) == uintptr_t(cpu));
+    EXPECT(leonida::title_gpu_views::set_independent_pages(uintptr_t(dst)));
     EXPECT(leonida::title_gpu_views::to_cpu(uintptr_t(dst)) == uintptr_t(dst));
     std::uint64_t pages[n]{}, count = n;
     EXPECT(allocate(0x280, &count, pages) && count == n);
@@ -241,6 +244,9 @@ int paired_views(ID3D12Device* real) {
     auto* cpu = static_cast<std::uint8_t*>(reserve(nullptr, size, MEM_RESERVE | kXmem64kPages, 0, PAGE_READWRITE));
     auto* gpu = static_cast<std::uint8_t*>(reserve(nullptr, size, MEM_RESERVE | kXmem64kPages, 0, 0x801));
     EXPECT(cpu && gpu && leonida::title_gpu_views::other_view(uintptr_t(gpu)) == uintptr_t(cpu));
+    // The twin is the kind slot 31 maps by itself (xmem pairs it as the legacy kind, read at the CPU view).
+    EXPECT(!leonida::title_gpu_views::independently_mapped(uintptr_t(gpu), size));
+    EXPECT(leonida::title_gpu_views::set_independent_pages(uintptr_t(gpu)));
     EXPECT(leonida::title_gpu_views::independently_mapped(uintptr_t(gpu), size));
     std::uint64_t pages[n]{}, count = n;
     EXPECT(allocate(0x280, &count, pages) && count == n && map(gpu, n, pages) == gpu);

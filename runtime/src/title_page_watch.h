@@ -258,6 +258,22 @@ inline bool note_reservation(std::uintptr_t base, std::uintptr_t size, bool gpu_
     return true;
 }
 
+// Marks the pair whose GPU-only range starts at `gpu` as one whose GPU-only range has pages of its own (queue slot 31
+// or XMemMapPhysicalPages map them at that address, not through the CPU view): the host reads it there (to_cpu) and
+// a slot-133 buffer over it is a shadow, not an import (independently_mapped). False when no pair starts at `gpu`.
+// Nothing in the runtime marks a pair yet: which of the title's pairs are independent is not decided (a pair xmem
+// makes is the legacy kind, read at its CPU view), so only tests that model an independent window call it.
+inline bool set_independent_pages(std::uintptr_t gpu, bool independent = true) {
+    State& s = state();
+    std::unique_lock lock(s.mutex);
+    for (View& v : s.views) {
+        if (v.gpu != gpu) continue;
+        v.independent_pages = independent;
+        return true;
+    }
+    return false;
+}
+
 // Where the host reads a GPU address. Slot 31 maps its window directly; legacy pairs use the CPU view.
 inline std::uintptr_t to_cpu(std::uintptr_t va, std::uintptr_t bytes = 1) {
     State& s = state();
