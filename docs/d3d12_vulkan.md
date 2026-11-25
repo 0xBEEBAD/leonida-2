@@ -2359,6 +2359,19 @@ Pipeline creation:
   The files must match the Vulkan vendor, device and pipeline-cache UUID. Vulkan supplies an opaque snapshot.
   Replacing part of the previous file would corrupt it.
   `LEONIDA_PIPELINE_CACHE_BYTES` caps session writes (256 MiB by default, zero disables the session file).
+  The session file can't keep a crashed run's compiles. It is written at teardown only, and a cache seeded from
+  the corpus returns the whole corpus, so it's over that cap. The heavy pipeline cache (RT-HEAVY-PIPELINE-CACHE,
+  `runtime/src/heavy_pipeline_cache.h`) keeps them. Every graphics and compute build first asks the corpus cache with
+  `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`. A pipeline the corpus doesn't have is built against a
+  second cache, seeded from `pipeline_cache.heavy.bin` next to `pipeline_cache.bin`, so that cache holds only the
+  corpus's misses.
+  A build that takes at least `LEONIDA_HEAVY_PIPELINE_CACHE_MS` (500 by default) marks the heavy cache for writing.
+  A thread of its own writes it whole: 3 s after the newest slow build, and no later than 20 s after the first unwritten
+  one, through the same staging file and rename as the session cache. A crash therefore loses at most the last 20 s
+  of slow builds, and the next launch starts with the rest. The thread stops and writes what is left at device
+  teardown. `LEONIDA_HEAVY_PIPELINE_CACHE_MS=0` turns the heavy cache off, and with it the
+  `pipelineCreationCacheControl` feature unless `LEONIDA_PIPELINE_COMPILE=cache-only` asks for it. A cache-only create
+  (`cache-only`) is left as it is.
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching
   compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
   It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.

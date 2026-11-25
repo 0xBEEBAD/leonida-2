@@ -780,6 +780,9 @@ if(BUILD_TESTING)
   add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
   add_test(NAME pipeline_cache_store COMMAND pipeline_cache_store_test)
 
+  add_executable(heavy_pipeline_cache_test test/heavy_pipeline_cache_test.cpp)
+  add_test(NAME heavy_pipeline_cache COMMAND heavy_pipeline_cache_test)
+
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
 
@@ -3996,6 +3999,11 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
       set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)
+      # The same draws through the heavy pipeline cache (src/heavy_pipeline_cache.h): every build first asks the
+      # offline cache without compiling, and a miss is built against the heavy cache in a folder of its own.
+      add_test(NAME d3d12_mesh_heavy_cache COMMAND d3d12_mesh_test)
+      set_tests_properties(d3d12_mesh_heavy_cache PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
+          "LEONIDA_HEAVY_PIPELINE_CACHE_MS=1;LEONIDA_PIPELINE_CACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/heavy_cache_test")
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_mesh_test are not built")
     endif()
