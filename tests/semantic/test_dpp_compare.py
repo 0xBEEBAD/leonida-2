@@ -133,7 +133,7 @@ class DppCompare(unittest.TestCase):
     def test_a_form_that_leaves_a_lane_unwritten_is_refused(self):
         for form in UNWRITTEN_FORMS:
             with self.subTest(form=form):
-                with self.assertRaisesRegex(Unsupported, "DPP compare with lanes that keep their mask bit"):
+                with self.assertRaisesRegex(Unsupported, "DPP compare with lanes DPP leaves unwritten"):
                     compare_vs("v_cmp_gt_f32_dpp", form)
 
 
@@ -208,7 +208,7 @@ class DppCompareExec(unittest.TestCase):
     def test_a_form_that_leaves_a_lane_unwritten_is_refused(self):
         for form in UNWRITTEN_FORMS:
             with self.subTest(form=form):
-                with self.assertRaisesRegex(Unsupported, "DPP compare with lanes that keep their mask bit"):
+                with self.assertRaisesRegex(Unsupported, "DPP compare with lanes DPP leaves unwritten"):
                     cmpx_vs("v_cmpx_gt_f32_dpp", form)
 
     def test_a_destination_operand_is_refused(self):

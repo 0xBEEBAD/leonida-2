@@ -7356,15 +7356,16 @@ class Gen:
             raise Unsupported("DPP operands")
         # A VOPC compare in DPP form (docs/design.md, "DPP on a VOPC compare"): src0 comes through the same lane
         # selection and the result is a mask bit, not a VGPR. Only the forms where every lane writes its bit are
-        # taken: what a lane that DPP leaves unwritten does to its VCC bit is not measured. v_cmpx writes EXEC instead
-        # and prints no destination, so its src0 is the first operand (SHADER-VOPCX-DPP).
+        # taken: what a lane that DPP leaves unwritten does to its VCC bit is measured on RDNA3 only (it gets 0), not
+        # on RDNA2. v_cmpx writes EXEC instead and prints no destination, so its src0 is the first operand
+        # (SHADER-VOPCX-DPP).
         compare = base_op(ins["op"]).startswith("v_cmp")
         first = 0 if base_op(ins["op"]).startswith("v_cmpx") else 1
         if compare:
             if len(args) != first + 2:
                 raise Unsupported("DPP compare operands")
             if row_mask != 0xF or bank_mask != 0xF or not (dpp8 is not None or bound):
-                raise Unsupported("DPP compare with lanes that keep their mask bit")
+                raise Unsupported("DPP compare with lanes DPP leaves unwritten")
         elif args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
         if args[first].get("n", 1) != 1:
