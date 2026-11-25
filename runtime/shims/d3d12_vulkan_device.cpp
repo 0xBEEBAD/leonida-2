@@ -12451,7 +12451,9 @@ public:
             log_once("shader-resource view denied by resource flags; format", int(r->desc().Format));
             return;
         }
-        if (!r->descriptor_image()) {
+        // A placed texture whose memory waits for its first use is a texture all the same, and asking for its image
+        // would bind that memory here, before write_image_descriptor can remember the view (prepare_on_bind).
+        if (!r->deferrable_sample() && !r->descriptor_image()) {
             if (!desc) {
                 log_once("buffer SRV requires a description; width", int(r->desc().Width));
                 return;

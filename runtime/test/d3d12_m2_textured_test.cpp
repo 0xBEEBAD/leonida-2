@@ -271,7 +271,9 @@ int main(int argc, char** argv) {
         for (UINT i=0; i<2; ++i) {
             if (placed) {
                 EXPECT(SUCCEEDED(at_address(placed_pages[i],texture_desc,D3D12_BARRIER_LAYOUT_COPY_DEST,&textures[i].p)));
-                EXPECT(rt::d3d12::vulkan_memory_flags(textures[i].p) == 0);
+                // A placed sampled texture waits for its memory only where views are prepared at bind time
+                // (prepare_on_bind); otherwise it is backed when it is made, like every other title image.
+                EXPECT((rt::d3d12::vulkan_memory_flags(textures[i].p) == 0) == staged_views);
             } else {
                 EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
                                                                   initial_state, nullptr, IID_PPV_ARGS(&textures[i].p))));
