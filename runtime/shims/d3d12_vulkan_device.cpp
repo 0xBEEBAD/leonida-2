@@ -6568,14 +6568,17 @@ struct DeviceState {
         leonida::StorageViews views{};
         VkImageViewCreateInfo storage_info{};
         bool storage_info_valid = false;
+        // storage_info's pNext chain: declared out here, since the 2D mirror below copies storage_info with its chain
+        // after this block. Declared inside it, the chain dangled and the driver followed it into stale stack (the
+        // 120 s hangs of d3d12_existing_heap, d3d12_r9g9b9e5_uav and the depth-storage tests).
+        VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        VkImageViewSlicedCreateInfoEXT sliced{VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT};
         if (storage) {
             storage_info = view_info;
             storage_info_valid = true;
             storage_info.components = {};
             storage_info.format = storage_format;
-            VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
             storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
-            VkImageViewSlicedCreateInfoEXT sliced{VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT};
             if (slices.count) {
                 sliced.sliceOffset = slices.first;
                 sliced.sliceCount = slices.count;
