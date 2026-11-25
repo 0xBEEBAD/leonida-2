@@ -438,7 +438,7 @@ trio (23-25). What the slots must answer is still **not measured**; that is the 
   returns true for any token. `XUserIsStoreUser` is true, as documented for console.
 - **First calls:** every served slot writes one `[rt] xgameruntime: XUser <name> first call: ...` line with its
   arguments and answer (`XUserGetGamertag` one per component, with the text it returned), so a boot log shows whether
-  the title added its user and read the gamertag its player-select prompt shows (T7 in `docs/re/takes/other-projects.md`).
+  the title added its user and read the gamertag its player-select prompt shows.
 
 `xgameruntime_user_test` calls every served slot with the documented arguments and reads back the first-call lines.
 
