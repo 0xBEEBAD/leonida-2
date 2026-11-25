@@ -2707,6 +2707,9 @@ The trace will enumerate them.
 
 ### 4.3 Barriers and layouts
 
+Plain buffer copies order earlier transfer writes on the same queue before reading or writing the next range.
+Set `LEONIDA_ORDER_BUFFER_COPIES=0` to omit this dependency when comparing replay behavior.
+
 Track a current state/layout per subresource. D3D12 states are bitmasks; a combined state takes the union of the
 mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` and log it. Legacy
 `D3D12_RESOURCE_STATE_*` maps to a (stage, access, layout) triple:
