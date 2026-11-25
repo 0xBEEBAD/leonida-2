@@ -29,6 +29,7 @@
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
 #include "spirv_capability.h"
+#include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <cmath>

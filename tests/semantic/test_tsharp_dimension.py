@@ -1,4 +1,4 @@
-﻿"""The T# dimension contract (docs/design.md, "Images and samplers (T# dimension)").
+"""The T# dimension contract (docs/design.md, "Images and samplers (T# dimension)").
 
 On RDNA2 the hardware addresses an image through the T#'s own TYPE, and the bindless set gives each image its index
 in ITS dimension's array. An instruction that reads a T# of another dimension therefore must not index its own

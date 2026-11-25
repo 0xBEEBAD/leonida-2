@@ -2929,8 +2929,11 @@ if(TARGET Vulkan::Headers)
           -o ${_journal_second_spv} ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
         COMMENT "Compiling the second authored compute journal control" VERBATIM)
-      add_executable(d3d12_compute_journal_test test/d3d12_compute_journal_test.cpp
-        ${_indirect_count_spv} ${_journal_second_spv})
+      # The first shader comes from gta6rt_indirect_count_shader: naming its output here too would give Make a second
+      # rule for the same file, and the two glslangValidator runs raced ("Failed to open file").
+      add_custom_target(gta6rt_compute_journal_shader DEPENDS ${_journal_second_spv})
+      add_executable(d3d12_compute_journal_test test/d3d12_compute_journal_test.cpp)
+      add_dependencies(d3d12_compute_journal_test gta6rt_indirect_count_shader gta6rt_compute_journal_shader)
       target_link_libraries(d3d12_compute_journal_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_compute_journal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         LEONIDA_TEST_COUNTER_SPV="${_indirect_count_spv}" LEONIDA_TEST_COUNTER_V2_SPV="${_journal_second_spv}")
