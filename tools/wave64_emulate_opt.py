@@ -1295,7 +1295,8 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
             u = work.pop()
             if u == skip or u in region:
                 continue
-            if u == b or u == 0 or not succ[u] or not blk_info[u][0]:
+            if (u == b or u == 0 or not succ[u] or not blk_info[u][0]
+                    or (len(raw_edges[u]) == 1 and terms[u][0] == "br" and terms[u][1] != "s_branch")):
                 ok = False
                 break
             region.add(u)

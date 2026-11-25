@@ -132,6 +132,55 @@ class StructuredPcUnwrapSemanticTest(unittest.TestCase):
                 mem = run_compute_workgroup(spv, 64, 32, push_constants=VSHARP + [s4])
                 self.assertEqual([mem.get(4 * t, 0) for t in range(64)], [want_val] * 64)
 
+    def test_wave64_emulate_exec_fold_refuses_last_block_cbranch_falloff(self):
+        """A wave64 s_cbranch_execz region containing a trailing conditional branch (no s_endpgm) must NOT be
+        folded into a region that unconditionally continues at `skip`: falling off the end must terminate."""
+        prog_to_x = [
+            "s_mov_b64 s[10:11], exec",
+            "s_cbranch_execz skip",
+            "s_branch last",
+            "X:",
+            "v_lshlrev_b32_e32 v2, 2, v0",
+            "v_mov_b32_e32 v1, 0x3333",
+            "buffer_store_dword v1, v2, s[0:3], 0 offen",
+            "s_branch skip",
+            "skip:",
+            "v_lshlrev_b32_e32 v2, 2, v0",
+            "v_mov_b32_e32 v1, 0x4444",
+            "buffer_store_dword v1, v2, s[0:3], 0 offen offset:256",
+            "s_endpgm",
+            "last:",
+            "s_cmp_eq_u32 s4, 1",
+            "s_cbranch_scc1 X",
+        ]
+        prog_to_skip = [
+            "s_mov_b64 s[10:11], exec",
+            "s_cbranch_execz skip",
+            "s_branch last",
+            "skip:",
+            "v_lshlrev_b32_e32 v2, 2, v0",
+            "v_mov_b32_e32 v1, 0x4444",
+            "buffer_store_dword v1, v2, s[0:3], 0 offen offset:256",
+            "s_endpgm",
+            "last:",
+            "s_cmp_eq_u32 s4, 1",
+            "s_cbranch_scc1 skip",
+        ]
+        for name, prog, want_taken_x, want_taken_skip in (
+            ("branch_to_x", prog_to_x, 0x3333, 0x4444),
+            ("branch_to_skip", prog_to_skip, 0, 0x4444),
+        ):
+            for structured in (True, False):
+                spv, _ = _translate_cs(
+                    f"cs_fold_falloff_{name}_{int(structured)}",
+                    prog, threads=64, emulate=True, structured=structured,
+                )
+                for s4, exp_x, exp_skip in ((0, 0, 0), (1, want_taken_x, want_taken_skip)):
+                    with self.subTest(case=name, structured=structured, s4=s4):
+                        mem = run_compute_workgroup(spv, 64, 32, push_constants=VSHARP + [s4])
+                        self.assertEqual([mem.get(4 * t, 0) for t in range(64)], [exp_x] * 64)
+                        self.assertEqual([mem.get(256 + 4 * t, 0) for t in range(64)], [exp_skip] * 64)
+
 
 if __name__ == "__main__":
     unittest.main()
