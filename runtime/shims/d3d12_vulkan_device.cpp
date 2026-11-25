@@ -3280,6 +3280,14 @@ struct DeviceState {
         if (base < arena.size || (geometry.cap() && geometry.lookup(arena.address + base, host, remaining))) return false;
         const std::uint32_t stride = (w1 >> 16) & 0x3FFFu;
         const std::uint64_t span = std::uint64_t(w2) * (stride ? stride : 1);
+        // A V# the layer wrote for one of its own buffers that the driver put below the arena (an upload buffer in
+        // ReBAR memory, say): the low 48 bits of a negative offset, which the shaders read sign-extended
+        // (vsharp_address). Not the title's memory: left as it is, never nulled.
+        if (base & (1ull << 47)) {
+            std::lock_guard lock(backing_mutex);
+            if (gpu_backings.covers(arena.address + (base | ~((1ull << 48) - 1)), std::max<std::uint64_t>(span, 1)))
+                return false;
+        }
         std::uint64_t to{};
         if (geometry.cap()) {
             const leonida::gfx10::BufferWords words{w0, w1, w2, w3};
