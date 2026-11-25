@@ -303,7 +303,11 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     const DWORD waited = WaitForSingleObject(done, 10000);
     CloseHandle(done);
     EXPECT(waited == WAIT_OBJECT_0);
-    EXPECT(std::memcmp(pages, reversed.data(), reversed.size()) == 0);
+    // A refused import (`may_refuse`) is a shadow at the same VA: filled from the pages before every submission but
+    // never written back, so only a real import shows the copy in the caller's pages.
+    if (!(may_refuse && rt::d3d12::title_shadow_buffer(buffer.p))) {
+        EXPECT(std::memcmp(pages, reversed.data(), reversed.size()) == 0);
+    }
 
     if (buffers_only) {
         // RGBA16 requires an 8-byte Vulkan buffer-image offset, while an imported host prefix may be +4.
