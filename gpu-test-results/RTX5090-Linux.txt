@@ -12,11 +12,11 @@ run_gpu_tests.py: 274 shaders: 274 translated, 274 pass spirv-val (both modes)
             native:                 208/264 passed, 55 skipped, 1 failed
             LEONIDA_W64_EMULATE=1:  242/264 passed, 21 skipped, 1 failed
 Failed:     cs_imgatomic_ext (native and emulated alike, 3 of 3 runs): 6 of 64 sint words differ, first
-            word 32: got 0x0badf00d, expected 0x00000101. The six differing words are the 3D-volume cases
-            (sint words 32..37: the glc return of swap, inc, dec, fmin, fmax and fcmpswap on the volume);
-            the 2D cases pass, and so do cs_imgatomic and cs_imgatomic3d. Word 32 holds the swap's data
-            register unchanged (0x0badf00d is its D), so the pre-op value is not returned there. design.md
-            reports the test exact on an RTX 4070 Ti with NVIDIA 620.70.06; this driver is older (595.99.02).
+            word 32: got 0x0badf00d, expected 0x00000101. These are the six 3D-volume glc returns (sint words
+            32..37); the 2D cases, cs_imgatomic and cs_imgatomic3d pass. Not this GPU: the same six words fail
+            on llvmpipe and on RADV (the 9950X's iGPU) on this PC. The fixture's volume T# (s[8:15]) lacks the
+            synthetic-UAV tag the translator gates 3D atomics on since c0a5d66fa, so the ops never run;
+            #1518 (GPU-IMG-ATOMIC-EXT-VOLUME-TAG) fixes the fixture.
 Skipped:    native: 33 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
             device" and 1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
             emulated run covers), 19 documented "run by d3d12_*_test / w64_graphics.py" cases and 1 "needs
