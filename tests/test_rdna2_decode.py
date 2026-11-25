@@ -207,6 +207,40 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(reparsed["op"], ins["op"])
         self.assertEqual(reparsed["mods"], ins["mods"])
 
+    def test_permlane16_opsel_is_the_fi_bound_ctrl_pair(self):
+        # v_permlane16_b32 v2, v0, s0, s1 is 0xD7770002 0x00040100, v_permlanex16_b32 0xD7780002; op_sel is w0 bits
+        # 11..14. llvm-mc 21.1.8 prints bits 0 and 1 as op_sel:[FI,BOUND_CTRL] and ignores bits 2 and 3, where the
+        # other VOP3 ops print [s0,s1,s2,dst]. Hand-assembled words, checked against llvm-mc -disassemble.
+        expect = {0x0: [], 0x1: ["op_sel:[1,0]"], 0x2: ["op_sel:[0,1]"], 0x3: ["op_sel:[1,1]"],
+                  0x4: [], 0x8: [], 0xC: [], 0x5: ["op_sel:[1,0]"], 0xE: ["op_sel:[0,1]"], 0xF: ["op_sel:[1,1]"]}
+        for w0, op in ((0xD7770002, "v_permlane16_b32"), (0xD7780002, "v_permlanex16_b32")):
+            for op_sel, mods in expect.items():
+                with self.subTest(op=op, op_sel=op_sel):
+                    info = rdna2_decode.decode_bytes(words(w0 | (op_sel << 11), 0x00040100))
+                    self.assertEqual(info["invalid"], 0)
+                    ins = info["insns"][0]
+                    self.assertEqual(ins["op"], op)
+                    self.assertEqual(ins["mods"], mods)
+                    reparsed = shader_ir.parse_line(rdna2_decode.format_insn(ins))
+                    self.assertEqual(reparsed["mods"], mods)
+
+    def test_exp_null_target_matches_the_parsed_line(self):
+        # exp null off, off, off, off done vm = 0xF8001890 0x00000000 (llvm-mc 21.1.8, gfx1013); mrt0 for contrast.
+        # shader_ir.parse_line gives the `null` target as the special register and every other target as a
+        # target, and decode_bytes has to hand out the same dictionaries as the line it prints, parsed back.
+        for w0, w1, kind, name in ((0xF8001890, 0x00000000, "special", "null"),
+                                   (0xF800180F, 0x09080706, "target", "mrt0")):
+            with self.subTest(target=name):
+                info = rdna2_decode.decode_bytes(words(w0, w1))
+                self.assertEqual(info["invalid"], 0)
+                ins = info["insns"][0]
+                self.assertEqual(ins["op"], "exp")
+                self.assertEqual((ins["args"][0]["k"], ins["args"][0]["t"]), (kind, name))
+                reparsed = shader_ir.parse_line(rdna2_decode.format_insn(ins))
+                self.assertEqual([(a["k"], a.get("t")) for a in reparsed["args"]],
+                                 [(a["k"], a.get("t")) for a in ins["args"]])
+                self.assertEqual(reparsed["mods"], ins["mods"])
+
     def test_smem_vcc_tuple_and_offsets(self):
         # s_buffer_load_dwordx8 [s100..s105,vcc_lo,vcc_hi], s[0:3], null (SMEM op=0x0b, sdata=100, sbase=0, soff=125)
         w0 = (0x3D << 26) | (0x0B << 18) | (100 << 6) | 0
@@ -348,12 +382,34 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 for field in ("op", "args", "mods"):
                     self.assertEqual(reparsed[field], expected[field])
 
+    def test_sopk_imm16_is_sign_extended_for_the_signed_ops_only(self):
+        # SOPK word: 0xB << 28 | op << 23 | sdst << 16 | simm16. The ten signed ops give the 16 bits sign-extended,
+        # the six unsigned compares give them as they are, and the printed line reads back as the same value.
+        signed = {0: "s_movk_i32", 2: "s_cmovk_i32", 3: "s_cmpk_eq_i32", 4: "s_cmpk_lg_i32", 5: "s_cmpk_gt_i32",
+                  6: "s_cmpk_ge_i32", 7: "s_cmpk_lt_i32", 8: "s_cmpk_le_i32", 15: "s_addk_i32", 16: "s_mulk_i32"}
+        unsigned = {9: "s_cmpk_eq_u32", 10: "s_cmpk_lg_u32", 11: "s_cmpk_gt_u32", 12: "s_cmpk_ge_u32",
+                    13: "s_cmpk_lt_u32", 14: "s_cmpk_le_u32"}
+        for table, sign_extends in ((signed, True), (unsigned, False)):
+            for opcode, name in table.items():
+                for simm16 in (0x0001, 0x7FFF, 0x8000, 0xFFFD, 0xFFFF):
+                    with self.subTest(op=name, simm16=hex(simm16)):
+                        code = words(0xB << 28 | opcode << 23 | 5 << 16 | simm16)
+                        ins, = rdna2_decode.decode_bytes(code)["insns"]
+                        want = simm16 - 0x10000 if sign_extends and simm16 & 0x8000 else simm16
+                        self.assertEqual((ins["op"], ins["args"][0]["r"], ins["args"][1]),
+                                         (name, 5, {"k": "imm", "v": want}))
+                        text, bad = rdna2_decode.disasm_bytes(code)
+                        self.assertEqual(bad, 0)
+                        self.assertEqual(shader_ir.parse_line(text.strip())["args"], ins["args"])
+
     def test_parity_with_llvm_mc_on_shader_fixtures(self):
         mc = os.environ.get("LLVM_MC") or shutil.which("llvm-mc") or shutil.which("llvm-mc-18")
         if not mc:
             self.skipTest("llvm-mc not available")
         asms = sorted(glob.glob(os.path.join(ROOT, "runtime", "test", "shaders", "*.asm")))
         self.assertGreater(len(asms), 50)
+        sopk_signed = {"s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32"} | {
+            f"s_cmpk_{cond}_i32" for cond in ("eq", "lg", "gt", "ge", "lt", "le")}
 
         def norm_op(op):
             for suf in ("_e32", "_e64", "_sdwa", "_dpp"):
@@ -367,7 +423,10 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 return (k, a["r"], a.get("n", 1), bool(a.get("neg")), bool(a.get("abs")), bool(a.get("sext")))
             if k == "imm":
                 # LLVM 18 disassembles SOPP branch offsets unsigned (0xfff0), LLVM 21/22 signed (-16).
-                mask = 0xFFFF if op in rdna2_decode._SOPP_BRANCHES else 0xFFFFFFFF
+                # The signed SOPK ops hold 16 bits as well: the decoder gives them sign-extended (s_addk_i32 s52,
+                # -32768; the test above), llvm-mc 23.1.4 prints the same word as 0x8000, and the translator reads
+                # the low 16 bits of either. cs_w32_salu_ext is the first fixture with bit 15 set in one.
+                mask = 0xFFFF if op in rdna2_decode._SOPP_BRANCHES or op in sopk_signed else 0xFFFFFFFF
                 return ("imm", a["v"] & mask, bool(a.get("neg")), bool(a.get("abs")))
             if k == "fimm":
                 return ("fimm", round(a["v"], 6), bool(a.get("neg")), bool(a.get("abs")))
@@ -393,11 +452,13 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             if r.returncode != 0 or "error:" in r.stderr:
                 continue
             raw = bytearray()
+            assembled = []
             for ln in r.stdout.splitlines():
                 if "; encoding:" not in ln or ln.lstrip().startswith("."):
                     continue
                 ins = shader_ir.parse_line(ln)
                 if ins and ins["enc"]:
+                    assembled.append(ins)
                     raw.extend(bytes.fromhex(ins["enc"]))
             dcmd = [mc, "-disassemble", "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
             if mattr:
@@ -416,7 +477,12 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             dec = rdna2_decode.decode_bytes(bytes(raw), wave32=wave32)
             self.assertEqual(dec["invalid"], 0, path)
             self.assertEqual(len(dec["insns"]), len(llvm_insns), path)
-            for li, di in zip(llvm_insns, dec["insns"]):
+            self.assertEqual(len(assembled), len(llvm_insns), path)
+            for ai, li, di in zip(assembled, llvm_insns, dec["insns"]):
+                # LLVM 19 re-encodes this disassembly with a spurious literal. Its assembler
+                # prints the original operand, modifiers and eight bytes for the same instruction.
+                if rdna2spirv.sdwa_inline_float(bytes.fromhex(ai["enc"]), bytes.fromhex(li["enc"]), li["op"]):
+                    li = ai
                 self.assertEqual(di["enc"], li["enc"], path)
                 self.assertEqual(norm_op(di["op"]), norm_op(li["op"]), path)
                 self.assertEqual([norm_arg(x, di["op"]) for x in di["args"]],
