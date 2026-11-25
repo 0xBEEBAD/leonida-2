@@ -3007,7 +3007,9 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_QUAD_DIR="${LEONIDA_QUAD_DIR}")
       target_compile_options(d3d12_quad_index_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_quad_index COMMAND d3d12_quad_index_test)
-      set_tests_properties(d3d12_quad_index PROPERTIES SKIP_RETURN_CODE 77)
+      # vs_quad_inst reads its root arguments in the pack() layout (from s0), which is LEONIDA_GRAPHICS_STAGE_LAYOUT=0.
+      set_tests_properties(d3d12_quad_index PROPERTIES SKIP_RETURN_CODE 77
+                           ENVIRONMENT "LEONIDA_GRAPHICS_STAGE_LAYOUT=0")
 
       # vk_bindless_test (the bindless set and its table at the Vulkan level, no D3D12) takes the translated vs_ids,
       # ps_tex and ps_imgatomic; it was only run by scripts/run_gpu_tests.py and check.py until D3D-314 needed it.
