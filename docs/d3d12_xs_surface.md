@@ -472,7 +472,7 @@ attributed.
 |---:|---|---:|---:|---|---|---|
 | 86 | `+0x2B0` | 37 | **1** (`0x142479A87`) | `[0x1475DF000]` (alias of the device pointer) | `rcx`=device, `rdx`=&desc (first qword `0x2B0`), `r8`=&`IID_ID3D12PipelineState`, `r9`=&out | three-argument, `riid`-out PSO stream creation (`CreatePipelineState` in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1) |
 | 101 | `+0x328` | 28 | **1** (`0x1424813EF`) | `[0x1475DF018]` (alias) | `rcx`=device, `rdx`=&desc (dword 0 = `3`, dword 4 = index, `+8` = pointer), `r8`=&`IID_ID3D12StateObject`, `r9`=&out | three-argument, `riid`-out state-object creation with a leading type word `3` (`CreateStateObject` in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1) |
-| 108 | `+0x360` | 31 | **2** (`0x140ABFDA9`, `0x140ABFE07`) | vtable fetched from the device (`[0x1475DF030]` / `[0x1475DF035]`); the device itself is in `rdx` | `rcx`=&16-byte out, `rdx`=device, `r8d`=1, `r9d`=1, `[rsp+0x20]`=pointer, `[rsp+0x28]`=pointer | six-argument C-ABI struct-return allocation query (16-byte `D3D12_RESOURCE_ALLOCATION_INFO` out in `rcx`; `GetResourceAllocationInfo2` in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1) |
+| 108 | `+0x360` | 31 | **2** (`0x140ABFDA9`, `0x140ABFE07`) | vtable fetched from the device (`[0x1475DF030]` / `[0x1475DF035]`); `rdx` is the device itself: the slot returns a 16-byte struct, so the MSVC x64 ABI puts the hidden return buffer in `rcx` and `this` moves to `rdx` | `rcx`=&16-byte `D3D12_RESOURCE_ALLOCATION_INFO` return, `rdx`=device, `r8d`=1 (`visibleMask`), `r9d`=1 (`numResourceDescs`), `[rsp+0x20]`=&56-byte `D3D12_RESOURCE_DESC`, `[rsp+0x28]`=&24-byte scratch (`D3D12_RESOURCE_ALLOCATION_INFO1`-sized) | allocation-info query over one 56-byte resource description (4 KiB small-resource retry; routed as `GetResourceAllocationInfo2` in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1) |
 | 131 | `+0x418` | 26 | **0** | - | - | the offset is called, but only on non-device receivers here; a device form is unproven |
 | 132 | `+0x420` | 47 | **1** (`0x1424745E4`) | `[0x1475DF048]` (the alias the copy loop reads) | `rcx`=device, `edx`=3 | single small enum/int argument |
 | 133 | `+0x428` | 74 | **5** (`0x14006DD85`, `0x14193DFF8`, `0x14193E2D4`, `0x141E8684C`, `0x1456F802B`) | `[0x1475DF048]` or `[0x148759D00]` | `rcx`=device, `rdx`=GPU VA, `r8`=&`D3D12_RESOURCE_DESC`, `r9d`=state (`6`, `0xFFFFFFFF` or a register), `[rsp+0x20]`=clear, `[rsp+0x28]`=&`IID_ID3D12Resource`, `[rsp+0x30]`=&out | six-argument placed-resource creation, stable across all five sites |
@@ -497,16 +497,33 @@ Per slot:
   and `[rdx+8]` a pointer (`rdi`). That is the DXR state-object side of the game, routed in
   [d3d12_vulkan.md](d3d12_vulkan.md) §3.1 (`runtime/shims/d3d12_xs_device.cpp`) as
   `CreateStateObject(desc, riid, out)` to PC slot 62 (`ID3D12Device5::CreateStateObject`).
-- **108.** At both sites the caller stages a 16-byte result and copies it out with two `vmovups`
-  right after the call (`0x140ABFE0D`, and the `0x140ABFDAF` twin). `rdx` holds a device alias but
-  `rcx` is the stack out block, so the vtable and the `this` register disagree; the compiler
-  devirtualised through the device. Call it a device method (the vtable is the device's) and note
-  that the ABI of the *argument list* is what matters for a shim: `(out16, device, 1, 1, ptr,
-  ptr)`. That matches the console C-ABI struct-return form of `GetResourceAllocationInfo2` routed
-  in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1 (`runtime/shims/d3d12_xs_device.cpp` -> PC slot 68,
-  `ID3D12Device8::GetResourceAllocationInfo2`): a 16-byte `D3D12_RESOURCE_ALLOCATION_INFO` return
-  buffer in `rcx`, the device in `rdx`, `visibleMask = 1`, `numResourceDescs = 1`, `pResourceDescs`,
-  and `pResourceAllocationInfo1`.
+- **108.** No GUID is compared at either site. Both sit in one function, `0x140ABFAE0`-`0x140ABFE6C`
+  (reached through the thunk at `0x140ABFAD0`), which first computes the surface size and then makes
+  the one call twice at most. The 5th argument is a 56-byte `D3D12_RESOURCE_DESC`: the callee reads
+  `Dimension` at `+0`, `Alignment` at `+8`, `Width` at `+0x10`, `Height` at `+0x18`,
+  `DepthOrArraySize` at `+0x1C`, `Format` at `+0x20`, `Layout` at `+0x2C` and `Flags` at `+0x30`, and
+  writes back the 4-texel-aligned `Width`/`Height` for block-compressed formats
+  (`0x140ABFB2B`-`0x140ABFB40`). `Format` becomes bits per pixel through `0x144D9F3C0`, which indexes
+  the 128/96/64/32/16/8/4-bit table at `0x1461ED5B8`; dimension 4 (3D) with `Layout` 0 has `Layout`
+  set to the console word `0x105` (`0x140ABFD4B`-`0x140ABFD57`), dimension 3 (2D) takes the tile-shape
+  table, and a buffer is plain `Width × Height × Depth × bits`. When the whole surface is under
+  `0x80008` bits it writes `Alignment = 0x1000`, asks for that alignment, and if the returned alignment
+  is not `0x1000` clears `Alignment` to 0 and calls again (`0x140ABFDBF`-`0x140ABFE07`) — the retry the
+  SDK's small-resource sample does with `D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT` (4096,
+  `d3d12.h:1304`), and the 4 KiB small-texture alignment the host layer already answers
+  ([d3d12_vulkan.md](d3d12_vulkan.md) §4.2). The 16-byte return is `{SizeInBytes, Alignment}` and the
+  code traps unless the high dword of `SizeInBytes` is 0, so a returned size has to fit 32 bits
+  (`0x140ABFE15`).
+  That is the argument list, return placement and struct use of
+  `ID3D12Device4::GetResourceAllocationInfo1(visibleMask, numResourceDescs, pResourceDescs,
+  pResourceAllocationInfo1)` (`d3d12.h:12418-12422`), including a 24-byte
+  `D3D12_RESOURCE_ALLOCATION_INFO1` buffer as the 4th argument (`d3d12.h:2965-2970`);
+  [d3d12_vulkan.md](d3d12_vulkan.md) §3.1 (`runtime/shims/d3d12_xs_device.cpp`) serves it by
+  expanding the 56-byte `D3D12_RESOURCE_DESC` (normalising `0x105` and Xbox flag bits) and routing to
+  PC slot 68 (`ID3D12Device8::GetResourceAllocationInfo2`). **Measured**: the shape, the struct
+  offsets, `0x1000`/`0x105`, the retry and the assert. **Open**: the exact console wire method name
+  (`GetResourceAllocationInfo1` vs `GetResourceAllocationInfoX` / `2`) — no IID or symbol string is
+  present at the sites.
 - **131.** Twenty-six sites, none on the device. Two are on sub-objects reached through another
   global (`0x1415A487D` indexes a table at `[rax+0x28]`), one at `0x14437CFED` follows slot 130
   (`+0x410`) on the same receiver and reads the out dword it wrote, and the rest are on arguments
