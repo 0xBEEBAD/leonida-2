@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -44,7 +45,8 @@ inline std::vector<std::uint8_t> fssm_program(std::initializer_list<std::uint32_
     return out;
 }
 
-inline std::vector<std::uint8_t> shader_container(const std::vector<std::uint8_t>& fssm) {
+inline std::vector<std::uint8_t> shader_container(const std::vector<std::uint8_t>& fssm,
+                                                  const std::array<std::uint8_t, 16>* digest = nullptr) {
     const auto stream = zlib_stored(fssm);
     std::vector<std::uint8_t> xbch = {'X', 'B', 'C', 'H'};
     for (const std::uint32_t v : {1u, std::uint32_t(stream.size()), 0u, std::uint32_t(fssm.size()), 0u}) put32(xbch, v);
@@ -59,11 +61,18 @@ inline std::vector<std::uint8_t> shader_container(const std::vector<std::uint8_t
     dxil.insert(dxil.end(), xbch.begin(), xbch.end());
     std::vector<std::uint8_t> out = {'D', 'X', 'B', 'C'};
     out.resize(28, 0);
-    put32(out, 1);
-    put32(out, 36);
+    put32(out, digest ? 2 : 1);
+    put32(out, digest ? 40 : 36);
+    if (digest) put32(out, 40 + 8 + std::uint32_t(dxil.size()));
     out.insert(out.end(), {'D', 'X', 'I', 'L'});
     put32(out, std::uint32_t(dxil.size()));
     out.insert(out.end(), dxil.begin(), dxil.end());
+    if (digest) {
+        out.insert(out.end(), {'H', 'A', 'S', 'H'});
+        put32(out, 20);
+        put32(out, 0);
+        out.insert(out.end(), digest->begin(), digest->end());
+    }
     return out;
 }
 
