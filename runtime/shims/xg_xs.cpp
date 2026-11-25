@@ -1,6 +1,7 @@
 // xg_xs.dll: the console's texture layout library. Titles ask it which swizzle mode a texture should use, how large it
 // is, where each mip and slice lies, and to copy linear data into tiled memory and back. The game executable
-// (1.0.2.1) imports two functions from it.
+// (1.0.2.1) imports two functions from it. The object has an Xbox vtable (AddRef and Release first, with no
+// QueryInterface).
 //
 // Measured from the call sites in the executable, read statically (shapes and checks only):
 //   HRESULT XGSuggestSwizzleMode(const desc*, 0, uint32_t* mode)
@@ -13,29 +14,36 @@
 //     one out pointer to a large stack structure (2 sites), slot 8 with six arguments in a loop over subresources
 //     (1 site) and slot 10 with seven arguments (1 site).
 //
-// The computer's methods, their arguments and the layout structure slot 2 fills are taken from Marvisak/VIctory
-// (GPL-3.0), crates/victory-hle/src/modules/xg.rs at commit d2a4bae1f, which serves the same title: 0 AddRef,
-// 1 Release, 2 the layout, 6 an element's byte offset, 8 a copy into and 9 a copy out of a subresource, 10 the 64 KiB
-// tiling. They match the slots measured above. The layouts come from runtime/src/console_texture_layout.h, ported
-// from the same project.
+// Two layout models answer, in this order:
+//   1. xg_xs_layout.h (single-plane textures that are not targets, in the linear, 4 KiB and 64 KiB standard and
+//      64 KiB display modes). The D3D12 layer lays the title's streamed and placed textures out with the same header,
+//      so what the title is told here is what the layer reads back.
+//   2. runtime/src/console_texture_layout.h, for a description the first cannot lay out (targets, depth with stencil,
+//      the other swizzle modes, multisampling): namespace `port` below. Its methods, their arguments and the layout
+//      structure slot 2 fills are taken from Marvisak/VIctory (GPL-3.0), crates/victory-hle/src/modules/xg.rs at
+//      commit d2a4bae1f, which serves the same title: 0 AddRef, 1 Release, 2 the layout, 6 an element's byte offset,
+//      8 a copy into and 9 a copy out of a subresource, 10 the 64 KiB tiling. They match the slots measured above.
+//      The layouts come from runtime/src/console_texture_layout.h, ported from the same project.
 //
-// Kept from the measured callers: a description this shim cannot lay out still gets a computer in *out (with a
+// Kept from the measured callers: a description neither model can lay out still gets a computer in *out (with a
 // negative HRESULT), because two callers use *out without checking the HRESULT. That computer answers every slot
-// with E_NOTIMPL and writes nothing. COM says *out is null on failure; this breaks that on purpose.
+// with E_NOTIMPL (0 for the slots that return a number) and writes nothing. COM says *out is null on failure; this
+// breaks that on purpose.
 //
-// Not modelled: compression metadata planes (HTILE, CMASK, FMASK, DCC), addressing and copies for the pipe/bank XOR
-// modes (_X, _T) and MSAA (they need the GPU's pipe configuration; the host renders those targets), and the slots no
-// caller reaches (size, alignment, mip offset, element coordinate, view descriptor), which log once and return
-// E_NOTIMPL.
+// Not modelled by the second model: compression metadata planes (HTILE, CMASK, FMASK, DCC), addressing and copies for
+// the pipe/bank XOR modes (_X, _T) and MSAA (they need the GPU's pipe configuration; the host renders those targets),
+// and the slots no caller reaches (element coordinate, view descriptor), which log once and return E_NOTIMPL.
 #include <windows.h>
 #include <intrin.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -44,15 +52,250 @@
 
 #include "../src/console_texture_layout.h"
 #include "shims.h"
+#include "xg_xs_layout.h"
+#include "../src/title_page_watch.h"
 
 namespace {
+
+using namespace rt::xg_xs;
+constexpr size_t kSlots = 32;
+
+struct Computer {
+    const void* const* vtable;
+    std::atomic<ULONG> refs{1};
+    Texture texture;
+};
+
+void trace(std::atomic<unsigned>& calls, const char* name, const void* caller, const char* format, ...) {
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("LEONIDA_XG_TRACE", value, sizeof(value)) == 1 && value[0] == '1';
+    }();
+    if (!enabled) return;
+    const unsigned call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (call > 1024) return;
+    char details[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(details, sizeof(details), format, args);
+    va_end(args);
+    std::fprintf(stderr, "[rt] xg_xs: LOCAL DIAGNOSTIC: %s #%u caller=%s %s\n",
+                 name, call, rt::shims::module_offset(reinterpret_cast<uint64_t>(caller)).c_str(), details);
+}
+
+void trace_desc(std::atomic<unsigned>& calls, const char* name, const void* caller,
+                const ResourceDesc* desc, const void* out, uint32_t options,
+                HRESULT hr, uint32_t mode, uint64_t bytes) {
+    if (!desc) {
+        trace(calls, name, caller, "desc=null out=%p options=%#x hr=0x%08x", out, options, uint32_t(hr));
+        return;
+    }
+    trace(calls, name, caller,
+          "dim=%u %llux%ux%u mips=%u fmt=%u samples=%u quality=%u align=%llu layout=%#x flags=%#x "
+          "options=%#x out=%p hr=0x%08x mode=%#x bytes=%llu",
+          desc->dimension, static_cast<unsigned long long>(desc->width), desc->height, unsigned(desc->depth_or_array),
+          unsigned(desc->mips), desc->format, desc->samples, desc->quality, static_cast<unsigned long long>(desc->alignment),
+          desc->layout, desc->flags, options, out, uint32_t(hr), mode, static_cast<unsigned long long>(bytes));
+}
+
+ULONG __stdcall add_ref(Computer* self) {
+    static std::atomic<unsigned> calls{0};
+    const ULONG refs = self->texture.layout.planes ? self->refs.fetch_add(1, std::memory_order_relaxed) + 1 : 1;
+    trace(calls, "slot 0", _ReturnAddress(), "this=%p refs=%lu", self, refs);
+    return refs;
+}
+
+ULONG __stdcall release(Computer* self) {
+    static std::atomic<unsigned> calls{0};
+    const ULONG refs = self->texture.layout.planes ? self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1 : 1;
+    trace(calls, "slot 1", _ReturnAddress(), "this=%p refs=%lu", self, refs);
+    if (!refs) delete self;
+    return refs;
+}
+
+HRESULT __stdcall get_layout(Computer* self, ResourceLayout* out) {
+    static std::atomic<unsigned> calls{0};
+    const auto& layout = self->texture.layout;
+    const HRESULT hr = !layout.planes ? E_NOTIMPL : !out ? E_POINTER : S_OK;
+    trace(calls, "slot 2", _ReturnAddress(), "this=%p out=%p hr=0x%08x bytes=%llu align=%llu mips=%u planes=%u",
+          self, out, uint32_t(hr), static_cast<unsigned long long>(layout.size),
+          static_cast<unsigned long long>(layout.alignment), layout.mips, layout.planes);
+    if (SUCCEEDED(hr)) {
+        *out = {layout.size, layout.alignment, layout.mips, layout.planes, {layout.plane[0]}, layout.dimension, 0};
+    }
+    return hr;
+}
+
+uint64_t __stdcall get_size(Computer* self) {
+    static std::atomic<unsigned> calls{0};
+    const uint64_t bytes = self->texture.layout.size;
+    trace(calls, "slot 3", _ReturnAddress(), "this=%p bytes=%llu", self, static_cast<unsigned long long>(bytes));
+    return bytes;
+}
+
+uint64_t __stdcall get_alignment(Computer* self) {
+    static std::atomic<unsigned> calls{0};
+    const uint64_t bytes = self->texture.layout.alignment;
+    trace(calls, "slot 4", _ReturnAddress(), "this=%p bytes=%llu", self, static_cast<unsigned long long>(bytes));
+    return bytes;
+}
+
+uint64_t __stdcall get_mip_offset(Computer* self, uint32_t plane, uint32_t level) {
+    static std::atomic<unsigned> calls{0};
+    const auto& layout = self->texture.layout;
+    const uint64_t offset = plane < layout.planes && level < layout.mips ? layout.plane[plane].mips[level].offset : 0;
+    trace(calls, "slot 5", _ReturnAddress(), "this=%p plane=%u mip=%u offset=%llu",
+          self, plane, level, static_cast<unsigned long long>(offset));
+    return offset;
+}
+
+uint64_t __stdcall get_element_offset(Computer* self, uint32_t plane, uint32_t level,
+                                      uint64_t x, uint32_t y, uint32_t z, uint32_t sample, uint32_t* bit) {
+    static std::atomic<unsigned> calls{0};
+    const auto& t = self->texture;
+    uint64_t offset = 0;
+    if (bit) *bit = 0;
+    if (plane < t.layout.planes && level < t.layout.mips && sample == 0) {
+        const auto& mip = t.layout.plane[plane].mips[level];
+        if (x < mip.width_elements && y < mip.height_elements && z < mip.depth) {
+            const ElementAddress address(t);
+            offset = address.offset(mip, address.tail_origin(mip), uint32_t(x), y, z);
+        }
+    }
+    trace(calls, "slot 6", _ReturnAddress(), "this=%p plane=%u mip=%u x=%llu y=%u z=%u sample=%u bit=%p offset=%llu",
+          self, plane, level, static_cast<unsigned long long>(x), y, z, sample, bit,
+          static_cast<unsigned long long>(offset));
+    return offset;
+}
+
+template<bool Into>
+HRESULT copy_subresource(const Texture& t, uint32_t plane, uint32_t subresource, uint32_t sample,
+                         const void* src, void* dst, uint32_t row_pitch, uint32_t slice_pitch) {
+    const auto& layout = t.layout;
+    if (!layout.planes) return E_NOTIMPL;
+    if (!src || !dst) return E_POINTER;
+    if (plane >= layout.planes || subresource >= layout.mips * t.array || sample) return E_INVALIDARG;
+    const auto& mip = layout.plane[plane].mips[subresource % layout.mips];
+    const uint32_t slice = subresource / layout.mips;
+    const uint32_t row_bytes = mip.width_elements * t.format.bytes;
+    if (row_pitch < row_bytes) return E_INVALIDARG;
+    const uint32_t depth = t.layout.dimension == kTexture3D ? mip.depth : 1;
+    const uint64_t one_slice = uint64_t(row_pitch) * (mip.height_elements - 1) + row_bytes;
+    if (depth > 1 && slice_pitch < one_slice) return E_INVALIDARG;
+    const uint64_t linear_size = uint64_t(slice_pitch) * (depth - 1) + one_slice;
+    const auto source = static_cast<const std::byte*>(src);
+    auto destination = static_cast<std::byte*>(dst);
+    if (leonida::gfx10::tiling_detail::overlap(
+            {source, Into ? linear_size : layout.size}, {destination, Into ? layout.size : linear_size}))
+        return E_INVALIDARG;
+    std::vector<uint64_t> columns;
+    copy_elements<Into>(t, subresource % layout.mips, slice, source, destination, row_pitch, slice_pitch, columns);
+    return S_OK;
+}
+
+HRESULT __stdcall copy_into(Computer* self, void* dst, uint32_t plane, uint32_t sub, const void* src,
+                            uint32_t row, uint32_t slice) {
+    static std::atomic<unsigned> calls{0};
+    const HRESULT hr = copy_subresource<true>(self->texture, plane, sub, 0, src, dst, row, slice);
+    // The texture's image on the PC GPU is filled from this memory: tell the D3D12 layer it changed.
+    if (SUCCEEDED(hr)) leonida::title_texel_writes::note(dst, size_t(self->texture.layout.size));
+    trace(calls, "slot 8", _ReturnAddress(), "this=%p dst=%p plane=%u sub=%u src=%p row=%u slice=%u hr=0x%08x",
+          self, dst, plane, sub, src, row, slice, uint32_t(hr));
+    return hr;
+}
+
+HRESULT __stdcall copy_from(Computer* self, void* dst, uint32_t plane, uint32_t sub, uint32_t sample,
+                            const void* src, uint32_t row, uint32_t slice) {
+    static std::atomic<unsigned> calls{0};
+    const HRESULT hr = copy_subresource<false>(self->texture, plane, sub, sample, src, dst, row, slice);
+    trace(calls, "slot 9", _ReturnAddress(), "this=%p dst=%p plane=%u sub=%u sample=%u src=%p row=%u slice=%u hr=0x%08x",
+          self, dst, plane, sub, sample, src, row, slice, uint32_t(hr));
+    return hr;
+}
+
+struct PackedMips {
+    uint8_t standard, packed;
+    uint16_t reserved;
+    uint32_t tiles, start;
+};
+struct TileShape { uint32_t width, height, depth; };
+struct SubresourceTiling { uint32_t width; uint16_t height, depth; uint32_t start; };
+static_assert(sizeof(PackedMips) == 12 && sizeof(TileShape) == 12 && sizeof(SubresourceTiling) == 12);
+
+HRESULT __stdcall get_tiling(Computer* self, uint32_t* total_tiles, PackedMips* packed, TileShape* shape,
+                             uint32_t* count, uint32_t first, SubresourceTiling* tilings) {
+    static std::atomic<unsigned> calls{0};
+    const auto& t = self->texture;
+    const auto& layout = t.layout;
+    const auto& p = layout.plane[0];
+    const unsigned requested = count ? *count : 0;
+    const bool supported = layout.alignment == kTileBytes && layout.dimension == kTexture2D;
+    const HRESULT hr = !layout.planes ? E_NOTIMPL : !supported ? E_FAIL : S_OK;
+    const uint32_t tiles = supported ? uint32_t(layout.size / kTileBytes) : 0;
+    unsigned written = 0;
+    if (SUCCEEDED(hr)) {
+        if (total_tiles) *total_tiles = tiles;
+        if (packed) *packed = {uint8_t(p.standard_mips), uint8_t(p.tail_mips), 0, p.tail_mips ? 1u : 0u, 0};
+        if (shape) *shape = {t.tile_width * t.format.side, t.tile_height * t.format.side, 1};
+        const uint32_t total_subresources = t.array * layout.mips;
+        if (count && first < total_subresources) {
+            const uint32_t end = std::min(requested, total_subresources - first);
+            for (uint32_t i = 0; i < end; ++i) {
+                const uint32_t sub = first + i;
+                const uint32_t level = sub % layout.mips;
+                if (level >= p.standard_mips) continue;
+                ++written;
+                if (!tilings) continue;
+                const auto& mip = p.mips[level];
+                const uint64_t start_bytes = (sub / layout.mips) * p.slice_bytes + mip.offset;
+                tilings[i] = {mip.padded_width / t.tile_width, uint16_t(mip.padded_height / t.tile_height), 1,
+                              uint32_t(start_bytes / kTileBytes)};
+            }
+        }
+        if (count) *count = written;
+    }
+    trace(calls, "slot 10", _ReturnAddress(),
+          "this=%p total=%p packed=%p shape=%p count=%p first=%u out=%p requested=%u written=%u "
+          "hr=0x%08x tiles=%u standard=%u tail=%u tile=%ux%u",
+          self, total_tiles, packed, shape, count, first, tilings, requested, written, uint32_t(hr),
+          tiles, p.standard_mips, p.tail_mips, t.tile_width * t.format.side, t.tile_height * t.format.side);
+    return hr;
+}
+
+template<size_t Slot>
+HRESULT __stdcall unimplemented_slot(Computer* self) {
+    static std::atomic<unsigned> calls{0};
+    trace(calls, "unknown slot", _ReturnAddress(), "this=%p slot=%zu hr=0x80004001", self, Slot);
+    return E_NOTIMPL;
+}
+
+template<size_t... Slot>
+auto make_vtable(std::index_sequence<Slot...>) {
+    std::array<void*, sizeof...(Slot)> vtable{reinterpret_cast<void*>(&unimplemented_slot<Slot>)...};
+    vtable[0] = reinterpret_cast<void*>(&add_ref);
+    vtable[1] = reinterpret_cast<void*>(&release);
+    vtable[2] = reinterpret_cast<void*>(&get_layout);
+    vtable[3] = reinterpret_cast<void*>(&get_size);
+    vtable[4] = reinterpret_cast<void*>(&get_alignment);
+    vtable[5] = reinterpret_cast<void*>(&get_mip_offset);
+    vtable[6] = reinterpret_cast<void*>(&get_element_offset);
+    vtable[8] = reinterpret_cast<void*>(&copy_into);
+    vtable[9] = reinterpret_cast<void*>(&copy_from);
+    vtable[10] = reinterpret_cast<void*>(&get_tiling);
+    return vtable;
+}
+const auto kVtable = make_vtable(std::make_index_sequence<kSlots>{});
+Computer unavailable{kVtable.data(), {1}, {}};
+
+// ---- The second model: runtime/src/console_texture_layout.h. ----
+
+namespace port {
 
 namespace ct = leonida::console_texture;
 
 constexpr HRESULT kNotImpl = static_cast<HRESULT>(rt::shims::kENotImpl);
 constexpr HRESULT kInvalidArg = static_cast<HRESULT>(0x80070057u);
 constexpr HRESULT kFail = static_cast<HRESULT>(0x80004005u);
-constexpr size_t kSlots = 32;
 
 // D3D12_RESOURCE_DESC, whose layout field carries 0x100 | swizzle mode on the console (1 row major, 0 "pick one").
 struct ResourceDesc {
@@ -178,32 +421,6 @@ std::optional<ct::Texture> texture_of(const ResourceDesc& d) {
     if (!texture || texture->planes[0].layout.mips.size() > kMips) return std::nullopt;
     return texture;
 }
-
-// ---- The computer that cannot lay its description out: every slot E_NOTIMPL, nothing written. ----
-
-ULONG __stdcall stub_add_ref(void*) { return 1; }
-ULONG __stdcall stub_release(void*) { return 1; }
-
-template <size_t Slot>
-HRESULT __stdcall stub_slot(void*) {
-    static std::atomic<bool> warned{false};
-    warn_once(warned, "texture computer slot ", static_cast<int>(Slot), _ReturnAddress(),
-              "no layout for this description; E_NOTIMPL");
-    return kNotImpl;
-}
-
-template <size_t... Slot>
-constexpr auto make_stub_vtable(std::index_sequence<Slot...>) {
-    return std::array<void*, sizeof...(Slot)>{
-        (Slot == 0   ? reinterpret_cast<void*>(&stub_add_ref)
-         : Slot == 1 ? reinterpret_cast<void*>(&stub_release)
-                     : reinterpret_cast<void*>(&stub_slot<Slot>))...};
-}
-const auto kStubVtable = make_stub_vtable(std::make_index_sequence<kSlots>{});
-struct StubComputer {
-    const void* const* vtable;
-};
-StubComputer g_stub{kStubVtable.data()};
 
 // ---- The computer with a layout. ----
 
@@ -360,6 +577,8 @@ HRESULT __stdcall copy_into(Computer* c, uint8_t* tiled, uint32_t plane, uint32_
     const ct::Error e = a->plane->layout.tile(tiled + offset, a->tiled - offset, a->mip, a->slice, linear, a->linear,
                                               row, depth);
     if (e != ct::Error::ok) warn_copy(c, "copy into", subresource, e);
+    // The texture's image on the PC GPU is filled from this memory: tell the D3D12 layer it changed.
+    if (e == ct::Error::ok) leonida::title_texel_writes::note(tiled, a->tiled);
     return result(e);
 }
 
@@ -438,6 +657,18 @@ uint64_t __stdcall element_offset(Computer* c, uint32_t plane, uint32_t mip, uin
     return p.offset + at;
 }
 
+// 3, 4: the size and the alignment slot 2 reports.
+uint64_t __stdcall total_size(Computer* c) { return c->texture.size; }
+uint64_t __stdcall total_alignment(Computer* c) { return c->texture.alignment; }
+
+// 5 (plane, mip): the offset slot 2 reports for the mip, 0 outside.
+uint64_t __stdcall mip_offset(Computer* c, uint32_t plane, uint32_t mip) {
+    if (plane >= c->texture.planes.size() || plane >= 4) return 0;
+    const ct::Layout& l = c->texture.planes[plane].layout;
+    if (mip >= l.mips.size() || mip >= kMips) return 0;
+    return mip_out(c->desc, l, mip).offset;
+}
+
 template <size_t Slot>
 HRESULT __stdcall unused_slot(Computer*) {
     static std::atomic<bool> warned{false};
@@ -452,6 +683,9 @@ constexpr auto make_vtable(std::index_sequence<Slot...>) {
         (Slot == 0    ? reinterpret_cast<void*>(&add_ref)
          : Slot == 1  ? reinterpret_cast<void*>(&release)
          : Slot == 2  ? reinterpret_cast<void*>(&layout)
+         : Slot == 3  ? reinterpret_cast<void*>(&total_size)
+         : Slot == 4  ? reinterpret_cast<void*>(&total_alignment)
+         : Slot == 5  ? reinterpret_cast<void*>(&mip_offset)
          : Slot == 6  ? reinterpret_cast<void*>(&element_offset)
          : Slot == 8  ? reinterpret_cast<void*>(&copy_into)
          : Slot == 9  ? reinterpret_cast<void*>(&copy_from)
@@ -460,45 +694,92 @@ constexpr auto make_vtable(std::index_sequence<Slot...>) {
 }
 const auto kVtable = make_vtable(std::make_index_sequence<kSlots>{});
 
-HRESULT __stdcall XGCreateTextureComputer(const ResourceDesc* desc, void** out) {
-    if (!out) return E_POINTER;
-    std::optional<ct::Texture> texture;
-    if (desc) texture = texture_of(*desc);
+// A computer for `desc`; on failure *out is left as it was.
+HRESULT create(const ResourceDesc& desc, void** out, const void* caller) {
+    std::optional<ct::Texture> texture = texture_of(desc);
     if (!texture) {
         static std::atomic<int> warned{0};
-        if (warned.fetch_add(1, std::memory_order_relaxed) < 8) {
-            if (desc)
-                std::fprintf(stderr,
-                             "[rt] xg_xs: XGCreateTextureComputer: no layout for dim=%u %llux%u depth/array=%u "
-                             "mips=%u format=%u samples=%u layout=0x%x flags=0x%x (caller %s)\n",
-                             desc->dimension, static_cast<unsigned long long>(desc->width), desc->height,
-                             desc->depth_or_array, desc->mips, desc->format, desc->samples, desc->layout,
-                             desc->flags,
-                             rt::shims::module_offset(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str());
-            else
-                std::fprintf(stderr, "[rt] xg_xs: XGCreateTextureComputer: null description\n");
-        }
-        *out = &g_stub;  // see the top of the file: two measured callers use *out without checking the HRESULT
-        return kInvalidArg;
+        if (warned.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr,
+                         "[rt] xg_xs: XGCreateTextureComputer: no layout for dim=%u %llux%u depth/array=%u "
+                         "mips=%u format=%u samples=%u layout=0x%x flags=0x%x (caller %s)\n",
+                         desc.dimension, static_cast<unsigned long long>(desc.width), desc.height,
+                         desc.depth_or_array, desc.mips, desc.format, desc.samples, desc.layout, desc.flags,
+                         rt::shims::module_offset(reinterpret_cast<uint64_t>(caller)).c_str());
+        return kNotImpl;
     }
     auto* c = new (std::nothrow) Computer;
-    if (!c) {
-        *out = &g_stub;
-        return E_OUTOFMEMORY;
-    }
+    if (!c) return E_OUTOFMEMORY;
     c->vtable = kVtable.data();
-    c->desc = *desc;
+    c->desc = desc;
     c->mips = static_cast<uint32_t>(texture->planes[0].layout.mips.size());
     c->texture = std::move(*texture);
     *out = c;
     return S_OK;
 }
 
-// (desc, flags, out layout); the title passes flags 0 and puts the result in the description's layout field.
-HRESULT __stdcall XGSuggestSwizzleMode(const ResourceDesc* desc, uint32_t /*flags*/, uint32_t* mode) {
-    if (!desc || !mode) return kInvalidArg;
-    *mode = kSwizzled | suggested(*desc);
-    return S_OK;
+}  // namespace port
+
+HRESULT __stdcall XGCreateTextureComputer(const void* desc, void** out) {
+    static std::atomic<unsigned> calls{0};
+    ResourceDesc d{};
+    if (desc) std::memcpy(&d, desc, sizeof(d));
+    Texture t;
+    HRESULT hr = E_NOTIMPL;
+    if (!out) hr = E_POINTER;
+    else {
+        // Two measured callers dereference the computer even after a failed creation.
+        *out = &unavailable;
+        if (!desc) hr = E_INVALIDARG;
+        else if (build_texture(d, t)) {
+            auto* computer = new (std::nothrow) Computer{kVtable.data(), {1}, t};
+            hr = computer ? S_OK : E_OUTOFMEMORY;
+            if (computer) *out = computer;
+            // How the title lays out a texture of this shape (title_xg_layouts): what its CPU writes use.
+            leonida::title_xg_layouts::note({d.dimension, d.format, d.height, d.depth_or_array, d.mips, d.width},
+                                            d.layout);
+        } else {
+            // What xg_xs_layout.h cannot lay out, the second model may: targets, depth with stencil, other modes.
+            port::ResourceDesc p;
+            std::memcpy(&p, desc, sizeof(p));
+            hr = port::create(p, out, _ReturnAddress());
+        }
+    }
+    trace_desc(calls, "create", _ReturnAddress(), desc ? &d : nullptr, out, 0, hr, t.mode, t.layout.size);
+    // LOCAL DIAGNOSTIC: LEONIDA_XG_TRACE_FORMAT=<DXGI format> logs the first 256 computers of that format whatever
+    // LEONIDA_XG_TRACE's cap, with the layout the title asked for (which tiling its CPU writes use).
+    static const uint32_t only = [] {
+        char value[8]{};
+        return GetEnvironmentVariableA("LEONIDA_XG_TRACE_FORMAT", value, sizeof(value)) ? uint32_t(atoi(value)) : 0u;
+    }();
+    static std::atomic<unsigned> only_logged{0};
+    if (only && desc && d.format == only && only_logged.fetch_add(1, std::memory_order_relaxed) < 256)
+        std::fprintf(stderr,
+                     "[rt] xg_xs: LOCAL DIAGNOSTIC: computer for format %u: dim=%u %llux%ux%u mips=%u layout=%#x "
+                     "flags=%#x -> mode %u, %llu bytes, hr 0x%08x, caller %s\n",
+                     d.format, d.dimension, static_cast<unsigned long long>(d.width), d.height,
+                     unsigned(d.depth_or_array), unsigned(d.mips), d.layout, d.flags, t.mode,
+                     static_cast<unsigned long long>(t.layout.size), uint32_t(hr),
+                     rt::shims::module_offset(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str());
+    return hr;
+}
+
+HRESULT __stdcall XGSuggestSwizzleMode(const void* desc, uint32_t options, uint32_t* out) {
+    static std::atomic<unsigned> calls{0};
+    ResourceDesc d{};
+    if (desc) std::memcpy(&d, desc, sizeof(d));
+    HRESULT hr = E_INVALIDARG;
+    uint32_t mode = 0;
+    if (desc && out && d.dimension >= kTexture1D && d.dimension <= kTexture3D && d.width) {
+        hr = E_NOTIMPL;
+        if (!options) {
+            mode = kSwizzled | select_mode(d);
+            *out = mode;
+            hr = S_OK;
+        }
+    }
+    trace_desc(calls, "suggest", _ReturnAddress(), desc ? &d : nullptr, out, options, hr, mode, 0);
+    return hr;
 }
 
 }  // namespace

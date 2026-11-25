@@ -472,6 +472,29 @@ int main() {
             return rt::d3d12::XboxPresentPlaneParameters{t, 1, &s.resource.p, rect, 0};
         };
 
+        // Shell art covers startup clears. A single coloured source texel hands off the entire frame;
+        // later black frames must stay black. These shell presents consume no Xbox frame tokens.
+        {
+            Source shell, title;
+            const FLOAT black[4] = {0, 0, 0, 1};
+            EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM, shell) && fill(shell, red));
+            EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM, title) && fill(title, black));
+            auto& launch = xbox.presenter();
+            EXPECT(launch.present_splash(shell.resource.p));
+            EXPECT(SUCCEEDED(launch.present(title.resource.p, 1)));
+            EXPECT(launch.read_back(frame.bytes, &frame.extent, &frame.format));
+            EXPECT(region_is(frame, 0, 0, width, height, {255, 0, 0}));
+            const D3D12_RECT corner{0, 0, 1, 1};
+            EXPECT(fill(title, blue, 1, &corner));
+            EXPECT(SUCCEEDED(launch.present(title.resource.p, 1)));
+            EXPECT(launch.read_back(frame.bytes, &frame.extent, &frame.format));
+            EXPECT(region_is(frame, 0, 0, 1, 1, {0, 0, 255}));
+            EXPECT(region_is(frame, width - 1, height - 1, width, height, {0, 0, 0}));
+            EXPECT(SUCCEEDED(launch.present_blank(1)));
+            EXPECT(launch.read_back(frame.bytes, &frame.extent, &frame.format));
+            EXPECT(region_is(frame, 0, 0, width, height, {0, 0, 0}));
+        }
+
         // 1 plane, solid colour, RGBA8.
         Source rgba;
         EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM, rgba));

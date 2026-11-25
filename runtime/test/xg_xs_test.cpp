@@ -1,35 +1,39 @@
-// Checks the registered xg_xs.dll shim (runtime/shims/xg_xs.cpp) and the console texture layout model behind it
-// (runtime/src/console_texture_layout.h). Synthetic textures only; no game files.
+// Checks the registered xg_xs.dll shim (runtime/shims/xg_xs.cpp) and the two texture layout models behind it
+// (runtime/shims/xg_xs_layout.h and runtime/src/console_texture_layout.h). Synthetic textures only; no game files.
 //
-// Both exports are resolved through rt::shims::find, so this is the table the runtime installs. The layout cases and
-// their expected numbers are those of the project the model is ported from (Marvisak/VIctory, GPL-3.0,
+// Both exports are resolved through rt::shims::find, so this is the table the runtime installs. The cases of the
+// second model and their expected numbers are those of the project it is ported from (Marvisak/VIctory, GPL-3.0,
 // crates/victory-formats/src/texture.rs and crates/victory-hle/src/modules/xg.rs tests at d2a4bae1f): hand-checked
 // addresses, mip tail placement, a two-plane depth-stencil, and a bijection plus round trip over every element.
 #include <windows.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <cstring>
 #include <vector>
 
 #include "../src/console_texture_layout.h"
 #include "shims.h"
+#include "xg_xs_layout.h"
+#include "../src/title_texture_memory.h"
+#include "../src/title_texture_refresh.h"
 
 namespace {
 
+using namespace rt::xg_xs;
 namespace ct = leonida::console_texture;
-
 using CreateFn = HRESULT(__stdcall*)(const void*, void**);
 using SuggestFn = HRESULT(__stdcall*)(const void*, uint32_t, uint32_t*);
-using ReleaseFn = ULONG(__stdcall*)(void*);
-using LayoutFn = HRESULT(__stdcall*)(void*, void*);
+using RefFn = ULONG(__stdcall*)(void*);
+using LayoutFn = HRESULT(__stdcall*)(void*, ResourceLayout*);
+using SizeFn = uint64_t(__stdcall*)(void*);
 using OffsetFn = uint64_t(__stdcall*)(void*, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t*);
-using IntoFn = HRESULT(__stdcall*)(void*, uint8_t*, uint32_t, uint32_t, const uint8_t*, uint32_t, uint32_t);
-using FromFn = HRESULT(__stdcall*)(void*, uint8_t*, uint32_t, uint32_t, uint32_t, const uint8_t*, uint32_t, uint32_t);
-using TilingFn = HRESULT(__stdcall*)(void*, uint32_t*, void*, uint32_t*, uint32_t*, uint32_t, void*);
-constexpr HRESULT kNotImpl = static_cast<HRESULT>(rt::shims::kENotImpl);
-constexpr HRESULT kInvalidArg = static_cast<HRESULT>(0x80070057u);
-constexpr HRESULT kFail = static_cast<HRESULT>(0x80004005u);
+using IntoFn = HRESULT(__stdcall*)(void*, void*, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+using FromFn = HRESULT(__stdcall*)(void*, void*, uint32_t, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+struct Tiling { uint32_t width; uint16_t height, depth; uint32_t start; };
+using TilingFn = HRESULT(__stdcall*)(void*, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t, Tiling*);
 
 int g_checks = 0;
 int g_failures = 0;
@@ -37,9 +41,70 @@ int g_failures = 0;
 void check(bool condition, const char* what) {
     ++g_checks;
     if (!condition) {
-        std::printf("FAIL %s\n", what);
         ++g_failures;
+        std::printf("FAIL %s\n", what);
     }
+}
+
+template<class Fn>
+Fn slot(void* computer, unsigned index) {
+    return reinterpret_cast<Fn>((*static_cast<void* const* const*>(computer))[index]);
+}
+
+bool make(CreateFn create, const ResourceDesc& d, void*& computer, const char* what) {
+    const bool success = create(&d, &computer) == S_OK && computer;
+    check(success, what);
+    return success;
+}
+
+void check_addresses(const Texture& t) {
+    const ElementAddress address(t);
+    std::vector<bool> seen(t.layout.size / t.format.bytes);
+    for (uint32_t slice = 0; slice < t.array; ++slice) {
+        for (uint32_t level = 0; level < t.layout.mips; ++level) {
+            const auto& mip = t.layout.plane[0].mips[level];
+            const auto tail = address.tail_origin(mip);
+            for (uint32_t y = 0; y < mip.height_elements; ++y) {
+                for (uint32_t x = 0; x < mip.width_elements; ++x) {
+                    const auto off = address.offset(mip, tail, x, y, slice);
+                    if (off % t.format.bytes || off / t.format.bytes >= seen.size() || seen[off / t.format.bytes]) {
+                        check(false, "every mip/array element has a distinct aligned address inside the resource");
+                        return;
+                    }
+                    seen[off / t.format.bytes] = true;
+                }
+            }
+        }
+    }
+    check(true, "every mip/array element has a distinct aligned address inside the resource");
+}
+
+// copy_elements (row + column addressing) reads every element where offset() says it is.
+void check_detile(const Texture& t) {
+    const ElementAddress address(t);
+    std::vector<uint8_t> tiled(t.layout.size);
+    for (size_t i = 0; i < tiled.size(); ++i) tiled[i] = uint8_t(i * 2654435761u >> 13);
+    std::vector<uint64_t> columns;
+    for (uint32_t slice = 0; slice < t.array; ++slice) {
+        for (uint32_t level = 0; level < t.layout.mips; ++level) {
+            const auto& mip = t.layout.plane[0].mips[level];
+            const uint32_t pitch = mip.width_elements * t.format.bytes + 4;
+            std::vector<uint8_t> linear(size_t(pitch) * mip.height_elements);
+            copy_elements<false>(t, level, slice, tiled.data(), linear.data(), pitch, 0, columns);
+            const auto tail = address.tail_origin(mip);
+            for (uint32_t y = 0; y < mip.height_elements; ++y) {
+                for (uint32_t x = 0; x < mip.width_elements; ++x) {
+                    const uint64_t at = address.offset(mip, tail, x, y, slice);
+                    if (std::memcmp(linear.data() + size_t(y) * pitch + size_t(x) * t.format.bytes, tiled.data() + at,
+                                    t.format.bytes)) {
+                        check(false, "copy_elements reads each element at offset()");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    check(true, "copy_elements reads each element at offset()");
 }
 
 bool all_bytes(const uint8_t* p, size_t n, uint8_t value) {
@@ -61,35 +126,6 @@ ct::Desc desc2d(uint32_t w, uint32_t h, uint32_t mips, uint32_t bpe, uint32_t sw
 uint64_t offset_of(const ct::Layout& l, uint32_t mip, uint32_t x, uint32_t y, uint32_t z) {
     uint64_t at = ~uint64_t{0};
     return l.offset(mip, x, y, z, at) == ct::Error::ok ? at : ~uint64_t{0};
-}
-
-// The D3D12-style description the title passes (0x38 bytes).
-struct ResourceDesc {
-    uint32_t dimension;
-    uint64_t alignment;
-    uint64_t width;
-    uint32_t height;
-    uint16_t depth_or_array;
-    uint16_t mips;
-    uint32_t format;
-    uint32_t samples;
-    uint32_t quality;
-    uint32_t layout;
-    uint32_t flags;
-};
-static_assert(sizeof(ResourceDesc) == 0x38);
-
-ResourceDesc rdesc(uint64_t w, uint32_t h, uint16_t mips, uint32_t format, uint32_t layout) {
-    ResourceDesc d{};
-    d.dimension = 3;
-    d.width = w;
-    d.height = h;
-    d.depth_or_array = 1;
-    d.mips = mips;
-    d.format = format;
-    d.samples = 1;
-    d.layout = layout;
-    return d;
 }
 
 void test_layout_model() {
@@ -262,125 +298,261 @@ void test_bijection_and_round_trip() {
     }
 }
 
-void test_shim(CreateFn create, SuggestFn suggest) {
-    // XGSuggestSwizzleMode follows the use: 4KB_S, then the XOR render and depth modes.
-    uint32_t mode = 0;
-    ResourceDesc d = rdesc(256, 256, 1, 98, 0);
-    check(suggest(&d, 0, &mode) == S_OK && mode == 0x105, "suggest: a sampled texture gets 4KB_S");
-    d.flags = 1;
-    check(suggest(&d, 0, &mode) == S_OK && mode == 0x11b, "suggest: a render target gets 64KB_R_X");
-    d.flags = 2;
-    check(suggest(&d, 0, &mode) == S_OK && mode == 0x118, "suggest: a depth target gets 64KB_Z_X");
-    check(suggest(nullptr, 0, &mode) == kInvalidArg, "suggest: a null description is E_INVALIDARG");
-
-    check(create(&d, nullptr) == E_POINTER, "XGCreateTextureComputer(desc, nullptr) is E_POINTER");
-
-    // A description with no layout still hands out a computer (two measured callers use *out without checking).
-    void* stub = nullptr;
-    const ResourceDesc bad = rdesc(256, 256, 1, 0, 0x10a);
-    check(create(&bad, &stub) == kInvalidArg, "an unknown format is E_INVALIDARG");
-    check(stub != nullptr, "and still stores a computer for the callers that do not check");
-    if (stub) {
-        void* const* vt = *static_cast<void* const* const*>(stub);
-        std::vector<uint8_t> out(0x1b40, 0xcd);
-        check(reinterpret_cast<LayoutFn>(vt[2])(stub, out.data()) == kNotImpl &&
-                  all_bytes(out.data(), out.size(), 0xcd),
-              "that computer's slot 2 is E_NOTIMPL and writes nothing");
-        reinterpret_cast<ReleaseFn>(vt[1])(stub);
-        reinterpret_cast<ReleaseFn>(vt[1])(stub);
-        check(reinterpret_cast<LayoutFn>(vt[2])(stub, out.data()) == kNotImpl,
-              "that computer stays usable after more Releases than it was handed out");
-    }
-
-    // Element offsets (slot 6): linear rows of 1 KiB (128 8-byte elements), 0 outside.
-    {
-        void* c = nullptr;
-        const ResourceDesc lin = rdesc(128, 4, 1, 11, 0x100);
-        check(create(&lin, &c) == S_OK && c, "a 128x4 R16G16B16A16 linear texture gets a computer");
-        if (c) {
-            void* const* vt = *static_cast<void* const* const*>(c);
-            uint32_t bit = 7;
-            check(reinterpret_cast<OffsetFn>(vt[6])(c, 0, 0, 3, 1, 0, 0, &bit) == (128 + 3) * 8 && bit == 0,
-                  "slot 6: element (3, 1) of linear rows");
-            check(reinterpret_cast<OffsetFn>(vt[6])(c, 0, 0, 128, 0, 0, 0, nullptr) == 0, "slot 6: 0 outside");
-            check(reinterpret_cast<ReleaseFn>(vt[1])(c) == 0, "Release frees the computer");
-        }
-    }
-
-    // The title's calls: the layout, then a copy in and out of each mip. 256x256 BC7, full chain, 64 KiB display.
-    void* c = nullptr;
-    const ResourceDesc bc7 = rdesc(256, 256, 0, 98, 0x10a);
-    check(create(&bc7, &c) == S_OK && c, "a 256x256 BC7 chain gets a computer");
-    if (!c) return;
-    void* const* vt = *static_cast<void* const* const*>(c);
-    std::vector<uint8_t> buf(0x1b40);
-    check(reinterpret_cast<LayoutFn>(vt[2])(c, buf.data()) == S_OK, "slot 2 fills the layout");
-    const auto u64 = [&](size_t at) { uint64_t v; std::memcpy(&v, &buf[at], 8); return v; };
-    const auto u32 = [&](size_t at) { uint32_t v; std::memcpy(&v, &buf[at], 4); return v; };
-    // LayoutOut: size 0x00, alignment 0x08, mips 0x10, planes 0x14, plane[0] at 0x18 (PlaneOut: element_bytes 0x28,
-    // standard 0x2c, tail 0x30, mips at 0x38, MipOut 0x70 bytes: offset 0x08, pitch_bytes 0x1c, elements 0x30, in_tail
-    // 0x64).
-    check(u64(0x00) == 131072 && u64(0x08) == 65536 && u32(0x10) == 9 && u32(0x14) == 1, "layout totals");
-    const size_t plane = 0x18;
-    check(u32(plane + 0x2c) == 1 && u32(plane + 0x30) == 8 && u32(plane + 0x28) == 16, "plane 0 mips and elements");
-    const size_t mip0 = plane + 0x38, mip1 = mip0 + 0x70;
-    check(u64(mip0 + 0x08) == 65536 && u32(mip0 + 0x1c) == 1024, "mip 0 offset and pitch");
-    check(u64(mip1 + 0x08) == 32768 && u32(mip1 + 0x64) == 1, "mip 1 sits in the tail");
-
-    std::vector<uint8_t> tiled(131072);
-    bool copies = true;
-    for (uint32_t mip = 0; mip < 9; ++mip) {
-        const size_t m = mip0 + mip * 0x70;
-        const uint32_t w = u32(m + 0x30), h = u32(m + 0x34), row = w * 16;
-        std::vector<uint8_t> rows(size_t{row} * h);
-        for (size_t i = 0; i < rows.size(); ++i) rows[i] = static_cast<uint8_t>(i ^ mip);
-        copies &= reinterpret_cast<IntoFn>(vt[8])(c, tiled.data(), 0, mip, rows.data(), row, 0) == S_OK;
-        std::vector<uint8_t> back(rows.size());
-        copies &= reinterpret_cast<FromFn>(vt[9])(c, back.data(), 0, mip, 0, tiled.data(), row, 0) == S_OK;
-        copies &= back == rows;
-    }
-    check(copies, "slots 8 and 9 copy every mip in and out");
-
-    // Slot 10: one tile for the tail, one for mip 0.
-    uint32_t tiles = 0, shape[3] = {}, count = 4;
-    uint8_t packed[12] = {};
-    uint8_t subs[4 * 12] = {};
-    check(reinterpret_cast<TilingFn>(vt[10])(c, &tiles, packed, shape, &count, 0, subs) == S_OK, "slot 10 succeeds");
-    uint32_t packed_tiles = 0, first_start = 0;
-    std::memcpy(&packed_tiles, packed + 4, 4);
-    std::memcpy(&first_start, subs + 8, 4);
-    check(tiles == 2 && packed[0] == 1 && packed[1] == 8 && packed_tiles == 1, "slot 10 tiles and packed mips");
-    check(shape[0] == 256 && shape[1] == 256 && shape[2] == 1 && count == 1 && first_start == 1,
-          "slot 10 shape and mip 0's tiling");
-    check(reinterpret_cast<ReleaseFn>(vt[1])(c) == 0, "Release frees the BC7 computer");
-
-    // 4 KiB modes have no 64 KiB tiling.
-    void* c4 = nullptr;
-    const ResourceDesc four = rdesc(256, 256, 0, 98, 0x105);
-    check(create(&four, &c4) == S_OK && c4, "a 4KB_S chain gets a computer");
-    if (c4) {
-        void* const* v4 = *static_cast<void* const* const*>(c4);
-        check(reinterpret_cast<TilingFn>(v4[10])(c4, &tiles, nullptr, nullptr, nullptr, 0, nullptr) == kFail,
-              "slot 10 of a 4 KiB mode is E_FAIL");
-        check(reinterpret_cast<LayoutFn>(v4[31])(c4, buf.data()) == kNotImpl, "the last slot (31) is E_NOTIMPL");
-        reinterpret_cast<ReleaseFn>(v4[1])(c4);
-    }
-}
-
 }  // namespace
 
 int main() {
+    {
+        struct Entry { bool mapped, stale; int id; };
+        Entry first{false, false, 1}, mapped{true, false, 2}, stale{false, true, 3};
+        Entry last{false, false, 4}, added{false, false, 5};
+        std::map<std::uint64_t, Entry*> entries{{10, &first}, {20, &mapped}, {30, &stale}, {40, &last}};
+        std::uint64_t cursor = 0;
+        std::vector<int> polled;
+        const auto visit = [&](Entry& t) { polled.push_back(t.id); };
+        leonida::poll_title_textures(entries, cursor, visit, [&] { return !polled.empty(); });
+        check(polled == std::vector<int>{1}, "budget stops after a background texture");
+        entries.erase(10);
+        entries[50] = &added;
+        leonida::poll_title_textures(entries, cursor, visit, [&] { return polled.size() == 2; });
+        check(polled == std::vector<int>{1, 4}, "poll resumes after deletion and skips priority textures");
+        polled.clear();
+        leonida::poll_title_textures(entries, cursor, visit, [] { return false; });
+        check(polled == std::vector<int>{5, 4}, "unlimited poll wraps once and includes new textures");
+        cursor = 20;
+        polled.clear();
+        for (unsigned pass = 0; pass < 3; ++pass)
+            leonida::poll_title_textures(entries, cursor, visit, [] { return true; });
+        check(polled == std::vector<int>{4}, "an expired wall budget advances past priority entries to the next texture");
+
+    }
+
+    {
+        leonida::TitleWriteRanges writes{{20, 30}, {10, 20}, {15, 17}, {60, 75}, {60, 67}, {90, 90}};
+        const auto original = writes;
+        leonida::merge_title_writes(writes);
+        check(writes == leonida::TitleWriteRanges{{10, 30}, {60, 75}}, "coalesce overlapping and adjacent writes");
+        bool same = true;
+        for (unsigned begin = 0; begin < 100; ++begin) {
+            for (unsigned end = begin; end < 100; ++end) {
+                const bool overlap = std::any_of(original.begin(), original.end(), [&](auto r) {
+                    return begin < end && r.first < r.second && r.first < end && r.second > begin;
+                });
+                same &= leonida::title_write_overlaps(writes, begin, end) == overlap;
+            }
+        }
+        check(same, "indexed writes find the same overlaps as scanning each original notification");
+    }
+
+    SYSTEM_INFO sys{};
+    GetSystemInfo(&sys);
+    const auto page = sys.dwPageSize;
+    leonida::TextureReadability residency;
+    unsigned probes = 0;
+    bool committed = false;
+    const auto probe = [&] { ++probes; return committed; };
+    for (unsigned pass = 0; pass < 100; ++pass) residency.check(8, true, probe);
+    check(probes == 1 && residency.pending(), "unchanged reserved texture is probed only once in 100 passes");
+    check(!residency.check(9, true, probe) && probes == 2, "a new map generation retries the failed footprint");
+    committed = true;
+    residency.retry();  // overlapping DirectStorage or XG write
+    check(residency.check(9, true, probe) && probes == 3, "write notification retries at the same generation");
+    committed = false;
+    check(!residency.check(9, true, probe) && probes == 4, "previous success is rechecked before the next read");
+    check(!residency.check(9, false, probe) && probes == 5, "rollback disables the failed-probe cache");
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, 65536, nullptr);
+    if (!section) return 1;
+    void* view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 65536);
+    if (!view) return 1;
+    const auto placed = reinterpret_cast<std::uintptr_t>(view);
+    const auto first_touch = [](const void* at, std::size_t bytes) {
+        return VirtualAlloc(const_cast<void*>(at), bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    };
+    check(!leonida::texture_memory_readable(placed, 65536), "background polling leaves mapped first-touch pages reserved");
+    check(!leonida::texture_memory_readable(placed, 65536, [](const void*, std::size_t) { return true; }),
+          "a section outside xmem stays deferred when the commit hook leaves it reserved");
+    check(leonida::texture_memory_readable(placed, 65536, first_touch), "persistent Map can populate a physical section before checking it");
+    UnmapViewOfFile(view);
+    CloseHandle(section);
+    void* reservation = VirtualAlloc(nullptr, 2 * page, MEM_RESERVE, PAGE_NOACCESS);
+    if (!reservation) return 1;
+    const auto address = reinterpret_cast<std::uintptr_t>(reservation);
+    check(!leonida::texture_memory_readable(address, page), "untouched reserved texture is deferred");
+    check(!leonida::texture_memory_readable(address, page, first_touch), "a persistent Map cannot commit a bare reservation");
+    leonida::TextureReadability persistent_map;
+    const auto probe_mapped = [&] { return leonida::texture_memory_readable(address, page); };
+    check(!persistent_map.check(11, false, probe_mapped), "persistent Map defers a reserved texture before decoder writes");
+    if (!VirtualAlloc(reservation, page, MEM_COMMIT, PAGE_READWRITE)) return 1;
+    auto* pixels = static_cast<std::uint8_t*>(reservation);
+    pixels[page - 1] = 93;
+    check(persistent_map.check(11, false, probe_mapped) && pixels[page - 1] == 93,
+          "persistent Map sees decoder writes after a failed probe at the same generation");
+    check(leonida::texture_memory_readable(address + 3, page - 3) &&
+          !leonida::texture_memory_readable(address + 3, page), "range crossing into a reserved mip is deferred");
+    if (!VirtualAlloc(reinterpret_cast<void*>(address + page), page, MEM_COMMIT, PAGE_READONLY)) return 1;
+    check(leonida::texture_memory_readable(address, 2 * page), "later stream commit completes the footprint");
+    DWORD previous = 0;
+    if (!VirtualProtect(reservation, page, PAGE_READWRITE | PAGE_GUARD, &previous)) return 1;
+    check(!leonida::texture_memory_readable(address, 2 * page), "guarded texture page remains untouched");
+    VirtualFree(reservation, page, MEM_DECOMMIT);
+    check(!leonida::texture_memory_readable(address, page), "previously readable page is rechecked after decommit");
+    VirtualFree(reservation, 0, MEM_RELEASE);
+
     auto create = reinterpret_cast<CreateFn>(rt::shims::find("xg_xs.dll", "XGCreateTextureComputer"));
     auto suggest = reinterpret_cast<SuggestFn>(rt::shims::find("xg_xs.dll", "XGSuggestSwizzleMode"));
-    check(create != nullptr, "XGCreateTextureComputer is registered");
-    check(suggest != nullptr, "XGSuggestSwizzleMode is registered");
-    check(rt::shims::owns_dll("xg_xs.dll"), "the registry owns xg_xs.dll");
+    check(create && suggest && rt::shims::owns_dll("xg_xs.dll"), "XG exports are registered");
     if (!create || !suggest) return 1;
 
     test_layout_model();
     test_bijection_and_round_trip();
-    test_shim(create, suggest);
 
+    ResourceDesc d{3, 0, 256, 128, 1, 1, DXGI_FORMAT_R8_UNORM, 1, 0, 0, 0};
+    check(suggest(&d, 0, &d.layout) == S_OK && d.layout == 0x105, "2D SRV selects SW_4KB_S with aliased output");
+    uint32_t mode = 0xdeadbeef;
+    check(suggest(&d, 1, &mode) == E_NOTIMPL && mode == 0xdeadbeef, "unknown selector leaves output unchanged");
+    check(create(&d, nullptr) == E_POINTER, "null computer output is rejected");
+    void* computer = nullptr;
+    if (!make(create, d, computer, "create 2D SW_4KB_S computer")) return 1;
+
+    ResourceLayout l;
+    std::memset(&l, 0xa5, sizeof(l));
+    auto get_layout = slot<LayoutFn>(computer, 2);
+    auto get_offset = slot<OffsetFn>(computer, 6);
+    auto copy_into = slot<IntoFn>(computer, 8);
+    check(get_layout(computer, &l) == S_OK, "slot 2 fills the Series layout");
+    check(l.size == 32768 && l.alignment == 4096 && l.planes == 1 && l.mips == 1 && l.dimension == 3,
+          "256x128 R8 uses eight 64x64 SW_4KB_S blocks");
+    check(l.plane[0].mips[0].pitch_bytes == 256 && l.plane[0].mips[0].offset == 0,
+          "slot 2 reports pitch and offset");
+    const std::array<PlaneLayout, 3> unused{};
+    check(std::memcmp(&l.plane[1], unused.data(), sizeof(unused)) == 0 && !l.reserved,
+          "slot 2 clears all three unused planes and the trailing reserved word");
+    check(slot<SizeFn>(computer, 3)(computer) == 32768 && slot<SizeFn>(computer, 4)(computer) == 4096,
+          "size and alignment agree with slot 2");
+    uint32_t bit = 99;
+    check(get_offset(computer, 0, 0, 0, 1, 0, 0, &bit) == 16 && bit == 0 &&
+          get_offset(computer, 0, 0, 64, 0, 0, 0, nullptr) == 4096,
+          "SW_4KB_S addresses Y0 at bit 4 and X6 in the second tile");
+    std::vector<uint8_t> tiled(l.size, 0xcd);
+    constexpr unsigned pitch = 260;
+    std::vector<uint8_t> linear(pitch * 128, 0);
+    linear[64] = 17;
+    linear[pitch] = 29;
+    check(copy_into(computer, tiled.data(), 0, 0, linear.data(), pitch, 0) == S_OK &&
+          tiled[4096] == 17 && tiled[16] == 29, "slot 8 writes expected tiled offsets from padded linear rows");
+    check(copy_into(computer, tiled.data(), 0, 1, linear.data(), pitch, 0) == E_INVALIDARG,
+          "slot 8 rejects an out-of-range subresource");
+    check(copy_into(computer, tiled.data(), 0, 0, linear.data(), 255, 0) == E_INVALIDARG,
+          "slot 8 rejects a short row pitch");
+    check(slot<TilingFn>(computer, 10)(computer, nullptr, nullptr, nullptr, nullptr, 0, nullptr) == E_FAIL,
+          "slot 10 requires a 64 KiB mode");
+    check(slot<RefFn>(computer, 0)(computer) == 2 && slot<RefFn>(computer, 1)(computer) == 1 &&
+          slot<RefFn>(computer, 1)(computer) == 0, "release deletes the computer at refcount zero");
+
+    // The VIctory 256x256 BC7 SW_64KB_D fixture has one 64 KiB standard
+    // mip and a tail block before it. Exercise it as a two-element array.
+    d = {3, 0, 256, 256, 2, 0, DXGI_FORMAT_BC7_UNORM, 1, 0, 0x10a, 0};
+    if (!make(create, d, computer, "create BC7 mipmapped array computer")) return 1;
+    check(slot<LayoutFn>(computer, 2)(computer, &l) == S_OK, "get BC7 layout");
+    const auto& p = l.plane[0];
+    check(l.size == 262144 && l.mips == 9 && p.slice_bytes == 131072 &&
+          p.standard_mips == 1 && p.tail_mips == 8 && p.element_bytes == 16,
+          "BC7 array uses a standard block and a tail block per slice");
+    check(p.mips[0].offset == 65536 && p.mips[0].pitch_bytes == 1024 &&
+          p.mips[1].offset == 32768 && p.mips[1].in_tail,
+          "BC7 standard mip and first tail offsets match fixture");
+    uint32_t tiles = 0, packed[3]{}, shape[3]{}, count = 18;
+    std::array<Tiling, 18> tilings{};
+    tilings[1].start = 0xdeadbeef;
+    check(slot<TilingFn>(computer, 10)(computer, &tiles, packed, shape, &count, 0, tilings.data()) == S_OK &&
+          tiles == 4 && packed[0] == 0x0801 && packed[1] == 1 && packed[2] == 0 &&
+          shape[0] == 256 && shape[1] == 256 && shape[2] == 1 && count == 2 &&
+          tilings[0].start == 1 && tilings[9].start == 3 && tilings[1].start == 0xdeadbeef,
+          "slot 10 reports standard tiles, texture-unit shape and packed tail");
+    tiled.assign(l.size, 0);
+    std::array<uint8_t, 16> block{}, back{};
+    block[0] = 77;
+    const unsigned last_mip_in_slice_1 = 17;
+    check(slot<IntoFn>(computer, 8)(computer, tiled.data(), 0, last_mip_in_slice_1, block.data(), 16, 0) == S_OK &&
+          tiled[p.slice_bytes + p.mips[8].offset] == 77 &&
+          slot<FromFn>(computer, 9)(computer, back.data(), 0, last_mip_in_slice_1, 0, tiled.data(), 16, 0) == S_OK &&
+          back == block, "slots 8 and 9 copy a BC block in the second slice's tail");
+    slot<RefFn>(computer, 1)(computer);
+
+    // The addrlib padded mip sizes use ceil division even for odd extents.
+    Texture texture;
+    d = {3, 0, 30, 20, 1, 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, 1, 0};
+    check(build_texture(d, texture) && texture.layout.size == 10240 &&
+          texture.layout.plane[0].mips[0].offset == 5120 && texture.layout.plane[0].mips[0].pitch_bytes == 256,
+          "row-major chain aligns each physical pitch to 256 B");
+
+    for (const uint32_t swizzle : {0x105u, 0x109u, 0x10au}) {
+        for (DXGI_FORMAT format : {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                   DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC7_UNORM}) {
+            d = {3, 0, 259, 175, 2, 0, uint32_t(format), 1, 0, swizzle, 0};
+            if (build_texture(d, texture)) check_addresses(texture), check_detile(texture);
+            else check(false, "create odd-sized tiled mip chain");
+        }
+    }
+
+    d = {4, 0, 9, 2, 2, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, 0x105, 0};
+    if (!make(create, d, computer, "create single-mip 3D SW_4KB_S computer")) return 1;
+    check(slot<LayoutFn>(computer, 2)(computer, &l) == S_OK &&
+          l.size == 8192 && l.plane[0].mips[0].padded_depth == 8 && l.plane[0].mips[0].tile_depth == 8,
+          "3D 4KB_S blocks for RGBA8 are 8x16x8");
+    check(slot<OffsetFn>(computer, 6)(computer, 0, 0, 0, 0, 1, 0, nullptr) == 16 &&
+          slot<OffsetFn>(computer, 6)(computer, 0, 0, 8, 0, 0, 0, nullptr) == 4096,
+          "3D 4KB_S selects Z0 at bit 4 and X3 in the second tile");
+    slot<RefFn>(computer, 1)(computer);
+
+    // GFX10 thick 4 KiB blocks: each 16-deep slab has one tail block, one
+    // level-1 block and four level-0 blocks. Crossing z=16 skips the whole slab.
+    ResourceDesc volume{4, 0, 32, 32, 32, 6, DXGI_FORMAT_R8_UNORM, 1, 0, 0x105, 0};
+    if (!build_texture(volume, texture)) return 1;
+    const ElementAddress thick(texture);
+    const auto& levels = texture.layout.plane[0].mips;
+    check(texture.layout.size == 49152 && levels[2].in_tail && levels[2].depth == 8 &&
+          thick.offset(levels[0], {}, 0, 0, 0) == 8192 &&
+          thick.offset(levels[0], {}, 0, 0, 16) == 32768 &&
+          thick.offset(levels[2], thick.tail_origin(levels[2]), 0, 0, 0) == 2048,
+          "3D mip chain uses per-slab macro offsets and a thick tail origin");
+    for (DXGI_FORMAT format : {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                               DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC5_UNORM}) {
+        volume = {4, 0, 61, 35, 67, 7, uint32_t(format), 1, 0, 0x105, 0};
+        if (!build_texture(volume, texture)) return 1;
+        const ElementAddress addr(texture);
+        std::vector<uint8_t> used(texture.layout.size);
+        bool distinct = true, matches = true;
+        for (unsigned level = 0; level < texture.layout.mips; ++level) {
+            const auto& mip = texture.layout.plane[0].mips[level];
+            const auto tail = addr.tail_origin(mip);
+            const unsigned pitch = mip.width_elements * texture.format.bytes + 8;
+            const unsigned slice_pitch = pitch * mip.height_elements + 16;
+            std::vector<uint8_t> source(slice_pitch * mip.depth), back(source.size()), tiled(texture.layout.size);
+            std::vector<uint64_t> columns;
+            for (unsigned z = 0; z < mip.depth; ++z)
+                for (unsigned y = 0; y < mip.height_elements; ++y)
+                    for (unsigned x = 0; x < mip.width_elements; ++x) {
+                        const auto at = addr.offset(mip, tail, x, y, z);
+                        if (at % texture.format.bytes || at > used.size() - texture.format.bytes || used[at]) {
+                            distinct = false;
+                            continue;
+                        }
+                        used[at] = 1;
+                        source[z * slice_pitch + y * pitch + x * texture.format.bytes] = uint8_t(1 + (x+y+z)%251);
+                    }
+            if (!distinct) break;
+            copy_elements<true>(texture, level, 0, source.data(), tiled.data(), pitch, slice_pitch, columns);
+            copy_elements<false>(texture, level, 0, tiled.data(), back.data(), pitch, slice_pitch, columns);
+            matches &= back == source;
+        }
+        check(distinct && matches, "odd volume mips and z slices are disjoint and preserve padded linear pitches");
+    }
+
+    d.format = DXGI_FORMAT_UNKNOWN;
+    check(create(&d, &computer) == E_NOTIMPL && computer, "unsupported texture keeps a safe fallback object");
+    check(slot<LayoutFn>(computer, 2)(computer, &l) == E_NOTIMPL && l.size == 8192 &&
+          slot<RefFn>(computer, 1)(computer) == 1, "fallback leaves caller outputs untouched and is safe to release");
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

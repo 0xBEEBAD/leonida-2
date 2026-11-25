@@ -143,7 +143,8 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 std::uint8_t texel_byte(UINT x, UINT y, UINT z, UINT i) { return std::uint8_t(x * 31 + y * 7 + z * 61 + i * 3 + 1); }
 
 // WriteToSubresource/ReadFromSubresource on `device`. Textures in a CPU-visible custom heap copy on the host when the
-// device has VK_EXT_host_image_copy, through a staging submit when it doesn't; main runs this once per path. Covers
+// device has VK_EXT_host_image_copy, through a staging submit when it doesn't or when the driver gave the
+// host-transfer image no memory type; main runs this once per path, three paths. Covers
 // zero-filled first reads, boxes with pitches unlike the texture's, a mip, a volume, BC1 blocks, a default-heap
 // texture (always staged), the rejected calls, and both directions between the CPU copies and GPU copies.
 int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
@@ -2425,7 +2426,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     if (o2.DepthBoundsTestSupported ||
         o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
         fail("OPTIONS2 unexpected support");
-    if (o3.CopyQueueTimestampQueriesSupported || o3.CastingFullyTypedFormatSupported ||
+    if (o3.CastingFullyTypedFormatSupported ||
         o3.WriteBufferImmediateSupportFlags != D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE ||
         o3.ViewInstancingTier != D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED || o3.BarycentricsSupported)
         fail("OPTIONS3 unexpected support");
@@ -2449,9 +2450,11 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o13.InvertedViewportHeightFlipsYSupported || o13.InvertedViewportDepthFlipsZSupported ||
         o13.TextureCopyBetweenDimensionsSupported || o13.AlphaBlendFactorSupported)
         fail("OPTIONS13 unexpected support");
-    if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported ||
-        o14.IndependentFrontAndBackStencilRefMaskSupported)
+    if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported)
         fail("OPTIONS14 unexpected support");
+    // DEPTH_STENCIL2's per-face masks and OMSetFrontAndBackStencilRef (d3d12_state_sweep_test draws them).
+    if (!o14.IndependentFrontAndBackStencilRefMaskSupported)
+        fail("OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported should be TRUE");
     if (o15.TriangleFanSupported || o15.DynamicIndexBufferStripCutSupported) fail("OPTIONS15 unexpected support");
     if (o16.DynamicDepthBiasSupported || o16.GPUUploadHeapSupported) fail("OPTIONS16 unexpected support");
     if (o18.RenderPassesValid) fail("OPTIONS18 unexpected support");
@@ -4371,6 +4374,14 @@ int compare_invalid_arguments(ID3D12Device* ours) {
                 std::printf("invalid arguments format %d %s: the host accepts it, this Vulkan driver can't\n", f, what);
                 continue;
             }
+            // The other way round is a mismatch, except where the layer takes a console format stand-in the host
+            // cannot attach: an R9G9B9E5 render target is made as B10G11R11 (console format stand-ins, fa83b2825),
+            // which the title asserts on. Only present on a GPU without a native E5B9G9R9 attachment.
+            if (SUCCEEDED(a) && FAILED(b) && format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+                flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                std::printf("invalid arguments format %d RT: a console stand-in the host itself refuses\n", f);
+                continue;
+            }
             ++mismatches;
             std::fprintf(stderr, "invalid arguments format %d %s: ours 0x%08lx, host 0x%08lx\n", f, what, a, b);
         }
@@ -5530,7 +5541,11 @@ int main() {
         if (feature_mismatches < 0)
             std::printf("CheckFeatureSupport: no host D3D12 device to compare with, skipped\n");
         EXPECT(feature_mismatches <= 0);
-        const int allocation_mismatches = compare_allocation_info(device.p);
+        // GetResourceAllocationInfo is compared on the layer's own PC device, not on the proxy: the proxy answers the
+        // console's placement of a title description (whole console tiles at the console's own alignment,
+        // d3d12_xs_alloc_size.h), which xs_proxy_mock's slot 25 test pins. The layer itself must match the PC runtime.
+        ID3D12Device* const layer_device = rt::d3d12_xs::device_proxy_real_device(device.p);
+        const int allocation_mismatches = compare_allocation_info(layer_device);
         if (allocation_mismatches < 0)
             std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
         EXPECT(allocation_mismatches <= 0);
@@ -5768,8 +5783,12 @@ int main() {
                    E_INVALIDARG);
         }
         {
+            // On the Xbox device proxy, slot 61 is the title's CreateSamplerX (e22994464), where ID3D12Device5 has
+            // CreateMetaCommand, so these PC methods are checked on the Vulkan device behind the proxy.
+            ID3D12Device* const pc5 = rt::d3d12_xs::is_device_proxy(device.p) ? rt::d3d12_xs::device_proxy_real_device(device.p)
+                                                                               : device.p;
             Ref<ID3D12Device5> device5;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5.p))));
+            EXPECT(SUCCEEDED(pc5->QueryInterface(IID_PPV_ARGS(&device5.p))));
             UINT meta_count = 7;
             EXPECT(device5->EnumerateMetaCommands(&meta_count, nullptr) == S_OK && meta_count == 0);
             EXPECT(device5->EnumerateMetaCommands(nullptr, nullptr) == E_INVALIDARG);
@@ -6584,12 +6603,18 @@ int main() {
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
                 EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                // Not through the proxy: its slot 78 is the Xbox SetFrameIntervalX (2dbcb882c), not this method.
-                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device10.p))));
-                EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                                  nullptr, IID_PPV_ARGS(&one.p))));
+                // On the Xbox device proxy, slot 78 is the title's SetFrameIntervalX (#6935) and slot 55 is the Xbox
+                // CreateDerivedPipelineState, so the PC methods are checked on the Vulkan device behind the proxy.
+                ID3D12Device* pc = rt::d3d12_xs::is_device_proxy(device.p) ? rt::d3d12_xs::device_proxy_real_device(device.p)
+                                                                            : device.p;
+                EXPECT(SUCCEEDED(pc->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                Ref<ID3D12Device4> real4;
+                EXPECT(SUCCEEDED(pc->QueryInterface(IID_PPV_ARGS(&real4.p))));
+                EXPECT(SUCCEEDED(real4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                nullptr, IID_PPV_ARGS(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
                                                                    nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
+                EXPECT(two.p);
                 EXPECT(one.p && two.p);
                 UINT tiles = 0;
                 device->GetResourceTiling(two.p, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
@@ -7031,11 +7056,20 @@ int main() {
     EXPECT(!mismatches);
 
     // CPU texture copies, once per path. A second D3D12 device on the same Vulkan device, told the extension is
-    // off, takes the staging path even on a GPU that has host image copy.
-    for (const bool host : {true, false}) {
+    // off, takes the staging path even on a GPU that has host image copy. The third path has the extension but
+    // treats every host-transfer image as one the driver gave no memory type (a GTX 1050 Ti, NVIDIA 582.78): the
+    // image is made again without host-transfer usage and copies on the staging path.
+    struct CopyPath {
+        const char* name;
+        bool host;
+        bool force_retry;
+    };
+    for (const CopyPath path : {CopyPath{"host image copy", true, false}, CopyPath{"staging copy", false, false},
+                                CopyPath{"host image copy refused by the driver", true, true}}) {
+        const bool host = path.host;
         if (host && !d.host_image_copy) {
-            std::printf("WriteToSubresource/ReadFromSubresource (host image copy): no VK_EXT_host_image_copy, "
-                        "skipped\n");
+            std::printf("WriteToSubresource/ReadFromSubresource (%s): no VK_EXT_host_image_copy, skipped\n",
+                        path.name);
             continue;
         }
         rt::d3d12::VulkanDeviceInfo info{};
@@ -7046,9 +7080,10 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.host_image_copy = host;
+        info.force_host_transfer_retry = path.force_retry;
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
-        EXPECT(cpu_copies(device.p, d.bc, host ? "host image copy" : "staging copy") == 0);
+        EXPECT(cpu_copies(device.p, d.bc, path.name) == 0);
     }
 
     {

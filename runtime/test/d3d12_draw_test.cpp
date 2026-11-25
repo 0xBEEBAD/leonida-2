@@ -16,7 +16,6 @@
 //     or across B8G8R8X8 and B8G8R8A8: the bytes land in the view's order and encoding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
-#include "../src/title_va_alias.h"
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
 #include "vk_test_device.h"
@@ -24,12 +23,14 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#include "../src/title_va_alias.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 #if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_INT_SPV) || \
     !defined(LEONIDA_TEST_PS_UINT_SPV)
@@ -76,7 +77,10 @@ static_assert(offsetof(Vertex, wrong_color) == 16);
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool title_index = argc == 2 && std::strcmp(argv[1], "--title-index-window") == 0;
+    const bool title_vertex = argc == 2 && std::strcmp(argv[1], "--title-vertex-window") == 0;
+    const bool title_window = title_index || title_vertex;
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
@@ -132,6 +136,19 @@ int main() {
     std::vector<std::uint8_t> step2_pixels(size * 256), step1_pixels(size * 256);
     const bool logic_op = d.enabled.logicOp == VK_TRUE;
     const bool has_divisor = d.vertex_attribute_divisor;
+    constexpr UINT title_bytes = 2 * 65536;
+    auto& aliases = leonida::title_va_aliases();
+    const auto release_title = [&](std::uint8_t* pages) {
+        aliases.remove_title_memory(reinterpret_cast<std::uintptr_t>(pages));
+        VirtualFree(pages, 0, MEM_RELEASE);
+    };
+    std::unique_ptr<std::uint8_t, decltype(release_title)> title_pages(title_window ? static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, title_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) : nullptr, release_title);
+    const auto title_va = reinterpret_cast<std::uintptr_t>(title_pages.get());
+    if (title_window) {
+        EXPECT(title_pages);
+        aliases.add_title_memory(title_va, title_bytes);
+    }
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -394,7 +411,7 @@ int main() {
             transition(vertex_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
             transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)};
         list->ResourceBarrier(2, barriers);
-        const FLOAT blue[4] = {0, 0, 1, 1};
+        const FLOAT blue[4] = {0, 0, 1, title_window ? 0.f : 1.f};
         list->ClearRenderTargetView(rtv, blue, 0, nullptr);
 
         // State for the draws; the pipeline came with CreateCommandList.
@@ -409,9 +426,28 @@ int main() {
             vbv.BufferLocation=reinterpret_cast<UINT64>(title_vertices.base);
             vbv.SizeInBytes=TitleGeometryPages::bytes_per_view;
         }
-        list->IASetVertexBuffers(0, 1, &vbv);
+        constexpr UINT vertex_after_window = (65536 + sizeof(Vertex) - 1) / sizeof(Vertex);
+        if (title_vertex) {
+            std::memcpy(title_pages.get() + vertex_after_window * sizeof(Vertex), vertices, sizeof(vertices));
+            const D3D12_VERTEX_BUFFER_VIEW small_view{title_va, sizeof(vertices), sizeof(Vertex)};
+            const D3D12_VERTEX_BUFFER_VIEW large_view{title_va, title_bytes, sizeof(Vertex)};
+            list->IASetVertexBuffers(0, 1, &small_view);
+            list->IASetVertexBuffers(0, 1, &large_view);
+        } else {
+            list->IASetVertexBuffers(0, 1, &vbv);
+        }
         const D3D12_INDEX_BUFFER_VIEW ibv{upload_va + 256, sizeof(indices), DXGI_FORMAT_R16_UINT};
-        list->IASetIndexBuffer(&ibv);
+        if (title_index) {
+            // First binding creates a 64 KiB window. A later view at the same VA
+            // needs indices in the second 64 KiB.
+            const D3D12_INDEX_BUFFER_VIEW small_title_ib{title_va, sizeof(indices), DXGI_FORMAT_R16_UINT};
+            const D3D12_INDEX_BUFFER_VIEW large_title_ib{title_va, title_bytes, DXGI_FORMAT_R16_UINT};
+            std::memcpy(title_pages.get() + 65536, indices, sizeof(indices));
+            list->IASetIndexBuffer(&small_title_ib);
+            list->IASetIndexBuffer(&large_title_ib);
+        } else {
+            list->IASetIndexBuffer(&ibv);
+        }
         const D3D12_VIEWPORT viewport{0, 0, float(size), float(size), 0, 1};
         const D3D12_RECT scissor{0, 0, LONG(size), LONG(size)};
         list->RSSetViewports(1, &viewport);
@@ -424,7 +460,14 @@ int main() {
         list->SetPipelineState(mrt.p);
         list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
-        list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+        list->DrawIndexedInstanced(6, 1, title_index ? 65536 / sizeof(indices[0]) : 0,
+                                   title_vertex ? vertex_after_window : 0, 0);
+        if (title_window) {
+            // Only draw 1 contributes to the coverage check.
+            const D3D12_RECT empty{};
+            list->RSSetScissorRects(1, &empty);
+            list->IASetIndexBuffer(&ibv);
+        }
         // Draw 2: offset (1, -1), green tint -> bottom-right quadrant green. The root signature is set again after
         // the arguments; it is the same one, so they stay bound (else the quad would land top-left, untinted).
         list->SetPipelineState(pso.p);
@@ -485,6 +528,25 @@ int main() {
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
+        if (title_window) {
+            unsigned painted = 0, wrong = 0;
+            for (unsigned y = 0; y < size; ++y) {
+                for (unsigned x = 0; x < size; ++x) {
+                    const bool inside = x < size / 2 && y < size / 2;
+                    const auto alpha = pixels[y * 256 + x * 4 + 3];
+                    painted += alpha == 255;
+                    wrong += alpha != (inside ? 255 : 0);
+                }
+            }
+            std::printf("title %s window: %u/%u pixels painted; %u differences from expected coverage\n",
+                        title_vertex ? "vertex" : "index", painted, size * size / 4, wrong);
+            EXPECT(wrong == 0);
+            EXPECT(aliases.shader_va(title_va + 65536) == aliases.shader_va(title_va) + 65536);
+            EXPECT(aliases.shader_va(title_va + 65536) != title_va + 65536);
+            readback->Unmap(0, nullptr);
+            EXPECT(d.validation_errors() == 0);
+            return 0;
+        }
 
         // Second pass on the same target, cleared blue again: the full-screen triangle (yellow, red tint: red)
         // through a viewport on the bottom-right quadrant, with no vertex buffer in its pipeline.

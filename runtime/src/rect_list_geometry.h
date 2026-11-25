@@ -2,25 +2,25 @@
 
 // Console rectangle lists on Vulkan, which has no such primitive.
 //
-// A rectangle is three corners and the hardware makes the fourth, a + b - p (p the right-angle corner, a and b its
-// neighbours), for the position and for every interpolant, after the vertex stage. Which vertex is p is not fixed:
-// the retail boot's full-screen rectangle has it at the second vertex. The stage picks the vertex opposite the longest
-// screen-space edge, and the first vertex on a tie. A list topology of rectangles (D3D_PRIMITIVE_TOPOLOGY 17) and a pipeline
-// whose topology type is 19 are console-only. The fact comes from xvalkyrie (GPL-3.0, commit 53af7df77c10, notes in
-// its backlog); no code is taken from it.
+// A rectangle is three corners (v1, v2, v3) of a screen-aligned rectangle and the hardware makes the fourth, for the
+// position and for every interpolant, after the vertex stage. A list topology of rectangles (D3D_PRIMITIVE_TOPOLOGY
+// 17) and a pipeline whose topology type is 19 are console-only. The fact comes from xvalkyrie (GPL-3.0, commit
+// 53af7df77c10, notes in its backlog); no code is taken from it. The corner between the other two (the right angle)
+// is not always v1: the title's own full-screen blit (VS_Blit_6e5520d1) gives (-1, 1) (-1, -1) (1, -1), the corner
+// at v2, and xcl's notes say the same of a retail title's full-screen pass and list v1, v2 and v3 as possible
+// (learned from its docs and tests, GPL-2.0-only, no code taken). Taking v1 there made the parallelogram
+// v2 + v3 - v1 = (1, -3), of which only the lower-left half of the screen is on screen.
 //
 // The fourth vertex depends on what the vertex stage wrote, not on what it read, so the expansion has to sit after
 // the vertex stage: a pre-pass over the vertex buffers is wrong for any shader that is not linear in its inputs (and
 // the translated vertex shaders fetch by V# themselves, so there is no vertex buffer to expand). The pipeline gets a
 // small geometry stage instead, built here from the vertex shader's own SPIR-V: it takes the triangle (v1, v2, v3)
-// the list draws and emits the parallelogram as the two triangles (p, a, f) and (p, f, b), with the winding of
-// (v1, v2, v3). Both start at p, so a flat input (taken from a triangle's first vertex) is p's over the whole
-// rectangle. Every Location output of the vertex stage is a vec4 float in the translator's output (rdna2spirv.py),
+// the list draws, finds the corner between the other two as the one opposite the longest side (from the positions'
+// x and y; a degenerate triangle takes v1), makes the fourth corner v4 = the other two's sum minus that corner, and
+// emits the rectangle as two triangles with the winding of (v1, v2, v3) that both start at v1, so a flat input
+// (taken from a triangle's first vertex) is v1's over the whole rectangle:
+//   corner v1: (v1, v2, v4) (v1, v4, v3);  corner v2: (v1, v2, v3) (v1, v3, v4);  corner v3: (v1, v2, v3) (v1, v4, v2). Every Location output of the vertex stage is a vec4 float in the translator's output (rdna2spirv.py),
 // and so is the stage's Position; the generated stage reads and writes exactly those.
-//
-// The edges are measured in normalized device coordinates, not pixels (the stage does not know the viewport). For the
-// usual axis-aligned rectangle that is exact; a rotated rectangle drawn into a very non-square viewport can pick a
-// different corner than the pixel-space right angle.
 //
 // Not covered, and refused with a reason: a vertex stage that writes ClipDistance, CullDistance, Layer or
 // ViewportIndex, or a Location output that is not a vec4 float.
@@ -49,10 +49,10 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     enum : std::uint32_t {
         op_entry_point = 15, op_type_void = 19, op_type_int = 21, op_type_float = 22,
         op_type_vector = 23, op_type_array = 28, op_type_pointer = 32, op_type_function = 33, op_constant = 43,
+        op_type_bool = 20, op_composite_construct = 80, op_composite_extract = 81, op_fmul = 133,
+        op_logical_and = 167, op_logical_not = 168, op_select = 169, op_ford_greater_than_equal = 190,
         op_function = 54, op_function_end = 56, op_variable = 59, op_load = 61, op_store = 62, op_access_chain = 65,
-        op_decorate = 71, op_fadd = 129, op_fsub = 131, op_fmul = 133, op_fdiv = 136,
-        op_type_bool = 20, op_composite_construct = 80, op_composite_extract = 81, op_logical_and = 167,
-        op_logical_not = 168, op_select = 169, op_ford_greater_equal = 190, op_emit_vertex = 218, op_end_primitive = 219, op_label = 248, op_return = 253,
+        op_decorate = 71, op_fadd = 129, op_fsub = 131, op_emit_vertex = 218, op_end_primitive = 219, op_label = 248, op_return = 253,
         op_capability = 17, op_memory_model = 14, op_execution_mode = 16,
         deco_builtin = 11, deco_location = 30, builtin_position = 0, builtin_point_size = 1,
         storage_input = 1, storage_output = 3
@@ -127,14 +127,12 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     };
     const std::uint32_t t_void = id(), t_fn = id(), t_uint = id(), t_float = id(), t_v4 = id(),
                         c3 = id(), t_arr = id(), t_pin_arr = id(), t_pin_v4 = id(),
-                        t_pout_v4 = id(), c0 = id(), c1 = id(), c2 = id(), t_bool = id(), t_bool4 = id();
+                        t_pout_v4 = id(), c0 = id(), c1 = id(), c2 = id();
     emit(globals, op_type_void, {t_void});
     emit(globals, op_type_function, {t_fn, t_void});
     emit(globals, op_type_int, {t_uint, 32, 0});
     emit(globals, op_type_float, {t_float, 32});
     emit(globals, op_type_vector, {t_v4, t_float, 4});
-    emit(globals, op_type_bool, {t_bool});
-    emit(globals, op_type_vector, {t_bool4, t_bool, 4});
     emit(globals, op_constant, {t_uint, c3, 3});
     emit(globals, op_constant, {t_uint, c0, 0});
     emit(globals, op_constant, {t_uint, c1, 1});
@@ -165,82 +163,79 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     const std::uint32_t main_fn = id(), entry_label = id();
     emit(body, op_function, {t_void, main_fn, 0, t_fn});
     emit(body, op_label, {entry_label});
-    // Per variable: the three vertices as drawn, loaded first.
-    struct Corners { std::uint32_t v[4]; };  // v[0] the right-angle corner, v[1], v[2] its neighbours, v[3] the fourth
+    // Per variable: the three corners.
+    struct Corners { std::uint32_t v[3]; };
     std::vector<Corners> corners;
-    std::vector<std::array<std::uint32_t, 3>> loaded;
     const std::uint32_t cs[3] = {c0, c1, c2};
     for (const Var& v : vars) {
-        std::array<std::uint32_t, 3> three{};
+        Corners c{};
         for (int k = 0; k < 3; ++k) {
             const std::uint32_t ptr = id();
-            three[k] = id();
+            c.v[k] = id();
             emit(body, op_access_chain, {t_pin_v4, ptr, v.in, cs[k]});
-            emit(body, op_load, {t_v4, three[k], ptr});
+            emit(body, op_load, {t_v4, c.v[k], ptr});
         }
-        loaded.push_back(three);
+        corners.push_back(c);
     }
-    // Which vertex is the right angle: the one opposite the longest edge, measured on screen (position.xy / position.w;
-    // a right triangle's longest edge is its hypotenuse). Ties go to the first vertex, which keeps the plain
-    // "v1 is the corner" order for every rectangle whose right angle is there. A triangle that is not a right
-    // triangle gets the same rule, so the choice is at least consistent.
-    std::uint32_t screen[3][2];
-    for (int k = 0; k < 3; ++k) {
-        const std::uint32_t x = id(), y = id(), w = id();
-        emit(body, op_composite_extract, {t_float, x, loaded[0][k], 0});
-        emit(body, op_composite_extract, {t_float, y, loaded[0][k], 1});
-        emit(body, op_composite_extract, {t_float, w, loaded[0][k], 3});
-        screen[k][0] = id();
-        screen[k][1] = id();
-        emit(body, op_fdiv, {t_float, screen[k][0], x, w});
-        emit(body, op_fdiv, {t_float, screen[k][1], y, w});
-    }
-    const auto squared_edge = [&](int a, int b) {
-        const std::uint32_t dx = id(), dy = id(), xx = id(), yy = id(), sum = id();
-        emit(body, op_fsub, {t_float, dx, screen[a][0], screen[b][0]});
-        emit(body, op_fsub, {t_float, dy, screen[a][1], screen[b][1]});
-        emit(body, op_fmul, {t_float, xx, dx, dx});
-        emit(body, op_fmul, {t_float, yy, dy, dy});
+    // The corner between the other two, opposite the longest side: squared lengths from the positions' x and y.
+    const std::uint32_t t_bool = id(), t_bv4 = id();
+    emit(globals, op_type_bool, {t_bool});
+    emit(globals, op_type_vector, {t_bv4, t_bool, 4});
+    const auto extract = [&](std::uint32_t vector, std::uint32_t component) {
+        const std::uint32_t r = id();
+        emit(body, op_composite_extract, {t_float, r, vector, component});
+        return r;
+    };
+    const auto length2 = [&](std::uint32_t a, std::uint32_t b) {
+        const std::uint32_t d = id(), xx = id(), yy = id(), sum = id();
+        emit(body, op_fsub, {t_v4, d, a, b});
+        const std::uint32_t x = extract(d, 0), y = extract(d, 1);
+        emit(body, op_fmul, {t_float, xx, x, x});
+        emit(body, op_fmul, {t_float, yy, y, y});
         emit(body, op_fadd, {t_float, sum, xx, yy});
         return sum;
     };
-    const std::uint32_t e01 = squared_edge(0, 1), e02 = squared_edge(0, 2), e12 = squared_edge(1, 2);
-    const std::uint32_t g12_01 = id(), g12_02 = id(), at_first = id(), g02_01 = id(), not_first = id(), at_second = id();
-    emit(body, op_ford_greater_equal, {t_bool, g12_01, e12, e01});
-    emit(body, op_ford_greater_equal, {t_bool, g12_02, e12, e02});
-    emit(body, op_logical_and, {t_bool, at_first, g12_01, g12_02});  // the edge opposite v1 is longest: v1 is the corner
-    emit(body, op_ford_greater_equal, {t_bool, g02_01, e02, e01});
-    emit(body, op_logical_not, {t_bool, not_first, at_first});
-    emit(body, op_logical_and, {t_bool, at_second, not_first, g02_01});  // else the edge opposite v2: v2; else v3
-    const std::uint32_t first4 = id(), second4 = id();
-    emit(body, op_composite_construct, {t_bool4, first4, at_first, at_first, at_first, at_first});
-    emit(body, op_composite_construct, {t_bool4, second4, at_second, at_second, at_second, at_second});
-    // The corner p, its neighbours a = next and b = the one after (the same cyclic order as v1 v2 v3, so the winding
-    // is the drawn triangle's), and the fourth corner a + b - p, for the position and for every interpolant alike.
-    for (const auto& three : loaded) {
-        Corners c{};
-        const auto pick = [&](std::uint32_t first, std::uint32_t second, std::uint32_t third) {
-            const std::uint32_t inner = id(), outer = id();
-            emit(body, op_select, {t_v4, inner, second4, second, third});
-            emit(body, op_select, {t_v4, outer, first4, first, inner});
-            return outer;
-        };
-        c.v[0] = pick(three[0], three[1], three[2]);
-        c.v[1] = pick(three[1], three[2], three[0]);
-        c.v[2] = pick(three[2], three[0], three[1]);
-        const std::uint32_t sum = id(), diff = id();
-        emit(body, op_fadd, {t_v4, sum, c.v[1], c.v[2]});
-        emit(body, op_fsub, {t_v4, diff, sum, c.v[0]});
-        c.v[3] = diff;
-        corners.push_back(c);
+    const auto at_least = [&](std::uint32_t a, std::uint32_t b) {
+        const std::uint32_t r = id();
+        emit(body, op_ford_greater_than_equal, {t_bool, r, a, b});
+        return r;
+    };
+    const auto both = [&](std::uint32_t a, std::uint32_t b) {
+        const std::uint32_t r = id();
+        emit(body, op_logical_and, {t_bool, r, a, b});
+        return r;
+    };
+    const auto splat = [&](std::uint32_t b) {  // OpSelect on vectors takes a vector condition before SPIR-V 1.4
+        const std::uint32_t r = id();
+        emit(body, op_composite_construct, {t_bv4, r, b, b, b, b});
+        return r;
+    };
+    const std::uint32_t* p = corners[0].v;  // vars[0] is the Position
+    const std::uint32_t l12 = length2(p[0], p[1]), l23 = length2(p[1], p[2]), l31 = length2(p[2], p[0]);
+    const std::uint32_t at_v1 = both(at_least(l23, l12), at_least(l23, l31)), not_v1 = id();
+    emit(body, op_logical_not, {t_bool, not_v1, at_v1});
+    const std::uint32_t at_v2 = both(not_v1, at_least(l31, l12));
+    const std::uint32_t c_v1 = splat(at_v1), c_v2 = splat(at_v2);
+    const auto pick = [&](std::uint32_t condition, std::uint32_t yes, std::uint32_t no) {
+        const std::uint32_t r = id();
+        emit(body, op_select, {t_v4, r, condition, yes, no});
+        return r;
+    };
+    // Per variable: the fourth corner, v1 + v2 + v3 - 2 * corner, and the six vertices of the two triangles.
+    std::vector<std::array<std::uint32_t, 6>> emitted;
+    for (const Corners& c : corners) {
+        const std::uint32_t corner = pick(c_v1, c.v[0], pick(c_v2, c.v[1], c.v[2]));
+        const std::uint32_t s12 = id(), s123 = id(), less = id(), fourth = id();
+        emit(body, op_fadd, {t_v4, s12, c.v[0], c.v[1]});
+        emit(body, op_fadd, {t_v4, s123, s12, c.v[2]});
+        emit(body, op_fsub, {t_v4, less, s123, corner});
+        emit(body, op_fsub, {t_v4, fourth, less, corner});
+        emitted.push_back({c.v[0], c.v[1], pick(c_v1, fourth, c.v[2]),
+                           c.v[0], pick(c_v2, c.v[2], fourth), pick(c_v1, c.v[2], pick(c_v2, fourth, c.v[1]))});
     }
-    // Two triangles, (p, a, f) and (p, f, b): the diagonal is p to f, so both start at p and a flat input
-    // (which Vulkan takes from a triangle's first vertex) is p's over the whole rectangle. The attributes are
-    // affine over the parallelogram, so the split does not change any interpolated value.
-    const int triangles[2][3] = {{0, 1, 3}, {0, 3, 2}};
-    for (const auto& triangle : triangles) {
-        for (int k : triangle) {
-            for (std::size_t i = 0; i < vars.size(); ++i) emit(body, op_store, {vars[i].out, corners[i].v[k]});
+    for (int triangle = 0; triangle < 2; ++triangle) {
+        for (int k = 0; k < 3; ++k) {
+            for (std::size_t i = 0; i < vars.size(); ++i) emit(body, op_store, {vars[i].out, emitted[i][triangle * 3 + k]});
             emit(body, op_emit_vertex, {});
         }
         emit(body, op_end_primitive, {});

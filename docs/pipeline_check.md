@@ -24,6 +24,8 @@ For an index entry with `lds_bytes`, the checker compares the reported workgroup
 limit counts as a module failure before Vulkan receives the shader. Older indexes without this field still use the
 normal driver check. Mesh pipelines on devices without mesh shader support still use the existing feature skip.
 
+Build with `make_game.py --stages shaders --compact-spirv` to run SPIRV-Tools local load elimination, redundant value elimination and dead-code elimination before validation. The same flag works on `tools/rdna2spirv.py` and `scripts/translate_pipeline_compute.py`. It preserves stage interfaces, descriptor bindings and specialization constants. Omit the flag for an unoptimized comparison. On NVIDIA use separate empty pipeline caches and set `__GL_SHADER_DISK_CACHE=0` for both arms. Use one pipeline per checker process with `--jobs 1 --slow 0` for per-module timings.
+
 ## Options
 
 `vk_pipeline_check <spirv dir> [cache.bin] [options]`
@@ -445,18 +447,24 @@ The runtime seeds its `VkPipelineCache` from the cache this tool saves, so a pip
 driver gives it the same cache key in both programs. Measured on Windows with an RX 9070 XT (driver
 32.0.32029.2010) and one synthetic compute shader, reading the application-cache-hit bit:
 
-- The three device features `robustBufferAccess`, `scalarBlockLayout` and `robustImageAccess` each affect the key.
-  The first two are disabled on both devices. This integration enables supported core image robustness for storage
-  views on both the runtime device and the checker. The seed test compares the two using one synthetic pipeline.
+- `robustBufferAccess`, `scalarBlockLayout` and `robustImageAccess` are each part of the key. The first two are
+  disabled on both devices; the runtime's device enables supported core image robustness for storage views, and so
+  does the checker. Nothing else that differs between the two devices changed the key on RX 9070 XT: the checker's
+  other features, the runtime's extensions, the application name.
+- On Windows 11 with an Intel RaptorLake-S iGPU, clearing those three features alone makes the checker's cache hit
+  on the runtime's device. On an NVIDIA GeForce RTX 5060 Laptop GPU (driver 621.24), NVIDIA also hashes
+  `VK_EXT_mesh_shader` (with `meshShaderQueries` enabled, matching the runtime since `#577`) and
+  `VK_KHR_maintenance8` into the pipeline cache key even for compute shaders, so the checker enables both whenever
+  supported and keeps `meshShaderQueries` on.
 - On a Windows RTX 5070 Ti (617.42), a compute-only seed missed with mesh features omitted and hit with the supported mesh and mesh-query features enabled on both devices. The shader, push constants and pipeline layout were identical. Cache-producing runs request this device configuration for every selected shader batch.
 - The executable's file name is part of the key; its folder is not. A copy of the checker under another name
   misses the cache the original wrote, and the runtime's device hits the checker's cache only from a program
   with the checker's file name. So on this driver a cache written by `vk_pipeline_check.exe` does not hit in
   `gta6rt.exe`, and one written by a copy of the checker named `gta6rt.exe` does.
 
-The `pipeline_cache_seed` test runs the checker, then creates the same pipeline on the runtime's device from
-the saved cache; the checker runs as a copy with the test program's file name. It is skipped where the driver
-reports no hit even for a cache the device wrote itself, as llvmpipe does.
+The `pipeline_cache_seed` test embeds a synthetic minimal compute shader and runs a copy of the checker under the
+test program's own file name, then creates the same pipeline on the runtime's device from the saved cache. It is
+skipped where the driver reports no hit even for a cache the device wrote itself, as llvmpipe does.
 
 ## Wave64-emulated corpus (`--wave64-emulate`)
 

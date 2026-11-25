@@ -23,6 +23,8 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/shader_library.h"
 #include "../src/title_va_alias.h"
+#include "../src/title_page_watch.h"
+#include "../src/title_geometry_watch.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -168,8 +170,8 @@ struct Context {
 
 // One kind of title pages: `protect` is PAGE_READWRITE, or with PAGE_WRITECOMBINE.
 int check_kind(Context& c, const char* kind, DWORD protect, int& checks) {
-    void* pages = VirtualAlloc(nullptr, kPages, MEM_RESERVE | MEM_COMMIT, protect);
-    void* other_pages = VirtualAlloc(nullptr, kPages, MEM_RESERVE | MEM_COMMIT, protect);
+    void* pages = VirtualAlloc(nullptr, kPages, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, protect);
+    void* other_pages = VirtualAlloc(nullptr, kPages, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, protect);
     EXPECT(pages && other_pages);
     const auto title_va = reinterpret_cast<std::uint64_t>(pages);
     EXPECT(title_va >= c.arena);  // outside the arena: heap_base + title_va names nothing of the layer's
@@ -303,9 +305,14 @@ int check_kind(Context& c, const char* kind, DWORD protect, int& checks) {
 //   - a root view (translated when set).
 // Negative controls: a raw V# whose base is an arena buffer and a T#-shaped slot whose base is the ring keep their
 // bytes; committed memory that is not the title's, and a title range with no committed page, are left alone.
-int check_title_memory(Context& c, int& checks) {
+// Two CPU addresses of one mapped physical tile. The runtime gets this information from XMem in production.
+static std::uintptr_t source_tile, peer_tile;
+void aliases_of_test_tile(std::uintptr_t va, std::vector<std::uintptr_t>& peers) {
+    if (va == source_tile) peers.push_back(peer_tile);
+}
+int check_title_memory(Context& c, int& checks, bool geometry) {
     constexpr UINT64 ring_bytes = 256 * 1024;
-    auto* ring = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, ring_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    auto* ring = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     EXPECT(ring);
     const auto ring_va = reinterpret_cast<std::uint64_t>(ring);
     EXPECT(ring_va >= c.arena);
@@ -327,13 +334,23 @@ int check_title_memory(Context& c, int& checks) {
                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                        IID_PPV_ARGS(&readback.p))));
 
-    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
-                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    struct ConsoleHeap {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        UINT64 address{}, size{};
+    } h;
+    if (geometry) {
+        h.size = 65536;
+        h.desc.NumDescriptors = UINT(h.size / 32);
+        h.address = reinterpret_cast<UINT64>(VirtualAlloc(nullptr, h.size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        EXPECT(h.address);
+    }
     Ref<ID3D12DescriptorHeap> heap;
-    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&h.desc, IID_PPV_ARGS(&heap.p))));
     const std::uint64_t cpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p);
     const std::uint64_t gpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p);
     const UINT inc = c.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    EXPECT(!geometry || cpu == h.address);
     const auto raw_vsharp = [](std::uint64_t address) {
         leonida::gfx10::Buffer b{};
         b.address = address;
@@ -344,11 +361,43 @@ int check_title_memory(Context& c, int& checks) {
     };
     // Slot 0: a V# the CPU writes itself, its base in the ring. Slot 1: CreateConstantBufferView of the ring.
     // Slot 2: a raw 64-bit VA (out[2]) for the root-view mode. Slots 3 and 4: the negative controls.
-    const auto v0 = raw_vsharp(ring_va + 0x1000);
-    std::memcpy(reinterpret_cast<void*>(cpu), v0.data(), sizeof(v0));
+    std::uint64_t guest = ring_va;
+    HANDLE section{};
+    void* primary{};
+    void* peer{};
+    constexpr auto data_offset = 0x1000u;
+    if (geometry) {
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 65536, nullptr);
+        EXPECT(section);
+        primary = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0);
+        peer = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0);
+        EXPECT(primary && peer);
+        source_tile = reinterpret_cast<std::uintptr_t>(primary);
+        peer_tile = reinterpret_cast<std::uintptr_t>(peer);
+        leonida::geometry_writes::aliases.store(&aliases_of_test_tile);
+        auto* gpu_range = VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE, PAGE_NOACCESS);
+        EXPECT(gpu_range);
+        guest = reinterpret_cast<std::uintptr_t>(gpu_range);
+        leonida::title_gpu_views::note_reservation(source_tile, 65536, false);
+        EXPECT(leonida::title_gpu_views::note_reservation(guest, 65536, true));
+        aliases.add_title_memory(guest, ring_bytes);
+        const auto srv = raw_srv(0, kElements);
+        EXPECT(rt::d3d12::write_placed_buffer_view(c.inner, false, &srv, guest + data_offset, kBytes,
+                                                    D3D12_CPU_DESCRIPTOR_HANDLE{cpu + 7 * inc}));
+        EXPECT(vsharp_base(cpu + 7 * inc) == guest + data_offset);
+    }
+    const auto v0 = raw_vsharp(guest + data_offset);
+    std::memcpy(reinterpret_cast<void*>(cpu + (geometry ? 9 * inc : 0)), v0.data(), sizeof(v0));
     const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{ring_va + 0x2000, 256};
+    // Simulate a Wine process whose title reservations leave no usable address in the main arena.
+    const auto* opt = std::getenv("LEONIDA_STREAM_BUFFER_WINDOWS");
+    const bool external = opt && !std::strcmp(opt, "1");
+    if (external) aliases.add_title_memory(1, c.arena - 1);
     c.device->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{cpu + inc});
-    EXPECT(vsharp_base(cpu + inc) < c.arena);  // translated when written
+    if (external) aliases.remove_title_memory(1);
+    const auto created = vsharp_base(cpu + inc);
+    EXPECT(created != cbv.BufferLocation && created == aliases.shader_va(cbv.BufferLocation));
+    EXPECT((created >= c.arena) == external);  // translated when written
     const std::uint64_t out2 = out[2]->GetGPUVirtualAddress();
     std::memcpy(reinterpret_cast<void*>(cpu + 2 * inc), &out2, sizeof(out2));
     const auto arena_vsharp = raw_vsharp(out[0]->GetGPUVirtualAddress());
@@ -362,6 +411,10 @@ int check_title_memory(Context& c, int& checks) {
 
     // The ring's data, written before the submission (after the descriptors, as a title fills its ring per frame).
     for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0xC0000000u + i * 7u;
+    if (geometry) {
+        // Only the other mapping changes after the view is made. Never write through the address the runtime reads.
+        std::memcpy(static_cast<std::uint8_t*>(peer) + data_offset, ring + data_offset / 4, kBytes);
+    }
 
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -372,13 +425,14 @@ int check_title_memory(Context& c, int& checks) {
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRootSignature(c.root);
     // The CPU-written V# (buffer SRV mode).
-    list->SetComputeRoot32BitConstant(0, 0, 0);
-    list->SetComputeRoot32BitConstant(0, 0xFFFFFFFFu, 1);
+    list->SetComputeRoot32BitConstant(0, geometry ? 9 : 0, 0);
+    list->SetComputeRoot32BitConstant(0, geometry ? 0xFFFFFFFCu : 0xFFFFFFFFu, 1);
     list->SetComputeRootUnorderedAccessView(1, out[0]->GetGPUVirtualAddress());
     list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
     list->Dispatch(1, 1, 1);
-    // The created CBV (CBV mode).
-    list->SetComputeRoot32BitConstant(0, 0, 1);
+    // A console CBV uses 16-byte records. Read its first four words through the same indexed-load fixture.
+    list->SetComputeRoot32BitConstant(0, geometry ? 1 : 0, 0);
+    list->SetComputeRoot32BitConstant(0, geometry ? 0xFFFFFFFCu : 0, 1);
     list->SetComputeRootUnorderedAccessView(1, out[1]->GetGPUVirtualAddress());
     list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + inc});
     list->Dispatch(1, 1, 1);
@@ -416,12 +470,14 @@ int check_title_memory(Context& c, int& checks) {
     const auto* got = static_cast<const std::uint32_t*>(mapped);
     UINT raw_ok = 0, cbv_ok = 0, root_ok = 0;
     for (UINT i = 0; i < kElements; ++i) {
-        if (got[i] == ring[0x1000 / 4 + i]) ++raw_ok;
-        if (got[kElements + i] == ring[0x2000 / 4 + i]) ++cbv_ok;
+        if (got[i] == ring[data_offset / 4 + (geometry ? i % 4 : i)]) ++raw_ok;
+        if (got[kElements + i] == ring[0x2000 / 4 + (geometry ? i % 4 : i)]) ++cbv_ok;
         if (got[2 * kElements + i] == ring[0x3000 / 4 + 64 + i] + kRootAdd) ++root_ok;
     }
     readback->Unmap(0, nullptr);
-    const bool rewritten = vsharp_base(cpu) < c.arena;
+    const bool rewritten = geometry
+        ? vsharp_base(cpu + 9 * inc) == guest + data_offset  // shader followed the copy; original bytes intact
+        : vsharp_base(cpu) != ring_va + data_offset && vsharp_base(cpu) == aliases.shader_va(ring_va + data_offset);
     const bool arena_kept = !std::memcmp(before3, reinterpret_cast<const void*>(cpu + 3 * inc), 32);
     const bool image_kept = !std::memcmp(before4, reinterpret_cast<const void*>(cpu + 4 * inc), 32);
     std::printf("title memory (a constant ring): CPU-written table V# %u/%u (rewritten before the submission: %s), "
@@ -438,8 +494,8 @@ int check_title_memory(Context& c, int& checks) {
     // Left alone and counted: committed memory that is not the title's (the runtime's own, say), and a title range
     // with no committed page.
     const std::uint64_t untranslated_before = aliases.untranslated(leonida::TitleVaAliases::created_view);
-    void* host = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    void* gone = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_READWRITE);
+    void* host = VirtualAlloc(nullptr, 65536, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* gone = VirtualAlloc(nullptr, 65536, MEM_TOP_DOWN | MEM_RESERVE, PAGE_READWRITE);
     const auto host_va = reinterpret_cast<std::uint64_t>(host), gone_va = reinterpret_cast<std::uint64_t>(gone);
     aliases.add_title_memory(gone_va, 65536);
     const D3D12_CONSTANT_BUFFER_VIEW_DESC not_title{host_va, 256}, reserved_only{gone_va, 256};
@@ -448,11 +504,50 @@ int check_title_memory(Context& c, int& checks) {
     EXPECT(vsharp_base(cpu + 5 * inc) == (host_va & 0xFFFFFFFFFFFFull));
     EXPECT(vsharp_base(cpu + 6 * inc) == (gone_va & 0xFFFFFFFFFFFFull));
     EXPECT(aliases.untranslated(leonida::TitleVaAliases::created_view) - untranslated_before == 2);
+    if (geometry) {
+        heap.reset();
+        leonida::geometry_writes::aliases.store(nullptr);
+        UnmapViewOfFile(peer);
+        UnmapViewOfFile(primary);
+        CloseHandle(section);
+        VirtualFree(reinterpret_cast<void*>(h.address), 0, MEM_RELEASE);
+        aliases.remove_title_memory(guest);
+        VirtualFree(reinterpret_cast<void*>(guest), 0, MEM_RELEASE);
+    }
     aliases.remove_title_memory(gone_va);
     aliases.remove_title_memory(ring_va);
     VirtualFree(host, 0, MEM_RELEASE);
     VirtualFree(gone, 0, MEM_RELEASE);
     checks += 4;
+    return 0;
+}
+
+// Four 4 MiB slabs fill the 16 MiB fixture budget. A final 1 MiB view still fits
+// immediately after the 3 MiB view in the second slab.
+int check_geometry_slab_tails(Context& c) {
+    constexpr std::uint64_t mib = 1ull << 20;
+    constexpr std::array<unsigned, 5> sizes{3, 3, 4, 4, 1};
+    void* pages = VirtualAlloc(nullptr, 15 * mib, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages);
+    const auto source = reinterpret_cast<std::uintptr_t>(pages);
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(source, 15 * mib);
+    alignas(32) std::uint32_t slot[8]{};
+    const auto dest = reinterpret_cast<std::uintptr_t>(slot);
+    std::array<std::uint64_t, sizes.size()> addresses{};
+    std::uint64_t offset = 0;
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+        const auto bytes = sizes[i] * mib;
+        const auto srv = raw_srv(0, UINT(bytes / 4));
+        EXPECT(rt::d3d12::write_placed_buffer_view(c.inner, false, &srv, source + offset, bytes, {dest}));
+        addresses[i] = vsharp_base(dest);
+        EXPECT(addresses[i] != source + offset);
+        offset += bytes;
+    }
+    EXPECT(addresses[4] == addresses[1] + sizes[1] * mib);
+    aliases.remove_title_memory(source);
+    VirtualFree(pages, 0, MEM_RELEASE);
+    std::puts("geometry slab tails: the final 1 MiB view used free space in an earlier slab at the cap");
     return 0;
 }
 
@@ -515,7 +610,7 @@ int check_rebound_tables(Context& c, ID3D12RootSignature* narrow, bool mirror, b
     list->SetComputeRootSignature(c.root);
     list->SetComputeRootDescriptorTable(2, table);
     list->SetGraphicsRootDescriptorTable(2, table);
-    const UINT args[] = {selected, 0xfffffffcu};
+    const UINT args[] = {selected, 0xfffffffbu};
     list->SetComputeRoot32BitConstants(0, 2, args, 0);
     list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress());
     list->Dispatch(1, 1, 1);
@@ -596,6 +691,8 @@ int main(int argc, char** argv) {
     const bool second_device = argc == 2 && std::strcmp(argv[1], "--rebound-second-device") == 0;
     const bool api_copy = api_copy_off || (argc == 2 && std::strcmp(argv[1], "--api-descriptor-copy") == 0);
     const bool rebind = api_copy || mirror_off || second_device || (argc == 2 && std::strcmp(argv[1], "--rebound-tables") == 0);
+    const char* setting = std::getenv("LEONIDA_GEOMETRY_MB");
+    const bool geometry = setting && std::atoi(setting) > 0;
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
@@ -628,6 +725,7 @@ int main(int argc, char** argv) {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
+        if (geometry) info.host_pointer_alignment = d.host_pointer_alignment;
         info.subgroup = d.subgroup;
         info.shader_dir = library.string();
         // Keep another compatibility device alive over the same physical GPU. Each owns its own arena.
@@ -653,6 +751,7 @@ int main(int argc, char** argv) {
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
         root_desc.Desc_1_0 = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        if (geometry) root_desc.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
         const auto root_blob = serialize(root_desc);
         EXPECT(!root_blob.empty());
         Ref<ID3D12RootSignature> root;
@@ -692,7 +791,8 @@ int main(int argc, char** argv) {
         }
         if (check_kind(c, "read-write", PAGE_READWRITE, checks)) return 1;
         if (check_kind(c, "write-combined", PAGE_READWRITE | PAGE_WRITECOMBINE, checks)) return 1;
-        if (check_title_memory(c, checks)) return 1;
+        if (check_title_memory(c, checks, geometry)) return 1;
+        if (geometry && std::atoi(setting) == 16 && check_geometry_slab_tails(c)) return 1;
     }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());

@@ -51,6 +51,10 @@ int main() {
     // A wrapping target (an import below heap_base) is kept as is: modular arithmetic.
     constexpr std::uint64_t below = 0xFFFFFFFFFFF00000ull;
     EXPECT(a.add(title + 0x100000, size, below) && a.shader_va(title + 0x100010) == below + 0x10);
+    std::uint64_t source{}, available{};
+    EXPECT(a.source_of_vsharp((below + 0x10) & ((1ull << 48) - 1), source, available));
+    EXPECT(source == title + 0x100010 && available == size - 0x10);
+    EXPECT(!a.source_of_vsharp((below + size) & ((1ull << 48) - 1), source, available));
     // A new buffer over part of a live range replaces it; the old range's removal does not touch the new one.
     EXPECT(a.add(title + 0x8000, size, 0x5000000));
     EXPECT(a.shader_va(title) == title);  // the replaced range is gone entirely

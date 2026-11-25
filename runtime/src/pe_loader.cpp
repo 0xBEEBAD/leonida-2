@@ -19,6 +19,8 @@
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "base_reservation.h"
+#include "clzero_patch.h"
+#include "cpu_emulation.h"
 
 namespace rt {
 
@@ -2182,6 +2184,24 @@ void Loader::bind_imports(Module& m) {
 void Loader::protect_sections(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     DWORD old;
+    // On a CPU without CLZERO, the image's CLZERO loops run from stubs instead of taking a #UD per cache line
+    // (clzero_patch.h). The sections are still writable here, and none of the image's code has run.
+    static const bool clzero_missing = !rt::cpu_emulation::detect_host().clzero;
+    if (clzero_missing && rt::clzero_patch::enabled()) {
+        std::vector<std::pair<uint8_t*, size_t>> code;
+        const IMAGE_SECTION_HEADER* cs = IMAGE_FIRST_SECTION(nt);
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++cs) {
+            if (!(cs->Characteristics & IMAGE_SCN_MEM_EXECUTE) || cs->VirtualAddress >= m.size) continue;
+            const uint64_t size = std::min<uint64_t>(std::min(cs->Misc.VirtualSize, cs->SizeOfRawData),
+                                                     m.size - cs->VirtualAddress);
+            if (size) code.push_back({m.base + cs->VirtualAddress, static_cast<size_t>(size)});
+        }
+        const auto patched = rt::clzero_patch::patch(code, uint64_t(m.base), uint64_t(m.base) + m.size);
+        if (patched.sites)
+            std::fprintf(stderr,
+                         "[rt] loader: %s: %zu CLZERO loops run from stubs at %p (%zu bytes), not as a #UD per line\n",
+                         m.name.c_str(), patched.sites, static_cast<void*>(patched.stubs), patched.stub_bytes);
+    }
     VirtualProtect(m.base, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old);
     auto* sec = IMAGE_FIRST_SECTION(nt);
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {

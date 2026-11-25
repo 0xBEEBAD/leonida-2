@@ -108,11 +108,11 @@ public:
     bool maintenance10 = false;  // depth/stencil transfers on non-graphics families, per format
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    bool request_depth_range_unrestricted = false;
+    bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled
     // VK_KHR_maintenance5 enabled, where VK_FORMAT_A8_UNORM_KHR can be sampled and blended as a colour attachment, as
     // gta6rt enables it (VulkanDeviceInfo::a8_render_target).
     bool a8_render_target = false;
-    // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
-    VkDeviceSize host_pointer_alignment = 0;
     bool sliced_3d_uav = false;    // imageSlicedViewOf3D and robustImageAccess enabled
     bool robust_image_access = false;
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
@@ -121,7 +121,6 @@ public:
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool prepare_on_bind=false;
-    bool first_use_backend_pipelines=false;
     bool cold_graphics_compile = false;
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
@@ -136,6 +135,9 @@ public:
     leonida::SubgroupSizeCaps subgroup;
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
+    bool shader_output_viewport_index = false;  // Vulkan 1.2 shaderOutputViewportIndex enabled
+    // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
+    VkDeviceSize host_pointer_alignment = 0;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -401,7 +403,6 @@ private:
         v13_.enable_pipeline_cache_control = cache_only && v13_.core && v13_.pipeline_cache_control;
         cold_graphics_compile = v13_.enable_pipeline_cache_control;
         prepare_on_bind = compile_mode && std::strcmp(compile_mode, "on-demand") == 0;
-        first_use_backend_pipelines = prepare_on_bind || (compile_mode && std::strcmp(compile_mode, "first-use") == 0);
         VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                                   v13_.enable(conditional_rendering ? &enable_conditional : nullptr)};
         if (v13_.core) {
@@ -432,6 +433,8 @@ private:
         enable12.descriptorBindingPartiallyBound = partially_bound;
         sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
         enable12.samplerFilterMinmax = sampler_filter_minmax;
+        shader_output_viewport_index = features12.shaderOutputViewportIndex == VK_TRUE;
+        enable12.shaderOutputViewportIndex = shader_output_viewport_index;
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));
@@ -473,6 +476,7 @@ private:
         enable.shaderStorageImageWriteWithoutFormat =
             enable_legacy_formatless_features && features.features.shaderStorageImageWriteWithoutFormat;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
+        enable.multiViewport = features.features.multiViewport;  // d3d12_multi_viewport_test, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
@@ -648,6 +652,11 @@ private:
         enabled = enable;
         std::vector<const char*> device_extensions;
         v13_.add_extensions(device_extensions);
+        depth_range_unrestricted = request_depth_range_unrestricted &&
+            std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME) == 0;
+            });
+        if (depth_range_unrestricted) device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
         conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
             return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
         });

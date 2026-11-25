@@ -13,6 +13,8 @@
 #include <vulkan/vulkan.h>
 #include "queue_families.h"
 
+#include "vulkan_device_fault.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -27,14 +29,15 @@ public:
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
     ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate, VkBufferUsageFlags extra_usage = 0,
-                   std::vector<std::uint32_t> families = {})
-        : device_(device), allocate_(std::move(allocate)), extra_usage_(extra_usage), families_(std::move(families)) {
+                   std::vector<std::uint32_t> families = {}, DeviceFaultDiagnostics* diagnostics = nullptr)
+        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)), extra_usage_(extra_usage),
+          families_(std::move(families)) {
         loaded_ = vk_.load(get, device);
     }
 
     ~ScratchBuffers() {
         if (!loaded_) return;
-        vk_.vkDeviceWaitIdle(device_);
+        DeviceFaultDiagnostics::observe(diagnostics_, vk_.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle");
         release(current_);
         for (auto& batch : retired_) release(batch);
         for (auto& chunk : spare_) destroy(chunk);
@@ -105,7 +108,9 @@ public:
             if (retired_[i].ticket != 0) {
                 std::uint64_t done = 0;
                 if (!retired_[i].timeline ||
-                    vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done) != VK_SUCCESS ||
+                    DeviceFaultDiagnostics::observe(diagnostics_,
+                        vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done),
+                        "vkGetSemaphoreCounterValue (scratch)") != VK_SUCCESS ||
                     done < retired_[i].ticket) {
                     ++i;
                     continue;
@@ -181,6 +186,7 @@ private:
     }
 
     VkDevice device_;
+    DeviceFaultDiagnostics* diagnostics_;
     Allocate allocate_;
     VkBufferUsageFlags extra_usage_ = 0;
     std::vector<std::uint32_t> families_;

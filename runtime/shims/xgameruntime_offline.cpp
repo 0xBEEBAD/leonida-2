@@ -596,7 +596,8 @@ const GUID kAccessibilityInterfaces[] = {
     {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}},   // IXAccessibilityImpl2
 };
 
-// The first-run profile forwards speech synthesis to the locally installed Windows gaming runtime.
+// LEONIDA_LOCAL_SPEECH=1 forwards speech synthesis to the locally installed Windows gaming runtime (the host's own
+// xgameruntime.dll, from System32). Off unless set: no profile sets it, and the silent voice below answers.
 struct HostSpeechProvider {
     HMODULE module=nullptr;
     IUnknown* base=nullptr;
@@ -660,6 +661,11 @@ HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* context, Installe
     return S_OK;
 }
 
+// Speech synthesis is silent rather than missing: XSpeechSynthesizerCreate hands out a synthesizer, every stream is a
+// valid WAVE file with no samples (16 kHz mono 16-bit PCM, 44 bytes), so a title that narrates plays silence and goes
+// on. Failing the create (as before) can keep a title from leaving its first-boot accessibility step. The approach and
+// the stream layout follow VIctory crates/victory-hle/src/modules/speech.rs (GPL-3.0-or-later, Marvisak/VIctory
+// 35b054e), whose vtable for this class matches the slot order below.
 // Valid 44-byte RIFF/WAVE header for 16 kHz, 16-bit mono PCM with 0 data bytes (silent speech stream).
 constexpr uint8_t kSilentWave[44] = {
     'R', 'I', 'F', 'F', 0x24, 0x00, 0x00, 0x00, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
@@ -676,6 +682,9 @@ HRESULT STDMETHODCALLTYPE speech_create(void*, void** handle) {
     if (handle && call_host_speech<9>(host_result, handle)) return host_result;
     if (!handle) return E_POINTER;
     *handle = &g_speech_synth_handle;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: speech synthesis is silent offline (empty WAVE streams)\n");
     return S_OK;
 }
 

@@ -12,8 +12,10 @@
 // submission), or its device address minus heap_base (mod 2^64) when it has its own memory (an imported slot-133
 // buffer). Addresses that are not in the title's memory are passed through unchanged.
 //
-// The table is process-wide, like the title's address space. A resolver makes a GPU copy for an address in the
-// title's memory that has none yet. Without it the table only translates previously added ranges.
+// The table is process-wide, like the title's address space. The device behind it registers two hooks: a resolver
+// that makes a GPU copy for an address in the title's memory that has none yet, and a scanner that rewrites the
+// buffer V#s of a bound descriptor table before a submission. Without hooks the table only translates what was
+// added to it, so it is tested without a GPU (title_va_alias_test).
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,6 +25,8 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <utility>
+#include <vector>
 
 namespace leonida {
 
@@ -36,6 +40,7 @@ public:
     // An address in the title's memory: true, with `shader_va` what a shader must be given (the address itself when
     // no copy could be made). False: not the title's memory (an arena VA, a buffer of the layer's).
     using Resolver = bool (*)(void* context, std::uint64_t va, std::uint64_t bytes, std::uint64_t& shader_va);
+    using TableScanner = void (*)(void* context, std::uint64_t table_va, std::uint32_t descriptors);
 
     // [title_va, title_va + bytes) is reached as [shader_va, shader_va + bytes). A range that overlaps a live one
     // replaces it (the title has placed a new buffer over pages it released). False for an empty or wrapping range.
@@ -59,14 +64,28 @@ public:
 
     // The address a shader must be given for `va` from the ranges added so far: translated inside one, unchanged
     // elsewhere. No copy is made here.
-    std::uint64_t shader_va(std::uint64_t va) const {
+    std::uint64_t shader_va(std::uint64_t va, std::uint64_t bytes = 1) const {
         if (!count_.load(std::memory_order_acquire)) return va;  // the common case: no title range at all
         std::shared_lock lock(mutex_);
         auto it = ranges_.upper_bound(va);
         if (it == ranges_.begin()) return va;
         --it;
-        if (va >= it->second.end) return va;
+        if (va >= it->second.end || bytes > it->second.end - va) return va;
         return it->second.shader_va + (va - it->first);
+    }
+
+    // Debug-only inverse lookup. V#s retain 48 bits, so an import below heap_base wraps.
+    bool source_of_vsharp(std::uint64_t base, std::uint64_t& title, std::uint64_t& available) const {
+        constexpr std::uint64_t mask = (1ull << 48) - 1;
+        std::shared_lock lock(mutex_);
+        for (const auto& [start, range] : ranges_) {
+            const auto delta = (base - range.shader_va) & mask;
+            if (delta >= range.end - start) continue;
+            title = start + delta;
+            available = range.end - title;
+            return true;
+        }
+        return false;
     }
 
     // The free span around `va` (not in any range): [lo, hi). A copy made for `va` must stay inside it, so it never
@@ -107,6 +126,19 @@ public:
         if (va && shader_va(va) != va) untranslated_[kind].fetch_add(1, std::memory_order_relaxed);
     }
 
+    // Before a submission: the device rewrites the buffer V#s of the `descriptors` slots the root signature declares
+    // for the table at `table_va` (a console VA in one of its shader-visible CBV/SRV/UAV heaps).
+    void scan_table(std::uint64_t table_va, std::uint32_t descriptors) {
+        TableScanner scanner;
+        void* context;
+        {
+            std::lock_guard lock(hook_mutex_);
+            scanner = scanner_;
+            context = hook_context_;
+        }
+        if (scanner) scanner(context, table_va, descriptors);
+    }
+
     // The scan's cost, per ExecuteCommandLists that had tables to scan.
     void note_scan(std::uint64_t nanoseconds) {
         scans_.fetch_add(1, std::memory_order_relaxed);
@@ -139,6 +171,11 @@ public:
     void remove_title_memory(std::uint64_t base) {
         std::unique_lock lock(memory_mutex_);
         memory_.erase(base);
+    }
+    // LOCAL DIAGNOSTIC (mem probe): every title range, [begin, end), in address order.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> title_memory_ranges() const {
+        std::shared_lock lock(memory_mutex_);
+        return {memory_.begin(), memory_.end()};
     }
     // The title range that holds `va`: [lo, hi). False when none does.
     bool title_memory(std::uint64_t va, std::uint64_t& lo, std::uint64_t& hi) const {
@@ -174,19 +211,65 @@ public:
     }
     std::uint64_t pulled() const { return pulled_.load(std::memory_order_relaxed); }
 
-    // The first device to register keeps the resolver until it clears it.
-    void set_resolver(void* context, Resolver resolver) {
+    // The end of the first title range that overlaps [lo, hi), or 0 when none does. The GPU address arena keeps its
+    // own allocations out of these ranges, so one number is never both an arena address and a title address.
+    std::uint64_t title_overlap_end(std::uint64_t lo, std::uint64_t hi) const {
+        std::shared_lock lock(memory_mutex_);
+        auto it = memory_.upper_bound(lo);
+        if (it != memory_.begin() && std::prev(it)->second > lo) return std::prev(it)->second;
+        if (it != memory_.end() && it->first < hi) return it->second;
+        return 0;
+    }
+
+    // A vertex or index buffer view at `va`. On the console every page of the title's memory is GPU memory, so a view
+    // may name any address: the retail title binds vertex data that lives in its own CPU heap, with no D3D12 resource
+    // over it. When `va` is in the title's memory the device's maker makes sure a buffer covers it (found with a
+    // debugger: the address a draw could not resolve was a field of a vertex-buffer object in the title's heap,
+    // docs/re/answers.md).
+    using BufferMaker = void (*)(void* context, std::uint64_t va, std::uint64_t bytes);
+    void set_buffer_maker(void* context, BufferMaker maker) {
+        std::lock_guard lock(hook_mutex_);
+        maker_context_ = context;
+        maker_ = maker;
+    }
+    void clear_buffer_maker(void* context) {
+        std::lock_guard lock(hook_mutex_);
+        if (maker_context_ != context) return;
+        maker_context_ = nullptr;
+        maker_ = nullptr;
+    }
+    void want_buffer(std::uint64_t va, std::uint64_t bytes) {
+        if (!va) return;
+        std::uint64_t lo = 0, hi = 0;
+        if (!title_memory(va, lo, hi)) return;
+        BufferMaker maker;
+        void* context;
+        {
+            std::lock_guard lock(hook_mutex_);
+            maker = maker_;
+            context = maker_context_;
+        }
+        if (maker) maker(context, va, bytes);
+    }
+
+    // The first device to register keeps the hooks until it clears them.
+    void set_hooks(void* context, Resolver resolver, TableScanner scanner) {
         std::lock_guard lock(hook_mutex_);
         if (hook_context_) return;
         hook_context_ = context;
         resolver_ = resolver;
+        scanner_ = scanner;
     }
-    void clear_resolver(void* context) {
+    void clear_hooks(void* context) {
         std::lock_guard lock(hook_mutex_);
         if (hook_context_ != context) return;
         hook_context_ = nullptr;
         resolver_ = nullptr;
+        scanner_ = nullptr;
     }
+    // The resolver alone, for a device that scans its descriptor tables itself.
+    void set_resolver(void* context, Resolver resolver) { set_hooks(context, resolver, nullptr); }
+    void clear_resolver(void* context) { clear_hooks(context); }
 
     std::size_t size() const { return count_.load(std::memory_order_acquire); }
     std::uint64_t translated(Kind kind) const { return translated_[kind].load(std::memory_order_relaxed); }
@@ -212,7 +295,10 @@ private:
     std::atomic<std::size_t> count_{0};
     std::mutex hook_mutex_;
     void* hook_context_ = nullptr;
+    void* maker_context_ = nullptr;
+    BufferMaker maker_ = nullptr;
     Resolver resolver_ = nullptr;
+    TableScanner scanner_ = nullptr;
     void* source_context_ = nullptr;
     DescriptorSource source_ = nullptr;
     std::atomic<std::uint64_t> pulled_{0};

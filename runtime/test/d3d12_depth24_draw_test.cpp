@@ -74,7 +74,7 @@ struct Pass {
     D3D12_COMPARISON_FUNC func = D3D12_COMPARISON_FUNC_ALWAYS;
     bool write = true;
     float clear = 1.0f;
-    float z = 0.5f, dz = 0.0f, shader_z = 0.0f;  // s0, s1 (vs_depth.vert), s2 (ps_depth_write.frag)
+    float z = 0.5f, dz = 0.0f, shader_z = 0.0f;  // s8, s9 (vs_depth.vert), s10 (ps_depth_write.frag)
 };
 
 struct Result {

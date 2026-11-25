@@ -3,7 +3,8 @@
 //     50, 75) are refused without reaching the device, the others get the real objects behind the proxies;
 //   - fences with and without ID3D12Fence1: 11 or 12 public slots, QueryInterface and slot 11 to match;
 //   - fence slot 12: the address of a completed value that follows the real fence, from a CPU Signal through the
-//     proxy and from a signal the proxy never sees, up to device removal, with the descriptor's code pointer unused;
+//     proxy and from a signal the proxy never sees, up to device removal, with the descriptor's code pointer unused, and
+//     the completion event left open when another reference keeps the real fence alive past the proxy;
 //   - creation that fails, that returns S_OK with no object, a null IID or output, and an interface the real object
 //     has but the proxy does not model;
 //   - OpenSharedHandle of a fence (as ID3D12Fence, IUnknown, Fence1), of a non-fence object, of an invalid handle,
@@ -14,12 +15,16 @@
 //     patching this executable's own import table before the first proxy table is built (one process each).
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
+#include "../src/d3d12_xs_frame_events.h"
 
 #include <d3d12.h>
 #include <windows.h>
 
+#include <algorithm>
+
 #include <crtdbg.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -90,9 +95,9 @@ struct Mock {
     Kind kind;
     long refs;
     int device_level;        // device: highest ID3D12DeviceN it answers (0 = ID3D12Device only)
+    int list_level;          // command_list: 0=base (60 slots), 7=GCL7 (81 slots), 8=GCL8 (82 slots)
     bool fence1;             // fence: answers ID3D12Fence1; device: the fences it makes do
     bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
-    int list_level = 0;       // highest requested mock list revision when testing the public COM chain
     bool full_chain_lists;   // device: CreateCommandList makes a full-chain list mock (Kind::list), else command_list
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
@@ -109,7 +114,9 @@ struct Mock {
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the description of its last CreateCommandQueue (slot 8)
     D3D12_SHADER_RESOURCE_VIEW_DESC srv;  // device: the description CreateShaderResourceView (slot 18) last received
-    IUnknown* held;                      // ID3D12Object::SetPrivateDataInterface (slot 5): one reference, until destroyed
+    IUnknown* held;                     // ID3D12Object::SetPrivateDataInterface (slot 5): one reference, until destroyed
+    std::uint64_t tail[kMockSlots][3];   // device slots 27/53: the words after the fifth (a6..a8), as received
+    bool words_only;                     // device slot 27: record the words and return S_OK, creating nothing
     UINT om_rtv_count;                   // list slot 46 (OMSetRenderTargets): captured RTV/DSV handles
     BOOL om_single_range;
     SIZE_T om_rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -121,6 +128,7 @@ struct Mock {
     UINT8 clear_dsv_stencil;
     UINT clear_dsv_num_rects;
     const D3D12_RECT* clear_dsv_rects;
+    D3D_FEATURE_LEVEL max_level;  // device: the highest level FEATURE_LEVELS reports (0: the query is refused)
 };
 
 Mock g_pool[256];
@@ -207,6 +215,7 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::fence:
             return IsEqualIID(iid, __uuidof(ID3D12Fence)) || (m->fence1 && IsEqualIID(iid, __uuidof(ID3D12Fence1)));
         case Kind::resource: return IsEqualIID(iid, __uuidof(ID3D12Resource));
+        case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
         case Kind::command_list:
             if (IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
                 IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList))) return true;
@@ -234,7 +243,6 @@ bool mock_has(const Mock* m, REFIID iid) {
             for (const IID& list_iid : lists) if (IsEqualIID(iid, list_iid)) return true;
             return false;
         }
-        case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
         default: return false;
     }
 }
@@ -270,36 +278,59 @@ void copy_array(Mock* m, unsigned slot, std::uint64_t objects, std::uint64_t cou
     for (std::uint32_t i = 0; in && i < static_cast<std::uint32_t>(count) && i < 4; ++i) m->array[slot][i] = in[i];
 }
 
-// The PC device's GetResourceAllocationInfo, as a driver that packs a surface with no tile padding answers it: a buffer
-// its width, a texture width x height x slices x element bytes (4 for RGBA8, 8 for RGBA16F), each rounded up to
-// 64 KiB, summed over the descriptions; a texture with no width is refused. The struct is written to the hidden return
-// pointer (RDX of a C++ method call), which comes back in RAX.
+// GetResourceAllocationInfo as a PC driver without console tile padding answers it. A buffer is its width, a texture
+// width x height x slices x element bytes (2 for B5G5R5A1, 4 for RGBA8, 8 for RGBA16F, 16 for RGBA32F; mips are not
+// counted, and one resource is at most 4 GiB, the way a driver caps an allocation), each rounded up to the
+// resource's alignment: 64 KiB, or 4 MiB with more than one sample. A texture with no width is refused. Resources are
+// laid out one after another, each at its own alignment, and the total is rounded up to the largest alignment, as the
+// Vulkan layer's place() does. The struct is written to the hidden return pointer (RDX of a C++ method call), which
+// comes back in RAX. `each` (slot 56) gets every resource's offset, alignment and size.
+std::uint64_t mock_align(std::uint64_t value, std::uint64_t to) {
+    return value > UINT64_MAX - (to - 1) ? UINT64_MAX / to * to : (value + to - 1) / to * to;
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO mock_one_allocation(const D3D12_RESOURCE_DESC& d) {
+    if (d.Width == 0) return {UINT64_MAX, 65536};
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return {mock_align(d.Width, 65536), 65536};
+    std::uint64_t element = 4;
+    if (d.Format == DXGI_FORMAT_B5G5R5A1_UNORM) element = 2;
+    if (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) element = 8;
+    if (d.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) element = 16;
+    const std::uint64_t samples = d.SampleDesc.Count ? d.SampleDesc.Count : 1;
+    const std::uint64_t alignment = samples > 1 ? 4194304 : 65536;
+    const std::uint64_t bytes = std::min<std::uint64_t>(
+        d.Width * d.Height * d.DepthOrArraySize * element * samples, std::uint64_t{4} << 30);
+    return {mock_align(bytes, alignment), alignment};
+}
+
 D3D12_RESOURCE_DESC g_seen_descs[4];  // the first descriptions the mock device's slot 25 was given
 std::uint32_t g_seen_desc_count = 0;
 std::uint32_t g_seen_calls = 0;  // slot 25 calls since the test cleared it; only the first is recorded
 
 std::uint64_t g_texture_size_bias = 0;  // added to each texture's answer: a driver that pads more than the console
 
-std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::uint64_t descs_word) {
+std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::uint64_t descs_word,
+                                   D3D12_RESOURCE_ALLOCATION_INFO1* each = nullptr) {
     const auto* descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(descs_word);
     if (g_seen_calls++ == 0) {
         g_seen_desc_count = static_cast<std::uint32_t>(count);
         for (std::uint32_t i = 0; descs && i < g_seen_desc_count && i < std::size(g_seen_descs); ++i)
             g_seen_descs[i] = descs[i];
     }
-    std::uint64_t total = 0;
+    D3D12_RESOURCE_ALLOCATION_INFO total{0, 1};
     bool refused = false;
     for (std::uint32_t i = 0; descs && i < static_cast<std::uint32_t>(count); ++i) {
-        const D3D12_RESOURCE_DESC& d = descs[i];
-        std::uint64_t bytes = d.Width;
-        if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
-            bytes = d.Width * d.Height * d.DepthOrArraySize * (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4);
-        refused = refused || d.Width == 0;
-        total += (bytes + 65535) / 65536 * 65536;
-        if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) total += g_texture_size_bias;
+        D3D12_RESOURCE_ALLOCATION_INFO one = mock_one_allocation(descs[i]);
+        if (descs[i].Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && one.SizeInBytes != UINT64_MAX)
+            one.SizeInBytes += g_texture_size_bias;
+        refused = refused || one.SizeInBytes == UINT64_MAX;
+        const std::uint64_t offset = mock_align(total.SizeInBytes, one.Alignment);
+        if (each) each[i] = {offset, one.Alignment, one.SizeInBytes};
+        total.SizeInBytes = one.SizeInBytes > UINT64_MAX - offset ? UINT64_MAX : offset + one.SizeInBytes;
+        total.Alignment = std::max(total.Alignment, one.Alignment);
     }
     auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(ret);
-    *out = {refused ? UINT64_MAX : total, 65536};
+    *out = {refused ? UINT64_MAX : mock_align(total.SizeInBytes, total.Alignment), total.Alignment};
     return ret;
 }
 
@@ -330,6 +361,8 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (a1 == kResourceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::resource, a2, a3));
                 return static_cast<std::uint32_t>(E_INVALIDARG);
             case 25: return mock_allocation_info(a1, a3, a4);  // GetResourceAllocationInfo (mask a2 is unused)
+            case 56:  // GetResourceAllocationInfo1: (return buffer, mask, count, descs, per-description array)
+                return mock_allocation_info(a1, a3, a4, reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(words[4]));
             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
             case 26: {  // GetCustomHeapProperties, the PC method: (return buffer, node mask, heap type)
@@ -373,6 +406,18 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (info1 && count > 0) info1[0] = {0, 0x10000, 0x40000};
                 return a1;
             }
+            case 13: {  // CheckFeatureSupport(feature, data, size): FEATURE_LEVELS only, as the host answers it
+                auto* levels = reinterpret_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS*>(a2);
+                if (static_cast<std::uint32_t>(a1) != D3D12_FEATURE_FEATURE_LEVELS || !levels || !m->max_level ||
+                    static_cast<std::uint32_t>(a3) != sizeof(*levels) || !levels->pFeatureLevelsRequested)
+                    return static_cast<std::uint32_t>(E_INVALIDARG);
+                D3D_FEATURE_LEVEL best = D3D_FEATURE_LEVEL(0);
+                for (UINT i = 0; i < levels->NumFeatureLevels; ++i)
+                    if (levels->pFeatureLevelsRequested[i] <= m->max_level)
+                        best = std::max(best, levels->pFeatureLevelsRequested[i]);
+                levels->MaxSupportedFeatureLevel = best;
+                return static_cast<std::uint32_t>(best ? S_OK : DXGI_ERROR_UNSUPPORTED);
+            }
             default: break;
         }
         return S_OK;
@@ -385,6 +430,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             default: break;
         }
     }
+    if (m->kind == Kind::queue && slot == 10) copy_array(m, 10, a2, a1);  // ExecuteCommandLists(count, lists)
+    if ((m->kind == Kind::command_list || m->kind == Kind::list) && slot == 28)
+        copy_array(m, slot, a2, a1);  // SetDescriptorHeaps(count, heaps)
     if (m->kind == Kind::queue && slot == 16 && a1) {
         // GetTimestampFrequency writes a fixed value — unless a1 is a mock object, which on this slot is a
         // newer-layout Signal's fence, not an out pointer.
@@ -401,8 +449,6 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         if (a1) reinterpret_cast<D3D12_GPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapGpuStart;
         return kMockHeapGpuStart;
     }
-    if (m->kind == Kind::queue && slot == 10) copy_array(m, slot, a2, a1);
-    if ((m->kind == Kind::list || m->kind == Kind::command_list) && slot == 28) copy_array(m, slot, a2, a1);
     if ((m->kind == Kind::list || m->kind == Kind::command_list) && slot == 46) {  // OMSetRenderTargets
         m->om_rtv_count = static_cast<UINT>(a1);
         m->om_single_range = static_cast<BOOL>(a3);
@@ -507,13 +553,18 @@ HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPE
                                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc,
                                               D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
                                               const IID* riid, void** out) {
-    // Seven words after `this`, so a device answers it from its own entry; other kinds keep the generic path.
     ++self->calls[27];
-    const std::uint64_t words[] = {reinterpret_cast<std::uint64_t>(heap), static_cast<std::uint64_t>(heap_flags),
-                                   reinterpret_cast<std::uint64_t>(desc), static_cast<std::uint64_t>(state),
-                                   reinterpret_cast<std::uint64_t>(clear)};
-    std::memcpy(self->args[27], words, sizeof(words));
+    // The first words are kept as every other slot's are (the lease checks read them), and the table is shared by
+    // every mock kind: only a device creates a resource here.
+    const std::uint64_t words[6] = {reinterpret_cast<std::uint64_t>(heap), static_cast<std::uint64_t>(heap_flags),
+                                    reinterpret_cast<std::uint64_t>(desc), static_cast<std::uint64_t>(state),
+                                    reinterpret_cast<std::uint64_t>(clear), reinterpret_cast<std::uint64_t>(riid)};
+    std::memcpy(self->args[27], words, 5 * sizeof(words[0]));
+    const std::uint64_t rest[3] = {reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out), 0};
+    std::memcpy(self->tail[27], rest, sizeof(rest));
     if (self->kind != Kind::device) return static_cast<HRESULT>(mock_call(self, 27, words));
+    // The initial-state checks pass made-up words for the clear value, riid and output: nothing is read or created.
+    if (self->words_only) return S_OK;
     g_committed = CommittedCall{};
     if (heap) g_committed.heap = *heap;
     g_committed.heap_flags = heap_flags;
@@ -530,21 +581,8 @@ HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPE
 }
 
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
-// PC ID3D12Device10::CreateCommittedResource3 (PC slot 76) takes ten words after `this`, so it has its own entry that
-// keeps all of them: the resource description is copied because the caller's copy is a local of the proxy. Two
-// records: slot 133's Device10 path (g_committed3_133) and slot 127's (g_committed3).
-struct Committed3Call {
-    unsigned calls;
-    D3D12_HEAP_PROPERTIES heap;
-    D3D12_RESOURCE_DESC1 desc;
-    std::uint32_t layout;
-    const D3D12_CLEAR_VALUE* clear;
-    const void* session;
-    UINT castable_count;
-    const IID* riid;
-};
-Committed3Call g_committed3_133{};
-
+// PC ID3D12Device10::CreateCommittedResource3 takes ten words after `this`, so it has its own entry (PC slot 76) that
+// keeps all of them: the resource description is copied because the caller's copy is a local of the proxy.
 struct CommittedResource3Call {
     unsigned calls;
     const Mock* device;  // the PC object the call arrived on
@@ -568,17 +606,23 @@ HRESULT WINAPI mock_create_committed_resource3(Mock* self, const D3D12_HEAP_PROP
                                                const IID* riid, void** out) {
     g_committed3 = {g_committed3.calls + 1, self, heap, flags, *desc, layout, clear, session, castable_count,
                     castable_formats, riid, out};
-    ++g_committed3_133.calls;
-    if (heap) g_committed3_133.heap = *heap;
-    if (desc) g_committed3_133.desc = *desc;
-    g_committed3_133.layout = layout;
-    g_committed3_133.clear = clear;
-    g_committed3_133.session = session;
-    g_committed3_133.castable_count = castable_count;
-    g_committed3_133.riid = riid;
     return mock_create(self, Kind::resource, reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out));
 }
 #endif
+
+// PC CreateCommittedResource (27) and CreateCommittedResource1 (53) take seven and eight words after `this`; the generic
+// thunk keeps five, so these two record the rest as well (a6..a8 in tail).
+template <unsigned Slot>
+std::uint64_t WINAPI mock_committed_resource(Mock* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                             std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+                                             std::uint64_t a8) {
+    ++self->calls[Slot];
+    const std::uint64_t head[] = {a1, a2, a3, a4, a5};
+    const std::uint64_t rest[] = {a6, a7, a8};
+    std::memcpy(self->args[Slot], head, sizeof(head));
+    std::memcpy(self->tail[Slot], rest, sizeof(rest));
+    return S_OK;
+}
 
 template <std::size_t... I>
 void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
@@ -594,6 +638,7 @@ void** mock_vtable() {
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
         table[76] = reinterpret_cast<void*>(&mock_create_committed_resource3);
 #endif
+        table[53] = reinterpret_cast<void*>(&mock_committed_resource<53>);
         return true;
     }();
     (void)filled;
@@ -655,11 +700,11 @@ const IID kUnknownIid = __uuidof(IUnknown);
 const IID kResourceIid = __uuidof(ID3D12Resource);
 const IID kDevice1Iid = __uuidof(ID3D12Device1);
 const D3D12_COMMAND_QUEUE_DESC kQueueDesc{};
-// The retail title's slot 48 desc is 32 bytes (the route logs words 4..7); type in word 0 as in kQueueDesc.
-const std::uint32_t kXboxQueueDesc[8]{};
+// The console's CreateCommandQueueX description: the PC description's 16 bytes, then four Xbox words (slot 48).
+const std::uint32_t kXboxQueueDesc[8] = {};
 
 // A device proxy over a new mock device. The proxy takes the mock's one reference.
-void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true, bool full_chain_lists = false, bool console_lists = true) {
+void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true, bool full_chain_lists = false) {
     mock = new_mock(Kind::device);
     mock->device_level = level;
     mock->fence1 = fence1;
@@ -668,7 +713,7 @@ void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true
     mock->refs = 1;
     void* device = nullptr;
     if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device,
-                                       console_lists)))
+                                       /*console_lists=*/true)))
         return nullptr;
     return device;
 }
@@ -687,7 +732,71 @@ unsigned long release(void* object) {
     return static_cast<unsigned long>(raw(object, 2));
 }
 
+// ---- 0. The host device's feature-level floor (BL-2) ----
+
+// A host D3D12CreateDevice whose adapter tops out at g_host_max: a minimum above it is refused with E_INVALIDARG,
+// as on a host that tops out at 11_x, and g_host_mode makes it fail outright or succeed with no object.
+D3D_FEATURE_LEVEL g_host_max = D3D_FEATURE_LEVEL_12_1;
+D3D_FEATURE_LEVEL g_host_minimum = D3D_FEATURE_LEVEL(0);  // the minimum the last call asked for
+enum class HostMode { normal, fail, no_object } g_host_mode = HostMode::normal;
+
+HRESULT WINAPI fake_create_device(IUnknown*, D3D_FEATURE_LEVEL minimum, REFIID riid, void** out) {
+    g_host_minimum = minimum;
+    if (!out) return S_FALSE;
+    *out = nullptr;
+    if (g_host_mode == HostMode::fail) return DXGI_ERROR_UNSUPPORTED;
+    if (g_host_mode == HostMode::no_object) return S_OK;
+    if (minimum > g_host_max) return E_INVALIDARG;
+    Mock* m = new_mock(Kind::device);
+    m->max_level = g_host_max;
+    return mock_query(m, &riid, out);
+}
+
+int check_host_device_floor() {
+    g_label = "xs_proxy_mock host feature level";
+    EXPECT(xs::kHostDeviceFloor == D3D_FEATURE_LEVEL_11_0);
+    const D3D_FEATURE_LEVEL tops[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
+                                      D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2};
+    for (const D3D_FEATURE_LEVEL top : tops) {
+        g_host_max = top;
+        // The floor 12_0 the host path used to ask for refuses the adapters that top out at 11_x.
+        void* old = nullptr;
+        const HRESULT old_hr = fake_create_device(nullptr, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), &old);
+        EXPECT(FAILED(old_hr) == (top < D3D_FEATURE_LEVEL_12_0));
+        if (old) release(old);
+
+        ID3D12Device* real = nullptr;
+        EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == S_OK && real);
+        EXPECT(g_host_minimum == D3D_FEATURE_LEVEL_11_0);
+        EXPECT(xs::max_feature_level(real) == top);   // the device keeps its highest level
+        // The title asks the device it gets (the Xbox-ABI proxy) through slot 13, CheckFeatureSupport.
+        void* device = nullptr;
+        EXPECT(SUCCEEDED(xs::create_device_proxy(real, __uuidof(ID3D12Device), &device)) && device);
+        D3D12_FEATURE_DATA_FEATURE_LEVELS levels{UINT(std::size(tops)), tops, D3D_FEATURE_LEVEL(0)};
+        EXPECT(hr_of(raw(device, 13, D3D12_FEATURE_FEATURE_LEVELS, word(&levels), sizeof(levels))) == S_OK);
+        EXPECT(levels.MaxSupportedFeatureLevel == top);
+        release(device);
+    }
+    g_host_max = D3D_FEATURE_LEVEL_12_1;
+    ID3D12Device* real = reinterpret_cast<ID3D12Device*>(&g_host_max);   // must be cleared on every failure
+    EXPECT(xs::create_host_device(nullptr, nullptr, &real) == E_NOTIMPL && !real);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, nullptr) == E_POINTER);
+    g_host_mode = HostMode::fail;
+    real = reinterpret_cast<ID3D12Device*>(&g_host_max);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == DXGI_ERROR_UNSUPPORTED && !real);
+    g_host_mode = HostMode::no_object;
+    real = reinterpret_cast<ID3D12Device*>(&g_host_max);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == E_FAIL && !real);
+    g_host_mode = HostMode::normal;
+    EXPECT(xs::max_feature_level(nullptr) == D3D_FEATURE_LEVEL(0));
+    g_label = "xs_proxy_mock";
+    return 0;
+}
+
 // ---- 1. Device interface levels ----
+
+// D3D12_RESOURCE_STATES is a 32-bit enum: MSVC stores only the low half of its 8-byte stack slot.
+std::uint32_t state_of(std::uint64_t word) { return static_cast<std::uint32_t>(word); }
 
 int check_levels() {
     struct Level { int level; unsigned slots; } const levels[] = {{0, 44}, {1, 47}, {3, 51}, {9, 76}};
@@ -752,6 +861,109 @@ int check_levels() {
         // 134: past every PC device vtable and not handled by the proxy (133 is, see check_placed_resource_x).
         // Refused, not a jump through a missing entry.
         EXPECT(hr_of(raw(device, 134)) == E_NOTIMPL && mock->calls[127] == 0);
+
+        // 133 with a handler (CreatePlacedResourceX): the arguments in the title's positions (va, desc, state,
+        // clear, riid, out) reach the handler with the real device, the Xbox flag bits masked to the PC ones the host
+        // takes (0x20004 -> 0x4, and 0x200 dropped) and the buffer's Xbox layout word made ROW_MAJOR.
+        {
+            static void* seen_real = nullptr;
+            static void* seen_va = nullptr;
+            static D3D12_RESOURCE_DESC seen_desc{};
+            static GUID seen_iid{};
+            static std::uint32_t seen_layout = 0;
+            const xs::PlacedAtVaHandler handler = [](ID3D12Device* real_device, void* va,
+                                                     const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
+                                                     REFIID iid, void** out) -> HRESULT {
+                seen_layout = layout;
+                seen_real = real_device;
+                seen_va = va;
+                seen_desc = desc;
+                seen_iid = iid;
+                *out = reinterpret_cast<void*>(0x1330);
+                return S_OK;
+            };
+            xs::set_placed_at_va_handler(handler);
+            D3D12_RESOURCE_DESC xbox_desc{};
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            xbox_desc.Width = 0x10000;
+            xbox_desc.Height = xbox_desc.DepthOrArraySize = xbox_desc.MipLevels = 1;
+            xbox_desc.SampleDesc.Count = 1;
+            xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);  // the Xbox row-major word
+            xbox_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20204);
+            const GUID resource_iid = __uuidof(ID3D12Resource);
+            void* placed = nullptr;
+            void* const va = reinterpret_cast<void*>(0x7f0000000000ull);
+            const HRESULT r133 = hr_of(raw(device, 133, word(va), word(&xbox_desc), 0xFFFFFFFFull, 0,
+                                           word(&resource_iid), word(&placed)));
+            xs::set_placed_at_va_handler(nullptr);
+            EXPECT(r133 == S_OK && placed == reinterpret_cast<void*>(0x1330));
+            EXPECT(seen_real == xs::device_proxy_real_device(device) && seen_va == va);
+            EXPECT(static_cast<std::uint32_t>(seen_desc.Flags) == 0x4);
+            EXPECT(seen_desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && seen_desc.Width == 0x10000);
+            EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
+            EXPECT(seen_layout == 0xFFFFFFFFu);  // the title's third word, passed through as the barrier layout
+            EXPECT(xs::device_slot_overridden(133));
+        }
+
+        // 133 with a pages hook (set_placed_at_va_pages_hook): a buffer's range [va, va + width) is handed to it
+        // before the handler runs; a texture is not; a hook that fails still leaves the call to the handler.
+        {
+            static int order = 0;
+            static int hook_at = 0;
+            static int handler_at = 0;
+            static const void* hook_va = nullptr;
+            static std::size_t hook_bytes = 0;
+            static bool hook_result = true;
+            order = hook_at = handler_at = 0;
+            const xs::PlacedAtVaPagesHook hook = [](const void* va, std::size_t bytes) -> bool {
+                hook_at = ++order;
+                hook_va = va;
+                hook_bytes = bytes;
+                return hook_result;
+            };
+            const xs::PlacedAtVaHandler handler = [](ID3D12Device*, void*, const D3D12_RESOURCE_DESC&, std::uint32_t,
+                                                     REFIID, void** out) -> HRESULT {
+                handler_at = ++order;
+                *out = reinterpret_cast<void*>(0x1331);
+                return S_OK;
+            };
+            xs::set_placed_at_va_handler(handler);
+            xs::set_placed_at_va_pages_hook(hook);
+            D3D12_RESOURCE_DESC xbox_desc{};
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            xbox_desc.Width = 0xadf0000;
+            xbox_desc.Height = xbox_desc.DepthOrArraySize = xbox_desc.MipLevels = 1;
+            xbox_desc.SampleDesc.Count = 1;
+            xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);
+            const GUID resource_iid = __uuidof(ID3D12Resource);
+            void* placed = nullptr;
+            void* const va = reinterpret_cast<void*>(0x7f0000010000ull);
+            auto place = [&]() {
+                placed = nullptr;
+                return hr_of(raw(device, 133, word(va), word(&xbox_desc), 0xFFFFFFFFull, 0, word(&resource_iid),
+                                 word(&placed)));
+            };
+            const HRESULT buffer_hr = place();
+            EXPECT(buffer_hr == S_OK && placed == reinterpret_cast<void*>(0x1331));
+            EXPECT(hook_at == 1 && handler_at == 2 && hook_va == va && hook_bytes == 0xadf0000);
+
+            hook_result = false;
+            order = hook_at = handler_at = 0;
+            const HRESULT refused_hr = place();
+            EXPECT(refused_hr == S_OK && hook_at == 1 && handler_at == 2);
+            hook_result = true;
+
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            xbox_desc.Width = 64;
+            xbox_desc.Height = 64;
+            order = hook_at = handler_at = 0;
+            const HRESULT texture_hr = place();
+            EXPECT(texture_hr == S_OK && hook_at == 0 && handler_at == 1);
+
+            xs::set_placed_at_va_pages_hook(nullptr);
+            xs::set_placed_at_va_handler(nullptr);
+        }
+
         // 86: Xbox CreatePipelineState -> PC slot 47 (ID3D12Device2)
         void* pso_out = reinterpret_cast<void*>(1);
         const HRESULT r86 = hr_of(raw(device, 86, 0, word(&kUnknownIid), word(&pso_out)));
@@ -953,6 +1165,25 @@ int check_fence_completed_value() {
         Mock* const quiet_mock = mock->last_child;
         EXPECT(quiet && hr_of(raw(quiet, 10, 3)) == S_OK && raw(quiet, 8) == 3 && quiet_mock->calls[9] == 0);
         EXPECT(release(quiet) == 0 && quiet_mock->refs == 0);
+
+        // Another reference keeps the real fence alive past the proxy. Its pending completion still names the
+        // mirror's event and cannot be cancelled, so the event stays open and a later signal sets it.
+        void* shared = make_fence(device);
+        Mock* const shared_mock = mock->last_child;
+        EXPECT(shared && raw(shared, 12, 0, 0, 0) != 0);
+        const ULONGLONG armed_by = GetTickCount64() + 1000;
+        while (!fence_armed_for(shared_mock, kCompletedValue + 1) && GetTickCount64() < armed_by) Sleep(1);
+        EXPECT(fence_armed_for(shared_mock, kCompletedValue + 1));
+        ++shared_mock->refs;  // the other holder
+        EXPECT(release(shared) == 0 && shared_mock->refs == 1);
+        AcquireSRWLockExclusive(&shared_mock->lock);
+        const HANDLE pending = shared_mock->armed_event;
+        ReleaseSRWLockExclusive(&shared_mock->lock);
+        DWORD handle_flags = 0;
+        EXPECT(pending && GetHandleInformation(pending, &handle_flags));
+        fence_signal(shared_mock, kCompletedValue + 1);
+        EXPECT(WaitForSingleObject(pending, 0) == WAIT_OBJECT_0);
+        --shared_mock->refs;
 
         // Out of memory for the mirror: slot 12 returns null, and the next call works.
         void* starved = make_fence(device);
@@ -1244,11 +1475,12 @@ int check_placed_resource_x() {
     EXPECT(device && xs::device_slot_overridden(133));
     xs::reset_device_proxy_stats();
     constexpr std::uint64_t kVa = 0x7f0000000000ull;  // any address: the stand-in does not touch it
-    const auto kXboxFlag = static_cast<D3D12_RESOURCE_FLAGS>(0x20000);  // not constexpr: outside the enum's range for clang  // a bit above every PC flag
+    // A bit above every PC flag; an integer (a D3D12_RESOURCE_FLAGS value past the last enumerator is not a constant
+    // expression for clang-cl), cast with the PC flag at run time.
+    constexpr std::uint32_t kXboxFlag = 0x20000;
 
-    // The fourth word is a D3D12_BARRIER_LAYOUT. On this device (no ID3D12Device10) it becomes the legacy state.
-    // A buffer with an Xbox flag bit, a non-PC layout word and the all-ones layout (UNDEFINED): PC flags only,
-    // ROW_MAJOR, COMMON, no clear value, DEFAULT heap, and the caller's IID.
+    // A buffer with an Xbox flag bit, a non-PC layout word and the all-ones state: PC flags only, ROW_MAJOR, COMMON,
+    // no clear value, DEFAULT heap, and the caller's IID.
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     buffer.Width = 1 << 20;
@@ -1271,28 +1503,23 @@ int check_placed_resource_x() {
     EXPECT(g_committed.riid == &kResourceIid);
     EXPECT(release(resource) == 0);
 
-    // A render-target texture in the RENDER_TARGET layout (2) gets that state and its clear value; the texture layout
-    // becomes UNKNOWN.
+    // A render-target texture in a PC state keeps the state and its clear value; the layout becomes UNKNOWN.
     D3D12_RESOURCE_DESC target = buffer;
     target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     target.Width = 64;
     target.Height = 32;
     target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     target.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | kXboxFlag);
-    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 2, word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), D3D12_RESOURCE_STATE_RENDER_TARGET, word(&clear),
+                      word(&kResourceIid), word(&resource))) == S_OK);
     EXPECT(mock->calls[27] == 2 && g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
     EXPECT(g_committed.state == D3D12_RESOURCE_STATE_RENDER_TARGET && g_committed.clear == &clear);
     EXPECT(release(resource) == 0);
-    // The same texture in the all-ones layout (UNDEFINED) is created in COMMON.
+    // The same texture in the all-ones state is created in COMMON.
     EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 0xFFFFFFFFu, 0, word(&kResourceIid), word(&resource))) ==
            S_OK);
     EXPECT(mock->calls[27] == 3 && g_committed.state == D3D12_RESOURCE_STATE_COMMON);
-    EXPECT(release(resource) == 0);
-    // The SHADER_RESOURCE layout (6), which the title passes for its 1x1 targets, is the shader-resource states, not
-    // INDEX_BUFFER | RENDER_TARGET.
-    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 6, 0, word(&kResourceIid), word(&resource))) == S_OK);
-    EXPECT(mock->calls[27] == 4 && g_committed.state == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     EXPECT(release(resource) == 0);
 
     // Refusals before the device is called; the output is cleared.
@@ -1302,47 +1529,23 @@ int check_placed_resource_x() {
     resource = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, 0, word(&resource))) == E_POINTER && !resource);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), 0)) == E_POINTER);
-    EXPECT(mock->calls[27] == 4);
+    EXPECT(mock->calls[27] == 3);
 
     // A failed creation is returned as it is, with no object.
     mock->create_result = E_OUTOFMEMORY;
     resource = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), word(&resource))) ==
            E_OUTOFMEMORY);
-    EXPECT(!resource && mock->calls[27] == 5);
+    EXPECT(!resource && mock->calls[27] == 4);
     mock->create_result = S_OK;
 
     EXPECT(release(device) == 0 && mock->refs == 0);
-
-#ifdef __ID3D12Device10_INTERFACE_DEFINED__
-    // A PC device with ID3D12Device10: CreateCommittedResource3 with the layout as given, never CreateCommittedResource.
-    Mock* mock10 = nullptr;
-    void* device10 = make_device(mock10, 10, true);
-    EXPECT(device10);
-    g_committed3_133 = {};
-    EXPECT(hr_of(raw6(device10, 133, kVa, word(&target), 6, word(&clear), word(&kResourceIid), word(&resource))) ==
-           S_OK);
-    EXPECT(resource && g_committed3_133.calls == 1 && mock10->calls[27] == 0);
-    EXPECT(g_committed3_133.layout == 6 && g_committed3_133.clear == &clear && !g_committed3_133.session &&
-           g_committed3_133.castable_count == 0 && g_committed3_133.riid == &kResourceIid);
-    EXPECT(g_committed3_133.heap.Type == D3D12_HEAP_TYPE_DEFAULT);
-    EXPECT(g_committed3_133.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET &&
-           g_committed3_133.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN && g_committed3_133.desc.Width == 64);
-    EXPECT(release(resource) == 0);
-    // A buffer goes in UNDEFINED whatever word it came with.
-    EXPECT(hr_of(raw6(device10, 133, kVa, word(&buffer), 2, 0, word(&kResourceIid), word(&resource))) == S_OK);
-    EXPECT(g_committed3_133.calls == 2 && g_committed3_133.layout == 0xFFFFFFFFu && !g_committed3_133.clear);
-    EXPECT(release(resource) == 0);
-    EXPECT(release(device10) == 0 && mock10->refs == 0);
-#endif
-    std::printf("%s: device slot 133 places a resource as a committed DEFAULT one (PC flags, its barrier layout, "
+    std::printf("%s: device slot 133 places a resource as a committed DEFAULT one (PC flags, COMMON for all-ones, "
                 "clear value for targets only), past a 76-slot device\n", g_label);
     return 0;
 }
 
-// ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) ----
 // ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) and the retail title (41) ----
-// ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) and the retail title (61) ----
 //
 // A device that answers ID3D12Device11 (80 PC slots) is the Vulkan layer's shape: slots 78/79 are inside its table
 // (CreateReservedResource2/CreateSampler2 there) and 80 is just past it. None of the five may reach the mock's own
@@ -1375,6 +1578,8 @@ int check_xbox_slots() {
     void* queue = nullptr;
     EXPECT(hr_of(raw(device, 48, word(kXboxQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
+    // The PC call gets the description's 16-byte PC prefix, not the console's 32 bytes.
+    EXPECT(std::memcmp(&mock->queue_desc, kXboxQueueDesc, sizeof(mock->queue_desc)) == 0);
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
     // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.
@@ -1393,15 +1598,14 @@ int check_xbox_slots() {
     const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
     void* list = nullptr;
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
-    // A console device answers with the console-shaped list proxy over the real list, as slot 12 does.
-    EXPECT(xs::is_list_proxy(list) &&
-           reinterpret_cast<Mock*>(xs::list_proxy_real_list(list))->kind == Kind::list);
+    // The list is the console list proxy over the PC list the mock made (slot 12's path); the mock's kind depends on
+    // full_chain_lists.
+    EXPECT(xs::is_list_proxy(list) && word(xs::list_proxy_real_list(list)) == word(mock->last_child));
+    EXPECT(mock->last_child->kind == Kind::command_list || mock->last_child->kind == Kind::list);
     EXPECT(mock->calls[73] == 0 && mock->calls[12] == 1 && xs::device_slot_hits(73) == 1);
     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
-    // The real list is created as ID3D12GraphicsCommandList; the console IID the caller asked for is answered by
-    // the proxy's QueryInterface instead.
-    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), __uuidof(ID3D12GraphicsCommandList)));
+    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), list_iid));
 
     // The measured console list IID (the 1.0.2.1 executable's only GUID of that form) maps to
     // ID3D12GraphicsCommandList6: slot 73 answers it, and a QueryInterface for it on the proxy returns the proxy.
@@ -1418,6 +1622,23 @@ int check_xbox_slots() {
     // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
     // output on failure, so an invalid call would clear this pointer.
     EXPECT(release(list) == 0);
+
+    // An IID the PC does not know (the console's own list IID; this one is made up for the test) still gets a list:
+    // the console list proxy, not a failure from the PC device.
+    // {8d2c4f61-3a5e-4b7c-9e10-2f6a8b4c3d51}
+    constexpr GUID kConsoleListIid{0x8d2c4f61, 0x3a5e, 0x4b7c, {0x9e, 0x10, 0x2f, 0x6a, 0x8b, 0x4c, 0x3d, 0x51}};
+    void* unknown_list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&kConsoleListIid), word(&unknown_list))) ==
+           S_OK);
+    EXPECT(xs::is_list_proxy(unknown_list) && mock->calls[12] == 3 && mock->calls[73] == 0);
+    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), list_iid));
+    EXPECT(release(unknown_list) == 0);
+    // A PC list IID the proxy answers is returned as asked.
+    const IID list1_iid = __uuidof(ID3D12GraphicsCommandList1);
+    void* list1 = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list1_iid), word(&list1))) == S_OK);
+    EXPECT(xs::is_list_proxy(list1) && mock->calls[12] == 4);
+    EXPECT(release(list1) == 0);
 
     // Missing description, allocator or output: E_INVALIDARG/E_POINTER before the real device is called.
     EXPECT(hr_of(raw(device, 73, 0, word(allocator), 0, word(&list_iid), word(&list))) == E_INVALIDARG);
@@ -1452,7 +1673,8 @@ int check_xbox_slots() {
     EXPECT(mock->calls[41] == 2 && mock->args[41][0] == word(&pc_sig));
     EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
 
-    // Device slot 61 serves the mapped title and desktop callers through their own ABI.
+    // 61 is CreateSamplerX(desc, dest) for the title and the PC CreateMetaCommand for a host caller. With no
+    // console-caller check installed (a host program like this one), the call is the PC slot 61.
     D3D12_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -1474,13 +1696,10 @@ int check_xbox_slots() {
     EXPECT(mock->calls[61] == 2 && mock->calls[22] == 1);
     xs::set_console_caller(nullptr);
 
-
     EXPECT(xs::device_slot_overridden(41) && xs::device_slot_overridden(48) && xs::device_slot_overridden(61) &&
            xs::device_slot_overridden(73) &&
-           xs::device_slot_overridden(78) && xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
-    EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
-           xs::device_slot_overridden(79) && xs::device_slot_overridden(80) && xs::device_slot_overridden(86) &&
-           xs::device_slot_overridden(101) && xs::device_slot_overridden(108));
+           xs::device_slot_overridden(78) && xs::device_slot_overridden(79) && xs::device_slot_overridden(80) &&
+           xs::device_slot_overridden(86) && xs::device_slot_overridden(101) && xs::device_slot_overridden(108));
 
     // 86 CreatePipelineState(desc, riid, out) -> PC slot 47 (ID3D12Device2::CreatePipelineState).
     D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{};
@@ -1562,18 +1781,177 @@ int check_xbox_slots() {
     EXPECT(mock->array[68][3] == ((static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR) << 32) |
                                   static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)));
 
+    // A count with a null descriptor array is refused with {UINT64_MAX, 0} and never reaches PC slot 68.
+    D3D12_RESOURCE_ALLOCATION_INFO null_ret{};
+    EXPECT(call_slot108_c_abi(&null_ret, device, 1, 2, nullptr, nullptr) == &null_ret);
+    EXPECT(null_ret.SizeInBytes == UINT64_MAX && null_ret.Alignment == 0);
+    EXPECT(mock->calls[68] == 3 && xs::device_slot_hits(108) == 4);
+
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens without reaching "
-                "the mock's own PC slots; slot 41 creates argument type 105 as DISPATCH\n", g_label);
     std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens, and slot 61 to "
-                "CreateSampler, without reaching the mock's own PC slots\n", g_label);
+                "CreateSampler, without reaching the mock's own PC slots; slot 41 creates argument type 105 as DISPATCH\n",
+                g_label);
     return 0;
 #else
     std::printf("%s: ID3D12Device11 is not in this SDK; Xbox slot 80's beyond-table case is not built\n", g_label);
     return 0;
 #endif
+}
+
+// ---- 7b. Console initial state 0x6 on a committed texture (slots 27, 53 and 76) ----
+//
+// The console creates render-target and depth textures with state 0x6, which the PC runtime refuses for a texture. The
+// mock device records the state it was given (slot 27's fourth word, a4 in args[27][3] / args[53][3]).
+D3D12_RESOURCE_DESC resource_desc(D3D12_RESOURCE_DIMENSION dimension, D3D12_RESOURCE_FLAGS flags) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = dimension;
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = flags;
+    return desc;
+}
+
+std::uint64_t raw8(const void* object, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                   std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7, std::uint64_t a8 = 0) {
+    void* const* vtable = *reinterpret_cast<void* const* const*>(object);
+    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, a7, a8, 0, 0, 0,
+                                                  0, 0, 0);
+}
+
+int check_committed_resource_states() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) == 76);
+    mock->words_only = true;  // slot 27 has the creating mock entry (slots 76/133 need it); here only the words count
+    const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_RESOURCE_DESC rt = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const D3D12_RESOURCE_DESC ds = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    const D3D12_RESOURCE_DESC plain = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE);
+    const D3D12_RESOURCE_DESC buffer = resource_desc(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const std::uint64_t kConsole = 0x6;
+    const std::uint64_t kRender = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    const std::uint64_t kDepth = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+
+    // Slot 27 (the title's CreateCommittedResource) and slot 53 (CreateCommittedResource1): the real device sees
+    // the mapped state; the description and the other words arrive as they were.
+    // The words after the state (clear value, protected session, riid, out) are distinct, so their positions show.
+    for (const unsigned slot : {27u, 53u}) {
+        const std::uint64_t before = mock->calls[slot];
+        const std::uint64_t clear = 0xC1EA, session = 0x5E55, riid = 0x41D, out = 0x0B7;
+        const std::uint64_t first = slot == 27 ? riid : session;
+        EXPECT(hr_of(raw8(device, slot, word(&props), 0x40, word(&rt), kConsole, clear, first, slot == 27 ? out : riid,
+                          slot == 27 ? 0 : out)) == S_OK);
+        EXPECT(mock->args[slot][1] == 0x40 && mock->args[slot][4] == clear);
+        EXPECT(mock->tail[slot][0] == first && mock->tail[slot][1] == (slot == 27 ? out : riid));
+        EXPECT(slot == 27 || mock->tail[slot][2] == out);
+        EXPECT(mock->calls[slot] == before + 1 && state_of(mock->args[slot][3]) == kRender);
+        EXPECT(mock->args[slot][0] == word(&props) && mock->args[slot][2] == word(&rt));
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&ds), kConsole)) == S_OK);
+        EXPECT(state_of(mock->args[slot][3]) == kDepth);
+        // Left alone: a buffer with 0x6, a render target with state 0, a texture without a use flag, any other state.
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&buffer), kConsole)) == S_OK && state_of(mock->args[slot][3]) == kConsole);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0)) == S_OK && state_of(mock->args[slot][3]) == 0);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&plain), kConsole)) == S_OK && state_of(mock->args[slot][3]) == kConsole);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0x4)) == S_OK && state_of(mock->args[slot][3]) == 0x4);
+    }
+    EXPECT(rt.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET && ds.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+
+    // Slot 76 (the Xbox resource creation) reaches the PC device's slot 27 with the same mapping.
+    const IID resource_iid = __uuidof(ID3D12Resource);
+    void* resource = nullptr;
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&rt), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
+    EXPECT(state_of(mock->args[27][3]) == kRender);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&ds), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
+    EXPECT(state_of(mock->args[27][3]) == kDepth);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&buffer), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
+    EXPECT(state_of(mock->args[27][3]) == kConsole);
+
+    EXPECT(xs::device_slot_overridden(27) && xs::device_slot_overridden(53));
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: committed textures with state 0x6 reach the PC device as RENDER_TARGET or DEPTH_WRITE; buffers and "
+                "other states are unchanged\n", g_label);
+    return 0;
+}
+
+// ---- 7c. Xbox queue ExecuteCommandLists variant (queue slot 35 -> PC slot 10) ----
+
+int check_xbox_queue_slots() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);  // full-chain list mocks, as check_lists
+    EXPECT(device);
+    void* queue = make_queue(device);
+    EXPECT(queue);
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    xs::reset_device_proxy_stats();
+
+    EXPECT(xs::queue_slot_overridden(35) && xs::queue_slot_overridden(14) && xs::queue_slot_overridden(15));
+    EXPECT(!xs::queue_slot_overridden(10) && !xs::queue_slot_overridden(34) && !xs::queue_slot_overridden(36));
+
+    // Real objects, not numbers: the array is read to replace list proxies by their real lists, as slot 10's is.
+    Mock* const list_a = new_mock(Kind::command_list);
+    Mock* const list_b = new_mock(Kind::command_list);
+    void* lists[2] = {list_a, list_b};
+    EXPECT(raw(queue, 35, (0xdeadbeefull << 32) | 2ull, word(lists)) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 1 && xs::queue_slot_first_call_seen(35));
+    EXPECT(xs::queue_slot_hits(10) == 0);
+    EXPECT(queue_mock->calls[35] == 0 && queue_mock->calls[10] == 1);
+    EXPECT(queue_mock->args[10][0] == 2);
+    EXPECT(queue_mock->array[10][0] == word(list_a) && queue_mock->array[10][1] == word(list_b));
+    EXPECT(lists[0] == list_a && lists[1] == list_b);  // the caller's array is not written
+
+    // With the console list proxy (#2490) on this branch, slot 35 hands the real queue the lists the way slot 10 does:
+    // a copy of the array with each list proxy replaced by its real list. So the entries are real objects here (the
+    // unwrap reads each one's first word), one a list proxy and one a plain object that goes through unchanged, and
+    // the mock queue records the array it was given.
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0, word(&gcl_iid),
+                     word(&list))) == S_OK);
+    Mock* const real_list = mock->last_child;
+    EXPECT(xs::is_list_proxy(list) && word(xs::list_proxy_real_list(list)) == word(real_list));
+    Mock* const plain = new_mock(Kind::resource);
+    void* proxied[2] = {list, plain};
+    EXPECT(raw(queue, 35, 2, word(proxied)) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 2 && queue_mock->calls[35] == 0 && queue_mock->calls[10] == 2);
+    EXPECT(queue_mock->array[10][0] == word(real_list) && queue_mock->array[10][1] == word(plain));
+    // PC slot 10 itself is the same path.
+    EXPECT(raw(queue, 10, 2, word(proxied)) == 0 && queue_mock->calls[10] == 3);
+    EXPECT(queue_mock->array[10][0] == word(real_list) && queue_mock->array[10][1] == word(plain));
+    EXPECT(proxied[0] == list && proxied[1] == plain);
+    EXPECT(release(list) == 0 && release(allocator) == 0);
+
+    EXPECT(raw(queue, 35, 0, 0) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 3 && queue_mock->calls[35] == 0 && queue_mock->calls[10] == 4);
+    EXPECT(queue_mock->args[10][0] == 0 && queue_mock->args[10][1] == 0);
+
+    // Queue slot 18. The title's call (one pointer to 8 bytes) is the frequency getter, PC slot 16, and never the
+    // PC slot 18 (GetDesc), which would write a 16-byte description through that pointer. A host caller, under a
+    // classifier and with none installed, keeps the PC slot 18.
+    std::uint64_t frequency[3] = {0xA5A5A5A5A5A5A5A5ull, 0xA5A5A5A5A5A5A5A5ull, 0xA5A5A5A5A5A5A5A5ull};
+    xs::set_console_caller([](std::uint64_t) { return true; });
+    raw(queue, 18, word(&frequency[1]));
+    EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 0 && queue_mock->args[16][0] == word(&frequency[1]));
+    EXPECT(frequency[0] == 0xA5A5A5A5A5A5A5A5ull && frequency[2] == 0xA5A5A5A5A5A5A5A5ull);
+    xs::set_console_caller([](std::uint64_t) { return false; });
+    D3D12_COMMAND_QUEUE_DESC host_desc{};
+    raw(queue, 18, word(&host_desc));
+    EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 1 && queue_mock->args[18][0] == word(&host_desc));
+    xs::set_console_caller(nullptr);
+    raw(queue, 18, word(&host_desc));
+    EXPECT(queue_mock->calls[16] == 1 && queue_mock->calls[18] == 2);
+
+    EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
+    std::printf("%s: queue slot 35 routes ExecuteCommandLists(count, lists) to PC slot 10 with UINT count masking "
+                "and list proxies unwrapped\n", g_label);
+    return 0;
 }
 
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
@@ -1582,11 +1960,10 @@ struct EnvPresenter {
     int stats = 0, present = 0, suspend = 0, resume = 0;
 };
 
-// `moved_to` puts one route on a slot that has a built-in handler too: 70 (SetFrameIntervalX) or 74 (WaitFrameEventX).
-int run_env_slots(bool valid, unsigned moved_to = 0) {
-    const char* frame_interval = moved_to == 70 ? "70" : valid ? "96" : "2";
+int run_env_slots(bool valid, bool on_slot74 = false, bool on_slot70 = false) {
+    const char* frame_interval = on_slot70 ? "70" : on_slot74 ? "74" : valid ? "96" : "2";
     const char* schedule_event = valid ? "97" : "2";
-    const char* wait_event = moved_to == 74 ? "74" : valid ? "98" : "2";
+    const char* wait_event = valid ? "98" : "2";
     const char* queue_x = valid ? "99" : "2";
     const char* list_x = valid ? "100" : "2";
     const char* frame_statistics = valid ? "101" : "2";
@@ -1606,16 +1983,16 @@ int run_env_slots(bool valid, unsigned moved_to = 0) {
     EXPECT(device);
     xs::reset_device_proxy_stats();
     std::uint64_t token = 0;
-    if (moved_to == 70) {
+    if (on_slot70) {
         // SetFrameIntervalX moved onto 70, which also has a built-in handler: the override wins, so (output, interval,
         // latency, flags) is a frame-interval call, never a shader-resource view whose handle is the latency.
         EXPECT(hr_of(raw(device, 70, 0, 16667, 1, 0)) == S_OK && mock->calls[70] == 0 && mock->calls[18] == 0);
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);  // the old default is a PC slot now
-    } else if (moved_to == 74) {
-        // WaitFrameEventX moved onto 74, which also has a built-in handler: the override wins, so the call writes its
-        // wait token through the last pointer, which the stand-in never does, and reaches no PC slot.
-        std::uint64_t token_74 = 0;
-        EXPECT(hr_of(raw(device, 74, 0, 0, 0, 0, word(&token_74))) == S_OK && token_74 && mock->calls[74] == 0);
+    } else if (on_slot74) {
+        // SetFrameIntervalX moved onto 74, which also has a built-in handler: the override wins, so (output, interval,
+        // latency, flags) is a frame-interval call that reaches no PC slot, not the stand-in that ignores its words.
+        EXPECT(hr_of(raw(device, 74, 0, 16667, 1, 0)) == S_OK && mock->calls[74] == 0);
+        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);  // the old default is a PC slot now
     } else if (valid) {
         // Every route moved: the new slot is handled, the default slot is forwarded to the mock.
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
@@ -1638,7 +2015,8 @@ int run_env_slots(bool valid, unsigned moved_to = 0) {
         EXPECT(release(allocator) == 0);
 
         // The presenter answers frame statistics at 101 only (81 is not routed, so the mock refuses it); PresentX
-        // stays at 30, SuspendX answers at 33, and ResumeX, asked for 30, is unrouted, so 32 is refused.
+        // stays at 30, SuspendX answers at 33, and ResumeX, asked for 30, is unrouted, so 32 is refused on a device
+        // with a presenter attached, without reaching the presenter.
         EnvPresenter env{};
         xs::PresentationHandler h{};
         h.context = &env;
@@ -1673,8 +2051,22 @@ int run_env_slots(bool valid, unsigned moved_to = 0) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        EXPECT(hr_of(raw(device, 81, 0, 0, 0, 0)) == S_FALSE);  // the default GetFrameStatisticsX slot, unattached
-        EXPECT(hr_of(raw(device, 71)) == S_OK && mock->calls[71] == 1);  // not an Xbox slot: forwarded
+        // The default GetFrameStatisticsX slot, unattached: a zero count and S_OK; a null count, or a count with no
+        // array, is E_POINTER.
+        UINT stats = 0;
+        EXPECT(hr_of(raw(device, 81, 0, 0, word(&stats), 0)) == S_OK && stats == 0 && mock->calls[81] == 0);
+        EXPECT(hr_of(raw(device, 81, 0, 0, 0, 0)) == E_POINTER);
+        stats = 2;
+        EXPECT(hr_of(raw(device, 81, 0, 0, word(&stats), 0)) == E_POINTER && stats == 2);
+        std::uint8_t stats_out[2 * 0x38] = {};
+        EXPECT(hr_of(raw(device, 81, 0, 0, word(&stats), word(stats_out))) == S_OK && stats == 0 &&
+               mock->calls[81] == 0);
+        // Slot 71 is the Xbox placed-UAV view of the title's own memory (d19339b07), not a PC slot: the proxy
+        // handles it before the PC vtable, so the PC slot 71 (CreateSamplerFeedbackUnorderedAccessView) is never
+        // reached and the mock records nothing.
+        EXPECT(hr_of(raw(device, 71)) == S_OK && mock->calls[71] == 0 && xs::device_slot_hits(71) == 1);
+        // A PC slot that is neither an Xbox route nor one of the defaults is still forwarded unchanged.
+        EXPECT(hr_of(raw(device, 72)) == S_OK && mock->calls[72] == 1);  // not an Xbox slot: forwarded
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,
@@ -1682,51 +2074,7 @@ int run_env_slots(bool valid, unsigned moved_to = 0) {
     return 0;
 }
 
-// ---- 9. Device slot 26, GetCustomHeapProperties, the console's way and the PC's ----
-
-int check_custom_heap_properties() {
-    Mock* mock = nullptr;
-    void* device = make_device(mock, 0, true);
-    EXPECT(device && xs::device_slot_overridden(26));
-    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
-
-    // The retail executable's call: the buffer for the struct in RCX, the device in RDX, node mask and heap type in
-    // R8 and R9 (their upper halves are not the callee's to read). The buffer sits inside a pattern that must stay.
-    struct Padded {
-        std::uint8_t before[16];
-        D3D12_HEAP_PROPERTIES value;
-        std::uint8_t after[64];
-    } padded;
-    std::memset(&padded, 0xA5, sizeof(padded));
-    using ConsoleFn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t);
-    const std::uint64_t returned = reinterpret_cast<ConsoleFn>(vtable[26])(
-        &padded.value, device, 0xdeadbeef00000001ull, 0xdeadbeef00000002ull);
-    EXPECT(returned == word(&padded.value));
-    // The PC method got (buffer, node mask, heap type) once, on the device behind the proxy.
-    EXPECT(mock->calls[26] == 1);
-    EXPECT(static_cast<std::uint32_t>(mock->args[26][1]) == 1 && static_cast<std::uint32_t>(mock->args[26][2]) == 2);
-    EXPECT(padded.value.Type == D3D12_HEAP_TYPE_UPLOAD && padded.value.CreationNodeMask == 1 &&
-           padded.value.VisibleNodeMask == kHeapMarker);
-    for (const std::uint8_t byte : padded.before) EXPECT(byte == 0xA5);
-    for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
-    // The proxy is what it was: main's forwarder took the buffer for the proxy, and a thunk that took the proxy
-    // for the buffer would write the struct over it.
-    EXPECT(xs::is_device_proxy(device) && word(xs::device_proxy_real_device(device)) == word(mock) &&
-           xs::device_proxy_slot_count(device) == 44 && xs::device_proxy_ref_count(device) == 1);
-
-    // A PC C++ caller: the proxy in RCX and its buffer in RDX. That call is forwarded as it is.
-    D3D12_HEAP_PROPERTIES pc{};
-    EXPECT(raw(device, 26, word(&pc), 1, 3) == word(&pc));
-    EXPECT(mock->calls[26] == 2 && mock->args[26][0] == word(&pc));
-    EXPECT(pc.Type == D3D12_HEAP_TYPE_READBACK && pc.CreationNodeMask == 1 && pc.VisibleNodeMask == kHeapMarker);
-
-    EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: device slot 26 with the buffer in RCX and the device in RDX reaches the PC method and writes "
-                "only the struct; the PC form is forwarded unchanged\n", g_label);
-    return 0;
-}
-
-// ---- 9b. Command lists (device slot 12): the console-shaped proxy and AllocateUploadMemory ----
+// ---- 9. Command lists (device slot 12): the console-shaped proxy and AllocateUploadMemory ----
 
 int check_lists() {
     const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
@@ -1882,8 +2230,8 @@ int check_signalx_detection() {
            queue4_mock->args[14][1] == 19);
     EXPECT(release(queue4) == 0 && release(fence4) == 0 && release(device3) == 0 && mock3->refs == 0);
 
-    // Ambiguous slot 18 on an undetected queue: the older GetDesc or the newer frequency getter. It is
-    // served as the frequency query — a desc write is far wider than the 8 bytes a frequency caller
+    // Ambiguous slot 18 on an undetected queue: the older GetDesc or the newer frequency getter. The title's
+    // call is served as the frequency query — a desc write is far wider than the 8 bytes a frequency caller
     // passes (a title often reads the frequency before its first fence call); once a fence proves the
     // layout the same call keeps reaching the getter through the shifted path.
     Mock* mock4 = nullptr;
@@ -1892,8 +2240,8 @@ int check_signalx_detection() {
     void* fence5 = make_fence(device4);
     EXPECT(device4 && queue5 && fence5);
     Mock* const queue5_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue5));
-    UINT64 hz = 0;
     xs::set_console_caller([](std::uint64_t) { return true; });
+    UINT64 hz = 0;
     EXPECT(hr_of(raw(queue5, 18, word(&hz))) == S_OK && hz == 1000000 &&
            queue5_mock->calls[16] == 1 && queue5_mock->calls[18] == 0);
     hz = 0;
@@ -1908,7 +2256,98 @@ int check_signalx_detection() {
     return 0;
 }
 
-// ---- 10b. Device slot 70: a view from raw words, never the PC CreatePlacedResource1 ----
+// ---- 8b. Device slot 26, GetCustomHeapProperties, the console's way and the PC's ----
+
+int check_custom_heap_properties() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, true);
+    EXPECT(device && xs::device_slot_overridden(26));
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+
+    // The retail executable's call: the buffer for the struct in RCX, the device in RDX, node mask and heap type in
+    // R8 and R9 (their upper halves are not the callee's to read). The buffer sits inside a pattern that must stay.
+    struct Padded {
+        std::uint8_t before[16];
+        D3D12_HEAP_PROPERTIES value;
+        std::uint8_t after[64];
+    } padded;
+    std::memset(&padded, 0xA5, sizeof(padded));
+    using ConsoleFn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t);
+    const std::uint64_t returned = reinterpret_cast<ConsoleFn>(vtable[26])(
+        &padded.value, device, 0xdeadbeef00000001ull, 0xdeadbeef00000002ull);
+    EXPECT(returned == word(&padded.value));
+    // The PC method got (buffer, node mask, heap type) once, on the device behind the proxy.
+    EXPECT(mock->calls[26] == 1);
+    EXPECT(static_cast<std::uint32_t>(mock->args[26][1]) == 1 && static_cast<std::uint32_t>(mock->args[26][2]) == 2);
+    EXPECT(padded.value.Type == D3D12_HEAP_TYPE_UPLOAD && padded.value.CreationNodeMask == 1 &&
+           padded.value.VisibleNodeMask == kHeapMarker);
+    for (const std::uint8_t byte : padded.before) EXPECT(byte == 0xA5);
+    for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
+    // The proxy is what it was: main's forwarder took the buffer for the proxy, and a thunk that took the proxy
+    // for the buffer would write the struct over it.
+    EXPECT(xs::is_device_proxy(device) && word(xs::device_proxy_real_device(device)) == word(mock) &&
+           xs::device_proxy_slot_count(device) == 44 && xs::device_proxy_ref_count(device) == 1);
+
+    // A PC C++ caller: the proxy in RCX and its buffer in RDX. That call is forwarded as it is.
+    D3D12_HEAP_PROPERTIES pc{};
+    EXPECT(raw(device, 26, word(&pc), 1, 3) == word(&pc));
+    EXPECT(mock->calls[26] == 2 && mock->args[26][0] == word(&pc));
+    EXPECT(pc.Type == D3D12_HEAP_TYPE_READBACK && pc.CreationNodeMask == 1 && pc.VisibleNodeMask == kHeapMarker);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: device slot 26 with the buffer in RCX and the device in RDX reaches the PC method and writes "
+                "only the struct; the PC form is forwarded unchanged\n", g_label);
+    return 0;
+}
+
+// ---- 8c. Device slot 25, GetResourceAllocationInfo, in the console's form and the PC's ----
+
+int check_resource_allocation_info() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, true);
+    EXPECT(device && xs::device_slot_overridden(25));
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+    D3D12_RESOURCE_DESC descs[2] = {};  // two one-byte buffers: the mock sizes each as one 64 KiB unit
+    for (D3D12_RESOURCE_DESC& d : descs) {
+        d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        d.Width = 1;
+        d.Height = d.DepthOrArraySize = d.MipLevels = 1;
+        d.SampleDesc.Count = 1;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    }
+
+    // The console form: the buffer for the struct in RCX, the device in RDX, then the mask, the count and the
+    // descriptions. The buffer sits inside a pattern that must stay.
+    struct Padded {
+        std::uint8_t before[16];
+        D3D12_RESOURCE_ALLOCATION_INFO value;
+        std::uint8_t after[64];
+    } padded;
+    std::memset(&padded, 0xA5, sizeof(padded));
+    using ConsoleFn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t, std::uint64_t);
+    const std::uint64_t returned =
+        reinterpret_cast<ConsoleFn>(vtable[25])(&padded.value, device, 1, 2, word(descs));
+    EXPECT(returned == word(&padded.value));
+    // The PC method got (a return buffer, mask, count, descriptions) once, on the device behind the proxy.
+    EXPECT(mock->calls[25] == 1 && mock->args[25][1] == 1 && mock->args[25][2] == 2);
+    EXPECT(padded.value.SizeInBytes == 2 * 65536 && padded.value.Alignment == 65536);
+    for (const std::uint8_t byte : padded.before) EXPECT(byte == 0xA5);
+    for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
+    EXPECT(xs::is_device_proxy(device) && word(xs::device_proxy_real_device(device)) == word(mock));
+
+    // A PC C++ caller: the proxy in RCX and its buffer in RDX.
+    D3D12_RESOURCE_ALLOCATION_INFO pc{};
+    EXPECT(raw(device, 25, word(&pc), 1, 1, word(descs)) == word(&pc));
+    EXPECT(mock->calls[25] == 2 && mock->args[25][2] == 1);
+    EXPECT(pc.SizeInBytes == 65536 && pc.Alignment == 65536);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: device slot 25 with the buffer in RCX and the device in RDX reaches the PC method and writes "
+                "only the struct; the PC form reaches it too\n", g_label);
+    return 0;
+}
+
+// ---- 8. Device slot 70: a view from raw words, never the PC CreatePlacedResource1 ----
 
 // What the layer's resource provider knows: one buffer at [kBufferStart, kBufferStart + kBufferSize).
 Mock* g_buffer = nullptr;
@@ -1971,9 +2410,10 @@ int check_slot70() {
         const std::uint64_t destination = 0x7000;
         raw(device, 70, word(words), word(view), destination);
         EXPECT(mock->calls[70] == 0 && xs::device_slot_hits(70) == 1);
-        // Words that are not the measured shape: the destination gets the PC null view (CreateShaderResourceView, slot
-        // 18, no resource), the destination handle unchanged.
-        EXPECT(mock->calls[18] == 1 && mock->args[18][2] == destination && is_null_view(mock));
+        // The destination gets the PC null view: CreateShaderResourceView (slot 18) with no resource, a desc, and the
+        // destination handle unchanged.
+        EXPECT(mock->calls[18] == 1 && mock->args[18][0] == 0 && mock->args[18][1] != 0 &&
+               mock->args[18][2] == destination);
         // No destination, no write.
         raw(device, 70, word(words), word(view), 0);
         EXPECT(mock->calls[70] == 0 && mock->calls[18] == 1);
@@ -2078,7 +2518,7 @@ int check_slot70_raw_buffer() {
     return 0;
 }
 
-// ---- 10c. Device slot 25, GetResourceAllocationInfo: a render target takes whole console tiles ----
+// ---- 7. Device slot 25, GetResourceAllocationInfo: a render target takes whole console tiles ----
 
 D3D12_RESOURCE_DESC target_desc(std::uint64_t width, UINT height, DXGI_FORMAT format, UINT slices = 1) {
     D3D12_RESOURCE_DESC d{};
@@ -2158,10 +2598,11 @@ int check_render_target_sizes() {
     mips.MipLevels = 3;
     EXPECT(ask(&mips, 1).SizeInBytes == (135 + 40 + 12) * 65536ull);
 
-    // The PC form (this in RCX, the buffer in RDX) answers the same sizes.
+    // The PC form (this in RCX, the buffer in RDX) is not the title's call: it gets the PC device's own size, 127
+    // units of 64 KiB for the mock, so code that compares the proxy with the PC device still agrees.
     D3D12_RESOURCE_ALLOCATION_INFO pc{};
     EXPECT(raw(device, 25, word(&pc), 0, 1, word(&hd)) == word(&pc));
-    EXPECT(pc.SizeInBytes == 8847360);
+    EXPECT(pc.SizeInBytes == 8323072);
 
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: device slot 25 pads render targets to whole console tiles and leaves the other sizes as the PC "
@@ -2169,7 +2610,7 @@ int check_render_target_sizes() {
     return 0;
 }
 
-// ---- 10d. Device slot 25 hands the PC device clean descriptions and leaves the title's array alone ----
+// ---- 7b. Device slot 25 hands the PC device clean descriptions and leaves the title's array alone ----
 
 int check_allocation_descriptions_cleaned() {
     constexpr std::uint32_t kXboxTiledLayout = 0x101, kXboxRowMajorLayout = 0x1, kXboxFlagBits = 0x40000 | 0x20000;
@@ -2215,6 +2656,69 @@ int check_allocation_descriptions_cleaned() {
     EXPECT(std::memcmp(kept, titles, sizeof(kept)) == 0);
     EXPECT(info.SizeInBytes == 8847360 + 131072);
 
+    const D3D12_TEXTURE_LAYOUT normalized_layouts[] = {
+        static_cast<D3D12_TEXTURE_LAYOUT>(kXboxTiledLayout),
+        static_cast<D3D12_TEXTURE_LAYOUT>(0x102),
+        static_cast<D3D12_TEXTURE_LAYOUT>(0x105),
+        D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+    };
+    for (const auto layout : normalized_layouts) {
+        D3D12_RESOURCE_DESC descs[] = {titles[0], titles[1]};
+        descs[0].Layout = descs[1].Layout = layout;
+        g_seen_calls = 0;
+        EXPECT(get_info(&info, device, 0, 2, descs) == &info);
+        EXPECT(g_seen_desc_count == 2);
+        EXPECT(g_seen_descs[0].Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+        EXPECT(g_seen_descs[1].Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    }
+
+    const D3D12_TEXTURE_LAYOUT preserved_layouts[] = {
+        D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE,
+    };
+    for (const auto layout : preserved_layouts) {
+        D3D12_RESOURCE_DESC descs[] = {titles[0], titles[1]};
+        descs[0].Layout = descs[1].Layout = layout;
+        g_seen_calls = 0;
+        EXPECT(get_info(&info, device, 0, 2, descs) == &info);
+        EXPECT(g_seen_desc_count == 2);
+        EXPECT(g_seen_descs[0].Layout == layout && g_seen_descs[1].Layout == layout);
+    }
+
+    constexpr auto kUav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    constexpr auto kDepthStencil = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    constexpr auto kRenderTarget = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_RESOURCE_DESC formats[] = {
+        target_desc(64, 64, DXGI_FORMAT_B5G5R5A1_UNORM),
+        target_desc(64, 64, DXGI_FORMAT_R32G8X24_TYPELESS),
+        target_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM),
+        target_desc(64, 64, DXGI_FORMAT_R32_FLOAT),
+    };
+    formats[0].Flags = kPcFlags;
+    formats[1].Flags = kDepthStencil | kUav;
+    formats[2].Flags = kPcFlags;
+    formats[3].Flags = kUav;
+    g_seen_calls = 0;
+    EXPECT(get_info(&info, device, 0, 4, formats) == &info);
+    EXPECT(g_seen_desc_count == 4);
+    EXPECT(g_seen_descs[0].Flags == kRenderTarget);
+    EXPECT(g_seen_descs[1].Flags == kDepthStencil);
+    EXPECT(g_seen_descs[2].Flags == kPcFlags);
+    EXPECT(g_seen_descs[3].Flags == kUav);
+
+    // PC calls must keep their layout and flags so the host can reject an invalid descriptor.
+    using PcFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(void*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT,
+                                                          const D3D12_RESOURCE_DESC*);
+    const auto get_pc_info = reinterpret_cast<PcFn>(vtable[25]);
+    D3D12_RESOURCE_DESC pc_buffer = titles[1];
+    pc_buffer.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    pc_buffer.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x1000);
+    g_seen_calls = 0;
+    EXPECT(get_pc_info(device, &info, 0, 1, &pc_buffer) == &info);
+    EXPECT(g_seen_desc_count == 1 && g_seen_descs[0].Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+    EXPECT(g_seen_descs[0].Flags == pc_buffer.Flags);
+
     // A null array with a zero count reaches the PC device as it came.
     g_seen_desc_count = 99;
     g_seen_calls = 0;
@@ -2226,7 +2730,111 @@ int check_allocation_descriptions_cleaned() {
     return 0;
 }
 
-// ---- 11. The console tail and the guard region ----
+// ---- 11. Console render target layout: alignment, per-description offsets, mips, formats, overflow ----
+
+int check_render_target_layout() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+    // The retail executable's calls: the buffer for the struct in RCX, the device in RDX.
+    using InfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                            const D3D12_RESOURCE_DESC*);
+    using Info1Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
+                                                             const D3D12_RESOURCE_DESC*,
+                                                             D3D12_RESOURCE_ALLOCATION_INFO1*);
+    const auto get_info = reinterpret_cast<InfoFn>(vtable[25]);
+    const auto get_info1 = reinterpret_cast<Info1Fn>(vtable[56]);
+    auto ask = [&](const D3D12_RESOURCE_DESC* descs, UINT count) {
+        D3D12_RESOURCE_ALLOCATION_INFO info{0xDEAD, 0xBEEF};
+        if (get_info(&info, device, 0, count, descs) != &info) info = {0, 0};
+        return info;
+    };
+    auto ask_one = [&](const D3D12_RESOURCE_DESC& d) { return ask(&d, 1); };
+    auto target = [](std::uint64_t w, UINT h, DXGI_FORMAT f, UINT slices, UINT mips) {
+        D3D12_RESOURCE_DESC d = target_desc(w, h, f, slices);
+        d.MipLevels = static_cast<UINT16>(mips);
+        return d;
+    };
+
+    // A four-sample 1 x 1 target is 4 MiB at 4 MiB alignment. Next to a 1080p target that grows to 8,847,360 B, the
+    // two need 4 MiB + 8,847,360 B = 13,041,664 B placed, and the total is a whole number of 4 MiB: 16 MiB, in
+    // either order. (The PC device says 12 MiB for them; adding the 512 KiB the padding takes would say 12.5 MiB.)
+    const D3D12_RESOURCE_DESC hd = target_desc(1920, 1080, DXGI_FORMAT_R8G8B8A8_UNORM);
+    D3D12_RESOURCE_DESC msaa = target_desc(1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+    msaa.SampleDesc.Count = 4;
+    const D3D12_RESOURCE_DESC msaa_first[] = {msaa, hd};
+    const D3D12_RESOURCE_DESC msaa_last[] = {hd, msaa};
+    D3D12_RESOURCE_ALLOCATION_INFO info = ask(msaa_first, 2);
+    EXPECT(info.SizeInBytes == 16777216 && info.Alignment == 4194304);
+    info = ask(msaa_last, 2);
+    EXPECT(info.SizeInBytes == 16777216 && info.Alignment == 4194304);
+    EXPECT(ask(&msaa, 1).SizeInBytes == 4194304);  // multisampled targets are left as the PC device sizes them
+
+    // GetResourceAllocationInfo1: the offsets follow the padded sizes, in the console form.
+    const D3D12_RESOURCE_DESC two[] = {hd, hd};
+    D3D12_RESOURCE_ALLOCATION_INFO1 each[2]{};
+    D3D12_RESOURCE_ALLOCATION_INFO total{};
+    EXPECT(get_info1(&total, device, 0, 2, two, each) == &total);
+    EXPECT(total.SizeInBytes == 17694720 && total.Alignment == 65536);
+    EXPECT(each[0].Offset == 0 && each[0].SizeInBytes == 8847360 && each[0].Alignment == 65536);
+    EXPECT(each[1].Offset == 8847360 && each[1].SizeInBytes == 8847360 && each[1].Alignment == 65536);
+    // The per-description array is optional: without one the total is the same 17,694,720 B.
+    D3D12_RESOURCE_ALLOCATION_INFO no_array{};
+    EXPECT(get_info1(&no_array, device, 0, 2, two, nullptr) == &no_array);
+    EXPECT(no_array.SizeInBytes == 17694720 && no_array.Alignment == 65536);
+    D3D12_RESOURCE_ALLOCATION_INFO1 mixed[2]{};
+    D3D12_RESOURCE_ALLOCATION_INFO pc{};
+    EXPECT(get_info1(&pc, device, 0, 2, msaa_first, mixed) == &pc);
+    EXPECT(pc.SizeInBytes == 16777216 && pc.Alignment == 4194304);
+    EXPECT(mixed[0].Offset == 0 && mixed[0].SizeInBytes == 4194304 && mixed[0].Alignment == 4194304);
+    EXPECT(mixed[1].Offset == 4194304 && mixed[1].SizeInBytes == 8847360 && mixed[1].Alignment == 65536);
+    // Nothing to pad: the PC device's answer stands, per-description array included.
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 100000;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const D3D12_RESOURCE_DESC buffers[] = {buffer, buffer};
+    D3D12_RESOURCE_ALLOCATION_INFO1 plain[2]{};
+    EXPECT(get_info1(&total, device, 0, 2, buffers, plain) == &total);
+    EXPECT(total.SizeInBytes == 262144 && plain[1].Offset == 131072 && plain[1].SizeInBytes == 131072);
+
+    // Mips: 0 is the full chain. 256 x 128 RGBA8 takes two tiles for mip 0, one for mip 1 (128 x 64 is wider than half a
+    // tile) and one tail tile for the rest.
+    EXPECT(ask_one(target(256, 128, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0)).SizeInBytes ==
+           4 * 65536ull);
+    // 128 x 32 with two mips and two slices: mip 0 is a whole tile, mip 1 (64 x 16) is the tail tile, per slice.
+    EXPECT(ask_one(target(128, 32, DXGI_FORMAT_R8G8B8A8_UNORM, 2, 2)).SizeInBytes ==
+           4 * 65536ull);
+    // 257 x 32 with two mips: mip 0 is 3 tiles across, mip 1 is 129 x 16 (an odd extent rounds up): 2 tiles.
+    EXPECT(ask_one(target(257, 32, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 2)).SizeInBytes ==
+           5 * 65536ull);
+    // 2-byte B5G5R5A1 is a 256 x 128 tile: 257 x 64 takes two.
+    EXPECT(ask_one(target(257, 64, DXGI_FORMAT_B5G5R5A1_UNORM, 1, 1)).SizeInBytes ==
+           2 * 65536ull);
+    // 16-byte RGBA32F is a 64 x 64 tile: 65 x 32 takes two.
+    EXPECT(ask_one(target(65, 32, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 1)).SizeInBytes ==
+           2 * 65536ull);
+
+    // Sums saturate where the PC device's do. A 2^26 x 2^26 RGBA32F target of 200 slices is 200 x 2^56 B (the PC mock
+    // caps it at 4 GiB); two of them are past 2^64.
+    const D3D12_RESOURCE_DESC huge = target(1ull << 26, 1u << 26, DXGI_FORMAT_R32G32B32A32_FLOAT, 200, 1);
+    EXPECT(ask(&huge, 1).SizeInBytes == 200ull << 56);
+    const D3D12_RESOURCE_DESC huge_two[] = {huge, huge};
+    info = ask(huge_two, 2);
+    EXPECT(info.SizeInBytes == 0xFFFFFFFFFFFF0000ull && info.Alignment == 65536);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: render targets are laid out at their own alignments, with per-description offsets, mip chains "
+                "and saturating sums\n", g_label);
+    return 0;
+}
+
+
 // ---- 9. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
@@ -2243,8 +2851,10 @@ int check_tail(bool want_guarded) {
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
     // Console-only queue methods (the tail past the PC chain, SignalX, PresentX) report S_OK instead of
     // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them.
-    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
+    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
+        if (xs::queue_slot_overridden(slot)) continue;  // slot 35 is forwarded (check_xbox_queue_slots)
         EXPECT(hr_of(raw(queue, slot)) == S_OK && queue_mock->calls[slot] == 0);
+    }
     EXPECT(raw(fence, 12) != 0);  // the completed value's address (check_fence_completed_value)
     for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
@@ -2396,7 +3006,7 @@ int check_committed_resource_leases() {
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
-    // Slot 76: the lease is the console tile size (135 tiles), not the PC one.
+    // Slot 76: the lease is the console-tiled size slot 25 answers (135 tiles), not the PC one.
     void* resource = nullptr;
     std::uint64_t words76[10] = {word(&heap), 0, word(&desc), 0, 0, word(&kResourceIid), word(&resource), 0, 0, 0};
     EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource);
@@ -2864,25 +3474,24 @@ int check_console_command_list() {
     EXPECT(xs::console_to_pc_list_slot(60) == 58);   // EndEvent
     EXPECT(xs::console_to_pc_list_slot(61) == 59);   // ExecuteIndirect
     EXPECT(xs::console_to_pc_list_slot(85) == 16);   // CopyTextureRegion
+    EXPECT(xs::console_to_pc_list_slot(139) == 10);  // Reset, as the retail title calls it
     EXPECT(xs::console_to_pc_list_slot(146) == 80);  // GCL7 Barrier
     EXPECT(xs::console_to_pc_list_slot(148) == xs::kListNotForwarded); // AllocateUploadMemory
 
+    xs::reset_device_proxy_stats();  // the list slot counts below start from this test
     Mock* mock_device = nullptr;
-    void* device = make_device(mock_device, 11, true, true, false, false);
+    void* device = make_device(mock_device, 11, true);
     EXPECT(device != nullptr);
 
-    // 2. PC Slot 12 vs Xbox Slot 73
-    // PC Slot 12 returns unwrapped list directly, so PC tests like tiny_frame can call slot 48 (ClearRenderTargetView)
+    // 2. Slot 12 and Xbox slot 73. On a device proxy made for console callers (console_lists, as make_device does),
+    // slot 12 gives the console list proxy too: the merge into main kept the boot stack's slot 12 (main's form
+    // returned the unwrapped PC list here). PC callers get PC lists from a proxy made with console_lists=false
+    // (check_lists covers both).
     void* pc_list = nullptr;
     const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
     EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, word(&list_iid), word(&pc_list))) == S_OK);
     EXPECT(pc_list != nullptr);
-    EXPECT(!xs::is_command_list_proxy(pc_list));
-    Mock* real_pc_list = reinterpret_cast<Mock*>(pc_list);
-    EXPECT(real_pc_list->kind == Kind::command_list);
-    // In PC ABI, slot 48 is ClearRenderTargetView
-    raw(pc_list, 48, 0x1111, 0x2222, 0, 0);
-    EXPECT(real_pc_list->calls[48] == 1);
+    EXPECT(xs::is_command_list_proxy(pc_list));
     EXPECT(release(pc_list) == 0);
 
     // Xbox Slot 73 returns wrapped console command list proxy
@@ -2952,10 +3561,14 @@ int check_console_command_list() {
     EXPECT(real_list->calls[59] == 1);
     EXPECT(real_list->args[59][0] == 0x10);
 
-    // The integrated upload allocator supplies writable memory at the requested alignment.
-    const auto upload = raw(list_proxy, 148, 2048, 512, 0, 0);
-    EXPECT(upload && upload % 512 == 0);
-    std::memset(reinterpret_cast<void*>(upload), 0x5a, 2048);
+    // Console slot 148 (AllocateUploadMemory) -> an upload-arena pointer (the boot stack's arena, which the merge
+    // kept; main's stub returned 0)
+    {
+        const std::uint64_t upload = raw(list_proxy, 148, 2048, 512, 0, 0);
+        EXPECT(upload != 0);
+        EXPECT(upload % 512 == 0);
+        std::memset(reinterpret_cast<void*>(upload), 0x5a, 2048);
+    }
     EXPECT(xs::list_slot_hits(148) == 1);
     EXPECT(xs::list_slot_first_call_seen(148));
 
@@ -2968,6 +3581,15 @@ int check_console_command_list() {
     EXPECT(hr_of(raw(list_proxy, 10, word(allocator), 0, 0, 0)) == S_OK);
     EXPECT(real_list->calls[10] == 1);
     EXPECT(real_list->args[10][0] == word(real_allocator));
+    std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
+    EXPECT(c18 == expected_limit);
+
+    // Console slot 139 is Reset as the retail title calls it: the same PC slot 10, allocator unwrapped, cursor
+    // re-pinned, and the list's own slot 139 never reached.
+    std::memcpy(reinterpret_cast<void*>(base + 0x18), &zero, sizeof(zero));
+    EXPECT(hr_of(raw(list_proxy, 139, word(allocator), 0, 0, 0)) == S_OK);
+    EXPECT(real_list->calls[10] == 2 && real_list->calls[139] == 0);
+    EXPECT(real_list->args[10][0] == word(real_allocator) && real_list->args[10][1] == 0);
     std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
     EXPECT(c18 == expected_limit);
 
@@ -3002,16 +3624,18 @@ int check_console_command_list() {
     EXPECT(real_queue->array[10][0] == word(unwrapped_list));
     EXPECT(real_queue->array[10][1] == word(real_list));
 
-    // 5b. Public list revisions the proxy does not model and unknown private IIDs must not trigger a retry.
+    // 5b. Public list revisions the proxy does not model and unknown private IIDs must not trigger a retry: the PC
+    // device is asked once, for ID3D12GraphicsCommandList, and the caller gets the console list proxy.
     // Spell out the Windows SDK's ID3D12GraphicsCommandList9 IID so this also builds with older headers.
     const IID list9_iid = {0x34ed2808, 0xffe6, 0x4c2b, {0xb1, 0x1a, 0xca, 0xbd, 0x2b, 0x0c, 0x59, 0xe1}};
     const IID unknown_iid = {0x12345678, 0x1234, 0x1234, {1, 2, 3, 4, 5, 6, 7, 8}};
     for (const IID* iid : {&list9_iid, &unknown_iid}) {
         const unsigned calls_before = mock_device->calls[12];
-        void* unsupported_list = list_proxy;
-        EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(iid), word(&unsupported_list))) ==
-               E_NOINTERFACE);
-        EXPECT(!unsupported_list && mock_device->calls[12] == calls_before + 1);
+        void* unsupported_list = nullptr;
+        EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(iid), word(&unsupported_list))) == S_OK);
+        EXPECT(xs::is_command_list_proxy(unsupported_list) && mock_device->calls[12] == calls_before + 1);
+        EXPECT(IsEqualIID(mock_device->create_riid, __uuidof(ID3D12GraphicsCommandList)));
+        EXPECT(release(unsupported_list) == 0);
     }
 
     // The measured Xbox list IID is created as ID3D12GraphicsCommandList in one call and stays queryable on the proxy.
@@ -3141,20 +3765,49 @@ int check_presentation_wiring() {
     EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&count), 0)) == S_FALSE && count == 0 && p.stats_calls == 1);
 
     // Queue slot 30 routes to PresentX while attached. SuspendX and ResumeX have no default route, so 31/32 are refused
-    // and never reach the presenter (the env mode, run_env_slots, routes them).
+    // on a device with a presenter attached and never reach the presenter (the env mode, run_env_slots, routes them).
     EXPECT(hr_of(raw(queue, 30, 1, 0x1000, 0x2000)) == S_OK && p.present_calls == 1 && p.last_planes == 1);
     EXPECT(hr_of(raw(queue, 31, 0)) == E_NOTIMPL && p.suspend_calls == 0);
     EXPECT(hr_of(raw(queue, 32)) == E_NOTIMPL && p.resume_calls == 0);
 
-    // Detaching restores default E_NOTIMPL refusal on beyond-PC queue slots.
+    // Detached, a device that had a presenter attached does not fall back to its own presenter or the console tail:
+    // queue slots 30 to 32 are refused and the presenter is not called again.
     EXPECT(xs::set_presentation_handler(device, nullptr));
-    UINT none = 7;  // unattached GetFrameStatisticsX: no statistics yet, never the PC slot 81
-    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), 0)) == S_FALSE && none == 0 && p.stats_calls == 1);
+    // Unattached GetFrameStatisticsX: no statistics yet (S_OK and a zero count), never the PC slot 81.
+    UINT none = 7;
+    std::uint8_t none_out[7 * 0x38] = {};
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), word(none_out))) == S_OK && none == 0 && p.stats_calls == 1);
+    none = 7;
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), 0)) == E_POINTER && none == 7 && p.stats_calls == 1);
+    EXPECT(hr_of(raw(device, 81, 77, 0x1a, 0, 0)) == E_POINTER && p.stats_calls == 1);
     EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) == E_NOTIMPL && p.present_calls == 1);
 
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: presentation handler wiring (slots 78-81 and queue PresentX 30) passed\n", g_label);
+
+    // PresentX is one slot per layout, never both. A queue is in the older layout (PresentX at 30) until a fence
+    // reaches slot 16 or 17, which only the newer layout's Signal and Wait take; from then on PresentX is two slots
+    // later, at 32, and slot 30 is another console method there; with a presenter attached the slot of the other
+    // layout is refused, and the presenter is not called.
+    Mock* newer_mock = nullptr;
+    void* newer_device = make_device(newer_mock, 11, true);
+    void* newer_queue = make_queue(newer_device);
+    void* newer_fence = make_fence(newer_device);
+    EXPECT(newer_device && newer_queue && newer_fence);
+    MockPresenter np;
+    xs::PresentationHandler nh = h;
+    nh.context = &np;
+    EXPECT(xs::set_presentation_handler(newer_device, &nh));
+    EXPECT(hr_of(raw(newer_queue, 30, 1, 0x1000, 0x2000)) == S_OK && np.present_calls == 1);
+    EXPECT(hr_of(raw(newer_queue, 32, 1, 0x1000, 0x2000)) == E_NOTIMPL && np.present_calls == 1);
+    EXPECT(hr_of(raw(newer_queue, 16, word(newer_fence), 1)) == S_OK);
+    EXPECT(hr_of(raw(newer_queue, 32, 2, 0x1000, 0x2000)) == S_OK && np.present_calls == 2 && np.last_planes == 2);
+    EXPECT(hr_of(raw(newer_queue, 30, 1, 0x1000, 0x2000)) == E_NOTIMPL && np.present_calls == 2);
+    EXPECT(xs::set_presentation_handler(newer_device, nullptr));
+    EXPECT(release(newer_queue) == 0 && release(newer_fence) == 0);
+    EXPECT(release(newer_device) == 0 && newer_mock->refs == 0);
+    std::printf("%s: presentation handler wiring (slots 78-81 and queue PresentX 30, or 32 in the newer layout) "
+                "passed\n", g_label);
     return 0;
 }
 
@@ -3164,18 +3817,28 @@ int main(int argc, char** argv) {
     if (argc == 2) {
         if (std::strcmp(argv[1], "--env-slots") == 0) return run_env_slots(true);
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
-        if (std::strcmp(argv[1], "--env-slots-70") == 0) return run_env_slots(true, 70);
-        if (std::strcmp(argv[1], "--env-slots-74") == 0) return run_env_slots(true, 74);
+        if (std::strcmp(argv[1], "--env-slots-74") == 0) return run_env_slots(true, true);
+        if (std::strcmp(argv[1], "--env-slots-70") == 0) return run_env_slots(true, false, true);
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_console_command_list() || check_presentation_wiring() || check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_create_failures() ||
-        check_open_shared() || check_alloc_failures() || check_allocators() || check_xbox_slots() ||
-        check_custom_heap_properties() || check_lists() || check_signalx_detection() || check_list_tail_names() ||
-        check_descriptor_heap_hooks() || check_slot70() || check_slot70_raw_buffer() ||
-        check_committed_resource3_x() || check_render_target_sizes() || check_allocation_descriptions_cleaned() ||
-        check_committed_resource_leases() || check_slot74() || check_fence_completed_value() ||
-        check_list_cpu_handles())
+    if (check_tail(true) || check_host_device_floor() || check_levels() || check_slot48() || check_fence1() ||
+        check_fence_completed_value() || check_create_failures() || check_open_shared() ||
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_lists() ||
+        check_signalx_detection() || check_list_tail_names() || check_console_command_list() ||
+        check_custom_heap_properties() ||
+        check_resource_allocation_info() || check_slot70() || check_slot70_raw_buffer() ||
+        check_committed_resource3_x() ||
+        check_descriptor_heap_hooks() ||
+        check_render_target_sizes() ||
+        check_allocation_descriptions_cleaned() ||
+        check_render_target_layout() ||
+        check_committed_resource_leases() ||
+        check_committed_resource_states() ||
+        check_slot74() ||
+        check_xbox_queue_slots() ||
+        check_list_cpu_handles() ||
+        check_presentation_wiring())
         return 1;
     if (check_placed_resource_x()) return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

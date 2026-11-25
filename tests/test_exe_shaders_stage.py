@@ -75,7 +75,7 @@ class IndexKey(unittest.TestCase):
     def test_the_extracted_layout_gives_the_translator_the_key_and_graphics_stages(self):
         programs = [("container_00", "vs", fssm_blob(1)), ("container_01", "ps", fssm_blob(2))]
         with tempfile.TemporaryDirectory() as t:
-            exe = os.path.join(t, make_game.EXE_FILE)
+            exe = os.path.join(t, make_game.EXE_IMAGE)
             with open(exe, "wb") as f:
                 f.write(exe_like(*(exe_container(stage, blob) for _, stage, blob in programs)))
             out = os.path.join(t, "exe")
@@ -105,7 +105,7 @@ class ExeStage(unittest.TestCase):
         self.work = os.path.join(self.tmp.name, "work")
         self.game = os.path.join(self.tmp.name, "game")
         os.makedirs(self.game)
-        self.exe = os.path.join(self.game, make_game.EXE_FILE)
+        self.exe = os.path.join(self.game, make_game.EXE_IMAGE)
         self.programs = {
             "container_00": ("vs", fssm_blob(1)),
             "container_01": ("ps", fssm_blob(2)),
@@ -179,9 +179,9 @@ class ExeStage(unittest.TestCase):
         # Graphics shaders: no --max-shared-memory compute LDS cap.
         self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "exe_build.json")))
-        self.assertIn(f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated", self.logs)
+        self.assertIn(f"shaders: 3 of 3 {make_game.EXE_IMAGE} programs translated", self.logs)
         self.assertEqual(self.run_step(), [])
-        self.assertEqual(self.logs, [f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated"])
+        self.assertEqual(self.logs, [f"shaders: 3 of 3 {make_game.EXE_IMAGE} programs translated"])
 
     def test_the_real_tools_fill_the_folder_and_a_second_run_leaves_no_duplicates(self):
         mc = os.path.join(self.tmp.name, "fake_mc.py")
@@ -209,7 +209,7 @@ class ExeStage(unittest.TestCase):
                     index = json.load(f)
                 self.assertEqual({n: (index[n]["stage"], index[n]["fssm_sha256"]) for n in index},
                                  {n: (st, hashlib.sha256(blob).hexdigest()) for n, (st, blob) in self.programs.items()})
-                self.assertIn(f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated", self.logs)
+                self.assertIn(f"shaders: 3 of 3 {make_game.EXE_IMAGE} programs translated", self.logs)
             self.assertEqual(self.run_step(signature="llvm-mc 24", py=run_tool), [])
 
     def test_no_exe_no_step(self):
@@ -226,7 +226,7 @@ class ExeStage(unittest.TestCase):
         self.assertEqual(self.run_step(), [])
         self.assertFalse(os.path.exists(index))
         self.assertFalse(os.path.exists(settings))
-        self.assertEqual(self.logs, [f"shaders: no {make_game.EXE_FILE} in the game folder, so no executable "
+        self.assertEqual(self.logs, [f"shaders: no {make_game.EXE_IMAGE} in the game folder, so no executable "
                                      "shader programs to translate"])
         self.assertEqual(self.run_step(), [])
         self.write_exe()
@@ -252,7 +252,7 @@ class ExeStage(unittest.TestCase):
         self.untranslated = {"container_01"}
         for expected in (TOOLS, [], []):
             self.assertEqual(self.run_step(), expected)
-            self.assertIn(f"shaders: 2 of 3 {make_game.EXE_FILE} programs translated", self.logs)
+            self.assertIn(f"shaders: 2 of 3 {make_game.EXE_IMAGE} programs translated", self.logs)
             named = [line for line in self.logs if "NOT translated: container_01." in line]
             self.assertEqual(len(named), 1, self.logs)
             self.assertNotIn("container_00", named[0])
@@ -264,7 +264,7 @@ class ExeStage(unittest.TestCase):
         self.untranslated = set(self.programs)
         with self.assertRaises(SystemExit), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             self.run_step()
-        self.assertIn(f"none of the {make_game.EXE_FILE} programs translated", err.getvalue())
+        self.assertIn(f"none of {make_game.EXE_IMAGE}'s programs translated", err.getvalue())
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "exe_build.json")))
         self.untranslated = set()
@@ -289,9 +289,9 @@ class ExeStage(unittest.TestCase):
             with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
                 f.write(bad_index)
             self.assertEqual(self.run_step(), TOOLS)
-            self.assertIn(f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated", self.logs)
+            self.assertIn(f"shaders: 3 of 3 {make_game.EXE_IMAGE} programs translated", self.logs)
             self.assertEqual(self.run_step(), [])
-            self.assertEqual(self.logs, [f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated"])
+            self.assertEqual(self.logs, [f"shaders: 3 of 3 {make_game.EXE_IMAGE} programs translated"])
 
 
 class ShadersStageWithTheExe(unittest.TestCase):
@@ -308,7 +308,7 @@ class ShadersStageWithTheExe(unittest.TestCase):
                 f.write(fspx_dll(fspx_container(program())))
             with open(os.path.join(game, make_game.BVH_DLL), "wb") as f:
                 f.write(bvh_dll(builder_container("SortKeys", fssm_blob(1))))
-            exe = os.path.join(game, make_game.EXE_FILE)
+            exe = os.path.join(game, make_game.EXE_IMAGE)
             with open(exe, "wb") as f:
                 f.write(exe_like(exe_container("vs", fssm_blob(2))))
             ran = []
@@ -359,7 +359,7 @@ class ShadersStageWithTheExe(unittest.TestCase):
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")
-                write("", spirv, "index.json")
+                write("{}", spirv, "index.json")
 
             def stage():
                 ran.clear()

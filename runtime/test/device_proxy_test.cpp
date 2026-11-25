@@ -11,6 +11,7 @@
 //   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
 // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
+#include <vector>
 #include <windows.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
@@ -26,8 +27,13 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_desc_clean.h"
 #include "d3d12_xs_device.h"
+#include "host_wine.h"
 #include "shims.h"
 #include "../src/frame_pacer.h"
+#include "../src/shader_library.h"
+
+#include <filesystem>
+#include <fstream>
 
 namespace {
 
@@ -108,6 +114,190 @@ bool load_compute_shader(ComPtr<ID3DBlob>& bytecode) {
     }
     check(SUCCEEDED(hr) && bytecode, "trivial compute shader compiles (cs_5_0)");
     return SUCCEEDED(hr) && bytecode;
+}
+
+// ---- Slot 55 (CreateDerivedPipelineState) ----
+
+constexpr std::size_t kRecordBytes = 0x14c;
+
+// One record: u32 tag, then the payload at +4 (d3d12_xs_pso_stream.h).
+void put_record(unsigned char* record, std::uint32_t tag, const void* payload, std::size_t size) {
+    std::memset(record, 0, kRecordBytes);
+    std::memcpy(record, &tag, sizeof(tag));
+    if (size) std::memcpy(record + 4, payload, size);
+}
+
+std::size_t align_up(std::size_t value, std::size_t align) { return (value + align - 1) / align * align; }
+
+// A stream written in the console's layout: u32 type, payload at its alignment, next entry 8-aligned.
+struct StreamBytes {
+    std::vector<unsigned char> bytes;
+    void add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const void* payload, std::size_t size, std::size_t align) {
+        const std::size_t at = bytes.size();
+        bytes.resize(at + 4);
+        const std::uint32_t t = type;
+        std::memcpy(bytes.data() + at, &t, sizeof(t));
+        bytes.resize(align_up(at + 4, align), 0);
+        const auto* p = static_cast<const unsigned char*>(payload);
+        bytes.insert(bytes.end(), p, p + size);
+        bytes.resize(align_up(bytes.size(), 8), 0);
+    }
+};
+
+bool compile_hlsl(const char* source, const char* target, ComPtr<ID3DBlob>& bytecode) {
+    HMODULE compiler = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    auto compile = compiler ? reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+    if (!compile) return false;
+    ComPtr<ID3DBlob> errors;
+    const HRESULT hr = compile(source, std::strlen(source), "device_proxy_slot55.hlsl", nullptr, nullptr, "main",
+                               target, D3DCOMPILE_ENABLE_STRICTNESS, 0, bytecode.GetAddressOf(),
+                               errors.GetAddressOf());
+    if (FAILED(hr) && errors) std::printf("shader compile error: %s\n", static_cast<const char*>(errors->GetBufferPointer()));
+    return SUCCEEDED(hr) && bytecode;
+}
+
+// Graphics stream with every state a derived record can patch: DEPTH_STENCIL1, RASTERIZER, BLEND, SAMPLE_MASK.
+std::vector<unsigned char> graphics_stream(ID3D12RootSignature* root, ID3DBlob* vs, ID3DBlob* ps) {
+    StreamBytes s;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, sizeof(root), alignof(void*));
+    const D3D12_SHADER_BYTECODE vs_code{vs->GetBufferPointer(), vs->GetBufferSize()};
+    const D3D12_SHADER_BYTECODE ps_code{ps->GetBufferPointer(), ps->GetBufferSize()};
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs_code, sizeof(vs_code), alignof(void*));
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps_code, sizeof(ps_code), alignof(void*));
+    D3D12_RT_FORMAT_ARRAY rt{};
+    rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rt.NumRenderTargets = 1;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt, sizeof(rt), 4);
+    const DXGI_FORMAT dsv = DXGI_FORMAT_UNKNOWN;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &dsv, sizeof(dsv), 4);
+    const DXGI_SAMPLE_DESC sample{1, 0};
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &sample, sizeof(sample), 4);
+    const D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &topology, sizeof(topology), 4);
+
+    D3D12_BLEND_DESC blend{};
+    for (auto& rtb : blend.RenderTarget) {
+        rtb.SrcBlend = rtb.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rtb.DestBlend = rtb.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rtb.BlendOp = rtb.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rtb.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rtb.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend, sizeof(blend), 4);
+    const UINT mask = 0xffffffffu;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &mask, sizeof(mask), 4);
+    D3D12_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D12_FILL_MODE_SOLID;
+    raster.CullMode = D3D12_CULL_MODE_BACK;
+    raster.DepthClipEnable = TRUE;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &raster, sizeof(raster), 4);
+    D3D12_DEPTH_STENCIL_DESC1 ds{};
+    ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    ds.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    ds.StencilReadMask = ds.StencilWriteMask = 0xff;
+    for (D3D12_DEPTH_STENCILOP_DESC* op : {&ds.FrontFace, &ds.BackFace}) {
+        op->StencilFailOp = op->StencilDepthFailOp = op->StencilPassOp = D3D12_STENCIL_OP_KEEP;
+        op->StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    }
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, &ds, sizeof(ds), 4);
+    return s.bytes;
+}
+
+void check_derived_states(ID3D12Device* device, void** proxy_vtbl, ID3D12RootSignature* root,
+                          ID3D12PipelineState* compute_base, ID3D12PipelineState* native_base) {
+    using DeriveFn = HRESULT(WINAPI*)(void*, void*, std::uint64_t, const void*, const IID*, void**);
+    auto derive = reinterpret_cast<DeriveFn>(proxy_vtbl[55]);
+    const IID iid = __uuidof(ID3D12PipelineState);
+    unsigned char rec_tag5[kRecordBytes], rec_raster[kRecordBytes];
+    unsigned char five[5 * kRecordBytes] = {};
+    put_record(rec_tag5, 5, nullptr, 0);
+    D3D12_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    raster.CullMode = D3D12_CULL_MODE_BACK;
+    raster.DepthClipEnable = TRUE;
+    put_record(rec_raster, 1, &raster, sizeof(raster));
+    ComPtr<ID3D12PipelineState> out;
+
+    // Refusals: a compute base has no graphics subobjects, a native compute PSO was never kept, and the arguments.
+    out.Reset();
+    check(derive(device, compute_base, 1, rec_tag5, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_INVALIDARG
+              && !out, "slot 55 refuses tag 5 (E_INVALIDARG, null output)");
+    out.Reset();
+    check(derive(device, compute_base, 1, rec_raster, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_INVALIDARG
+              && !out, "slot 55 refuses a rasterizer record on a base without RASTERIZER (E_INVALIDARG)");
+    out.Reset();
+    check(derive(device, native_base, 1, rec_raster, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_FAIL
+              && !out, "slot 55 refuses a base PSO that was never kept (null output, no derivation)");
+    out.Reset();
+    check(derive(device, compute_base, 1, nullptr, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_POINTER,
+          "slot 55 with null records is E_POINTER");
+    out.Reset();
+    check(derive(device, compute_base, 0, rec_raster, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_INVALIDARG,
+          "slot 55 with n = 0 is E_INVALIDARG");
+    check(derive(device, compute_base, 5, five, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_INVALIDARG,
+          "slot 55 with n = 5 is E_INVALIDARG");
+    check(derive(device, compute_base, 1, rec_raster, nullptr, reinterpret_cast<void**>(out.GetAddressOf())) == E_POINTER,
+          "slot 55 with null riid is E_POINTER");
+
+    // Positive: a graphics base through slot 86, then tags 0, 1 and 3 in one call, tag 2 alone, and tag 2 again on
+    // the derived PSO (a derived PSO is a base too).
+    ComPtr<ID3DBlob> vs, ps;
+    if (!compile_hlsl("float4 main() : SV_Position { return float4(0, 0, 0, 1); }", "vs_5_0", vs) ||
+        !compile_hlsl("float4 main() : SV_Target { return float4(0, 0, 0, 1); }", "ps_5_0", ps)) {
+        check(false, "graphics shaders compile for the slot 55 positive test");
+        return;
+    }
+    const std::vector<unsigned char> stream = graphics_stream(root, vs.Get(), ps.Get());
+    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{stream.size(), const_cast<unsigned char*>(stream.data())};
+    using CreateStreamFn = HRESULT(WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
+    ComPtr<ID3D12PipelineState> base;
+    HRESULT hr = reinterpret_cast<CreateStreamFn>(proxy_vtbl[86])(device, &stream_desc, &iid,
+                                                                  reinterpret_cast<void**>(base.GetAddressOf()));
+    check(SUCCEEDED(hr) && base, "slot 86 creates the graphics base PSO (WARP accepts the stream)");
+    if (!base) return;
+
+    D3D12_DEPTH_STENCIL_DESC ds{};
+    ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    ds.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    ds.StencilReadMask = ds.StencilWriteMask = 0xff;
+    for (D3D12_DEPTH_STENCILOP_DESC* op : {&ds.FrontFace, &ds.BackFace}) {
+        op->StencilFailOp = op->StencilDepthFailOp = op->StencilPassOp = D3D12_STENCIL_OP_KEEP;
+        op->StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    }
+    unsigned char recs[3 * kRecordBytes];
+    put_record(recs, 0, &ds, sizeof(ds));
+    put_record(recs + kRecordBytes, 1, &raster, sizeof(raster));
+    const UINT sample_mask = 0x1;
+    put_record(recs + 2 * kRecordBytes, 3, &sample_mask, sizeof(sample_mask));
+    ComPtr<ID3D12PipelineState> three;
+    hr = derive(device, base.Get(), 3, recs, &iid, reinterpret_cast<void**>(three.GetAddressOf()));
+    check(SUCCEEDED(hr) && three, "slot 55 derives a PSO from tags 0, 1 and 3 (n = 3) on the graphics base");
+
+    D3D12_BLEND_DESC blend{};
+    for (auto& rtb : blend.RenderTarget) {
+        rtb.SrcBlend = rtb.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rtb.DestBlend = rtb.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rtb.BlendOp = rtb.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rtb.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rtb.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    // Four records (raster, depth-stencil, sample mask, blend): the largest count the console builds.
+    unsigned char four_recs[4 * kRecordBytes];
+    std::memcpy(four_recs, recs, 3 * kRecordBytes);
+    put_record(four_recs + 3 * kRecordBytes, 2, &blend, sizeof(blend));
+    ComPtr<ID3D12PipelineState> quad;
+    hr = derive(device, base.Get(), 4, four_recs, &iid, reinterpret_cast<void**>(quad.GetAddressOf()));
+    check(SUCCEEDED(hr) && quad, "slot 55 derives a PSO from four records (n = 4)");
+
+    unsigned char rec_blend[kRecordBytes];
+    put_record(rec_blend, 2, &blend, sizeof(blend));
+    ComPtr<ID3D12PipelineState> blended;
+    hr = derive(device, base.Get(), 1, rec_blend, &iid, reinterpret_cast<void**>(blended.GetAddressOf()));
+    check(SUCCEEDED(hr) && blended, "slot 55 derives a PSO from tag 2 (blend), n = 1");
+
+    ComPtr<ID3D12PipelineState> chained;
+    hr = derive(device, three.Get(), 1, rec_blend, &iid, reinterpret_cast<void**>(chained.GetAddressOf()));
+    check(SUCCEEDED(hr) && chained, "slot 55 derives from a derived PSO (its stream is kept too)");
 }
 
 }  // namespace
@@ -206,12 +396,25 @@ int main(int argc, char** argv) {
     const LUID real_luid = real ? real->GetAdapterLuid() : LUID{};
     check(proxy_luid.LowPart == real_luid.LowPart && proxy_luid.HighPart == real_luid.HighPart,
           "slot 43 forwards GetAdapterLuid (struct return)");
-    // Slot 25 returns a struct wider than 8 bytes. The console title calls it with the C ABI: the hidden
+    // Slots 25 and 26 return a struct wider than 8 bytes. The console title calls them with the C ABI: the hidden
     // return pointer first (RCX), then the device (RDX), then the arguments, and the buffer comes back in RAX
-    // (measured for slot 26 on the retail executable). Call slot 25 that way through a raw function pointer and compare
-    // with the PC device's own answer.
+    // (measured for slot 26 on the retail executable). Call them that way through raw function pointers and compare
+    // with the PC device's own answers.
     check(rt::d3d12_xs::device_slot_overridden(25), "device slot 25 is the C-ABI GetResourceAllocationInfo override");
+    check(rt::d3d12_xs::device_slot_overridden(26), "device slot 26 is the C-ABI GetCustomHeapProperties override");
     if (real) {
+        using HeapPropsFn = D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
+        auto get_heap_props = reinterpret_cast<HeapPropsFn>(proxy_vtbl[26]);
+        for (D3D12_HEAP_TYPE type : {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK}) {
+            D3D12_HEAP_PROPERTIES got;
+            std::memset(&got, 0xcd, sizeof(got));
+            D3D12_HEAP_PROPERTIES* returned = get_heap_props(&got, device.Get(), 1, type);
+            const D3D12_HEAP_PROPERTIES want = real->GetCustomHeapProperties(1, type);
+            check(returned == &got, "slot 26 returns the caller's buffer in RAX");
+            check(std::memcmp(&got, &want, sizeof(got)) == 0,
+                  "slot 26 (C ABI) writes the PC device's GetCustomHeapProperties into the caller's buffer");
+        }
+
         using AllocInfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
                                                                      const D3D12_RESOURCE_DESC*);
         auto get_alloc_info = reinterpret_cast<AllocInfoFn>(proxy_vtbl[25]);
@@ -227,8 +430,11 @@ int main(int argc, char** argv) {
         check(got.SizeInBytes == want.SizeInBytes && got.Alignment == want.Alignment,
               "slot 25 (C ABI) writes the PC device's GetResourceAllocationInfo into the caller's buffer");
 
-        // The runtime's own code calls the proxy through d3d12.h (PC form: this, then the return buffer). Slot 25
-        // still answers that form.
+        // The runtime's own code calls the proxy through d3d12.h (PC form: this, then the return buffer). Both
+        // slots still answer that form.
+        const D3D12_HEAP_PROPERTIES pc_props = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
+        const D3D12_HEAP_PROPERTIES pc_want = real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
+        check(std::memcmp(&pc_props, &pc_want, sizeof(pc_props)) == 0, "slot 26 still answers the PC (C++) form");
         const D3D12_RESOURCE_ALLOCATION_INFO pc_info = device->GetResourceAllocationInfo(0, 1, &desc);
         check(pc_info.SizeInBytes == want.SizeInBytes && pc_info.Alignment == want.Alignment,
               "slot 25 still answers the PC (C++) form");
@@ -248,8 +454,11 @@ int main(int argc, char** argv) {
         ds_uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         D3D12_RESOURCE_DESC pc_pair = ds_uav;
         pc_pair.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        check(real->GetResourceAllocationInfo(0, 1, &pc_pair).SizeInBytes == UINT64_MAX,
-              "the PC device refuses a depth-stencil texture with unordered access (negative control)");
+        // Microsoft's runtime validates the flag pair; Wine's vkd3d sizes the texture without looking at it, so the
+        // control only says something about the first.
+        if (!hostwine::host_is_wine())
+            check(real->GetResourceAllocationInfo(0, 1, &pc_pair).SizeInBytes == UINT64_MAX,
+                  "the PC device refuses a depth-stencil texture with unordered access (negative control)");
         D3D12_RESOURCE_DESC ds_only = pc_pair;
         ds_only.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         const D3D12_RESOURCE_ALLOCATION_INFO ds_want = real->GetResourceAllocationInfo(0, 1, &ds_only);
@@ -267,9 +476,35 @@ int main(int argc, char** argv) {
               "pc_resource_desc keeps unordered access on buffers and color textures");
         D3D12_RESOURCE_ALLOCATION_INFO ds_got{~0ull, ~0ull};
         get_alloc_info(&ds_got, device.Get(), 0, 1, &ds_uav);
-        check(ds_got.SizeInBytes != UINT64_MAX && ds_got.SizeInBytes >= ds_want.SizeInBytes &&
-                  (ds_got.SizeInBytes >> 32) == 0,
+        // Sized as the console lays it out (12eb84f75: a depth plane and a stencil plane in 64 KiB tiles), which can
+        // be less than the PC answer for the depth-stencil texture alone, so only "sized, and in 32 bits" is checked.
+        check(ds_got.SizeInBytes != UINT64_MAX && ds_got.SizeInBytes != 0 && (ds_got.SizeInBytes >> 32) == 0,
               "slot 25 (C ABI) sizes a console depth-stencil texture with unordered access");
+    }
+
+    constexpr auto kUav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    constexpr auto kDepthStencil = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    constexpr auto kRenderTarget = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const struct {
+        DXGI_FORMAT format;
+        D3D12_RESOURCE_FLAGS input;
+        D3D12_RESOURCE_FLAGS expected;
+        const char* message;
+    } flag_cases[] = {
+        {DXGI_FORMAT_B5G5R5A1_UNORM, kRenderTarget | kUav, kRenderTarget, "B5G5R5A1 keeps only RT"},
+        {DXGI_FORMAT_R32G8X24_TYPELESS, kDepthStencil | kUav, kDepthStencil, "R32G8X24 depth keeps only DS"},
+        {DXGI_FORMAT_R8G8B8A8_UNORM, kRenderTarget | kUav, kRenderTarget | kUav, "RGBA8 keeps RT and UAV"},
+        {DXGI_FORMAT_R32_FLOAT, kUav, kUav, "R32_FLOAT keeps UAV"},
+        {DXGI_FORMAT_R32_TYPELESS, kUav, kUav, "R32_TYPELESS without DS keeps UAV"},
+        {DXGI_FORMAT_D16_UNORM, kDepthStencil | kUav, kDepthStencil, "D16 depth keeps only DS"},
+    };
+    for (const auto& test : flag_cases) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Format = test.format;
+        desc.Flags = test.input;
+        const auto clean = rt::d3d12_xs::pc_resource_desc(desc);
+        check(clean.Flags == test.expected && clean.Format == test.format && desc.Flags == test.input, test.message);
     }
 
     D3D12_RESOURCE_DESC reserved_desc = buffer_desc();
@@ -287,6 +522,7 @@ int main(int argc, char** argv) {
         D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
     auto get_custom_heap = reinterpret_cast<XboxGetCustomHeapPropertiesFn>(proxy_vtbl[26]);
     const D3D12_HEAP_TYPE heap_types[] = {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK};
+    const auto slot26_hits_before = rt::d3d12_xs::device_slot_hits(26);
     bool console_returns_buffer = true, console_matches_pc = real != nullptr, console_writes_only_struct = true;
     for (const D3D12_HEAP_TYPE type : heap_types) {
         struct Padded {
@@ -304,15 +540,18 @@ int main(int argc, char** argv) {
     check(console_returns_buffer, "slot 26 console form returns the buffer's address");
     check(console_matches_pc, "slot 26 console form writes the PC device's DEFAULT, UPLOAD and READBACK properties");
     check(console_writes_only_struct, "slot 26 console form writes nothing past the struct");
-    check(rt::d3d12_xs::device_slot_hits(26) == 3, "slot 26 hit counter is 3");
+    check(rt::d3d12_xs::device_slot_hits(26) == slot26_hits_before + 3,
+          "slot 26 hit counter increases by three for the console calls");
     check(rt::d3d12_xs::is_device_proxy(device.Get()) && rt::d3d12_xs::device_proxy_real_device(device.Get()) == real,
           "the proxy is intact after the console-form calls");
     // A PC C++ call through the proxy (the proxy in RCX, the buffer in RDX) is still forwarded.
     const D3D12_HEAP_PROPERTIES pc_form = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
     const D3D12_HEAP_PROPERTIES pc_want = real ? real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD)
                                                : D3D12_HEAP_PROPERTIES{};
-    check(real && std::memcmp(&pc_form, &pc_want, sizeof(pc_want)) == 0 && rt::d3d12_xs::device_slot_hits(26) == 4,
+    check(real && std::memcmp(&pc_form, &pc_want, sizeof(pc_want)) == 0,
           "slot 26 PC form still forwards GetCustomHeapProperties");
+    check(rt::d3d12_xs::device_slot_hits(26) == slot26_hits_before + 4,
+          "slot 26 hit counter also includes the PC call");
 
     // Slot 14: descriptor heap through the proxy. The proxy wraps the real PC heap for the handle ABI.
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
@@ -590,6 +829,7 @@ int main(int argc, char** argv) {
                   "slot 86 creates a PSO via PC ID3D12Device2::CreatePipelineState (slot 47)");
             check(rt::d3d12_xs::device_slot_hits(86) == 1, "slot 86 hit counter is 1");
             check(rt::d3d12_xs::device_slot_first_call_seen(86), "slot 86 first-call flag is set");
+            check_derived_states(device.Get(), proxy_vtbl, root_signature.Get(), pso86.Get(), pso67.Get());
         }
     }
 
@@ -967,6 +1207,151 @@ int main(int argc, char** argv) {
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
+    // Slot 57 (DeserializeGraphicsPipelineStateX):
+    // 1. Guard-page test on the measured 188-byte (0xbc) pipeline blob from PSO #1 (record 8916), whose third element
+    //    ("TEXCOORD" at 0x9b, fields at 0xa4) has its 28-byte block truncated by 4 bytes at 0xbc. Placing the 188-byte
+    //    blob at the very end of a committed page right before a PAGE_NOACCESS guard page proves the parser decodes all
+    //    3 elements (POSITION R32G32B32_FLOAT @0, COLOR R8G8B8A8_UNORM @12, TEXCOORD R32G32_FLOAT @16) without reading
+    //    past `blob_size`.
+    // 2. ShaderLibrary `fspx_gfx/index.json` loading and separate `fspx_size()`, `fspx_gfx_size()`, `bvh_size()` counters.
+    {
+        auto put_u32 = [](std::uint8_t* dst, std::size_t off, std::uint32_t v) {
+            std::memcpy(dst + off, &v, 4);
+        };
+        std::uint8_t blob188[0xbc]{};
+        put_u32(blob188, 0x00, 0xea6f6e56u);  // PSO 1 magic/checksum
+        put_u32(blob188, 0x04, 0x00001000u);  // constant
+        put_u32(blob188, 0x08, 0u);
+        put_u32(blob188, 0x0c, 1u);
+        put_u32(blob188, 0x10, 0x0000001cu);  // 28 bytes (7 u32) per element
+        put_u32(blob188, 0x1c, 0xffffffffu);
+        put_u32(blob188, 0x24, 0x00130100u);
+        put_u32(blob188, 0x28, 1u);
+        put_u32(blob188, 0x38, 0x00000070u);  // 4 + 3*28 + (9+6+9) = 112
+        put_u32(blob188, 0x3c, 0x0000000cu);
+        put_u32(blob188, 0x4c, 3u);           // 3 input elements
+        put_u32(blob188, 0x50, 9u);           // max name stride including NUL
+
+        // Element 0 @ 0x54: "POSITION\0" (9 B) + 28 B fields @ 0x5d..0x79
+        std::memcpy(blob188 + 0x54, "POSITION", 9);
+        put_u32(blob188, 0x5d + 0x00, 0u);                                    // InputSlot 0
+        put_u32(blob188, 0x5d + 0x04, static_cast<std::uint32_t>(DXGI_FORMAT_R32G32B32_FLOAT));  // 6
+        put_u32(blob188, 0x5d + 0x08, 0u);                                    // SemanticIndex 0
+        put_u32(blob188, 0x5d + 0x0c, 0u);                                    // AlignedByteOffset 0
+        put_u32(blob188, 0x5d + 0x18, 6u);
+
+        // Element 1 @ 0x79: "COLOR\0" (6 B) + 28 B fields @ 0x7f..0x9b
+        std::memcpy(blob188 + 0x79, "COLOR", 6);
+        put_u32(blob188, 0x7f + 0x00, 0u);
+        put_u32(blob188, 0x7f + 0x04, static_cast<std::uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM));   // 28
+        put_u32(blob188, 0x7f + 0x08, 0u);
+        put_u32(blob188, 0x7f + 0x0c, 12u);
+        put_u32(blob188, 0x7f + 0x18, 9u);
+
+        // Element 2 @ 0x9b: "TEXCOORD\0" (9 B) + 24 B fields @ 0xa4..0xbc (truncated by 4 B at 0xbc!)
+        std::memcpy(blob188 + 0x9b, "TEXCOORD", 9);
+        put_u32(blob188, 0xa4 + 0x00, 0u);
+        put_u32(blob188, 0xa4 + 0x04, static_cast<std::uint32_t>(DXGI_FORMAT_R32G32_FLOAT));     // 16
+        put_u32(blob188, 0xa4 + 0x08, 0u);
+        put_u32(blob188, 0xa4 + 0x0c, 16u);
+
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        const std::size_t page = si.dwPageSize ? si.dwPageSize : 4096;
+        auto* pages = static_cast<std::uint8_t*>(
+            VirtualAlloc(nullptr, page * 2, MEM_RESERVE, PAGE_NOACCESS));
+        check(pages != nullptr, "slot 57 pipeline blob guard pages reserved");
+        if (pages) {
+            void* committed = VirtualAlloc(pages, page, MEM_COMMIT, PAGE_READWRITE);
+            check(committed == pages, "slot 57 pipeline blob first page committed before guard page");
+            std::uint8_t* guarded_blob = pages + page - sizeof(blob188);
+            std::memcpy(guarded_blob, blob188, sizeof(blob188));
+            std::vector<rt::d3d12_xs::XboxPipelineInputElement> elems;
+            const bool ok = rt::d3d12_xs::parse_xbox_pipeline_blob_input_layout(
+                guarded_blob, sizeof(blob188), elems);
+            check(ok && elems.size() == 3,
+                  "slot 57 pipeline blob parser decodes 3 elements from truncated 188-byte blob adjacent to PAGE_NOACCESS");
+            if (elems.size() == 3) {
+                check(elems[0].semantic_name == "POSITION" && elems[0].format == DXGI_FORMAT_R32G32B32_FLOAT &&
+                          elems[0].aligned_byte_offset == 0 && elems[0].input_slot == 0,
+                      "slot 57 pipeline blob element 0 is POSITION R32G32B32_FLOAT @0");
+                check(elems[1].semantic_name == "COLOR" && elems[1].format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                          elems[1].aligned_byte_offset == 12 && elems[1].input_slot == 0,
+                      "slot 57 pipeline blob element 1 is COLOR R8G8B8A8_UNORM @12");
+                check(elems[2].semantic_name == "TEXCOORD" && elems[2].format == DXGI_FORMAT_R32G32_FLOAT &&
+                          elems[2].aligned_byte_offset == 16 && elems[2].input_slot == 0,
+                      "slot 57 pipeline blob element 2 is TEXCOORD R32G32_FLOAT @16");
+            }
+            VirtualFree(pages, 0, MEM_RELEASE);
+        }
+
+        // Slot 57 null-argument checks on the device proxy.
+        void** vtable = *reinterpret_cast<void***>(device.Get());
+        using Slot57Fn = HRESULT(WINAPI*)(void*, const void*, const IID*, void**);
+        const IID iid_pso = __uuidof(ID3D12PipelineState);
+        void* pso_out = reinterpret_cast<void*>(0x1111);
+        hr = reinterpret_cast<Slot57Fn>(vtable[57])(device.Get(), nullptr, &iid_pso, &pso_out);
+        check(FAILED(hr) && pso_out == nullptr, "slot 57 nulls its output for a null description");
+
+        // Synthetic test for ShaderLibrary loading `fspx_gfx/index.json` alongside `fspx/index.json` and `bvh/index.json`
+        // while keeping `fspx_size()`, `fspx_gfx_size()`, and `bvh_size()` independent.
+        wchar_t temp_root[MAX_PATH]{};
+        if (GetTempPathW(MAX_PATH, temp_root)) {
+            const std::filesystem::path tmp_dir =
+                std::filesystem::path(temp_root) / ("leonida_fspx_gfx_test_" + std::to_string(GetCurrentProcessId()));
+            std::error_code ec;
+            std::filesystem::create_directories(tmp_dir / "fspx", ec);
+            std::filesystem::create_directories(tmp_dir / "fspx_gfx", ec);
+            std::filesystem::create_directories(tmp_dir / "bvh", ec);
+            {
+                std::ofstream(tmp_dir / "index.json") << "{\n}\n";
+                std::ofstream(tmp_dir / "fspx" / "index.json")
+                    << "{\n"
+                    << "  \"libcs_00001\": {\n"
+                    << "    \"stage\": \"cs\",\n"
+                    << "    \"fspx_code_sha256\": \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
+                    << "  }\n"
+                    << "}\n";
+                std::ofstream(tmp_dir / "fspx_gfx" / "index.json")
+                    << "{\n"
+                    << "  \"3333333333333333333333333333333333333333333333333333333333333333\": {\n"
+                    << "    \"stage\": \"ps\",\n"
+                    << "    \"spv\": \"3333333333333333_libps_00001.spv\",\n"
+                    << "    \"fspx_code_sha256\": \"3333333333333333333333333333333333333333333333333333333333333333\"\n"
+                    << "  },\n"
+                    << "  \"4444444444444444444444444444444444444444444444444444444444444444\": {\n"
+                    << "    \"stage\": \"vs\",\n"
+                    << "    \"spv\": \"4444444444444444_libvs_00002.spv\",\n"
+                    << "    \"fspx_code_sha256\": \"4444444444444444444444444444444444444444444444444444444444444444\"\n"
+                    << "  }\n"
+                    << "}\n";
+                std::ofstream(tmp_dir / "bvh" / "index.json")
+                    << "{\n"
+                    << "  \"bvh_00001\": {\n"
+                    << "    \"stage\": \"cs\",\n"
+                    << "    \"fspx_code_sha256\": \"2222222222222222222222222222222222222222222222222222222222222222\"\n"
+                    << "  }\n"
+                    << "}\n";
+            }
+            leonida::ShaderLibrary lib;
+            std::string err;
+            const bool loaded = lib.load(tmp_dir, &err);
+            check(loaded, "ShaderLibrary::load loads index.json + fspx + fspx_gfx + bvh");
+            check(lib.fspx_size() == 1, "ShaderLibrary::fspx_size() counts only fspx/ entries");
+            check(lib.fspx_gfx_size() == 2, "ShaderLibrary::fspx_gfx_size() counts only fspx_gfx/ entries");
+            check(lib.bvh_size() == 1, "ShaderLibrary::bvh_size() counts only bvh/ entries");
+            const auto* ps_entry =
+                lib.find_fspx_by_code("3333333333333333333333333333333333333333333333333333333333333333");
+            const auto* vs_entry =
+                lib.find_fspx_by_code("4444444444444444444444444444444444444444444444444444444444444444");
+            check(ps_entry && ps_entry->stage == "ps" && ps_entry->spv_file == "fspx_gfx/3333333333333333_libps_00001.spv",
+                  "fspx_gfx PS entry preserves stage and its spv filename, under the folder prefix");
+            check(vs_entry && vs_entry->stage == "vs" && vs_entry->spv_file == "fspx_gfx/4444444444444444_libvs_00002.spv",
+                  "fspx_gfx VS entry preserves stage and its spv filename, under the folder prefix");
+            std::filesystem::remove_all(tmp_dir, ec);
+        }
+    }
+
     if (real) real->AddRef();
     // Drop every device child before the proxy so the PC device is not released first.
     root_signature.Reset();

@@ -178,6 +178,8 @@ the HRESULT and call through the object at once; that object answers every slot 
 `xg_xs_test` covers the model (hand-checked addresses, mip tails, a bijection and round trip over every element) and the
 shim's slots. The table above was measured before this shim and still lists these two as unimplemented; they are served
 now.
+Set `LEONIDA_XG_TRACE=1` to log the first 1024 calls per entry point; the source notes are in
+[xg_xs_THIRD_PARTY.md](../runtime/shims/xg_xs_THIRD_PARTY.md).
 
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
@@ -290,12 +292,51 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   when its folder is missing, was removed, or is a file, and creates nothing (`T:` is the exception: a create there
   makes its parent folders); `FindFirstFile` fails the same way for a
   listing inside such a folder (a pattern that matches nothing in a folder that exists is still
-  `ERROR_FILE_NOT_FOUND`, and a listing directly below a file is `ERROR_DIRECTORY`, as on the host).
+  `ERROR_FILE_NOT_FOUND`, and a listing directly below a file is `ERROR_DIRECTORY`, as on the host). `DeleteFile*`,
+  `RemoveDirectory*`, `SetFileAttributes*` and the source of `MoveFile*` answer a name inside such a folder with
+  `ERROR_PATH_NOT_FOUND` too, and a missing name in a folder that exists with `ERROR_FILE_NOT_FOUND`, as on the host.
 - `MoveFile*` onto the same name succeeds and changes nothing. A rename that changes only the case renames the overlay
   entry; a package file gets an overlay copy under the new spelling, and a package folder is refused like any other
   move of one.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
+
+## Console identity in the registry
+
+GTA VI does not only ask `XSystemGetDeviceType` which console it runs on. Code linked into the executable opens
+`HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\OEM`, reads the `DWORD` value `ConsoleMode`
+(`0x64` Series X, `0x60` Series S) and closes the key. A missing value means a PC, and a PC takes the PC memory
+budgets and resolution, so without an answer the title does not run as the console build. It decides the console
+model, and with it the back buffer size (1920x1080 for Series S, 3840x2160 for Series X).
+
+Measured with `tools/pe_inspect.py` on the retail 1.0.2.1 package:
+
+| Module | Imports | From |
+|---|---|---|
+| `game_scarlett_master.exe` | `RegOpenKeyW`, `RegQueryValueExW`, `RegCloseKey` | `ADVAPI32.dll` |
+| `libHttpClient.GDK.dll` | the same three and `RegOpenKeyExW` | `ADVAPI32.dll` |
+| `XCurl.dll` | `RegOpenKeyExW`, `RegQueryValueExW`, `RegCloseKey`; `RegOpenKeyW` | `api-ms-win-core-registry-l1-1-0.dll`; `-l2-1-0.dll` |
+
+Before `runtime/shims/console_registry.cpp` the loader bound all of them to the host's advapi32 (`pe_inspect` labels
+them `shim` only because it ran on Linux, with no `System32` to find them in). Under Proton the lead wrote the value
+into the Wine prefix; on a Windows PC the key does not exist and writing it needs administrator rights.
+
+`console_registry.cpp` now serves the four functions under `advapi32.dll` and the registry API sets. It answers only
+`HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM` / `ConsoleMode`, with a pseudo key; every other key,
+value and handle goes to the host's advapi32 unchanged. It follows the `RegQueryValueExW` contract for the value:
+`REG_DWORD` is reported when the type pointer is set, a null data pointer is a size query (4 bytes), a buffer under
+4 bytes gives `ERROR_MORE_DATA` with the size, and a data pointer without a size is `ERROR_INVALID_PARAMETER`.
+
+One setting drives both answers (`runtime/shims/console_identity.h`): `LEONIDA_DEVICE_TYPE` 6 gives `ConsoleMode`
+`0x60`, 7 (also the default) gives `0x64`, 8 (devkit) gives `0x68`. For the types that have no value (0, 1, 2 to 5) the
+key is not ours and the host registry answers, so a missing key stays missing, as on a PC. The first answer of each
+value is logged once: `[rt] registry: ConsoleMode answered 0x64 (LEONIDA_DEVICE_TYPE=7)`. `advapi32.dll` is a host
+module in `rt::shims::owns_dll`: `LoadLibrary("advapi32.dll")` still returns the real module.
+
+Credit: the pseudo key design and the value numbers follow VIctory `crates/victory-hle/src/modules/xsystem.rs`
+(`mod device_type`, GPL-3.0-or-later, commit 2849477); `0x68` for the devkit follows xbox-emulator
+`crates/compat/xpal` and `compat-common/src/gdk/hook.rs` (GPL-3.0, commit 0284e83). The test is
+`runtime/test/console_registry_test.cpp` (`ctest -R console_registry`).
 
 ## When an unimplemented import is called
 
@@ -338,22 +379,18 @@ mostly correspond one to one to the `xgameruntime.lib` functions. The executable
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, and the DirectStorage
-modules `dstorage_xs.dll`, `xcrdapi.dll` and `dstorage.dll`, [directstorage.md](directstorage.md)) with a
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, `acphal.dll`) with a
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, `xapu.dll`, `chad.dll`) with a
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `xg_xs.dll`, `gameinput.dll`, and the
+DirectStorage modules `dstorage_xs.dll`, `xcrdapi.dll` and `dstorage.dll`, [directstorage.md](directstorage.md)) with a
 pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `xg_xs.dll`, `gameinput.dll`)
-with a pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points and `XErrorReport(HRESULT, const char*)`, the same
 function as `IXErrorImpl` slot 3 (below), so a report reaches the callback `XErrorSetCallback` set either way. The
-initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
-`XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
-(below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
-`XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and `XLauncherImpl` from xgameruntime-docs' layout (below); for any other class it logs
+initializers succeed offline and log the GDK version and mode once. `QueryApiImpl` serves `XThreadingImpl`,
+`XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`, `XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`,
+`XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl` (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`,
+`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and
+`XLauncherImpl` from xgameruntime-docs' layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` serves slot by slot.
@@ -386,7 +423,7 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 | `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`), 3-20 (`libHttpClient.GDK.dll`, each in its documented argument shape, e.g. 18-20 (enum, u64 pointer / u64 / pointer)) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool). Served offline, asked for with `IXNetworkingImpl2`'s id |
 | `XSystemImpl` (`IXSystemImpl5`, slots 3-8 known) | 3-8 (`libHttpClient.GDK.dll`) | 3-5 `XSystemGetConsoleId` / `GetXboxLiveSandboxId` / `GetAppSpecificDeviceId` (size, pointer, pointer each), 6 `XSystemHandleTrack` (two pointers, IXSystemImpl3), 7 `XSystemIsHandleValid` (pointer), 8 `XSystemAllowFullDownloadBandwidth` (bool, IXSystemImpl4); IXSystemImpl2 and 5 add no known method. Served offline |
 | `XPersistentLocalStorageImpl` (`IXPersistentLocalStorageImpl3`, slots 3-8) | none called (the table of ids only) | slots 3-7 are `XPersistentLocalStorageGetPathSize` / `GetPath` / `GetSpaceInfo` / `PromptUserForSpaceAsync` / `PromptUserForSpaceResult`, slot 8 `XPersistentLocalStorageMountForPackage` (IXPersistentLocalStorageImpl3). Slots from the public xgameruntime-docs and Wine IDL, not measured in a caller. Served offline: the folder is `<overlay>\.gta6rt-persistent`, which `GAME:` does not see, the quota is the 2048 MB of `MicrosoftGame.Config`, a prompt for space the quota holds succeeds, and `MountForPackage` is `E_NOTIMPL` |
-| `XPackageImpl` (`IXPackageImpl3`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2. Served offline: 3 identifier, 4 packaged process, 11 user locale, 24-26 mount path size / path / close; the rest log once and return `E_NOTIMPL` |
+| `XPackageImpl` (`IXPackageImpl3`, `IXPackageImpl4`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`); 3-7, 9, 12, 14, 16-19, 25, 26, 34, 37-39 (the retail executable, as `IXPackageImpl4`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2, 41 IXPackageImpl4's `XPackageGetPackageKind`. Served offline: 3 identifier, 4 packaged process, 5-10 installation monitor (create, close, progress complete, no update, progress registration, unregister), 11 user locale, 12-19 chunks of the fully installed package (every selector Ready, declared languages enumerated, install order / install / async install complete at once with a monitor, 0-byte download estimate, uninstall accepted with nothing removed; ported from VIctory's xpackage.rs), 22 unregister installed, 23-26 mount / path size / path / close, 34 uninstall package, 37-38 mount with UI (a mapped content package mounts, any other completes with `E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER`), 39 `XPackageEnumeratePackages` (S_OK, the callback never runs: no content packages to list; VIctory answers the title's call the same way); the rest log once and return `E_NOTIMPL` |
 | `XGameImpl` (`IXGameImpl3`, slots 3-5) | none in the package's DLLs (`libHttpClient.GDK.dll` holds its id only in the linked id table); the executable's requests are unmeasured | from the xgameruntime IDL: 3 `XGameGetXboxTitleId` (pointer), 4 `XLaunchNewGame` (two strings and a user handle, `void`), 5 `XLaunchRestartOnCrash` (string, u32). Served offline: the title id is `MicrosoftGame.Config`'s `<TitleId>` (`E_FAIL` without one), a new game launch is logged and ignored, a crash restart succeeds with nothing registered |
 
 **Two layout sources, and where they differ.** Besides xgameruntime-docs (GPL; facts only), the LGPL
@@ -432,8 +469,11 @@ trio (23-25). What the slots must answer is still **not measured**; that is the 
 - **Validity:** handles are looked up in a live set, never read, so a closed or foreign pointer is refused without
   touching its memory, and a double close does nothing. Unregistering a change callback is never pending, so it
   returns true for any token. `XUserIsStoreUser` is true, as documented for console.
+- **First calls:** every served slot writes one `[rt] xgameruntime: XUser <name> first call: ...` line with its
+  arguments and answer (`XUserGetGamertag` one per component, with the text it returned), so a boot log shows whether
+  the title added its user and read the gamertag its player-select prompt shows.
 
-`xgameruntime_user_test` calls every served slot with the documented arguments.
+`xgameruntime_user_test` calls every served slot with the documented arguments and reads back the first-call lines.
 
 `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`) is served from the same layout, also **not measured**:
 - **Interfaces:** the class id doubles as `IXGameSaveImpl`'s; `IXGameSaveImpl2` (adds the three `XGameSaveFiles`
