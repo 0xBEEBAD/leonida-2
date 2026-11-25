@@ -298,6 +298,50 @@ int check_kind(Context& c, const char* kind, DWORD protect, int& checks) {
     return 0;
 }
 
+// With imports on: a slot-133 buffer the layer does not import holds no import memory once
+// create_buffer_at_host_address has returned, whichever step declined it. The memory an import declined after its
+// allocation (one the driver put below the arena) used to wait in the deferred queue past the next submission, while
+// the shadow made instead over the same pages made them read-only: RADV then rejects every submission (found and
+// measured by NateWeav, #14). Two placements: at a page start (imported where the driver takes it) and 4 bytes into
+// a page (declined after the buffer exists wherever the buffer's alignment is above 4). Then a submission over the
+// shadow's pages, which must still succeed.
+int check_declined_imports(Context& c) {
+    const std::uint64_t before = rt::d3d12::title_host_imports(c.inner);
+    void* pages = VirtualAlloc(nullptr, kPages, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages);
+    const D3D12_RESOURCE_DESC desc = buffer_desc(kPages / 2);
+    int shadows = 0;
+    for (const std::size_t at : {std::size_t(0), std::size_t(4)}) {
+        Ref<ID3D12Resource> buffer;
+        EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, static_cast<std::uint8_t*>(pages) + at,
+                                                                  desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p))));
+        const bool shadow = rt::d3d12::title_shadow_buffer(buffer.p);
+        shadows += shadow;
+        const std::uint64_t live = rt::d3d12::title_host_imports(c.inner);
+        std::printf("slot-133 buffer at page offset %zu: %s, %llu import(s) live\n", at,
+                    shadow ? "declined (shadow)" : "imported", static_cast<unsigned long long>(live - before));
+        EXPECT(live == before + (shadow ? 0 : 1));
+        // A submission with the buffer alive: the shadow's tracker guards its pages here.
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list;
+        EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                          IID_PPV_ARGS(&allocator.p))));
+        EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                     IID_PPV_ARGS(&list.p))));
+        EXPECT(list->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list.p};
+        c.queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(c.queue) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(c.queue->Signal(c.fence, ++c.fence_value)));
+        EXPECT(SUCCEEDED(c.fence->SetEventOnCompletion(c.fence_value, nullptr)));
+        buffer.reset();
+        EXPECT(rt::d3d12::title_host_imports(c.inner) == before);
+    }
+    VirtualFree(pages, 0, MEM_RELEASE);
+    std::printf("declined imports: %d of 2 placements took the shadow, none left import memory behind\n", shadows);
+    return 0;
+}
+
 // The title's own memory outside any slot-133 buffer: a VirtualAlloc range standing for its per-frame constant ring
 // (#8862 section 3.5). Three ways a shader is given an address in it, each read back through an arena buffer:
 //   - a buffer V# the CPU writes into a shader-visible heap itself, as the title does (rewritten before the submission);
@@ -794,6 +838,7 @@ int main(int argc, char** argv) {
             EXPECT(d.validation_errors() == 0);
             return 0;
         }
+        if (geometry && check_declined_imports(c)) return 1;
         if (check_kind(c, "read-write", PAGE_READWRITE, checks)) return 1;
         if (check_kind(c, "write-combined", PAGE_READWRITE | PAGE_WRITECOMBINE, checks)) return 1;
         if (check_title_memory(c, checks, geometry)) return 1;
