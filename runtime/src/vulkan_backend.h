@@ -1603,8 +1603,11 @@ public:
     bool prepare_sample_table(std::uint64_t address, std::uint32_t count) const {
         return !sample_table_resolver_ || sample_table_resolver_(address,count);
     }
-    void scan_table(std::uint64_t va, std::uint32_t descriptors) const {
-        if (table_scanner_) table_scanner_(va, descriptors);
+    // False when this context has no scanner of its own.
+    bool scan_table(std::uint64_t va, std::uint32_t descriptors) const {
+        if (!table_scanner_) return false;
+        table_scanner_(va, descriptors);
+        return true;
     }
 
     // `before` is called at the start of every submission of command lists (a held batch: when it is released),

@@ -2129,7 +2129,10 @@ public:
             if (!tables.empty()) {
                 const auto start = std::chrono::steady_clock::now();
                 for (const auto& [table, descriptors] : tables) {
-                    leonida::title_va_aliases().scan_table(table, descriptors);
+                    // A table VA is an offset in this device's arena, so its own scanner reads it; the process-wide
+                    // hook belongs to the first device that registered and serves a context without a scanner.
+                    if (!context_.scan_table(table, descriptors))
+                        leonida::title_va_aliases().scan_table(table, descriptors);
                     if (!context_.prepare_sample_table(table, descriptors)) {
                         last_result_ = leonida::ReplayResult::unresolved_resource;
                         d3d12_trace::record(method, "failed");
