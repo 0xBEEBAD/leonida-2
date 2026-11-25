@@ -3012,17 +3012,18 @@ if(TARGET Vulkan::Headers)
       get_filename_component(LEONIDA_SPIRV_TOOLS_DIR ${LEONIDA_SPIRV_AS} DIRECTORY)
       file(TO_NATIVE_PATH "${LEONIDA_SPIRV_TOOLS_DIR}" LEONIDA_SPIRV_TOOLS_NATIVE)
       set(LEONIDA_M15_FILES ${LEONIDA_M15_DIR}/spirv/index.json ${LEONIDA_M15_DIR}/fssm/vs_m15.fssm
-                            ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm)
+                            ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm ${LEONIDA_M15_DIR}/fssm/ps_m15_dual.fssm)
       add_custom_command(
         OUTPUT ${LEONIDA_M15_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M15_DIR}
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${LEONIDA_M15_DIR} vs_m15 ps_m15
+                ${LEONIDA_M15_DIR} vs_m15 ps_m15 ps_m15_dual
         DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m15.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m15.asm
-        COMMENT "Translating vs_m15 and ps_m15 for the translated draw test"
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m15_dual.asm
+        COMMENT "Translating vs_m15, ps_m15 and ps_m15_dual for the translated draw test"
         VERBATIM)
       add_executable(d3d12_translated_draw_test test/d3d12_translated_draw_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
                      ${LEONIDA_M15_FILES})
@@ -3036,6 +3037,11 @@ if(TARGET Vulkan::Headers)
       add_test(NAME xbox_derived_mask_restore COMMAND d3d12_translated_draw_test --derived-restore)
 
       set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # Dual-source blending (RT-DUAL-SOURCE-BLEND): with lazy pipelines (the default) and built at creation.
+      add_test(NAME d3d12_dual_source_draw COMMAND d3d12_translated_draw_test --dual-source)
+      add_test(NAME d3d12_dual_source_draw_eager COMMAND d3d12_translated_draw_test --dual-source)
+      set_tests_properties(d3d12_dual_source_draw d3d12_dual_source_draw_eager PROPERTIES SKIP_RETURN_CODE 77)
+      set_tests_properties(d3d12_dual_source_draw_eager PROPERTIES ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0")
 
       # The console's rectangle and quad lists (src/rect_list_geometry.h), through the same translated vs_m15 / ps_m15.
       # The files are d3d12_translated_draw_test's: a second target that lists them runs the translation a second
