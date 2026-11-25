@@ -28,8 +28,8 @@
 #include "d3d12_title_image_census.h"
 #include "d3d12_xs_native_pso.h"
 #include "dxgi_com.h"
-#include "xmem.h"  // rt::xmem::call_title_write: the console's value writes (list slots 71 and 72)
 #include "../src/arena_size.h"
+#include "../src/value_write_sink.h"
 #include "../src/arena_blocks.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -2721,21 +2721,31 @@ struct DeviceState {
         return true;
     }
 
-    // The console's value writes (list slots 71 and 72): where the bytes land once the submission that carried
-    // them has completed on the GPU. A VA in the arena is a default-heap buffer: the arena is host-visible, so its
-    // host mapping holds the bytes the GPU reads. Every other VA is a page of the title's own memory, and a placed
-    // buffer imports those same pages, so the CPU's write is the GPU's read.
-    bool write_value_bytes(std::uint64_t va, const void* bytes, std::uint32_t size) {
-        if (!va || !size || !bytes) return false;
-        if (va < arena.size) {
-            if (!arena.mapped) return false;
-            // A sparse resource's memory is bound by the sparse pass, not by the arena's mapping.
-            if (context && context->is_sparse_va(va)) return false;
+    // The console's value writes (list slots 71 and 72) whose address is an arena offset: a default-heap buffer.
+    // The arena is host-visible, so its host mapping holds the bytes the GPU reads. As in resolve_title_memory, an
+    // address below the arena's size is an arena address unless the title's own memory is there (arena_allocate
+    // keeps out of those ranges); an arena address is never stored to as a host address, so it is the arena's
+    // whether or not it can be written here (src/value_write_sink.h). Below the first offset the arena hands out are
+    // the null region, the zero page and the quad indices, which shaders read: a value there is refused, as is one
+    // past the end.
+    leonida::value_sink::Landing write_arena_value(std::uint64_t va, const void* bytes, unsigned size) {
+        using leonida::value_sink::Landing;
+        if (!arena.mapped || va >= arena.size) return Landing::elsewhere;
+        std::uint64_t title_lo = 0, title_hi = 0;
+        if (leonida::title_va_aliases().title_memory(va, title_lo, title_hi)) return Landing::elsewhere;
+        if (!bytes || !size || va < arena.first || size > arena.size - va) return Landing::refused;
+        // A sparse resource's memory is bound by the sparse pass, not by the arena's mapping.
+        if (context && context->is_sparse_va(va)) return Landing::refused;
+        // An aligned value in one store, so a reader never sees half of it.
+        if (size == 4 && !(va & 3))
+            std::atomic_ref(*reinterpret_cast<std::uint32_t*>(arena.mapped + va))
+                .store(*static_cast<const std::uint32_t*>(bytes), std::memory_order_relaxed);
+        else if (size == 8 && !(va & 7))
+            std::atomic_ref(*reinterpret_cast<std::uint64_t*>(arena.mapped + va))
+                .store(*static_cast<const std::uint64_t*>(bytes), std::memory_order_relaxed);
+        else
             std::memcpy(arena.mapped + va, bytes, size);
-            return true;
-        }
-        // A page of the title's own memory that the xmem shim owns: the host's own copy of the physical page.
-        return rt::xmem::call_title_write(reinterpret_cast<const void*>(va), bytes, size);
+        return Landing::landed;
     }
 
     struct ShaderVisibleHeap {
@@ -2951,6 +2961,7 @@ struct DeviceState {
         std::uint8_t* mapped = nullptr;
         VkDeviceAddress address = 0;
         VkDeviceSize size = 0;
+        VkDeviceSize first = 0;  // the first offset handed out: below it are the null region and kArenaReserved
         std::uint32_t memory_type = 0;
         std::mutex mutex;
         leonida::ArenaBlocks blocks;  // offset -> size, guarded by mutex (src/arena_blocks.h)
@@ -10901,12 +10912,11 @@ public:
         }
 #endif
         state_.context->set_depth_range_unrestricted(info.depth_range_unrestricted);
-        // The console's value writes (list slots 71 and 72): where the bytes land. The label path on main
-        // (src/vulkan_gpu_labels.h) writes a completed label into the title's memory; this sink is the runtime's
-        // own host-visible memory, the arena and the pages of the title's own memory the xmem shim owns.
-        leonida::label::set_value_sink(
-            [](void* device, std::uintptr_t address, const void* bytes, unsigned size) {
-                return static_cast<DeviceState*>(device)->write_value_bytes(address, bytes, size);
+        // The console's value writes (list slots 71 and 72) at an arena offset land in the arena
+        // (src/value_write_sink.h): the list values' pump and the GPU-label path ask this device before any host store.
+        leonida::value_sink::set_arena(
+            [](void* device, std::uint64_t address, const void* bytes, unsigned size) {
+                return static_cast<DeviceState*>(device)->write_arena_value(address, bytes, size);
             },
             &state_);
         if (info.physical && state_.format_properties) {
@@ -11411,6 +11421,7 @@ public:
             // another thread must not see half done.
             std::lock_guard lock(arena.mutex);
             arena.blocks.reset(null_bytes + kArenaReserved, arena.size);
+            arena.first = null_bytes + kArenaReserved;
             char check[2] = {};
             size_t check_length = 0;
             arena.check_all = getenv_s(&check_length, check, "LEONIDA_ARENA_CHECK") == 0 && check_length > 1 &&
@@ -11458,6 +11469,7 @@ public:
     }
 
     ~Device() override {
+        leonida::value_sink::clear_arena(&state_);  // first: it waits for a value write into the arena in progress
         raw_images_.clear();
         geometry_refresher_.reset();  // its refresh uses state_.geometry
         title_filler_.reset();        // its fills use the title-texture registry

@@ -6532,7 +6532,7 @@ const char* list_tail_slot_name(unsigned slot, unsigned char console_layout) {
     X(waits_relayed) X(gates_held) X(gates_met) X(gates_timed_out) X(cuts) X(cuts_deferred) X(cut_failures)  \
     X(gates_short) X(demotions) X(late_met) X(bundle_ops) X(releases) X(release_us) X(release_us_max)        \
     X(pass_us_max) X(release_stalls) X(remaps_now) X(remaps_deferred) X(remaps_failed) X(remap_wait_us_max)    \
-    X(stamps_gpu) X(stamps_cpu) X(labels_handed)
+    X(stamps_gpu) X(stamps_cpu) X(labels_handed) X(writes_arena) X(writes_title_pages)
 
 ListValueStats list_value_stats() {
     const list_values::Counters& c = list_values::counters();

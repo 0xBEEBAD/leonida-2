@@ -48,6 +48,7 @@
 #include "../src/title_page_watch.h"
 #include "../src/title_geometry_watch.h"
 #include "../src/title_va_alias.h"
+#include "../src/value_write_sink.h"
 
 namespace {
 
@@ -2681,16 +2682,25 @@ bool write_title_bytes(const void* address, const void* bytes, std::size_t size)
         std::size_t chunk = kPhysicalPageSize - offset;
         if (chunk > size - done) chunk = size - done;
         std::uint8_t* const host = static_cast<std::uint8_t*>(pages[index].section->scratch) + pages[index].offset;
-        std::memcpy(host + offset, static_cast<const std::uint8_t*>(bytes) + done, chunk);
+        // An aligned value in one store, as kernel_writes::store makes it: a title thread polling the same physical
+        // page through another view never reads half of it.
+        if (chunk == size && size == 4 && !(offset & 3))
+            std::atomic_ref(*reinterpret_cast<std::uint32_t*>(host + offset))
+                .store(*static_cast<const std::uint32_t*>(bytes), std::memory_order_relaxed);
+        else if (chunk == size && size == 8 && !(offset & 7))
+            std::atomic_ref(*reinterpret_cast<std::uint64_t*>(host + offset))
+                .store(*static_cast<const std::uint64_t*>(bytes), std::memory_order_relaxed);
+        else
+            std::memcpy(host + offset, static_cast<const std::uint8_t*>(bytes) + done, chunk);
         done += chunk;
     }
     return true;
 }
 
-// The D3D12 layer calls this through a pointer (xmem.h), so that the D3D12 library does not have to link the xmem
-// shim into every consumer of that library. A process that links the shim gets the real write; one that does not
-// keeps the console's value writes dropped.
-[[maybe_unused]] const bool g_title_write_set = (rt::xmem::title_write_fn = &write_title_bytes, true);
+// The D3D12 layer calls this through leonida::value_sink (src/value_write_sink.h), so that the D3D12 library does not
+// have to link the xmem shim into every consumer of that library. A process that links the shim gets the write; one
+// that does not drops a value write that its host store could not land.
+[[maybe_unused]] const bool g_title_write_set = (leonida::value_sink::set_title_pages(&write_title_bytes), true);
 
 // The label target of an address in the pages the title maps: those pages are the title's memory, and the
 // console's value writes name them (src/gpu_label_memory.h). The region is tracked on demand, one per page, so
