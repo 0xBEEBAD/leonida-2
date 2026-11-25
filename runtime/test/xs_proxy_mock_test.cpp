@@ -3675,7 +3675,29 @@ int check_presentation_wiring() {
 
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: presentation handler wiring (slots 78-81 and queue PresentX 30) passed\n", g_label);
+
+    // PresentX is one slot per layout, never both. A queue is in the older layout (PresentX at 30) until a fence
+    // reaches slot 16 or 17, which only the newer layout's Signal and Wait take; from then on PresentX is two slots
+    // later, at 32, and slot 30 is another console method there: S_OK, and the presenter is not called.
+    Mock* newer_mock = nullptr;
+    void* newer_device = make_device(newer_mock, 11, true);
+    void* newer_queue = make_queue(newer_device);
+    void* newer_fence = make_fence(newer_device);
+    EXPECT(newer_device && newer_queue && newer_fence);
+    MockPresenter np;
+    xs::PresentationHandler nh = h;
+    nh.context = &np;
+    EXPECT(xs::set_presentation_handler(newer_device, &nh));
+    EXPECT(hr_of(raw(newer_queue, 30, 1, 0x1000, 0x2000)) == S_OK && np.present_calls == 1);
+    EXPECT(hr_of(raw(newer_queue, 32, 1, 0x1000, 0x2000)) == S_OK && np.present_calls == 1);
+    EXPECT(hr_of(raw(newer_queue, 16, word(newer_fence), 1)) == S_OK);
+    EXPECT(hr_of(raw(newer_queue, 32, 2, 0x1000, 0x2000)) == S_OK && np.present_calls == 2 && np.last_planes == 2);
+    EXPECT(hr_of(raw(newer_queue, 30, 1, 0x1000, 0x2000)) == S_OK && np.present_calls == 2);
+    EXPECT(xs::set_presentation_handler(newer_device, nullptr));
+    EXPECT(release(newer_queue) == 0 && release(newer_fence) == 0);
+    EXPECT(release(newer_device) == 0 && newer_mock->refs == 0);
+    std::printf("%s: presentation handler wiring (slots 78-81 and queue PresentX 30, or 32 in the newer layout) "
+                "passed\n", g_label);
     return 0;
 }
 
