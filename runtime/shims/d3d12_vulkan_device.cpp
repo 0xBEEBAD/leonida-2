@@ -2841,11 +2841,15 @@ struct DeviceState {
         if (!base || !bytes) return 0;
         auto& aliases = leonida::title_va_aliases();
         constexpr uint64_t mask = (1ull << 48) - 1;
+        // A negative offset (a buffer of the layer's that the driver put below the arena) fits the 48 bits as the
+        // translated shaders read them, sign-extended (docs/design.md, "Heap-relative buffer device addresses"); only
+        // a buffer registered in gpu_backings or the geometry copies is ever accepted, so LEONIDA_IMPORT_BELOW_ARENA
+        // still decides alone whether title memory is imported there.
         const auto encodable = [&](uint64_t offset) {
             const uint64_t limit = signed_vsharp_offsets() ? mask / 2 : mask;
             if (offset <= limit) return bytes - 1 <= limit - offset;
-            return signed_vsharp_offsets() && offset >= UINT64_MAX - limit &&
-                   bytes - 1 <= limit - offset; // unsigned distance across zero
+            return offset >= UINT64_MAX - mask / 2 &&
+                   bytes - 1 <= mask / 2 - offset; // unsigned distance across zero
         };
         const auto backed = [&](uint64_t offset) {
             if (!encodable(offset)) return false;
@@ -2867,6 +2871,8 @@ struct DeviceState {
         uint64_t offset = base;
         if (signed_vsharp_offsets() && base <= mask && (base & (1ull << 47))) offset |= ~mask;
         if (backed(offset)) return offset;
+        // Read the other way: bit 47 as a sign, for a below-arena buffer's V# the layer wrote itself.
+        if (offset == base && base <= mask && (base & (1ull << 47)) && backed(base | ~mask)) return base | ~mask;
         if (try_geometry) {
             to = geometry_va(base, bytes, false);
             if (to && encodable(to)) return to;
