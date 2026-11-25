@@ -2571,7 +2571,7 @@ if(TARGET Vulkan::Headers)
 
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)
-    target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com)
+    target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_uav_clear_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_uav_clear_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_uav_clear COMMAND d3d12_uav_clear_test)
