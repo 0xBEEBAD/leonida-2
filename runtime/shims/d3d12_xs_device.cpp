@@ -2258,16 +2258,22 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         std::unique_lock<std::mutex> queue_order;
         if constexpr (K == ChildKind::queue && queue_slot_orders_work(Slot))
             queue_order = std::unique_lock(self->queue_order);
+        // CopyPageMappingsBatchX when something can remap: a hook (set_copy_page_mappings_hook) or xmem. Without
+        // either (a proxy compiled without xmem) the slot keeps the answer every unmodelled queue slot past the
+        // public chain gets below: console-only S_OK, or E_NOTIMPL on a queue whose presentation is managed outside.
         if constexpr (K == ChildKind::queue && Slot == kQueueCopyPageMappingsBatchX) {
-            const HRESULT hr = queue_copy_page_mappings(self, UINT(a1), reinterpret_cast<const xmem::PageBatch*>(a2),
-                                                        a3, UINT(a4), UINT(a5));
-            if (FAILED(hr)) {
-                static std::atomic<unsigned> failures{0};
-                if (failures.fetch_add(1, std::memory_order_relaxed) < 8)
-                    std::fprintf(stderr, "[rt] CopyPageMappingsBatchX failed: hr=0x%08x batches=%u pool=%p pages=%u flags=%u\n",
-                                 unsigned(hr), UINT(a1), reinterpret_cast<void*>(a3), UINT(a4), UINT(a5));
+            if (g_copy_page_mappings.load(std::memory_order_acquire) || rt::xmem::copy_page_mappings_fn) {
+                const HRESULT hr = queue_copy_page_mappings(
+                    self, UINT(a1), reinterpret_cast<const xmem::PageBatch*>(a2), a3, UINT(a4), UINT(a5));
+                if (FAILED(hr)) {
+                    static std::atomic<unsigned> failures{0};
+                    if (failures.fetch_add(1, std::memory_order_relaxed) < 8)
+                        std::fprintf(stderr, "[rt] CopyPageMappingsBatchX failed: hr=0x%08x batches=%u pool=%p "
+                                     "pages=%u flags=%u\n", unsigned(hr), UINT(a1), reinterpret_cast<void*>(a3),
+                                     UINT(a4), UINT(a5));
+                }
+                return hr_to_u64(d3d12_trace::result(child_trace_name<K>(Slot), hr));
             }
-            return hr_to_u64(d3d12_trace::result(child_trace_name<K>(Slot), hr));
         }
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
             d3d12_trace::record(child_trace_name<K>(Slot));
