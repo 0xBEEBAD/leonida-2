@@ -29,10 +29,12 @@
 //     shim must not throw into the title, so an element the DLL would reject is logged and skipped instead. The one
 //     rule a correct title meets every time is kept: the offline-statistics postbuild type (0x10) is never written.
 //   - Rehydration: RehydrateRaytracingAccelerationStructureBatched2X rebuilds each structure from the source
-//     geometry its description carries (BuildRaytracingAccelerationStructure) (docs/bvh.md §4a), in the leaf frame
-//     compressionParams gives. The GPU cannot read offline dehydrated console streams directly (docs/bvh.md §4/§4a),
+//     geometry its description carries (BuildRaytracingAccelerationStructure) (docs/bvh.md §4a). The leaf frame
+//     compressionParams gives is not applied yet: the leaves are built from the geometry as the description has it.
+//     The GPU cannot read offline dehydrated console streams directly (docs/bvh.md §4/§4a),
 //     so source-only streams without geometry are refused with E_NOTIMPL. The title passes Scratch = 0, so the shim
-//     supplies its own scratch buffer sized via GetRaytracingAccelerationStructurePrebuildInfo.
+//     supplies scratch: one buffer per call, sized via GetRaytracingAccelerationStructurePrebuildInfo, in which each
+//     element has a region of its own (rehydrate_scratch).
 //
 // The builder object belongs to the title, which allocates it with a size this file doesn't know, so nothing is
 // written into it: what the shim keeps (the device, the Morton option) lives in a table keyed by its address.
@@ -50,7 +52,11 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "d3d12_com.h"   // rt::d3d12::hold_until_reset
+#endif
 #include "d3d12_xs_device.h"
 #include "shims.h"
 #include "../src/xdxr_descs.h"
@@ -62,9 +68,17 @@ namespace xdxr = leonida::xdxr;
 struct BuilderState {
     ID3D12Device5* device = nullptr;   // a reference held for the builder's lifetime; null if it has no DXR methods
     bool morton64 = false;
-    ID3D12Resource* scratch = nullptr;
-    UINT64 scratch_size = 0;
+    // Rehydration scratch made for a list that cannot hold it (not the layer's own, rehydrate_scratch): kept until the
+    // builder is destroyed, since the shim never learns when the GPU is done with it.
+    std::vector<ID3D12Resource*> kept;
 };
+
+void release_state(BuilderState& state) {
+    for (ID3D12Resource* scratch : state.kept) scratch->Release();
+    state.kept.clear();
+    if (state.device) state.device->Release();
+    state.device = nullptr;
+}
 
 std::mutex g_mutex;
 std::unordered_map<const void*, BuilderState> g_builders;
@@ -112,9 +126,8 @@ void* builder_construct(void* self, void* device, bool) {
     }
     std::lock_guard<std::mutex> lock(g_mutex);
     BuilderState& state = g_builders[self];
-    if (state.scratch) state.scratch->Release();
-    if (state.device) state.device->Release();   // the same storage constructed twice without a destructor
-    state = BuilderState{device5, false, nullptr, 0};
+    release_state(state);   // the same storage constructed twice without a destructor
+    state = BuilderState{device5, false, {}};
     return self;
 }
 
@@ -123,8 +136,7 @@ void builder_destruct(void* self) {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_builders.find(self);
     if (it == g_builders.end()) return;
-    if (it->second.scratch) it->second.scratch->Release();
-    if (it->second.device) it->second.device->Release();
+    release_state(it->second);
     g_builders.erase(it);
 }
 
@@ -145,29 +157,21 @@ ID3D12Device5* builder_device(void* self) {
     return it->second.device;
 }
 
-// Ensures a scratch buffer is allocated and held by the builder state for rebuilds where the title
-// passes ScratchAccelerationStructureData = 0 (docs/xdxr.md §6).
-UINT64 builder_ensure_scratch(void* self, ID3D12Device5* device, UINT64 needed) {
-    if (!device) return 0;
-    UINT64 req = (needed < 65536) ? 65536 : ((needed + 65535) & ~65535ull);
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_builders.find(self);
-    if (it == g_builders.end()) return 0;
-    BuilderState& state = it->second;
-    if (state.scratch && state.scratch_size >= req) {
-        return state.scratch->GetGPUVirtualAddress();
-    }
-    if (state.scratch) {
-        state.scratch->Release();
-        state.scratch = nullptr;
-        state.scratch_size = 0;
-    }
+// Scratch for one RehydrateRaytracingAccelerationStructureBatched2X call, where the title passes
+// ScratchAccelerationStructureData = 0 (measured on the retail title): a new buffer of `bytes`, in which each element
+// that needs scratch has a region of its own. It is never shared with another call: two calls on one list (the title
+// puts no barrier between them for scratch it does not know of) or lists recorded on several threads never write the
+// same bytes. The list holds the buffer until it is Reset or released (rt::d3d12::hold_until_reset), and the layer
+// destroys it after the submission that used it has retired; a list that cannot hold it leaves it to the builder,
+// which keeps it until its destruction. Returns the buffer's GPU address, 0 when it could not be made.
+UINT64 rehydrate_scratch(void* self, ID3D12Device5* device, ID3D12GraphicsCommandList4* list, UINT64 bytes) {
+    if (!device || !bytes) return 0;
     D3D12_HEAP_PROPERTIES heap_props{};
     heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC res_desc{};
     res_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     res_desc.Alignment = 0;
-    res_desc.Width = req;
+    res_desc.Width = bytes;
     res_desc.Height = 1;
     res_desc.DepthOrArraySize = 1;
     res_desc.MipLevels = 1;
@@ -182,9 +186,32 @@ UINT64 builder_ensure_scratch(void* self, ID3D12Device5* device, UINT64 needed) 
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
         IID_PPV_ARGS(&res));
     if (FAILED(hr) || !res) return 0;
-    state.scratch = res;
-    state.scratch_size = req;
-    return res->GetGPUVirtualAddress();
+    const UINT64 va = res->GetGPUVirtualAddress();
+    bool held = false;
+#ifdef LEONIDA_VULKAN_DEVICE
+    held = rt::d3d12::hold_until_reset(list, res);
+#else
+    (void)list;
+#endif
+    if (held) {
+        res->Release();   // the list's reference keeps it from here
+        return va;
+    }
+    static std::atomic<bool> s_logged{false};
+    log_once(s_logged, "RehydrateRaytracingAccelerationStructureBatched2X: the list cannot hold its scratch; the "
+                       "builder keeps it until it is destroyed");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_builders.find(self);
+    if (it == g_builders.end()) {   // destroyed during the call: nothing is recorded with this scratch
+        res->Release();
+        return 0;
+    }
+    it->second.kept.push_back(res);
+    return va;
+}
+
+bool has_geometry(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS& inputs) {
+    return inputs.NumDescs > 0 && (inputs.pGeometryDescs || inputs.InstanceDescs);
 }
 
 void note_stream(const xdxr::StreamDesc& stream) {
@@ -291,25 +318,58 @@ HRESULT builder_rehydrate_batched2x(void* self, void* list, UINT count,
         return E_NOINTERFACE;
     }
     ID3D12Device5* device = builder_device(self);
+    // First pass: the descriptions as they are recorded, and for each element that builds without scratch of the
+    // title's a region of its own in one scratch buffer for the batch, at D3D12's acceleration-structure alignment
+    // (256 bytes, which the layer checks scratch addresses against). The XDXR recorder leaves the dependency between
+    // builds to the caller's barrier (src/xdxr_build.h, dispatch()) and the title puts none between the elements of
+    // a batch, so elements must not share scratch bytes. The first source-only element ends the batch (below).
+    constexpr UINT64 kAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
+    constexpr UINT64 kNoRegion = ~0ull;
+    std::vector<D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC> builds;
+    std::vector<UINT64> regions;
+    builds.reserve(count);
+    regions.reserve(count);
+    UINT64 scratch_bytes = 0;
+    bool source_only = false;
     for (UINT i = 0; i < count; ++i) {
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build = descs[i];
         const UINT64 src = source_data ? source_data[i] : build.SourceAccelerationStructureData;
-        // Do not copy source_data into SourceAccelerationStructureData: the layer reads that address
-        // for an update (d3d12_vulkan_device.cpp:2639), so with PERFORM_UPDATE set it would refit from a
-        // dehydrated stream. For fresh rebuild from geometry, clear SourceAccelerationStructureData unless
-        // PERFORM_UPDATE is set.
-        if (!(build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)) {
-            build.SourceAccelerationStructureData = 0;
+        // A rehydrate is a fresh build from geometry. The title sets SourceAccelerationStructureData to the
+        // dehydrated stream (measured on the retail title), and the layer reads that address for an update
+        // (d3d12_com.cpp, BuildRaytracingAccelerationStructure), so with PERFORM_UPDATE kept it would refit from
+        // the stream's bytes. Both are cleared.
+        if (build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) {
+            static std::atomic<bool> s_update_logged{false};
+            log_once(s_update_logged,
+                     "RehydrateRaytracingAccelerationStructureBatched2X: an element asks for PERFORM_UPDATE; it is "
+                     "built afresh from its geometry instead (the source is the dehydrated stream)");
+            build.Inputs.Flags &= ~D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
         }
-        if (build.Inputs.NumDescs > 0 && (build.Inputs.pGeometryDescs || build.Inputs.InstanceDescs)) {
-            // The title passes ScratchAccelerationStructureData = 0 (measured in docs/xdxr.md §6).
-            // Supply a scratch buffer to prevent d3d12_com.cpp from poisoning the command list.
+        build.SourceAccelerationStructureData = 0;
+        UINT64 region = kNoRegion;
+        if (has_geometry(build.Inputs)) {
             if (!build.ScratchAccelerationStructureData && device) {
                 D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild{};
                 device->GetRaytracingAccelerationStructurePrebuildInfo(&build.Inputs, &prebuild);
-                build.ScratchAccelerationStructureData =
-                    builder_ensure_scratch(self, device, prebuild.ScratchDataSizeInBytes);
+                const UINT64 size = prebuild.ScratchDataSizeInBytes ? prebuild.ScratchDataSizeInBytes : 1;
+                region = scratch_bytes;
+                scratch_bytes += (size + kAlign - 1) / kAlign * kAlign;
             }
+        } else if (src) {
+            source_only = true;
+            break;
+        }
+        builds.push_back(build);
+        regions.push_back(region);
+    }
+    const UINT64 scratch = scratch_bytes ? rehydrate_scratch(self, device, list4, scratch_bytes) : 0;
+
+    for (std::size_t i = 0; i < builds.size(); ++i) {
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build = builds[i];
+        if (has_geometry(build.Inputs)) {
+            // The title passes ScratchAccelerationStructureData = 0 (measured on the retail title).
+            // Supply a scratch region to prevent d3d12_com.cpp from poisoning the command list.
+            if (regions[i] != kNoRegion && scratch) build.ScratchAccelerationStructureData = scratch + regions[i];
             if (!build.ScratchAccelerationStructureData) {
                 static std::atomic<bool> s_scratch_logged{false};
                 log_once(s_scratch_logged,
@@ -318,19 +378,6 @@ HRESULT builder_rehydrate_batched2x(void* self, void* list, UINT count,
                 continue;
             }
             list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
-        } else if (src) {
-            // docs/bvh.md §4/§4a: the rehydrate source is a dehydrated console stream (element chunks,
-            // level table, box overrides), not a D3D12 serialized blob. On the XDXR path, a DESERIALIZE
-            // copy is replayed as a byte clone, so the destination would hold dehydrated bytes the GPU
-            // traversal shaders cannot read. Rehydration requires geometry reconstruction (docs/bvh.md §4a),
-            // in the leaf frame compressionParams gives. Refusing source-only rehydration without geometry.
-            static std::atomic<bool> s_source_only_logged{false};
-            log_once(s_source_only_logged,
-                     "RehydrateRaytracingAccelerationStructureBatched2X: source-only dehydrated stream without "
-                     "geometry cannot be deserialized as a D3D12 BLAS (docs/bvh.md §4/§4a); refusing element");
-            if (device) device->Release();
-            list4->Release();
-            return E_NOTIMPL;
         } else {
             static std::atomic<bool> s_empty_logged{false};
             log_once(s_empty_logged,
@@ -338,9 +385,20 @@ HRESULT builder_rehydrate_batched2x(void* self, void* list, UINT count,
                      "skipping empty structure");
         }
     }
+    if (source_only) {
+        // docs/bvh.md §4/§4a: the rehydrate source is a dehydrated console stream (element chunks,
+        // level table, box overrides), not a D3D12 serialized blob. On the XDXR path, a DESERIALIZE
+        // copy is replayed as a byte clone, so the destination would hold dehydrated bytes the GPU
+        // traversal shaders cannot read. Rehydration requires geometry reconstruction (docs/bvh.md §4a).
+        // Refusing source-only rehydration without geometry.
+        static std::atomic<bool> s_source_only_logged{false};
+        log_once(s_source_only_logged,
+                 "RehydrateRaytracingAccelerationStructureBatched2X: source-only dehydrated stream without "
+                 "geometry cannot be deserialized as a D3D12 BLAS (docs/bvh.md §4/§4a); refusing element");
+    }
     if (device) device->Release();
     list4->Release();
-    return S_OK;
+    return source_only ? E_NOTIMPL : S_OK;
 }
 
 constexpr const char kDll[] = "xboxbvhbuilder.dll";

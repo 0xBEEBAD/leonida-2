@@ -63,6 +63,25 @@ class XboxBvhBuilderRehydrateTest(unittest.TestCase):
         self.assertIn("rehydrate(builder, list.p, 1, &source_only_desc, &source) == E_NOTIMPL", test_content)
         self.assertIn("rehydrate(builder, list.p, 1, &empty_desc, nullptr) == S_OK", test_content)
         self.assertIn("rehydrate(builder, list.p, 1, &zero_scratch_desc, &source) == S_OK", test_content)
+        self.assertIn("rehydrate(builder, list.p, 2, pair_desc, nullptr) == S_OK", test_content)
+        # The zero-scratch build and both batch elements are read back and handed to check-build.
+        for name in ("shim_blas_rehydrated_zero_scratch", "shim_blas_rehydrated_batch"):
+            self.assertIn(name, test_content)
+
+    def test_scratch_regions_and_fresh_build(self):
+        content = XBOX_BVH_CPP.read_text(encoding="utf-8")
+        m = re.search(r"HRESULT builder_rehydrate_batched2x\([^)]*\)\s*\{(.*?)\n\}", content, re.DOTALL)
+        self.assertIsNotNone(m)
+        body = m.group(1)
+        # One scratch buffer per call, a region per element at the D3D12 alignment.
+        self.assertIn("rehydrate_scratch(self, device, list4, scratch_bytes)", body)
+        self.assertIn("D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT", body)
+        # The list holds the scratch until it is Reset; no buffer is kept or regrown on the builder.
+        self.assertIn("rt::d3d12::hold_until_reset(list, res)", content)
+        self.assertNotIn("builder_ensure_scratch", content)
+        # A rehydrate is a fresh build: the update flag and the source are cleared.
+        self.assertIn("&= ~D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE", body)
+        self.assertIn("build.SourceAccelerationStructureData = 0;", body)
 
 
 if __name__ == "__main__":
