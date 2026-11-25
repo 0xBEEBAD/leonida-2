@@ -221,7 +221,9 @@ int main() {
             extra.push_back(numbered(1000000 + k));
             set.insert_key(extra.back(), live.front().index);
         }
-        g_fail = Fail::device_local;
+        // Without a host memory type outside device-local memory (llvmpipe has one type for everything) refusing
+        // device-local memory refuses all of it, which is case 4 below, not this one: the table then grows normally.
+        if (host_type) g_fail = Fail::device_local;
         const unsigned refused_before = g_refused;
         EXPECT(frame());
         EXPECT(!set.last_flush_degraded() && set.table_buffer_bytes() >= table.size_bytes());
