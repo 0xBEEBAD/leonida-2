@@ -1298,15 +1298,15 @@ int main(int argc, char** argv) {
                     << "}\n";
                 std::ofstream(tmp_dir / "fspx_gfx" / "index.json")
                     << "{\n"
-                    << "  \"9e5ffd2c6c521c037cf57582a23f8ff7ba494a71ca63bb899357caee8baab850\": {\n"
+                    << "  \"3333333333333333333333333333333333333333333333333333333333333333\": {\n"
                     << "    \"stage\": \"ps\",\n"
-                    << "    \"spv\": \"9e5ffd2c6c521c03_libps_00842.spv\",\n"
-                    << "    \"fspx_code_sha256\": \"9e5ffd2c6c521c037cf57582a23f8ff7ba494a71ca63bb899357caee8baab850\"\n"
+                    << "    \"spv\": \"3333333333333333_libps_00001.spv\",\n"
+                    << "    \"fspx_code_sha256\": \"3333333333333333333333333333333333333333333333333333333333333333\"\n"
                     << "  },\n"
-                    << "  \"160fbe4368fb1a6349a2683bf72817f183d780c42a35cf25c86560917228061a\": {\n"
+                    << "  \"4444444444444444444444444444444444444444444444444444444444444444\": {\n"
                     << "    \"stage\": \"vs\",\n"
-                    << "    \"spv\": \"160fbe4368fb1a63_libvs_00843.spv\",\n"
-                    << "    \"fspx_code_sha256\": \"160fbe4368fb1a6349a2683bf72817f183d780c42a35cf25c86560917228061a\"\n"
+                    << "    \"spv\": \"4444444444444444_libvs_00002.spv\",\n"
+                    << "    \"fspx_code_sha256\": \"4444444444444444444444444444444444444444444444444444444444444444\"\n"
                     << "  }\n"
                     << "}\n";
                 std::ofstream(tmp_dir / "bvh" / "index.json")
@@ -1325,12 +1325,12 @@ int main(int argc, char** argv) {
             check(lib.fspx_gfx_size() == 2, "ShaderLibrary::fspx_gfx_size() counts only fspx_gfx/ entries");
             check(lib.bvh_size() == 1, "ShaderLibrary::bvh_size() counts only bvh/ entries");
             const auto* ps_entry =
-                lib.find_fspx_by_code("9e5ffd2c6c521c037cf57582a23f8ff7ba494a71ca63bb899357caee8baab850");
+                lib.find_fspx_by_code("3333333333333333333333333333333333333333333333333333333333333333");
             const auto* vs_entry =
-                lib.find_fspx_by_code("160fbe4368fb1a6349a2683bf72817f183d780c42a35cf25c86560917228061a");
-            check(ps_entry && ps_entry->stage == "ps" && ps_entry->spv_file == "fspx_gfx/9e5ffd2c6c521c03_libps_00842.spv",
+                lib.find_fspx_by_code("4444444444444444444444444444444444444444444444444444444444444444");
+            check(ps_entry && ps_entry->stage == "ps" && ps_entry->spv_file == "fspx_gfx/3333333333333333_libps_00001.spv",
                   "fspx_gfx PS entry preserves stage and its spv filename, under the folder prefix");
-            check(vs_entry && vs_entry->stage == "vs" && vs_entry->spv_file == "fspx_gfx/160fbe4368fb1a63_libvs_00843.spv",
+            check(vs_entry && vs_entry->stage == "vs" && vs_entry->spv_file == "fspx_gfx/4444444444444444_libvs_00002.spv",
                   "fspx_gfx VS entry preserves stage and its spv filename, under the folder prefix");
             std::filesystem::remove_all(tmp_dir, ec);
         }
