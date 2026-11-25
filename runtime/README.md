@@ -269,7 +269,11 @@ Current limits, by design:
   depth views, committed resources and copies (uploads, readbacks, BC textures), root signatures, graphics and
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
   missing. `LEONIDA_DEVICE_FAULT=1` enables a stderr report with supported Vulkan fault information and queue
-  checkpoints on the first observed device loss.
+  checkpoints on the first observed device loss. On NVIDIA, a build configured with
+  `-DLEONIDA_AFTERMATH_SDK=<unpacked Nsight Aftermath SDK>` also takes `LEONIDA_AFTERMATH=1`: GPU crash dumps
+  (`.nv-gpudmp`, plus `.nvdbg` shader debug info) in `LEONIDA_AFTERMATH_DIR`, and a decoded summary on stderr that
+  names the faulting shader by its library name, the page fault and the active shaders (`src/vulkan_aftermath.h`).
+  The SDK is not part of the repository; its DLL is loaded at run time (`LEONIDA_AFTERMATH_DLL` overrides the path).
 
 - `dstorage_xs.dll` / `xcrdapi.dll` / `dstorage.dll` — `DStorageGetFactory`: the console DirectStorage API
   (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
