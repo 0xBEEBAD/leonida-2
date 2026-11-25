@@ -23,7 +23,6 @@
 #pragma once
 
 #include <windows.h>
-#include <set>
 
 #include <atomic>
 #include <cerrno>
@@ -31,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <mutex>
 #include <string>
 
@@ -310,16 +310,17 @@ inline bool readable_byte(const unsigned char* p) {
 
 // The int3 (0xCC) a breakpoint stopped at, or null. Windows reports Rip and ExceptionAddress on the 0xCC byte, and so
 // did Wine 11.22 (Staging) in a probe here; Spacecer2's Wine 11.22 boot reported both one byte past it (old upstream
-// 7599). The byte at Rip is tried first, so the Windows form is handled as before. In a run of 0xCC bytes the second
-// form can name the next int3, which is then stepped over with it.
+// 7599). The candidate taken is the one ExceptionAddress agrees with (on it, or one byte before it), the byte at Rip
+// first, so the Windows form is handled as before. With Rip one past the 0xCC and ExceptionAddress on it, a run of
+// 0xCC bytes still gives the int3 ExceptionAddress names, not the one at Rip. When both name the byte after the int3
+// (the second form) and that byte is another 0xCC, the next int3 is taken, and stepped over with this one.
 inline const unsigned char* int3_from(const EXCEPTION_RECORD& r, const CONTEXT& c) {
     const auto* rip = reinterpret_cast<const unsigned char*>(c.Rip);
     const auto* address = static_cast<const unsigned char*>(r.ExceptionAddress);
-    const unsigned char* at = nullptr;
-    if (readable_byte(rip) && *rip == 0xCC) at = rip;
-    else if (rip && readable_byte(rip - 1) && rip[-1] == 0xCC) at = rip - 1;
-    if (!at || (address != at && address != at + 1)) return nullptr;
-    return at;
+    if (!rip) return nullptr;
+    for (const unsigned char* at : {rip, rip - 1})
+        if ((address == at || address == at + 1) && readable_byte(at) && *at == 0xCC) return at;
+    return nullptr;
 }
 
 // With LEONIDA_SKIP_INT3, steps over an int3: Rip ends one byte past the 0xCC in either form.

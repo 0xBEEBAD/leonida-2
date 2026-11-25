@@ -142,6 +142,21 @@ void case_wine() {
     check(log.find(event_at(at)) != std::string::npos, "the event names the 0xCC byte, not the byte after it");
 }
 
+// nop, int3, int3, nop: a run of int3 padding.
+alignas(16) unsigned char g_padding[4] = {0x90, 0xCC, 0xCC, 0x90};
+
+void case_padding() {
+    SetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", L"1");
+    Trace trace;
+    const unsigned char* at = g_padding + 1;
+    Breakpoint mixed(at, at + 1);  // ExceptionAddress on the first 0xCC, Rip on the second
+    check(mixed.skip() && mixed.rip_is(at + 1),
+          "ExceptionAddress on an int3 followed by another, Rip past it: the int3 ExceptionAddress names is skipped");
+    const std::string log = trace.close_and_read();
+    check(count(log, "\"kind\":\"int3_skipped\"") == 1, "one int3_skipped event");
+    check(log.find(event_at(at)) != std::string::npos, "the event names the int3 ExceptionAddress names");
+}
+
 void case_null() {
     SetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", L"1");
     Trace trace;
@@ -180,7 +195,8 @@ struct Case {
     void (*run)();
 };
 constexpr Case kCases[] = {{"real", case_real}, {"windows", case_windows}, {"wine", case_wine},
-                           {"null", case_null}, {"init", case_init},       {"off", case_off}};
+                           {"padding", case_padding}, {"null", case_null}, {"init", case_init},
+                           {"off", case_off}};
 
 // Runs `this-exe --case NAME` and returns its exit code.
 DWORD run_child(const char* name) {
