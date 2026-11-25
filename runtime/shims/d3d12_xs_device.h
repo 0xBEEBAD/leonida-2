@@ -347,8 +347,16 @@ inline constexpr unsigned console_to_pc_list_slot(unsigned slot) {
 }
 
 
-// Number of live references on a device proxy. Test helper for the heap's GetDevice/lifetime checks.
+// Number of live references on a device proxy. Test helper for the heap's GetDevice/lifetime checks. References the
+// layer under the proxy holds for background work of its own are waited out first (set_reference_settler), so the
+// count is the callers'.
 unsigned long device_proxy_ref_count(const void* device);
+
+// The layer under the proxy may keep an object, and through it the device, for work it started itself in the
+// background: the Vulkan layer's pipeline builds hold their pipeline state until the worker has run them. `settle`
+// returns when no such work is pending. device_proxy_ref_count calls it before it reads the count; nothing else does.
+using ReferenceSettler = void (*)();
+void set_reference_settler(ReferenceSettler settle);
 
 // Per-slot call counters and first-call flags for the device and heap proxies. Slot 0 also counts the
 // QueryInterface call made while a proxy is created, so tests reset the counters after creation.

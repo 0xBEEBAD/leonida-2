@@ -8766,6 +8766,9 @@ public:
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
         rt::d3d12_xs::set_console_descriptor_heap_handler(&rt::d3d12::create_console_descriptor_heap);
+        // A queued pipeline build holds its PipelineState, which holds the device: a reference count read while the
+        // worker still has a warm-up to run is one too high. The proxy's count waits for the pool.
+        rt::d3d12_xs::set_reference_settler([] { PipelineCompiler::instance().wait_idle(); });
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);

@@ -105,6 +105,12 @@ public:
         std::lock_guard lock(mutex_);
         return !jobs_.empty() && jobs_.begin()->first != SIZE_MAX;
     }
+    // Returns when no job is queued or running. A job owns its pipeline state, and through it the device, until it
+    // finishes; a caller that counts references (rt::d3d12_xs::device_proxy_ref_count) waits here first.
+    void wait_idle() {
+        std::unique_lock wait(mutex_);
+        idle_.wait(wait, [this] { return jobs_.empty() && !running_; });
+    }
 private:
     void run() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -116,12 +122,21 @@ private:
                 auto first = jobs_.begin();
                 job = std::move(first->second);
                 jobs_.erase(first);
+                running_ = true;
             }
             job();
+            job = nullptr;  // what the job captured goes before the pool reports itself idle
+            {
+                std::lock_guard done(mutex_);
+                running_ = false;
+            }
+            idle_.notify_all();
         }
     }
     std::mutex mutex_;
     std::condition_variable wake_;
+    std::condition_variable idle_;
+    bool running_ = false;
     std::multimap<std::size_t, std::function<void()>> jobs_;
     bool started_ = false;
 };

@@ -80,6 +80,7 @@ static_assert(kMaxSlots > 133, "the proxy table must cover the slots the retail 
 
 // Set by the Vulkan device behind the proxy; slot 14 uses it for a console-extended CreateDescriptorHeap.
 std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
+std::atomic<ReferenceSettler> g_reference_settler{nullptr};
 // Commits the title's pages before slot 133 imports them or slot 14 checks them (set_placed_at_va_pages_hook; gta6rt
 // registers xmem's commit_physical_range, which leaves memory other than mapped physical pages alone).
 std::atomic<PlacedAtVaPagesHook> g_placed_at_va_pages{nullptr};
@@ -4837,6 +4838,10 @@ void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
     g_console_descriptor_heap.store(handler, std::memory_order_release);
 }
 
+void set_reference_settler(ReferenceSettler settle) {
+    g_reference_settler.store(settle, std::memory_order_release);
+}
+
 ID3D12Device* device_proxy_real_device(const void* device) {
     if (!is_device_proxy(device)) return nullptr;
     return static_cast<const DeviceProxy*>(device)->real;
@@ -5008,6 +5013,7 @@ bool device_slot_first_call_seen(unsigned slot) {
 
 unsigned long device_proxy_ref_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
+    if (const ReferenceSettler settle = g_reference_settler.load(std::memory_order_acquire)) settle();
     return static_cast<const DeviceProxy*>(device)->refs.load(std::memory_order_relaxed);
 }
 
