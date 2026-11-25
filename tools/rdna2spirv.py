@@ -17574,12 +17574,12 @@ def restore_mix_inline_literal(ins, raw, literal):
 
 def skipped_form(ins, blob, at):
     """Whether rdna2_decode's instruction at blob offset ``at`` is one of the forms llvm-mc skips that
-    restore_vcc_tuples takes from the blob: a tuple that reaches vcc (SGPRs 106 and 107), a VOPC f32 compare in DPP
-    form (docs/design.md, "DPP on a VOPC compare"), or the measured v_dot4_i32_i8 with op_sel 2 / op_sel_hi 5 and no
+    restore_vcc_tuples takes from the blob: a tuple that reaches vcc (SGPRs 106 and 107), a VOPC f32 compare (v_cmp or
+    v_cmpx) in DPP form (docs/design.md, "DPP on a VOPC compare"), or the measured v_dot4_i32_i8 with op_sel 2 / op_sel_hi 5 and no
     clamp or neg, all reserved bits clear (tedin7, upstream PR #281; docs/fspx.md). shader_disasm.py prints the last
     two itself; this covers a listing made without that pass (#984)."""
     op = ins["op"]
-    if op.startswith("v_cmp_") and op.endswith("_f32_dpp"):
+    if op.startswith(("v_cmp_", "v_cmpx_")) and op.endswith("_f32_dpp"):
         return True
     if op == "v_dot4_i32_i8" and int.from_bytes(blob[at:at + 4], "little") >> 8 == 0xCC1650 and blob[at + 7] >> 3 == 1:
         return True
