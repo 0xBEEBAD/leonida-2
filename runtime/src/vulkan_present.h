@@ -28,6 +28,7 @@
 #include "vulkan_backend.h"
 #include "vulkan_present_compose.h"
 #include "fsdraw_probe.h"  // LOCAL DIAGNOSTIC
+#include "local_diagnostics.h"
 
 // Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
 #if defined(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
@@ -405,7 +406,7 @@ public:
         if (source_rect) pending.rect = *source_rect;
         if (planes) pending.planes = *planes;
         deferred_.push_back(pending);
-        if (const std::uint64_t n = ++probe_deferred_; n <= 8 || n % 600 == 0)  // LOCAL DIAGNOSTIC
+        if (const std::uint64_t n = ++probe_deferred_; local_diagnostics() && (n <= 8 || n % 600 == 0))
             std::fprintf(stderr, "[rt] present-probe: present #%llu queued behind held work (%zu queued)\n",
                          static_cast<unsigned long long>(n), deferred_.size());
         last_tore_ = false;
@@ -759,7 +760,7 @@ private:
             }
         }
         if (id && !resolved) ++probe_unresolved_;
-        if (n <= 6 || n % 600 == 0)
+        if (local_diagnostics() && (n <= 6 || n % 600 == 0))
             std::fprintf(stderr,
                          "[rt] present-probe: submit #%llu path %s source 0x%llx resolved %d image %p format %d %ux%u "
                          "mips %u layers %u samples %u sampled %d (blit %llu compose %llu blank %llu unresolved %llu)\n",

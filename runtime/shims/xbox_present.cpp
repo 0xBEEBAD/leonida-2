@@ -150,10 +150,10 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
     return d3d12_trace::result("XboxPresentation::PresentX", present_x(plane_count, planes, params));
 }
 
-// LOCAL DIAGNOSTIC (not for upstream): which check refuses PresentX, with its HRESULT.
+// LOCAL DIAGNOSTIC (LEONIDA_LOCAL_DIAGNOSTICS=1): which check refuses PresentX, with its HRESULT.
 static HRESULT present_diag(int line, HRESULT hr) {
     static std::atomic<int> logged{0};
-    if (FAILED(hr) && logged.fetch_add(1) < 40)
+    if (FAILED(hr) && leonida::local_diagnostics() && logged.fetch_add(1) < 40)
         std::fprintf(stderr, "[rt] PresentX diag: refused at line %d hr 0x%08lx\n", line, static_cast<unsigned long>(hr));
     return hr;
 }
@@ -161,7 +161,7 @@ static HRESULT present_diag(int line, HRESULT hr) {
 HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlaneParameters* planes,
                                     const XboxPresentParameters* params) {
     std::lock_guard serialise(present_mutex_);
-    {
+    if (leonida::local_diagnostics()) {
         static std::atomic<int> dumped{0};
         if (dumped.fetch_add(1) < 6) {
             std::fprintf(stderr, "[rt] PresentX diag: planes %u params %p suspended %d registered %d\n", plane_count,

@@ -8,6 +8,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/title_va_alias.h"
 #include "../src/fsdraw_probe.h"  // LOCAL DIAGNOSTIC
+#include "../src/local_diagnostics.h"
 
 #include <algorithm>
 #include <array>
@@ -767,7 +768,8 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
-        {  // LOCAL DIAGNOSTIC: what the title clears, and with which colour
+        // LOCAL DIAGNOSTIC: what the title clears, and with which colour
+        if (leonida::local_diagnostics()) {
             static std::atomic<std::uint64_t> clears{0};
             const std::uint64_t n = ++clears;
             if (n <= 6 || n % 600 == 0) {
@@ -1684,7 +1686,8 @@ private:
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or every bound viewport empty: D3D12 rasterizes
         // nothing, and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
-        {  // LOCAL DIAGNOSTIC: the state each draw is recorded with
+        // LOCAL DIAGNOSTIC: the state each draw is recorded with
+        if (leonida::local_diagnostics()) {
             static std::atomic<std::uint64_t> draws{0}, skipped{0};
             const bool skip = !any_nonempty_viewport();
             const std::uint64_t n = ++draws, k = skip ? ++skipped : skipped.load();
@@ -2008,7 +2011,8 @@ public:
                 if (origin != table)
                     leonida::fsdraw::poke_cb(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(origin)));
             }
-            {  // LOCAL DIAGNOSTIC (fsdraw): what the bound tables hold when the lists are submitted
+            // LOCAL DIAGNOSTIC (fsdraw): what the bound tables hold when the lists are submitted
+            if (leonida::local_diagnostics()) {
                 static std::atomic<std::uint64_t> submits{0};
                 const std::uint64_t n = tables.empty() ? 0 : ++submits;
                 if (n && (n <= 6 || n % 300 == 0)) {

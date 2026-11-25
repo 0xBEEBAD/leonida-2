@@ -53,6 +53,7 @@
 #include "../src/vulkan13_features.h"
 #include "d3d12_compute_input_probe.h"
 #include "../src/fsdraw_probe.h"  // LOCAL DIAGNOSTIC
+#include "../src/local_diagnostics.h"
 #include "../src/mem_probe.h"  // LOCAL DIAGNOSTIC
 
 #include <vulkan/vulkan_win32.h>
@@ -2950,6 +2951,7 @@ struct DeviceState {
     }
     // Before a submission, after the console heaps' copies are refreshed: the whole heap, now and then.
     void probe_census() {
+        if (!leonida::local_diagnostics()) return;
         const std::uint64_t n = ++probe_submissions;
         if (n != 1 && n != 64 && n != 512 && n != 2048 && n % 4096) return;
         std::lock_guard lock(probe_mutex);
@@ -7177,7 +7179,8 @@ public:
             code_base_ = offset;
             graphics_.code_base = offset;
         }
-        {  // LOCAL DIAGNOSTIC: what this pipeline is, for the fsdraw probe's draw lines
+        // LOCAL DIAGNOSTIC: what this pipeline is, for the fsdraw probe's draw lines
+        if (leonida::local_diagnostics()) {
             const auto& rt0 = desc.BlendState.RenderTarget[0];
             char text[640];
             std::snprintf(text, sizeof text,
@@ -11232,7 +11235,8 @@ public:
             words[3] = 0x0002403Cu;
         }
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        {  // LOCAL DIAGNOSTIC: the CBVs the title makes, where they go and what V# they get
+        // LOCAL DIAGNOSTIC: the CBVs the title makes, where they go and what V# they get
+        if (leonida::local_diagnostics()) {
             static std::atomic<std::uint64_t> made{0};
             const std::uint64_t n = ++made;
             if (n <= 8 || n % 600 == 0 || n % 600 == 1)
@@ -11429,7 +11433,8 @@ public:
             }
         }
         write_image_descriptor(*r, view, destination, false);
-        {  // LOCAL DIAGNOSTIC: the texture SRVs the title makes, where they go and the T# they get
+        // LOCAL DIAGNOSTIC: the texture SRVs the title makes, where they go and the T# they get
+        if (leonida::local_diagnostics()) {
             static std::atomic<std::uint64_t> made{0};
             const std::uint64_t n = ++made;
             if (n <= 8 || n % 600 == 0 || n % 600 == 1) {

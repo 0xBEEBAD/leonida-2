@@ -31,6 +31,7 @@
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
 #include "../src/frame_pacer.h"
+#include "../src/local_diagnostics.h"
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 #include "../src/title_page_watch.h"  // leonida::kernel_writes for slot 14
@@ -2888,7 +2889,8 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
             const auto stride = self->real->GetDescriptorHandleIncrementSize(desc->Type);
-            {  // LOCAL DIAGNOSTIC: what the title passes on slot 14, and whether the console path takes it
+            // LOCAL DIAGNOSTIC: what the title passes on slot 14, and whether the console path takes it
+            if (leonida::local_diagnostics()) {
                 static std::atomic<int> logged{0};
                 if (logged.fetch_add(1) < 32)
                     std::fprintf(stderr, "[rt] heap-probe: slot 14 type %d num %u flags 0x%x console va 0x%llx size %llu "
@@ -2927,7 +2929,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     }
     if (!console_extended)
         hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
-    {  // LOCAL DIAGNOSTIC
+    if (leonida::local_diagnostics()) {  // LOCAL DIAGNOSTIC
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 32)
             std::fprintf(stderr, "[rt] heap-probe: slot 14 -> %s heap, hr 0x%08lx\n", console_extended ? "CONSOLE" : "pc",
@@ -2992,7 +2994,8 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 
     hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
                            custom_cpu_start ? free_fn : nullptr);
-    {  // LOCAL DIAGNOSTIC (fsdraw): which CPU start the title gets for this heap
+    // LOCAL DIAGNOSTIC (fsdraw): which CPU start the title gets for this heap
+    if (leonida::local_diagnostics()) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 32)
             std::fprintf(stderr, "[rt] fsdraw: heap type %d num %u flags 0x%x console %d: title CPU start 0x%llx (custom "
@@ -3097,7 +3100,8 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D1
     const D3D12_CPU_DESCRIPTOR_HANDLE dest = translate_cpu_handle(self, dest_start);
     const D3D12_CPU_DESCRIPTOR_HANDLE src = translate_cpu_handle(self, src_start);
     self->real->CopyDescriptorsSimple(num_descriptors, dest, src, type);
-    {  // LOCAL DIAGNOSTIC (fsdraw): where the title copies its descriptors, and what lands there
+    // LOCAL DIAGNOSTIC (fsdraw): where the title copies its descriptors, and what lands there
+    if (leonida::local_diagnostics()) {
         static std::atomic<std::uint64_t> copies{0};
         const std::uint64_t n = ++copies;
         if (n <= 24 || n % 600 == 0 || n % 600 == 1) {
