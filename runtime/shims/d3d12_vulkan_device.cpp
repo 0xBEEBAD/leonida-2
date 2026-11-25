@@ -1448,7 +1448,17 @@ constexpr Format rgb96_format(VkFormat wide, bool typeless = false) {
 // (and asserts when GetResourceAllocationInfo calls the description invalid). No D16S8 on the PC GPUs in reach, and
 // the PC has no such DXGI format: they are the D24_UNORM_S8_UINT family here, whose planes are viewed the same way
 // (depth as UNORM in X, stencil as UINT). Every entry point that takes a format from the title goes through this.
-constexpr DXGI_FORMAT pc_format(DXGI_FORMAT format) {
+//
+// That holds where the GPU has D24_UNORM_S8_UINT as a depth-stencil attachment. Where it has none (AMD), the D24S8
+// family would itself be stored as D32_SFLOAT_S8_UINT, a third precision the title did not ask for; there the
+// family is kept as it is and takes the D16/S8 path (Format::xbox_depth16_stencil8: D16_UNORM_S8_UINT where the GPU
+// has it, else the first usable of D32_SFLOAT_S8_UINT and D24_UNORM_S8_UINT, with clears and stores quantised to
+// 16 bits), which is the path an AMD card was measured on past the title's first frames. The device decides when it
+// is created; LEONIDA_CONSOLE_D16S8=native or =d24 chooses for every GPU. Process-wide, like the title's one device.
+std::atomic<bool> g_console_d16s8_native{false};
+inline bool console_d16s8_native() { return g_console_d16s8_native.load(std::memory_order_relaxed); }
+inline DXGI_FORMAT pc_format(DXGI_FORMAT format) {
+    if (console_d16s8_native()) return format;
     switch (static_cast<int>(format)) {
     case 118: return DXGI_FORMAT_D24_UNORM_S8_UINT;
     case 119: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
@@ -9543,6 +9553,23 @@ public:
             state_.probe_uint_backed_uav(VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM);
         state_.bgra8_srgb_uav_emulated =
             state_.probe_uint_backed_uav(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM);
+        {
+            // The console's D16S8 family (pc_format): as D24S8 where the GPU has that format, as itself where not.
+            const char* asked = std::getenv("LEONIDA_CONSOLE_D16S8");
+            const bool d24 = state_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT);
+            const bool native = asked && std::strcmp(asked, "native") == 0   ? true
+                                : asked && std::strcmp(asked, "d24") == 0    ? false
+                                                                             : !d24;
+            g_console_d16s8_native.store(native, std::memory_order_relaxed);
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12: console D16S8 textures are %s (D24_UNORM_S8_UINT attachments: %s, "
+                             "D16_UNORM_S8_UINT: %s%s)\n",
+                             native ? "kept as D16+S8" : "made as D24S8", d24 ? "yes" : "no",
+                             state_.depth_usable(VK_FORMAT_D16_UNORM_S8_UINT) ? "yes" : "no",
+                             asked ? ", LEONIDA_CONSOLE_D16S8 set" : "");
+        }
         if (console_format_stand_ins()) {
             state_.r9g9b9e5_target_stand_in = !state_.color_attachment_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) &&
                                               state_.color_attachment_usable(VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
