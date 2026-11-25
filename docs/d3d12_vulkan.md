@@ -2392,7 +2392,11 @@ Pipeline creation:
   A build that takes at least `LEONIDA_HEAVY_PIPELINE_CACHE_MS` (500 by default) marks the heavy cache for writing.
   A thread of its own writes it whole: 3 s after the newest slow build, and no later than 20 s after the first unwritten
   one, through the same staging file and rename as the session cache. A crash therefore loses at most the last 20 s
-  of slow builds, and the next launch starts with the rest. At device teardown the thread stops, and the cache is
+  of slow builds, and the next launch starts with the rest. A write that fails, or whose
+  `vkGetPipelineCacheData` returns anything but `VK_SUCCESS` (`VK_INCOMPLETE` means the cache grew after the size
+  query, so the blob is truncated), leaves the previous file in place and the cache dirty: it is tried again 5 s
+  later, the delay doubling with each failure in a row up to 2 min, so the cache is not left unsaved until teardown
+  and a write that keeps failing does not spin. At device teardown the thread stops, and the cache is
   written if any build went into it. Fast builds are kept that way: without an offline seed every build is a miss,
   so they no longer reach `pipeline_cache.session.bin`. `LEONIDA_HEAVY_PIPELINE_CACHE_MS=0` turns the heavy cache off, and with it the
   `pipelineCreationCacheControl` feature unless `LEONIDA_PIPELINE_COMPILE=cache-only` asks for it. A cache-only create

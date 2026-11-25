@@ -1530,8 +1530,10 @@ bool save_heavy_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevic
     }
     auto written = size;
     const VkResult result = vk.vkGetPipelineCacheData(device, cache, &written, staging.data);
-    const bool ok = (result == VK_SUCCESS || result == VK_INCOMPLETE) &&
-                    written > sizeof(VkPipelineCacheHeaderVersionOne) && staging.publish(path, written);
+    // VK_INCOMPLETE means the cache grew after the size query and the blob is a truncated snapshot; it must not
+    // replace a complete file. The writer tries again later with a fresh size.
+    const bool ok = result == VK_SUCCESS && written > sizeof(VkPipelineCacheHeaderVersionOne) && written <= size &&
+                    staging.publish(path, written);
     if (ok)
         std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.heavy.bin in %.1f s (%llu slow builds "
                              "and %llu other builds past the offline cache so far)\n",
@@ -2184,10 +2186,12 @@ struct DeviceState {
             }
             const std::uint64_t generation = heavy_schedule.generation();
             lock.unlock();
-            save_heavy_pipeline_cache(context->vk, info.device, heavy_cache_handle, heavy_compiles.load(),
-                                      heavy_hits.load());
+            const bool saved = save_heavy_pipeline_cache(context->vk, info.device, heavy_cache_handle,
+                                                         heavy_compiles.load(), heavy_hits.load());
             lock.lock();
-            heavy_schedule.written(generation, now);
+            // A failed write leaves the cache dirty: it is tried again after a growing delay, not only at teardown.
+            if (saved) heavy_schedule.written(generation, now);
+            else heavy_schedule.failed(now);
         }
     }
 

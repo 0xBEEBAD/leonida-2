@@ -69,9 +69,41 @@ static int test_schedule() {
     return 0;
 }
 
+static int test_failed_write() {
+    using S = heavy::WriteSchedule;
+    S s;
+    s.note_heavy(1000);
+    std::uint64_t now = 1000 + S::settle_ms;
+    CHECK(s.due(now));
+    // A failed write keeps the cache dirty and waits out the backoff before the next try.
+    s.failed(now);
+    CHECK(s.dirty() && s.failures() == 1);
+    CHECK(!s.due(now) && !s.due(now + S::retry_ms - 1) && s.due(now + S::retry_ms));
+    // Failures in a row double the delay up to the cap, so a write that keeps failing does not spin.
+    std::uint64_t expect = S::retry_ms;
+    for (int i = 0; i < 12; ++i) {
+        now = s.due_ms();
+        s.failed(now);
+        expect = expect * 2 > S::max_retry_ms ? S::max_retry_ms : expect * 2;
+        CHECK(s.due_ms() == now + expect);
+    }
+    CHECK(s.due_ms() - now == S::max_retry_ms);
+    // A heavy compile during the backoff does not bring the retry forward.
+    s.note_heavy(now + 1);
+    CHECK(!s.due(now + S::settle_ms + 1) && s.due(now + S::max_retry_ms));
+    // A successful write clears the dirty flag and the backoff.
+    now = s.due_ms();
+    s.written(s.generation(), now);
+    CHECK(!s.dirty() && s.failures() == 0);
+    s.note_heavy(now + 10);
+    CHECK(s.due(now + 10 + S::settle_ms));
+    return 0;
+}
+
 int main() {
     if (const int r = test_threshold()) return r;
     if (const int r = test_schedule()) return r;
-    std::printf("heavy_pipeline_cache: threshold parsing and the write schedule\n");
+    if (const int r = test_failed_write()) return r;
+    std::printf("heavy_pipeline_cache: threshold parsing, the write schedule and retries after a failed write\n");
     return 0;
 }

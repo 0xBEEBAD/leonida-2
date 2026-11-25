@@ -40,11 +40,15 @@ inline Threshold parse_threshold(const char* text) {
 
 // When the writer thread writes. A heavy compile marks the cache dirty; the write waits `settle_ms` after the
 // newest one (heavy compiles come in bursts at a load, and each write copies the whole heavy cache) but never more
-// than `max_delay_ms` after the first unwritten one, so a long burst is still saved as it goes.
+// than `max_delay_ms` after the first unwritten one, so a long burst is still saved as it goes. A write that fails
+// keeps the cache dirty and is tried again `retry_ms` later, the delay doubling with each failure in a row up to
+// `max_retry_ms`, so a disk that stays full or a driver that keeps failing does not make the writer spin.
 class WriteSchedule {
 public:
     static constexpr std::uint64_t settle_ms = 3000;
     static constexpr std::uint64_t max_delay_ms = 20000;
+    static constexpr std::uint64_t retry_ms = 5000;
+    static constexpr std::uint64_t max_retry_ms = 120000;
 
     void note_heavy(std::uint64_t now_ms) {
         if (!dirty_) first_ = now_ms;
@@ -56,7 +60,8 @@ public:
     // The time to write at; only meaningful while dirty.
     std::uint64_t due_ms() const {
         const std::uint64_t settled = last_ + settle_ms, latest = first_ + max_delay_ms;
-        return settled < latest ? settled : latest;
+        const std::uint64_t at = settled < latest ? settled : latest;
+        return at > retry_at_ ? at : retry_at_;
     }
     bool due(std::uint64_t now_ms) const { return dirty_ && now_ms >= due_ms(); }
     // Taken when a write starts; the write covers every heavy compile noted up to then.
@@ -64,13 +69,26 @@ public:
     // A write that started at `generation` and `started_ms` is done. A heavy compile noted after it started, even in
     // the same millisecond tick, keeps the cache dirty for the next write, due as if it were first noted then.
     void written(std::uint64_t generation, std::uint64_t started_ms) {
+        failures_ = 0;
+        retry_at_ = 0;
         if (generation_ == generation) dirty_ = false;
         else first_ = started_ms;
     }
+    // A write that started at `started_ms` failed: the cache stays dirty and the next try waits out the backoff.
+    void failed(std::uint64_t started_ms) {
+        std::uint64_t delay = retry_ms;
+        for (std::uint32_t i = 0; i < failures_ && delay < max_retry_ms; ++i) delay *= 2;
+        if (delay > max_retry_ms) delay = max_retry_ms;
+        if (failures_ < 64) ++failures_;
+        retry_at_ = started_ms + delay;
+    }
+    std::uint32_t failures() const { return failures_; }
 
 private:
     bool dirty_ = false;
     std::uint64_t first_ = 0, last_ = 0, generation_ = 0;
+    std::uint32_t failures_ = 0;   // failed writes in a row
+    std::uint64_t retry_at_ = 0;   // no write before this time after a failure
 };
 
 }  // namespace leonida::heavy_pipeline_cache
