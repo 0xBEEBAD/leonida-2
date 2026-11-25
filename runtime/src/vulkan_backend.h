@@ -2092,7 +2092,7 @@ public:
         }
         if (result != VK_SUCCESS) return 0;
         if (value == UINT64_MAX) {
-            // A lost device can show itself here first: measured on NVIDIA 617.14, 621.14 and 621.24, the counter
+            // A lost device can show itself here first: measured on NVIDIA 621.24 and reported on 617.14, the counter
             // query succeeds with UINT64_MAX (and vkWaitSemaphores with a zero timeout succeeds too) before any call
             // has returned VK_ERROR_DEVICE_LOST. vkDeviceWaitIdle is what then says so, and it is also what a driver
             // needs to have returned before vkGetDeviceFaultInfoEXT answers (LEONIDA_DEVICE_FAULT=1). When
