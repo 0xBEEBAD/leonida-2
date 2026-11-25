@@ -2963,11 +2963,7 @@ private:
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
         const auto run_compiles = [this](std::size_t count, const std::function<void(std::size_t)>& job) {
-            if (context_.pipeline_workers_) {
-                context_.pipeline_workers_->run(count, job);
-            } else {
-                for (std::size_t i = 0; i < count; ++i) job(i);
-            }
+            context_.pipeline_workers_->run(count, job);
         };
         PipelineCompiles prior_compiles;
         bool has_prior_compiles = false;
@@ -3171,15 +3167,22 @@ private:
                 recycle_khr_as_queries(khr_guard.as_queries);
                 geometry.clear();
 
-                compiles.build(run_compiles);
+                if (context_.pipeline_workers_)
+                    compiles.build(run_compiles);
+                else
+                    compiles.build_serial();
                 const ReplayResult compile_result = check_compiled_pipelines(compiles, prepare_result);
                 if (compile_result != ReplayResult::success) return compile_result;
                 prior_compiles = std::move(compiles);
                 has_prior_compiles = true;
                 continue;
             }
-            prepare_result = build_pipelines(compiles, std::span(prepared).first(lists.size()), prepare_result,
-                                             run_compiles, has_prior_compiles ? &prior_compiles : nullptr);
+            const PipelineCompiles* prior = has_prior_compiles ? &prior_compiles : nullptr;
+            prepare_result = context_.pipeline_workers_
+                                 ? build_pipelines(compiles, std::span(prepared).first(lists.size()), prepare_result,
+                                                   run_compiles, prior)
+                                 : build_pipelines_serial(compiles, std::span(prepared).first(lists.size()),
+                                                          prepare_result, prior);
             replay.compiles = nullptr;
             if (prepare_result != ReplayResult::success) return prepare_result;
             break;

@@ -159,8 +159,8 @@ int test_unlocks_resources_during_compile(bool with_workers) {
     fast_pso.pipeline = handle<VkPipeline>(0x8001);
     context.add_pipeline(fast_id, fast_pso);
 
-    VulkanQueue queue_a(context, handle<VkQueue>(1), 0, QueueKind::compute);
-    VulkanQueue queue_b(context, handle<VkQueue>(2), 0, QueueKind::compute);
+    VulkanQueue queue_a(context, handle<VkQueue>(1), 0, VulkanQueue::QueueKind::compute);
+    VulkanQueue queue_b(context, handle<VkQueue>(2), 0, VulkanQueue::QueueKind::compute);
     EXPECT(queue_a.ok() && queue_b.ok());
 
     CommandList list_a;
@@ -266,7 +266,7 @@ int test_failed_compute_dispatch_built_once() {
     pso.built = [](void* ctx) { return static_cast<SlowPipeline*>(ctx)->find(); };
     context.add_pipeline(fail_id, pso);
 
-    VulkanQueue queue(context, handle<VkQueue>(3), 0, QueueKind::compute);
+    VulkanQueue queue(context, handle<VkQueue>(3), 0, VulkanQueue::QueueKind::compute);
     EXPECT(queue.ok());
 
     CommandList list;
@@ -274,7 +274,7 @@ int test_failed_compute_dispatch_built_once() {
     EXPECT(list.close());
     const CommandList* ptr = &list;
     const ReplayResult r = queue.execute({&ptr, 1});
-    EXPECT(r == (strict_replay() ? ReplayResult::unresolved : ReplayResult::success));
+    EXPECT(r == (strict_replay() ? ReplayResult::unresolved_resource : ReplayResult::success));
     EXPECT(failing.builds.load() == 1);
     return 0;
 }

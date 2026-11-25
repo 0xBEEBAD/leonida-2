@@ -1032,6 +1032,26 @@ public:
         });
     }
 
+    // Compiles jobs serially in command order without workers, stopping at the first fatal refusal (a failed draw, a
+    // failed indirect dispatch, or any failed dispatch under strict_replay()). Matches serial prepare() short-circuit
+    // semantics while allowing the caller to compile outside resource_mutex_.
+    void build_serial(const PipelineCompiles* prior = nullptr) {
+        std::vector<bool> done(jobs_.size(), false);
+        for (const Use& use : uses_) {
+            const std::size_t i = use.ticket - 1;
+            if (!done[i]) {
+                done[i] = true;
+                Job& job = jobs_[i];
+                if (!prior || !prior->lookup(job.graphics, job.compute, job.flags, job.built)) {
+                    job.built =
+                        job.graphics ? job.graphics->variant(job.flags) : job.compute->build(job.compute->build_context);
+                }
+            }
+            if (!jobs_[i].built && (use.user == User::draw || use.user == User::indirect_dispatch || strict_replay()))
+                return;
+        }
+    }
+
 private:
     struct Job {
         const GraphicsPipeline* graphics;  // one of the two
@@ -2938,14 +2958,8 @@ inline ReplayResult check_compiled_pipelines(const PipelineCompiles& compiles, R
     return result;
 }
 
-// Ends the preparation of a submission whose prepare() calls used `compiles` and returned `result` (the first that
-// failed, if any): builds the pipelines through run(count, job), puts them into `lists`, and returns what the calls would
-// have returned had they built each pipeline themselves.
-template<typename Run>
-ReplayResult build_pipelines(PipelineCompiles& compiles, std::span<PreparedList> lists, ReplayResult result,
-                             Run&& run, const PipelineCompiles* prior = nullptr) {
-    if (compiles.empty()) return result;
-    compiles.build(run, prior);
+inline ReplayResult finish_compiled_pipelines(const PipelineCompiles& compiles, std::span<PreparedList> lists,
+                                              ReplayResult result, const PipelineCompiles* prior = nullptr) {
     const ReplayResult checked = check_compiled_pipelines(compiles, result, prior);
     if (checked != ReplayResult::success) return checked;
     for (PreparedList& list : lists) {
@@ -2955,6 +2969,24 @@ ReplayResult build_pipelines(PipelineCompiles& compiles, std::span<PreparedList>
             if (list.draws[i].compile) list.draws[i].pipeline = compiles.built(list.draws[i].compile);
     }
     return checked;
+}
+
+// Ends the preparation of a submission whose prepare() calls used `compiles` and returned `result` (the first that
+// failed, if any): builds the pipelines through run(count, job), puts them into `lists`, and returns what the calls would
+// have returned had they built each pipeline themselves.
+template<typename Run>
+ReplayResult build_pipelines(PipelineCompiles& compiles, std::span<PreparedList> lists, ReplayResult result,
+                             Run&& run, const PipelineCompiles* prior = nullptr) {
+    if (compiles.empty()) return result;
+    compiles.build(run, prior);
+    return finish_compiled_pipelines(compiles, lists, result, prior);
+}
+
+inline ReplayResult build_pipelines_serial(PipelineCompiles& compiles, std::span<PreparedList> lists,
+                                           ReplayResult result, const PipelineCompiles* prior = nullptr) {
+    if (compiles.empty()) return result;
+    compiles.build_serial(prior);
+    return finish_compiled_pipelines(compiles, lists, result, prior);
 }
 
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
