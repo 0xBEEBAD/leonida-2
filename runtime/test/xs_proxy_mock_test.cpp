@@ -15,7 +15,6 @@
 //     patching this executable's own import table before the first proxy table is built (one process each).
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
-#include "../src/d3d12_xs_frame_events.h"
 
 #include <d3d12.h>
 #include <windows.h>
@@ -1573,16 +1572,11 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, 0)) == E_POINTER);
     EXPECT(mock->calls[80] == 0 && xs::device_slot_hits(80) == 3);
 
-    // 81 GetFrameEventsX(frame_token, flags, &num_events, events): sets *num_events = 0 and returns S_OK without
-    // reaching the mock's table (slot 81 is past ID3D12Device11's 80 slots).
-    std::uint32_t num_events = 6;
-    leonida::d3d12_xs::XboxFrameEvent events[6] = {};
-    EXPECT(hr_of(raw(device, 81, token, 0x11100u, word(&num_events), word(events))) == S_OK && num_events == 0);
-    EXPECT(hr_of(raw(device, 81, token, 0x11100u, word(&num_events), 0)) == S_OK && num_events == 0);
-    EXPECT(hr_of(raw(device, 81, token, 0x11100u, 0, word(events))) == E_POINTER);
-    num_events = 6;
-    EXPECT(hr_of(raw(device, 81, token, 0x11100u, word(&num_events), 0)) == E_POINTER);
-    EXPECT(mock->calls[81] == 0 && xs::device_slot_hits(81) == 4);
+    // 81 GetFrameStatisticsX with no presenter attached: S_FALSE and no statistics, never the PC slot 81
+    // (check_presentation_wiring covers an attached presenter).
+    UINT stats_count = 7;
+    EXPECT(hr_of(raw(device, 81, token, 0x1a, word(&stats_count), 0)) == S_FALSE && stats_count == 0);
+    EXPECT(mock->calls[81] == 0 && xs::device_slot_hits(81) == 1);
 
     // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path (filtered desc copy).
     void* queue = nullptr;
@@ -1633,16 +1627,14 @@ int check_xbox_slots() {
     // output on failure, so an invalid call would clear this pointer.
     EXPECT(release(list) == 0);
 
-    // An IID the PC does not know (the console's own list IID; this one is made up for the test) still gets a list:
-    // the console list proxy, not a failure from the PC device.
+    // An IID that is neither a PC list IID nor the measured console one (made up for the test) goes to the PC device
+    // as asked, once, and its refusal comes back (main's slot 73; check_console_command_list has the console IID).
     // {8d2c4f61-3a5e-4b7c-9e10-2f6a8b4c3d51}
     constexpr GUID kConsoleListIid{0x8d2c4f61, 0x3a5e, 0x4b7c, {0x9e, 0x10, 0x2f, 0x6a, 0x8b, 0x4c, 0x3d, 0x51}};
     void* unknown_list = nullptr;
-    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&kConsoleListIid), word(&unknown_list))) ==
-           S_OK);
-    EXPECT(xs::is_list_proxy(unknown_list) && mock->calls[12] == 3 && mock->calls[73] == 0);
-    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), list_iid));
-    EXPECT(release(unknown_list) == 0);
+    EXPECT(FAILED(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&kConsoleListIid),
+                            word(&unknown_list)))));
+    EXPECT(!unknown_list && mock->calls[12] == 3 && mock->calls[73] == 0);
     // A PC list IID the proxy answers is returned as asked.
     const IID list1_iid = __uuidof(ID3D12GraphicsCommandList1);
     void* list1 = nullptr;
@@ -1949,7 +1941,6 @@ int run_env_slots(bool valid, bool on_slot70 = false, bool on_slot74 = false) {
 
     const char* schedule_event = valid ? "97" : "2";
     const char* wait_event = on_slot74 ? "74" : valid ? "98" : "2";
-    const char* frame_events = valid ? "102" : "2";
     const char* queue_x = valid ? "99" : "2";
     const char* list_x = valid ? "100" : "2";
     const char* frame_statistics = valid ? "101" : "2";
@@ -1984,10 +1975,6 @@ int run_env_slots(bool valid, bool on_slot70 = false, bool on_slot74 = false) {
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
         EXPECT(hr_of(raw(device, 98, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
-        std::uint32_t ev_count = 6;
-        leonida::d3d12_xs::XboxFrameEvent ev_buf[6] = {};
-        EXPECT(hr_of(raw(device, 102, token, 0x11100u, word(&ev_count), word(ev_buf))) == S_OK && ev_count == 0 &&
-               mock->calls[102] == 0);
         void* queue = nullptr;
         EXPECT(hr_of(raw(device, 99, word(kXboxQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
         EXPECT(xs::is_queue_proxy(queue) && mock->calls[99] == 0);
@@ -2005,7 +1992,7 @@ int run_env_slots(bool valid, bool on_slot70 = false, bool on_slot74 = false) {
         EXPECT(release(allocator) == 0);
 
         // The presenter answers frame statistics at 101 only (81 is not routed, so the mock refuses it); PresentX
-        // stays at 30, SuspendX answers at 33, and ResumeX, asked for 30, is unrouted, so 32 is refused.
+        // stays at 30, SuspendX answers at 33, and ResumeX, asked for 30, is unrouted, so 32 never reaches it.
         EnvPresenter env{};
         xs::PresentationHandler h{};
         h.context = &env;
@@ -2031,7 +2018,8 @@ int run_env_slots(bool valid, bool on_slot70 = false, bool on_slot74 = false) {
         EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&count), 0)) == E_NOTIMPL && env.stats == 1);
         EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) == S_OK && env.present == 1);
         EXPECT(hr_of(raw(queue, 33)) == S_OK && env.suspend == 1);
-        EXPECT(hr_of(raw(queue, 32)) == E_NOTIMPL && env.resume == 0);
+        raw(queue, 32);  // a console queue slot: answered by the queue proxy, never by the presenter's ResumeX
+        EXPECT(env.resume == 0);
         EXPECT(xs::set_presentation_handler(device, nullptr));
         EXPECT(release(queue) == 0);
     } else {
@@ -3570,17 +3558,19 @@ int check_presentation_wiring() {
     UINT count = 3;
     EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&count), 0)) == S_FALSE && count == 0 && p.stats_calls == 1);
 
-    // Queue slot 30 routes to PresentX while attached. SuspendX and ResumeX have no default route, so 31/32 are refused
-    // and never reach the presenter (the env mode, run_env_slots, routes them).
+    // Queue slot 30 routes to PresentX while attached. SuspendX and ResumeX have no default route, so 31/32 stay with
+    // the queue proxy's console slots and never reach the presenter (the env mode, run_env_slots, routes them).
     EXPECT(hr_of(raw(queue, 30, 1, 0x1000, 0x2000)) == S_OK && p.present_calls == 1 && p.last_planes == 1);
-    EXPECT(hr_of(raw(queue, 31, 0)) == E_NOTIMPL && p.suspend_calls == 0);
-    EXPECT(hr_of(raw(queue, 32)) == E_NOTIMPL && p.resume_calls == 0);
+    raw(queue, 31, 0);
+    raw(queue, 32);
+    EXPECT(p.suspend_calls == 0 && p.resume_calls == 0);
 
-    // Detaching restores default E_NOTIMPL refusal on beyond-PC queue slots.
+    // Detaching: GetFrameStatisticsX no longer reaches the presenter (queue slot 30 goes back to the queue proxy's
+    // own PresentX, which check_xbox_queue_slots and the boot runs cover).
     EXPECT(xs::set_presentation_handler(device, nullptr));
     UINT none = 7;  // unattached GetFrameStatisticsX: no statistics yet, never the PC slot 81
     EXPECT(hr_of(raw(device, 81, 77, 0x1a, word(&none), 0)) == S_FALSE && none == 0 && p.stats_calls == 1);
-    EXPECT(hr_of(raw(queue, 30, 1, 0, 0)) == E_NOTIMPL && p.present_calls == 1);
+    EXPECT(p.present_calls == 1);
 
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
