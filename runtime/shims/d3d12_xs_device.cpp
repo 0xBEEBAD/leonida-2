@@ -1583,10 +1583,15 @@ HWND create_fallback_window(bool show) {
     return thread ? start.window : nullptr;
 }
 
-// The device's own presentation paces the frame events (device slots 78 to 81) once the first PresentX has built
-// it. LEONIDA_FRAME_PACING=0 turns that off: the slots then answer from the token counter alone.
+// Device slots 78 to 81 answer from the device's token counter, with no wait: that is what the retail boot was
+// measured with through the story load. LEONIDA_FRAME_PACING=1 (the --first-run-ui profile sets it) hands them to
+// the device's own presentation once the first PresentX has built it, with the title's interval and origin event
+// replayed to its pacer; without that replay the next WaitFrameEventX would fail.
 bool frame_pacing_enabled() {
-    static const bool enabled = [] { const auto* p = std::getenv("LEONIDA_FRAME_PACING"); return !(p && *p == '0'); }();
+    static const bool enabled = [] {
+        const auto* p = std::getenv("LEONIDA_FRAME_PACING");
+        return p && *p && *p != '0';
+    }();
     return enabled;
 }
 
