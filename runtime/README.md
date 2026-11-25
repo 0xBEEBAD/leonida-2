@@ -133,7 +133,13 @@ with the seed on stderr; a seed of 0 uses a fixed non-zero state. Unset, the hos
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
-that base is taken, copies headers and sections, applies `IMAGE_REL_BASED_DIR64` and `HIGHLOW` relocations
+that base is taken. An image with a relocation table is moved and fixed up whatever `IMAGE_FILE_RELOCS_STRIPPED`
+says; without one, the flag refuses the move, and an image with the flag clear is moved with nothing fixed up (the
+loader logs that). The Windows 11 (build 26200) loader does the same in these three cases, as Zombins2 measured
+with synthetic DLLs in a review of old pull request 8847 of the original repository, which is no longer readable.
+Open question from the same measurement: Windows also refused flag-set DLLs without a relocation directory at a free
+preferred base (error 487, linker-built `/FIXED` DLLs included), and why is not known; the loader still maps those
+at their base, as before. It copies headers and sections, applies `IMAGE_REL_BASED_DIR64` and `HIGHLOW` relocations
 (rejecting the other types, such as `HIGH`, `LOW` and `HIGHADJ`, which no x64 MSVC image contains), binds
 imports by name or ordinal, parses the export table, sets section protections, and registers the
 image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
@@ -322,7 +328,8 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_LAZY_PIPELINES` | on | Graphics pipelines are built at their first draw. `0` builds each at `CreatePipelineState`, as before; the title creates far more pipelines at startup than it draws with. |
 | `LEONIDA_LAZY_COMPUTE` | on | Compute pipelines are built at the first dispatch that names them, or earlier by the warm-up thread. `0` builds each at `CreateComputePipelineState`. |
 | `LEONIDA_COMPUTE_WARMUP_MAX_BYTES` | `1048576` | The largest SPIR-V module, in bytes, the background warm-up thread (`LEONIDA_COMPUTE_WARMUP`) builds ahead of its first dispatch. Larger modules wait for that dispatch. |
-| `LEONIDA_SERIAL_BIG_COMPILES` | on | Compute modules over 128 KiB of SPIR-V compile one at a time, because the driver's compiler needs hundreds of MiB for each. `0` lets them compile side by side. |
+| `LEONIDA_SERIAL_BIG_COMPILES` | unset | Large pipelines (compute modules over 128 KiB of SPIR-V, graphics pipelines of 1 MiB or more) compile side by side while their estimates, 512 bytes of memory for each byte of SPIR-V, fit a budget (`LEONIDA_BIG_COMPILE_BUDGET_MB`): one always does, what a submission waits for goes before the warm-up, and the warm-up takes a quarter of the budget at most. `1` compiles the compute ones one at a time, and the graphics ones of a submission one after another, as before there was a budget. `0` lets all of them compile side by side. |
+| `LEONIDA_BIG_COMPILE_BUDGET_MB` | unset | The budget, in MiB: a fixed number (`0`: one large pipeline at a time) instead of three quarters of the memory that is free at the moment, which is the smaller of the free RAM and the room under the commit limit, read again for each pipeline. Text that is not a number is ignored. |
 | `LEONIDA_CONSOLE_FORMATS` | on | Texture descriptions the console accepts and a PC GPU may not (an R9G9B9E5 render target, an sRGB RGBA8 or BGRA8 texture with unordered access) get a host format that can do the job. `0` refuses them, as a PC D3D12 runtime does. |
 | `LEONIDA_CONSOLE_HEAP_SHADOW` | on | A console descriptor heap has a copy in the descriptor arena that the shaders read. `0` keeps its bytes in the title's memory only (the comparison for a run that misbehaves with the copy). |
 | `LEONIDA_IMPORT_BELOW_ARENA` | unset | `1` keeps a host-memory import that the driver put below the GPU address arena. By default such an import is not used and the shadow buffer in the arena answers, because a V# cannot name an address below the arena. |

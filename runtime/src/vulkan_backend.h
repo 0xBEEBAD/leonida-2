@@ -130,7 +130,8 @@ struct VulkanDeviceFunctions {
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) X(vkMergePipelineCaches)   \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)                                                            \
+    X(vkCmdBeginQueryIndexedEXT) X(vkCmdEndQueryIndexedEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -165,6 +166,9 @@ struct VulkanDeviceFunctions {
         return vkCmdBeginRendering && vkCmdEndRendering && vkCmdBindVertexBuffers2 && vkCmdSetPrimitiveTopology &&
                vkCmdSetPrimitiveRestartEnable;
     }
+    // VK_EXT_transform_feedback is enabled on the device: the indexed-query entry points are loaded, so an
+    // SO_STATISTICS heap can be a real transform-feedback pool (D3D-302).
+    bool transform_feedback = false;
 };
 
 // Both kinds of compute resolve use the same storage buffer, descriptor set and pipeline layout.
@@ -1090,6 +1094,8 @@ public:
                   GraphicsIndirectCapabilities indirect = {})
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
+        // VK_EXT_transform_feedback: enabled on the device when its indexed-query entry points resolved (D3D-302).
+        vk.transform_feedback = vk.vkCmdBeginQueryIndexedEXT && vk.vkCmdEndQueryIndexedEXT;
         if (loaded_ && gpu_labels_.initialize(device, get)) {
             replay_.gpu_label = [this](VkCommandBuffer cb, const label::Write& write) { gpu_labels_.record(cb, write); };
         }
@@ -1125,6 +1131,11 @@ public:
         replay_.reset_query_pool = vk.vkCmdResetQueryPool;
         replay_.begin_query = vk.vkCmdBeginQuery;
         replay_.end_query = vk.vkCmdEndQuery;
+        // VK_EXT_transform_feedback (D3D-302), loaded when the device enabled it: indexed SO_STATISTICS queries.
+        if (vk.transform_feedback) {
+            replay_.begin_query_indexed = vk.vkCmdBeginQueryIndexedEXT;
+            replay_.end_query_indexed = vk.vkCmdEndQueryIndexedEXT;
+        }
         replay_.write_timestamp = vk.vkCmdWriteTimestamp;
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
         replay_.bind_pipeline = vk.vkCmdBindPipeline;
@@ -1571,6 +1582,14 @@ public:
     void set_pipeline_workers(std::unique_ptr<PipelineWorkers> workers) {
         std::unique_lock lock(pipeline_mutex_);
         pipeline_workers_.swap(workers);
+    }
+    // For the large pipelines of a submission: the memory they may use while they compile together
+    // (PipelineCompiles::build), and what is kept while they do (LargeModuleGate::Demand). None (the default): they compile
+    // one after another.
+    void set_large_compiles(std::function<std::uint64_t()> budget, std::function<std::shared_ptr<void>()> demand) {
+        std::unique_lock lock(pipeline_mutex_);
+        large_compile_budget_ = std::move(budget);
+        large_compile_demand_ = std::move(demand);
     }
     PipelineWorkers::Stats pipeline_worker_stats() {
         std::shared_lock lock(pipeline_mutex_);
@@ -2189,6 +2208,8 @@ private:
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unique_ptr<PipelineWorkers> pipeline_workers_;
+    std::function<std::uint64_t()> large_compile_budget_;
+    std::function<std::shared_ptr<void>()> large_compile_demand_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
@@ -3168,10 +3189,13 @@ private:
                 recycle_khr_as_queries(khr_guard.as_queries);
                 geometry.clear();
 
+                std::shared_ptr<void> demand;
+                if (context_.large_compile_demand_ && compiles.any_large()) demand = context_.large_compile_demand_();
                 if (context_.pipeline_workers_)
-                    compiles.build(run_compiles);
+                    compiles.build(run_compiles, context_.large_compile_budget_);
                 else
                     compiles.build_serial();
+                demand.reset();
                 const ReplayResult compile_result = check_compiled_pipelines(compiles, prepare_result);
                 if (compile_result != ReplayResult::success) return compile_result;
                 prior_compiles = std::move(compiles);
@@ -3181,7 +3205,7 @@ private:
             const PipelineCompiles* prior = has_prior_compiles ? &prior_compiles : nullptr;
             prepare_result = context_.pipeline_workers_
                                  ? build_pipelines(compiles, std::span(prepared).first(lists.size()), prepare_result,
-                                                   run_compiles, prior)
+                                                   run_compiles, context_.large_compile_budget_, prior)
                                  : build_pipelines_serial(compiles, std::span(prepared).first(lists.size()),
                                                           prepare_result, prior);
             replay.compiles = nullptr;
