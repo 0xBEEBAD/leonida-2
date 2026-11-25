@@ -27,6 +27,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_desc_clean.h"
 #include "d3d12_xs_device.h"
+#include "host_wine.h"
 #include "shims.h"
 #include "../src/frame_pacer.h"
 #include "../src/shader_library.h"
@@ -453,8 +454,11 @@ int main(int argc, char** argv) {
         ds_uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         D3D12_RESOURCE_DESC pc_pair = ds_uav;
         pc_pair.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        check(real->GetResourceAllocationInfo(0, 1, &pc_pair).SizeInBytes == UINT64_MAX,
-              "the PC device refuses a depth-stencil texture with unordered access (negative control)");
+        // Microsoft's runtime validates the flag pair; Wine's vkd3d sizes the texture without looking at it, so the
+        // control only says something about the first.
+        if (!hostwine::host_is_wine())
+            check(real->GetResourceAllocationInfo(0, 1, &pc_pair).SizeInBytes == UINT64_MAX,
+                  "the PC device refuses a depth-stencil texture with unordered access (negative control)");
         D3D12_RESOURCE_DESC ds_only = pc_pair;
         ds_only.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         const D3D12_RESOURCE_ALLOCATION_INFO ds_want = real->GetResourceAllocationInfo(0, 1, &ds_only);
