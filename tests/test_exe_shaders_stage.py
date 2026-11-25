@@ -354,12 +354,14 @@ class ShadersStageWithTheExe(unittest.TestCase):
                         write('{"SortKeys": {"stage": "cs", "fssm_sha256": "%s"}}' % ("a" * 64), out, "index.json")
                         write("", out, "SortKeys.spv")
                     else:
-                        write('{"Upscale": {"stage": "cs"}}', out, "index.json")
+                        # the FSPX step keeps its output only when the index names a compute program whose module is
+                        # there, keyed by fspx_code_sha256 (make_game.fspx_cache_complete)
+                        write('{"Upscale": {"stage": "cs", "fspx_code_sha256": "%s"}}' % ("c" * 64), out, "index.json")
                         write("", out, "Upscale.spv")
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")
-                write("{}", spirv, "index.json")
+                write('{"shader": {"stage": "vs"}}', spirv, "index.json")
 
             def stage():
                 ran.clear()
