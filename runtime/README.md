@@ -269,7 +269,11 @@ Current limits, by design:
   depth views, committed resources and copies (uploads, readbacks, BC textures), root signatures, graphics and
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
   missing. `LEONIDA_DEVICE_FAULT=1` enables a stderr report with supported Vulkan fault information and queue
-  checkpoints on the first observed device loss.
+  checkpoints on the first observed device loss. On NVIDIA, a build configured with
+  `-DLEONIDA_AFTERMATH_SDK=<unpacked Nsight Aftermath SDK>` also takes `LEONIDA_AFTERMATH=1`: GPU crash dumps
+  (`.nv-gpudmp`, plus `.nvdbg` shader debug info) in `LEONIDA_AFTERMATH_DIR`, and a decoded summary on stderr that
+  names the faulting shader by its library name, the page fault and the active shaders (`src/vulkan_aftermath.h`).
+  The SDK is not part of the repository; its DLL is loaded at run time (`LEONIDA_AFTERMATH_DLL` overrides the path).
 
 - `dstorage_xs.dll` / `xcrdapi.dll` / `dstorage.dll` — `DStorageGetFactory`: the console DirectStorage API
   (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
@@ -348,7 +352,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_PIPELINE_COMPILE` | unset | `on-demand` (the `--first-run-ui` profile sets it) prepares pipeline-state streams and sampled views at bind time: a placed 2D texture then waits for its memory until a command or a view first uses it. `cache-only` makes an eager build (`LEONIDA_LAZY_PIPELINES=0`) ask the driver's cache first and leaves what would have to be compiled to the first draw. `first-use` is accepted and means the default. When a pipeline is compiled is `LEONIDA_LAZY_PIPELINES`. |
 | `LEONIDA_GRAPHICS_STAGE_LAYOUT` | on | Graphics root arguments are laid out as the console does for the vertex, pixel and geometry stages (from `s8`, a descriptor table in one dword). `0` keeps `rt::rootsig::pack()` (from `s0`, two dwords per address) for every graphics signature. |
 | `LEONIDA_FRAME_PACING` | unset | `1` (the `--first-run-ui` profile sets it) hands device slots 78 to 81 (`SetFrameIntervalX`, `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX`) to the device's own presentation once the first `PresentX` has built it, with the title's interval and origin event replayed to its pacer. Unset, the slots answer from the device's token counter with no wait. |
-| `LEONIDA_GPU_LABELS` | on | records the labels of console list slots 71 and 72 and stores each into the title's memory when the GPU has finished the command buffer that carries it (`src/vulkan_gpu_labels.h`): the value lands in the title's own private pages, in the GPU address arena, or in a page of the title's own memory that the xmem shim owns. `0` turns the two slots off; the retail title calls the two slots every frame, and the wait that would order a consumer of the value is slot 73 or 74, which stay no-ops here. |
+| `LEONIDA_GPU_LABELS` | unset | `1` records the labels of console list slots 71 and 72 and stores each into the title's memory when the GPU has finished the command buffer that carries it (`src/vulkan_gpu_labels.h`), for lists the list values (`LEONIDA_LIST_VALUES`, on by default) do not track: those land their slot 71 to 74 writes themselves, and a second writer could rewind a counter. Unset, the two slots of an untracked list do nothing. |
 | `LEONIDA_LINEAR_MAP_FIRST` | unset | `Map` of a slot 133 texture leased as linear answers with the placement address and the title texture registry fills the image. `1` gives it the linear mapping instead: pinned pages, with a GPU-written texture read back into them, and a refusal when the pages are gone. |
 | `LEONIDA_CONSOLE_D16S8` | by GPU | The console's `D16_UNORM_S8_UINT` family (DXGI 118 to 120) is made as the D24S8 family where the GPU has `D24_UNORM_S8_UINT` as a depth-stencil attachment and keeps its own D16/S8 path where it has none (AMD). `native` or `d24` chooses for every GPU. The device logs which it took. |
 | `LEONIDA_RGBA4_COPY_REFUSE` | unset | `1` refuses a footprint copy to or from a `B4G4R4A4_UNORM` render target stored as RGBA8 (its texels are four bytes there, not two). Unset, the copy is made. |
@@ -358,6 +362,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_WINDOW` | unset | `WxH` resizes the title's window when the presenter attaches to it. |
 | `LEONIDA_PRESENT_DUMP` | unset | *Diagnostic.* `DIR` or `DIR,N` writes every Nth presented frame (60 by default) as a PNG into `DIR` (`src/present_dump.h`). The files are pictures of the title: keep them out of commits, issues and pull requests. |
 | `LEONIDA_LOCAL_SPEECH` | unset | `1` forwards the title's speech-synthesis calls to the host's installed `xgameruntime.dll` where there is one. Unset, and wherever that library is missing, the silent voice answers. No profile sets it. |
+| `LEONIDA_AUDIO` | unset | `silent` (any case) makes the title's `MMDeviceEnumerator` answer every render question with the runtime's silent output endpoint, even on a host that has an output (`shims/silent_audio.cpp`, read at each `CoCreateInstance`): no host audio device is opened and every sample is thrown away, for muted test runs. Unset, or any other value, the host's endpoint answers when there is one and the silent endpoint only when the host has none. Capture keeps the host's answer either way. See [docs/runtime_imports.md](../docs/runtime_imports.md#audio-output-off-the-console-wasapi). |
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
