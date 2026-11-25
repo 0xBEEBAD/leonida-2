@@ -3367,8 +3367,8 @@ int check_console_command_list() {
     EXPECT(xs::console_to_pc_list_slot(60) == 58);   // EndEvent
     EXPECT(xs::console_to_pc_list_slot(61) == 59);   // ExecuteIndirect
     EXPECT(xs::console_to_pc_list_slot(85) == 16);   // CopyTextureRegion
-    EXPECT(xs::console_to_pc_list_slot(146) == 80);  // GCL7 Barrier
     EXPECT(xs::console_to_pc_list_slot(139) == 10);  // Reset, as the retail title calls it
+    EXPECT(xs::console_to_pc_list_slot(146) == 80);  // GCL7 Barrier
     EXPECT(xs::console_to_pc_list_slot(148) == xs::kListNotForwarded); // AllocateUploadMemory
 
     xs::reset_device_proxy_stats();  // the list slot counts below start from this test
