@@ -1,5 +1,15 @@
 #pragma once
 
+// Source: adapted from enx/leonida, commit 5c175db901f8486bcdefd03746b578b657e3151f on the original author's git
+// mirror (https://git.notrexed.dev/enx/leonida), a fork of this project. Licence: GPL-3.0-or-later as a fork of this
+// project. That server could not be reached on 2026-11-25, when this file was merged, so the source and its licence
+// could not be read there; the maintainer accepted the file because the source is a fork of this same
+// GPL-3.0-or-later project (the README links the server as the original author's mirror) and because
+// tools/native_pso_hashes.py is adapted from the same commit. Changed, as the pull request that brought it describes
+// it (the source could not be compared): the parsing is standard-library code of its own, apart from the D3D12 part
+// (runtime/shims/d3d12_xs_native_pso.h), and a stage is taken from the translator's index entry of the container
+// its records name, not from the position of its block.
+//
 // The description Xbox device slot 57 receives (native graphics pipelines) and how its stages find the game's own
 // shader containers. Standard library only, so the parsing is tested on every platform.
 //
