@@ -2769,7 +2769,7 @@ struct DeviceState {
     std::atomic<int> probe_view_logs{0};
     // Where a Create*View / CopyDescriptors* write landed, for the first ones.
     void probe_view(const char* what, SIZE_T ptr, UINT count) {
-        if (probe_view_logs.fetch_add(1) >= 48) return;
+        if (!leonida::local_diagnostics() || probe_view_logs.fetch_add(1) >= 48) return;
         std::lock_guard lock(probe_mutex);
         for (const auto& p : probes)
             if (ptr >= p->console_va && ptr < p->console_va + p->slots * kDescriptorSize) {
@@ -2794,6 +2794,8 @@ struct DeviceState {
         return !(q[0] | q[1] | q[2] | q[3]);
     }
     void probe_add(std::uint64_t console_va, std::uint64_t shader_va, std::size_t slots, bool shadowed) {
+        // Nothing reads a probe unless one of the two diagnostics is on; without probes the other probe_* are no-ops.
+        if (!leonida::local_diagnostics() && !rt::compute_probe::enabled()) return;
         auto probe = std::make_unique<HeapProbe>();
         probe->console_va = console_va;
         probe->shader_va = shader_va;

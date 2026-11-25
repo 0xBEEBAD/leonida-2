@@ -399,6 +399,24 @@ bool reserved_only(const void* address) {
     return VirtualQuery(address, &info, sizeof(info)) && info.State == MEM_RESERVE;
 }
 
+// The address is inside a section view (whatever state the host reports for its pages), not a bare reservation.
+bool in_view(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) && info.Type == MEM_MAPPED;
+}
+
+// Physical pages are views of a reserved section and are committed on first touch. Windows then reports the page as
+// MEM_COMMIT with its protection. Wine's VirtualQuery keeps reporting MEM_RESERVE and no protection for a view page
+// that has been written and reads back, so a check of the reported state and protection has nothing to look at
+// there. True for exactly that answer on that host; the caller says what it skips.
+bool touched_view_reported_reserved(const MEMORY_BASIC_INFORMATION& info) {
+    static const bool wine = [] {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+    }();
+    return wine && info.Type == MEM_MAPPED && info.State == MEM_RESERVE && info.Protect == 0;
+}
+
 struct PhysicalApi {
     XMemVirtualAllocFn virtual_alloc;
     XMemAllocatePhysicalPagesFn allocate;
@@ -438,8 +456,16 @@ void test_physical_pages(const PhysicalApi& api) {
     {
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(window, &info, sizeof(info));
-        check(info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READWRITE,
-              "a mapped page is a read-write view with the window's protection");
+        if (touched_view_reported_reserved(info)) {
+            std::printf("SKIP the mapped page's reported state and protection: this host's VirtualQuery shows a "
+                        "written view page as reserved (Wine)\n");
+            check(info.Type == MEM_MAPPED && info.AllocationProtect == PAGE_READWRITE &&
+                      page_holds(window, 0x1000u),
+                  "a mapped page is a read-write view that holds what was written");
+        } else {
+            check(info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READWRITE,
+                  "a mapped page is a read-write view with the window's protection");
+        }
         check(info.AllocationBase == window && info.RegionSize == kPages * kPage64k,
               "consecutive pages of one allocation are mapped as one view");
     }
@@ -963,8 +989,8 @@ void test_long_run(const PhysicalApi& api) {
     for (uint64_t i = 0; i < 4; ++i) fill_page(window + i * kPage64k, static_cast<uint32_t>(i + 1));
     check(api.free_pages(4, pages.data()) == TRUE, "they are freed while mapped");
     void* const second = window + kPage64k;
-    check(api.scatter(&second, 1, nullptr) == TRUE && !reserved_only(window) &&
-              !reserved_only(window + 2 * kPage64k) && page_holds(window, 1u) &&
+    check(api.scatter(&second, 1, nullptr) == TRUE && in_view(window) && !in_view(second) &&
+              in_view(window + 2 * kPage64k) && page_holds(window, 1u) &&
               page_holds(window + 2 * kPage64k, 3u) && page_holds(window + 3 * kPage64k, 4u),
           "unmapping one of them afterwards keeps the others' memory");
     api.map(window, 4, nullptr);
@@ -1025,8 +1051,12 @@ void test_write_combine_window(const PhysicalApi& api) {
         *static_cast<volatile unsigned char*>(window) = 1;
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(window, &info, sizeof(info));
-        check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
-              "the page mapped there is a plain read-write view");
+        if (touched_view_reported_reserved(info))
+            std::printf("SKIP the write-combine window page's reported state and protection: this host's "
+                        "VirtualQuery shows a written view page as reserved (Wine)\n");
+        else
+            check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
+                  "the page mapped there is a plain read-write view");
         fill_page(window, 0x77000000u);
         check(page_holds(window, 0x77000000u), "the page in the write-combine window holds data");
     }

@@ -30,6 +30,21 @@ endforeach()
 
 set(missing "${TRACE_DIR}/leonida_no_such_temp")
 file(REMOVE_RECURSE "${missing}")
+# TMP and TEMP reach the loader's GetTempPathW only where the loader runs natively. Under an emulator (Wine) the
+# process takes its temporary folder from the emulator's prefix whatever the caller's environment says, so the home
+# clone is written, the reservation succeeds and there is nothing to refuse. --dry-run tells the two apart without
+# running the image: with the override in effect it maps the image with the note about index 0.
+if(RUNNER)
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env "TMP=${missing}" "TEMP=${missing}" ${RUNNER} "${LOADER}" --dry-run "${GUEST}"
+    TIMEOUT 90
+    RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE error)
+  if(code STREQUAL "0" AND NOT error MATCHES "module TLS index 0")
+    message(STATUS "SKIP the failed-reservation half: TMP and TEMP set for ${RUNNER} do not reach the loader's "
+                   "GetTempPathW (the emulator takes its temporary folder from its prefix)")
+    return()
+  endif()
+endif()
 foreach(mode run init dry-run)
   execute_process(
     COMMAND ${CMAKE_COMMAND} -E env "TMP=${missing}" "TEMP=${missing}" ${RUNNER} "${LOADER}" --${mode} "${GUEST}"

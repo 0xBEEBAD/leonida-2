@@ -201,14 +201,14 @@ def build(game, output, trainer, base_history=None, json_out=None, if_needed=Fal
     stamp = output.with_suffix(".bcph.stamp")
     signature = fingerprint(pools, base_history)
     if if_needed and stamp.is_file() and output.is_file() and output.stat().st_size == 60936:
-        if stamp.read_text() == signature + ":" + hashlib.sha256(output.read_bytes()).hexdigest():
+        if stamp.read_text(encoding="utf-8") == signature + ":" + hashlib.sha256(output.read_bytes()).hexdigest():
             return
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
         temp = Path(tmp)
         print(f"Fitting DirectStorage predictors from {len(pools)} local pools.", flush=True)
         if base_history:
-            docs = {name: json.loads((base_history/(name+".json")).read_text()) for name in ("bc6h", "bc7")}
+            docs = {name: json.loads((base_history/(name+".json")).read_text(encoding="utf-8")) for name in ("bc6h", "bc7")}
         else:
             fits = {6: calib.Bc6hCalibrator(), 7: calib.Bc7Calibrator()}
             calib.calibrate_from_pools(pools, fits)
@@ -247,6 +247,10 @@ def build(game, output, trainer, base_history=None, json_out=None, if_needed=Fal
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except AttributeError:
+        pass
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("game", type=Path)
     ap.add_argument("--out", required=True, type=Path)

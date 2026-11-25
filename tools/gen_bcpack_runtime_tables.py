@@ -1,4 +1,5 @@
 """Build C++ codec tables from the shipped Python decoder. Reads no user input."""
+import argparse
 from pathlib import Path
 import sys
 import struct
@@ -75,8 +76,19 @@ def write_profile(source, output):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--profile":
-        write_profile(sys.argv[2], sys.argv[3])
-    else:
-        with Path(sys.argv[1]).open("w", encoding="utf-8", newline="\n") as output:
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except AttributeError:
+        pass
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", nargs="?", help="the C++ tables to write (bcpack_tables.inc)")
+    parser.add_argument("--profile", nargs=2, metavar=("JSON", "OUT"),
+                        help="serialize a local calibration JSON to OUT instead of writing the tables")
+    args = parser.parse_args()
+    if args.profile:
+        write_profile(*args.profile)
+    elif args.output:
+        with Path(args.output).open("w", encoding="utf-8", newline="\n") as output:
             generate(output)
+    else:
+        parser.error("name the tables file to write, or use --profile")
