@@ -2383,8 +2383,38 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_pipeline_workers_eager COMMAND d3d12_pipeline_workers_test)
     set_tests_properties(d3d12_pipeline_workers d3d12_pipeline_workers_eager PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    # One large pipeline after another: the jobs of the pool are then known (d3d12_big_compute has the budget).
+    set_tests_properties(d3d12_pipeline_workers PROPERTIES ENVIRONMENT "LEONIDA_SERIAL_BIG_COMPILES=1")
     set_tests_properties(d3d12_pipeline_workers_eager PROPERTIES
-                         ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0;LEONIDA_LAZY_COMPUTE=0")
+                         ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0;LEONIDA_LAZY_COMPUTE=0;LEONIDA_SERIAL_BIG_COMPILES=1")
+    # Large pipelines compiled within a memory budget, with real large compute modules: the same values for each setting
+    # (read once for each process). 260 MiB holds three of the modules, 1 MiB none. The modules' compile runs on the test's
+    # threads, so they get the loader's stack (docs/pipeline_check.md, "Stack reserve").
+    add_executable(d3d12_big_compute_test test/d3d12_big_compute_test.cpp)
+    target_link_libraries(d3d12_big_compute_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_big_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_big_compute_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(d3d12_big_compute_test PRIVATE /STACK:${GTA6RT_STACK})
+    add_test(NAME d3d12_big_compute COMMAND d3d12_big_compute_test)
+    add_test(NAME d3d12_big_compute_budget COMMAND d3d12_big_compute_test)
+    add_test(NAME d3d12_big_compute_tight COMMAND d3d12_big_compute_test)
+    add_test(NAME d3d12_big_compute_serial COMMAND d3d12_big_compute_test)
+    add_test(NAME d3d12_big_compute_unlimited COMMAND d3d12_big_compute_test)
+    add_test(NAME d3d12_big_compute_warmup COMMAND d3d12_big_compute_test warmup)
+    add_test(NAME d3d12_big_compute_eager COMMAND d3d12_big_compute_test eager)
+    set_tests_properties(d3d12_big_compute d3d12_big_compute_budget d3d12_big_compute_tight d3d12_big_compute_serial
+                         d3d12_big_compute_unlimited d3d12_big_compute_warmup d3d12_big_compute_eager
+                         PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    set_tests_properties(d3d12_big_compute_budget PROPERTIES ENVIRONMENT "LEONIDA_BIG_COMPILE_BUDGET_MB=260")
+    set_tests_properties(d3d12_big_compute_tight d3d12_big_compute_warmup PROPERTIES
+                         ENVIRONMENT "LEONIDA_BIG_COMPILE_BUDGET_MB=1")
+    set_tests_properties(d3d12_big_compute_eager PROPERTIES
+                         ENVIRONMENT "LEONIDA_BIG_COMPILE_BUDGET_MB=1;LEONIDA_LAZY_COMPUTE=0")
+    set_tests_properties(d3d12_big_compute_serial PROPERTIES  # neither of these two has a budget
+                         ENVIRONMENT "LEONIDA_SERIAL_BIG_COMPILES=1;LEONIDA_BIG_COMPILE_BUDGET_MB=4096")
+    set_tests_properties(d3d12_big_compute_unlimited PROPERTIES
+                         ENVIRONMENT "LEONIDA_SERIAL_BIG_COMPILES=0;LEONIDA_BIG_COMPILE_BUDGET_MB=1")
     # ExecuteCommandLists refuses a list whose type isn't the queue's (debug-layer message 836).
     add_executable(d3d12_queue_list_type_test test/d3d12_queue_list_type_test.cpp)
     target_link_libraries(d3d12_queue_list_type_test PRIVATE gta6rt_d3d12_com)
