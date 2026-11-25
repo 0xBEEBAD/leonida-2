@@ -783,6 +783,12 @@ if(BUILD_TESTING)
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
 
+  # The gate of large_module_gate.h as the runtime uses it for large pipelines (LEONIDA_BIG_COMPILE_BUDGET_MB): pure
+  # stdlib.
+  add_executable(big_compile_gate_test test/big_compile_gate_test.cpp)
+  target_link_libraries(big_compile_gate_test PRIVATE Threads::Threads)
+  add_test(NAME big_compile_gate COMMAND big_compile_gate_test)
+  set_tests_properties(big_compile_gate PROPERTIES TIMEOUT 120)
   # vk_pipeline_check's memory budget for large modules: pure stdlib, no Vulkan device.
   add_executable(large_module_gate_test test/large_module_gate_test.cpp)
   find_package(Threads REQUIRED)
