@@ -2823,6 +2823,17 @@ if(TARGET Vulkan::Headers)
     # LEONIDA_PRESENT_PLANE1=0 is that rule's switch back.
     set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_PRESENT_PLANE1=0")
 
+    # The presentation the device proxy makes on the title's first PresentX, driven through the device's frame-event
+    # slots and the queue's PresentX slot. The proxy is compiled into this test with LEONIDA_VULKAN_DEVICE, as in
+    # gta6rt; the library's copy, built without it, is then not linked.
+    add_executable(xs_present_lazy_test test/xs_present_lazy_test.cpp shims/d3d12_xs_device.cpp)
+    target_link_libraries(xs_present_lazy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi user32)
+    target_compile_definitions(xs_present_lazy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
+    target_compile_options(xs_present_lazy_test PRIVATE /W4 /permissive- /utf-8)
+    # Needs a Vulkan GPU that can present to a window; exits 77 (skipped) otherwise.
+    add_test(NAME xs_present_lazy COMMAND xs_present_lazy_test)
+    set_tests_properties(xs_present_lazy PROPERTIES SKIP_RETURN_CODE 77)
+
     # TEST-528: a real boot-movie frame (the package's Bink2Scarlett.dll) uploaded through the Xbox-ABI proxy and
     # presented with PresentX, checked against the decoded BGRA. Package-gated like bink_decode_test: skips (77)
     # unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set; no game data is written into the repo.
