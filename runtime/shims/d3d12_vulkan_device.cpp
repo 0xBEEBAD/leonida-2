@@ -10248,19 +10248,11 @@ public:
             }
         }
         // With Resizable BAR, keep the arena where its buffer may still use DEVICE_LOCAL | HOST_VISIBLE memory
-        // (arena_size.h, device_local_arena_bytes): a driver can leave that type out of a very large buffer.
+        // A large buffer can exclude that type, or require more bytes than its heap can hold.
         if (leonida::resizable_bar(state_.memory)) {
-            const auto device_local = [&](std::uint32_t bits) {
-                constexpr VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-                for (std::uint32_t i = 0; i < state_.memory.memoryTypeCount; ++i)
-                    if ((bits & (1u << i)) && (state_.memory.memoryTypes[i].propertyFlags & wanted) == wanted) return true;
-                return false;
-            };
             const VkDeviceSize asked = info.size;
             const VkDeviceSize fitted = leonida::device_local_arena_bytes(asked, [&](VkDeviceSize bytes) {
-                if (bytes == asked) return device_local(requirements.memoryTypeBits);
+                if (bytes == asked) return leonida::device_local_arena_fits(state_.memory, requirements);
                 VkBufferCreateInfo probe = info;
                 probe.size = bytes;
                 VkBuffer buffer = VK_NULL_HANDLE;
@@ -10268,7 +10260,8 @@ public:
                 VkMemoryRequirements r{};
                 vk.vkGetBufferMemoryRequirements(state_.info.device, buffer, &r);
                 vk.vkDestroyBuffer(state_.info.device, buffer, nullptr);
-                return device_local(r.memoryTypeBits);
+                return (!limits.max_allocation_size || r.size <= limits.max_allocation_size) &&
+                       leonida::device_local_arena_fits(state_.memory, r);
             });
             if (fitted != asked) {
                 vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
@@ -10283,9 +10276,8 @@ public:
                                  "device's %s\n",
                          static_cast<unsigned long long>(size.bytes >> 20),
                          static_cast<unsigned long long>(size.requested >> 20), leonida::arena_cap_name(size.capped));
-        arena.memory = state_.allocate(requirements,
-                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true, &arena.memory_type);
+        arena.memory = state_.allocate(requirements, leonida::kArenaRequiredMemory, leonida::kArenaPreferredMemory,
+                                       nullptr, true, &arena.memory_type);
         void* mapped = nullptr;
         if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
             vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {

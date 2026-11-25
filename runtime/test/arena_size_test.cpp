@@ -120,6 +120,21 @@ int resizable_bar_fit() {
     CHECK(device_local_arena_bytes(4095 * MiB, [&](VkDeviceSize bytes) { ++calls; return bytes <= 4064 * MiB; }) ==
           4064 * MiB);
     CHECK(calls == 3);   // 4095 (as asked), then 4080 and 4064 MiB: one buffer probe per step tried
+
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[0] = {8 * GiB, 0};
+    memory.memoryHeaps[1] = {4070 * MiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryTypeCount = 2;
+    memory.memoryTypes[0] = {kArenaRequiredMemory, 0};
+    memory.memoryTypes[1] = {kArenaRequiredMemory | kArenaPreferredMemory, 1};
+    CHECK(device_local_arena_bytes(4095 * MiB, [&](VkDeviceSize bytes) {
+        const std::uint32_t bits = bytes > 4080 * MiB ? 0b01 : 0b11;
+        const VkMemoryRequirements requirements{bytes, 4096, bits};
+        return device_local_arena_fits(memory, requirements);
+    }) == 4064 * MiB);
+    const VkMemoryRequirements padded{4071 * MiB, 4096, 0b11};
+    CHECK(!device_local_arena_fits(memory, padded));
     CHECK(std::string_view(arena_cap_name(arena_cap_bar | arena_cap_buffer)).find("Resizable BAR") == 0);
     return 0;
 }
