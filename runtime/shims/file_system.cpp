@@ -6,7 +6,8 @@
 // here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
-//     the overlay (RT-218); any other path is a host path and goes to the host;
+//     the overlay (RT-218), <overlay>\\.gta6rt-temp\\<run>, a new one reserved by every process; any other path is a
+//     host path and goes to the host;
 //   - an open that can write, and DeleteFile, go to the overlay (--overlay, default <game-dir>\\overlay), so the
 //     package stays exactly as installed. A write-open of a package file copies it into the overlay first, so
 //     OPEN_EXISTING keeps its bytes; a delete of a package file leaves an empty marker under
@@ -26,6 +27,7 @@
 #include <intrin.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -49,7 +51,7 @@ namespace {
 constexpr wchar_t kGamePrefix[] = L"game:";
 constexpr size_t kGamePrefixLength = 5;
 constexpr wchar_t kDeletedDir[] = L".gta6rt-deleted";
-constexpr wchar_t kScratchDir[] = L".gta6rt-temp";  // what "T:\" names, inside the overlay
+constexpr wchar_t kScratchDir[] = L".gta6rt-temp";  // holds one folder per process; "T:\" names this process's
 // A removed package folder is marked by this file inside its marker folder: the marker folder itself can already
 // exist because files below it were deleted, and that alone does not hide the folder.
 constexpr wchar_t kRemovedDirMarker[] = L".gta6rt-dir";
@@ -167,8 +169,67 @@ std::filesystem::path win32_find_path(const std::filesystem::path& path, const s
 // other console layers map those two drives (RT-218). Only the executable can say which spelling the title uses, so
 // a host drive of the same letter must keep working: a path under --game-dir or the overlay (a package on drive G:,
 // or a path GetModuleFileName handed back) stays a host path, and so does every G:/T: path while no roots are
-// configured. The scratch folder lives in the overlay, as `.gta6rt-temp`.
+// configured. The scratch folder lives in the overlay, as `.gta6rt-temp\<run>`, one per process (scratch_folder()).
 enum class Drive { None, Game, Scratch };
+
+// The stem of this process's T: folder below `.gta6rt-temp`: the process's start time (UTC, to the millisecond) and
+// its id, e.g. "20261123-181502-123-pid4242". On the console T: is the title's own temporary drive, empty at launch
+// and shared with nothing; one folder that every run shared kept the files earlier runs left, so a title that makes a
+// file there with CREATE_NEW (its crash dump and crash log, measured under Wine) got ERROR_FILE_EXISTS. The stem only
+// makes the folder easy to find: a reused process id in the same millisecond gives the same stem, so the folder is
+// reserved by reserve_unique_dir, which never hands out one that already existed.
+const std::wstring& scratch_run() {
+    static const std::wstring name = [] {
+        const DWORD last_error = ::GetLastError();
+        FILETIME created{}, exited{}, kernel{}, user{};
+        SYSTEMTIME t{};
+        if (!::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user) ||
+            !::FileTimeToSystemTime(&created, &t))
+            ::GetSystemTime(&t);
+        wchar_t buffer[64];
+        const unsigned long pid = ::GetCurrentProcessId();
+        std::swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%04u%02u%02u-%02u%02u%02u-%03u-pid%lu",
+                      unsigned{t.wYear}, unsigned{t.wMonth}, unsigned{t.wDay}, unsigned{t.wHour}, unsigned{t.wMinute},
+                      unsigned{t.wSecond}, unsigned{t.wMilliseconds}, pid);
+        ::SetLastError(last_error);
+        return std::wstring(buffer);
+    }();
+    return name;
+}
+
+// The T: folder this process reserved in each overlay it was given (configure() may name several, as the test does),
+// or the error that stopped the reservation. Decided once per overlay, under the mutex, so concurrent first T: calls
+// get the same folder.
+struct ScratchFolder {
+    std::wstring name;  // empty: the reservation failed with `error`
+    DWORD error = 0;
+};
+std::mutex g_scratch_mutex;
+std::map<std::wstring, ScratchFolder> g_scratch_folders;  // keyed by the overlay path, lowercased
+
+// The name of this process's folder below <overlay>\.gta6rt-temp, reserved on the first call for that overlay; empty
+// when it could not be reserved (logged once). With no overlay configured nothing is made and the stem is the name.
+std::wstring scratch_folder(const std::filesystem::path& overlay) {
+    if (overlay.empty()) return scratch_run();
+    std::lock_guard lock(g_scratch_mutex);
+    ScratchFolder& folder = g_scratch_folders[lower(overlay.native())];
+    if (folder.name.empty() && folder.error == 0) {
+        const DWORD last_error = ::GetLastError();
+        DWORD error = 0;
+        const std::filesystem::path reserved = reserve_unique_dir(overlay / kScratchDir, scratch_run(), error);
+        if (reserved.empty()) {
+            folder.error = error ? error : ERROR_CANNOT_MAKE;
+            std::fprintf(stderr,
+                         "[rt] file_system: no T: folder could be reserved below %ls (Win32 error %lu); T: paths "
+                         "fail with ERROR_INVALID_NAME\n",
+                         (overlay / kScratchDir).c_str(), static_cast<unsigned long>(folder.error));
+        } else {
+            folder.name = reserved.filename().native();
+        }
+        ::SetLastError(last_error);
+    }
+    return folder.name;
+}
 
 Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     if (path.size() >= kGamePrefixLength && lower(path.substr(0, kGamePrefixLength)) == kGamePrefix) {
@@ -191,11 +252,15 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     if (drive == Drive::None) return Parsed::Host;
     parts.clear();
     if (drive == Drive::Scratch) {
-        parts.push_back(kScratchDir);
         const std::filesystem::path overlay = roots().overlay;
+        const std::wstring folder = scratch_folder(overlay);
+        if (folder.empty()) return Parsed::Refused;
+        parts.push_back(kScratchDir);
+        parts.push_back(folder);
+        // The folder is this process's from its reservation on; made again if something removed it since.
         const DWORD last_error = ::GetLastError();
         std::error_code ec;
-        if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
+        if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir / folder), ec);
         ::SetLastError(last_error);
     }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
@@ -227,7 +292,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     if (!flush()) return Parsed::Refused;
     // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
-    // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
+    // T: still names the scratch folder: its first two parts are pushed above, not parsed from the title's path.
     if (drive == Drive::Game && !parts.empty() && internal_dir(parts.front().c_str())) return Parsed::Refused;
     return Parsed::Console;
 }
@@ -244,7 +309,7 @@ std::filesystem::path disk_path(const std::filesystem::path& root, const std::ve
 
 bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts) {
     size_t prefix_length = 0;
-    return parts.empty() || (parts.size() == 1 && console_drive(path, prefix_length) == Drive::Scratch);
+    return parts.empty() || (parts.size() == 2 && console_drive(path, prefix_length) == Drive::Scratch);
 }
 
 struct Target {
@@ -685,6 +750,34 @@ std::filesystem::path game_dir() {
 std::filesystem::path overlay_dir() {
     std::lock_guard lock(g_mutex);
     return g_overlay_dir;
+}
+
+std::filesystem::path scratch_dir() {
+    const std::filesystem::path overlay = overlay_dir();
+    if (overlay.empty()) return {};
+    const std::wstring folder = scratch_folder(overlay);
+    return folder.empty() ? std::filesystem::path() : overlay / kScratchDir / folder;
+}
+
+std::wstring scratch_stem() { return scratch_run(); }
+
+std::filesystem::path reserve_unique_dir(const std::filesystem::path& base, const std::wstring& stem, DWORD& error,
+                                         unsigned max_tries) {
+    error = 0;
+    std::error_code ec;
+    std::filesystem::create_directories(win32_io_path(base), ec);
+    for (unsigned n = 1; n <= max_tries; ++n) {
+        const std::filesystem::path candidate = base / (n == 1 ? stem : stem + L"-" + std::to_wstring(n));
+        // Create-only: success means no other process or run had this name, so the folder is new and ours. Through
+        // win32_io_path, as every other create here, so a long overlay root keeps working.
+        if (::CreateDirectoryW(win32_io_path(candidate).c_str(), nullptr)) {
+            error = 0;
+            return candidate;
+        }
+        error = ::GetLastError();
+        if (error != ERROR_ALREADY_EXISTS) return {};  // another name will not get past this error
+    }
+    return {};
 }
 
 // gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the

@@ -135,7 +135,16 @@ Useful switches:
 * `--overlay DIR` sends the guest's writes to DIR instead of the default `<game-dir>\overlay` (useful when the
   package drive is read-only); the package itself is never written. Set `LEONIDA_WRITE_DIR` to override that folder
   for one run (it wins over `--overlay`). For a fresh first-run profile, also set `LEONIDA_SAVE_DIR` to a separate
-  empty directory for the local game-save provider.
+  empty directory for the local game-save provider. The title's `T:` drive (its temporary drive,
+  where it writes its crash dump `T:\<guid>.dmp` and crash log) is a folder of each process's own inside the overlay,
+  `<overlay>\.gta6rt-temp\<YYYYMMDD-HHMMSS-mmm>-pid<id>` (the process's start time in UTC and its id).
+  The folder is reserved with a create-only `CreateDirectoryW` when `gta6rt` starts the title (or on the first `T:`
+  call): when that name already exists, as after a reused process id in the same millisecond, it takes `-2`, `-3`,
+  ... (up to 1000 names), so a run never writes into a folder that existed before it. The startup line names it
+  (`console paths: GAME: -> ..., writes -> ..., T: -> ...`).
+  Folders of earlier runs are kept, so a run's crash files can be read after it stops; delete them by hand. With
+  one folder for every run, a `CREATE_NEW` of a name an earlier run had left failed with `ERROR_FILE_EXISTS` (80)
+  and no report landed (old upstream issue 7913).
 
 ### Under Wine on Linux
 
