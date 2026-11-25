@@ -250,7 +250,7 @@ with a blob holding the dword 0, so the DLL creates no compute scratch buffer; w
 Not done here: using kind 0 at run time beyond what the translated module already carries (its thread-group size
 and `RSRC2`).
 
-**Slot 57 (`DeserializeGraphicsPipelineStateX`, graphics FSPX).** At `game_scarlett_master.exe+0x2477578`, the retail
+**Slot 57 (`DeserializeGraphicsPipelineStateX`, graphics FSPX).** At one call site (measured locally), the retail
 title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3-f624-4c6f-a828-ace948622445}`) and a
 104-byte description (`+0x00..+0x60`) populated from the zlib-compressed pipeline library in `shaders.rpf`
 ([shader_library.md](shader_library.md): 25,471 graphics records + 2,693 compute records):
