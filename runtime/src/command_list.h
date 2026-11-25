@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu_label_memory.h"
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
@@ -527,6 +528,7 @@ struct UavView {
     std::uint32_t mip;           // texture
     std::uint32_t first_layer;
     std::uint32_t layer_count;
+    bool exact_clear_format = false; // newly exposed 1D/3D UAVs: do not clear via a different backing format
 };
 
 // ClearUnorderedAccessViewUint / ...Float; the resource must be in unordered_access state at execution. values are
@@ -667,7 +669,7 @@ struct AccelerationStructurePostbuild {
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
-                             WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
+                             WriteImmediate, label::Write, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
                              ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
                              AccelerationStructurePostbuild>;
 
@@ -701,10 +703,11 @@ public:
         return append(barrier);
     }
 
+    // LayoutAfter UNDEFINED is legal: the subresources' contents are no longer needed, as before their memory is
+    // aliased (the retail title ends a depth buffer's use this way, #984; WARP closes such a list,
+    // d3d12_close_parity_test). Replay keeps the image's Vulkan layout and orders the accesses only.
     bool barrier(const TextureBarrier& barrier) {
         if (!barrier.resource || !valid_sync(barrier.sync_before, barrier.sync_after)) return false;
-        if (barrier.layout_after == d3d12_layout::undefined && barrier.layout_before != d3d12_layout::undefined)
-            return false;
         if (barrier.flags & ~texture_barrier_discard) return false;
         if (barrier.range.mip_count && (!barrier.range.layer_count || !barrier.range.plane_count)) return false;
         if (barrier.sync_after == d3d12_sync::split) return !closed_;
@@ -796,6 +799,11 @@ public:
     }
 
     // WriteBufferImmediate: D3D12 requires a 4-byte aligned, non-null address and one of the three modes.
+    bool write_gpu_label(const label::Write& write) {
+        if(write.target.owner.expired() || write.clock>2) return false;
+        return append(write);
+    }
+
     bool write_immediate(const WriteImmediate& write) {
         if (!write.address || write.address % 4 || write.mode > write_immediate_mode::marker_out) return false;
         return append(write);
