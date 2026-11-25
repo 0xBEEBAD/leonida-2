@@ -315,9 +315,12 @@ headers). Measured on 1.0.2.1 over all 5,680 distinct blobs, which the 25,471 gr
   there and D3D12 refuses a PSO that asks for it. One library pipeline enables `MAX` on an `R8_UINT` target beside
   two others.
 - **Stand-in targets:** where `B4G4R4A4_UNORM` is not renderable, the Vulkan layer draws it into an RGBA8 stand-in
-  and refuses blending there (`E_NOTIMPL`, the output is quantized before it). The factory then turns blending off on
-  those targets only, and on every target if that is still refused, instead of leaving the pipeline to the PC
-  description path. On an RTX 4070 Laptop that is the same library pipeline (the first one the title creates).
+  and refuses blending there (`E_NOTIMPL`, the output is quantized before it). The factory then retries the pipeline
+  with blending off on those targets only (`shims/d3d12_xs_native_pso_fallback.h`), instead of leaving it to the PC
+  description path. On an RTX 4070 Laptop that is the same library pipeline (the first one the title creates). Only a
+  pipeline that blends a `B4G4R4A4` target is retried: `E_NOTIMPL` also stands for refusals unrelated to blending (a
+  rect list without its geometry stage, mesh limits, `FullyCovered`, a dual-source output that does not fit
+  `Location 0, Index 1`), and those keep the blend the title asked for.
 - **Dual-source:** the 1,937 records that blend with `SRC1` factors get them as `D3D12_BLEND_SRC1_*`. The Vulkan
   layer then moves the pixel shader's `SV_Target1` from `Location 1` to `Location 0, Index 1`
   (`runtime/src/dual_source_fragment.h`, RT-DUAL-SOURCE-BLEND).
