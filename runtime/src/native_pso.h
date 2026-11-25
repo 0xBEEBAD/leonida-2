@@ -196,10 +196,11 @@ struct TargetBlend {
 };
 
 // An RDNA2 blend factor (V_028780_BLEND_*, the gfx10 register header) as a D3D12_BLEND, or 0 for one this path does
-// not take: BOTH_(INV_)SRC_ALPHA (11, 12; not on gfx10) and the dual-source SRC1 factors (15 to 18), whose second
-// pixel-shader output the translator does not declare. For an alpha factor, a colour factor names its alpha.
+// not take: BOTH_(INV_)SRC_ALPHA (11, 12; not on gfx10). The dual-source SRC1 factors (15 to 18) read the pixel
+// shader's SV_Target1, which the Vulkan layer moves to Location 0, Index 1 (RT-DUAL-SOURCE-BLEND). For an alpha
+// factor, a colour factor names its alpha.
 inline std::uint8_t d3d12_blend_factor(std::uint32_t f, bool alpha) {
-    static constexpr std::uint8_t colour[21] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 14, 15, 0, 0, 0, 0, 20, 21};
+    static constexpr std::uint8_t colour[21] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 14, 15, 16, 17, 18, 19, 20, 21};
     if (f >= std::size(colour)) return 0;
     if (alpha) {
         switch (f) {
@@ -207,6 +208,8 @@ inline std::uint8_t d3d12_blend_factor(std::uint32_t f, bool alpha) {
             case 3: return 6;   // ONE_MINUS_SRC_COLOR -> INV_SRC_ALPHA
             case 8: return 7;   // DST_COLOR -> DEST_ALPHA
             case 9: return 8;   // ONE_MINUS_DST_COLOR -> INV_DEST_ALPHA
+            case 15: return 18; // SRC1_COLOR -> SRC1_ALPHA
+            case 16: return 19; // INV_SRC1_COLOR -> INV_SRC1_ALPHA
             default: break;
         }
     }

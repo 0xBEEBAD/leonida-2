@@ -318,9 +318,11 @@ headers). Measured on 1.0.2.1 over all 5,680 distinct blobs, which the 25,471 gr
   and refuses blending there (`E_NOTIMPL`, the output is quantized before it). The factory then turns blending off on
   those targets only, and on every target if that is still refused, instead of leaving the pipeline to the PC
   description path. On an RTX 4070 Laptop that is the same library pipeline (the first one the title creates).
-- **Kept on the defaults:** the 1,937 records that blend with the dual-source `SRC1` factors, because the translator
-  declares no second pixel-shader output. A blob of another shape, or a target with a factor this path does not
-  take, keeps the whole pipeline on the defaults and is logged.
+- **Dual-source:** the 1,937 records that blend with `SRC1` factors get them as `D3D12_BLEND_SRC1_*`. The Vulkan
+  layer then moves the pixel shader's `SV_Target1` from `Location 1` to `Location 0, Index 1`
+  (`runtime/src/dual_source_fragment.h`, RT-DUAL-SOURCE-BLEND).
+- **Kept on the defaults:** a blob of another shape, or a target with a factor or function this path does not take,
+  keeps the whole pipeline on the defaults and is logged.
 
 ## Translation status
 

@@ -30,6 +30,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
 #include "../src/rgba4_fragment.h"
+#include "../src/dual_source_fragment.h"
 #include "../src/rect_list_geometry.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
@@ -7240,6 +7241,19 @@ public:
                 packed_color_mask|=1u<<i;
             }
         }
+        // Dual-source blending (RT-DUAL-SOURCE-BLEND): a SRC1 factor reads the pixel shader's SV_Target1, which the
+        // translator declares at Location 1 and Vulkan takes from Location 0, Index 1 (dual_source_fragment.h).
+        bool dual_source = false;
+        for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
+            const auto& b = desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
+            const auto src1 = [](D3D12_BLEND f) {
+                return f == D3D12_BLEND_SRC1_COLOR || f == D3D12_BLEND_INV_SRC1_COLOR || f == D3D12_BLEND_SRC1_ALPHA ||
+                       f == D3D12_BLEND_INV_SRC1_ALPHA;
+            };
+            if (b.BlendEnable &&
+                (src1(b.SrcBlend) || src1(b.DestBlend) || src1(b.SrcBlendAlpha) || src1(b.DestBlendAlpha)))
+                dual_source = true;
+        }
         bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
         // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
@@ -7338,6 +7352,9 @@ public:
             }
             stage.words = library->spirv(*stage.entry);
             if(stage.bit==VK_SHADER_STAGE_FRAGMENT_BIT && packed_color_mask && !leonida::rgba4::quantize(stage.words,packed_color_mask)) return E_INVALIDARG;
+            if (stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT && dual_source && !leonida::dual_source::remap(stage.words))
+                return stream_unsupported("a SRC1 blend factor needs the pixel shader's second colour output; this module's "
+                                          "outputs do not fit Location 0 Index 1; stage", 0);
             if (stage.words.empty()) return E_FAIL;
             const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
             if (!inner.valid) return E_INVALIDARG;

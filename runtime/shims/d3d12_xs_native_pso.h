@@ -55,7 +55,7 @@ inline void fill_blend_state(const np::FixedState& s, D3D12_BLEND_DESC& out) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
             std::fprintf(stderr, "[rt] d3d12_xs: slot 57: %s, so this pipeline keeps blending off (CB_BLEND0 %08x)\n",
-                         s.blend ? "a target's blend state is not one this path builds (dual-source or unknown factor)"
+                         s.blend ? "a target's blend state is not one this path builds (an unknown factor or function)"
                                  : "blob A is absent or not the measured shape",
                          s.blend ? static_cast<unsigned>(s.blend->blend[0]) : 0u);
         return;
