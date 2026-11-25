@@ -2770,8 +2770,14 @@ struct DeviceState {
         // Slots the title wrote in its own backing of this heap, if it gave the heap one.
         aliases.pull_descriptors(arena.mapped + table_va, std::size_t(end - table_va));
         if (sampler) return;  // S# words describe sampling state. They have no buffer address to translate.
-        for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize)
-            rebase_title_vsharp(reinterpret_cast<std::uint32_t*>(arena.mapped + at), aliases);
+        // Each slot's V# and the counter V# in its second half, as a console heap's GPU copy (fix_vsharp): a base in
+        // the title's memory is rebased, one nothing backs becomes zero-size instead of a GPU fault at heap_base plus
+        // that address.
+        for (VkDeviceSize at = table_va; at + kDescriptorSize <= end; at += kDescriptorSize) {
+            auto* const w = reinterpret_cast<std::uint32_t*>(arena.mapped + at);
+            fix_vsharp(w, VsharpPath::table);
+            fix_vsharp(w + 4, VsharpPath::table);
+        }
     }
 
     // A buffer V# (its first four dwords at `w`) whose base is in the title's own memory gets the console VA of a GPU
