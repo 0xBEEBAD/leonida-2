@@ -3543,7 +3543,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `WaitFrameEventX` returns at the next origin with the next token (1, 2, 3, ...; 0 is the null token) and does not
   return while `latency` presented frames are still waiting for their vblank. A frame presented before the origin event
   is armed is not paced (`PresentX` does not hold it for a vblank), so it is shown at once and never waits for a vblank:
-  blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once
+  blank presents of a loading screen do not delay the first wait. At most `latency` frames are in flight once the event
+  is armed: a present into a full queue (several presents with no wait between them) replaces the newest queued frame
+  and takes its vblank, like a mailbox, so the replaced frame is never shown (no display statistic) and the older ones
+  keep their vblanks. However many presents come between two waits, the next wait passes when the oldest frame is
+  shown. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
   `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
   `LEONIDA_PRESENT_UNCAP` (any non-empty value other than "0", read when the object is made) takes the frame-rate
@@ -3559,8 +3563,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `SuspendX`/`ResumeX` so suspended pauses are excluded), computing nearest-rank `p50`/`p95`/`p99` and the mean drift
   against the active target interval (`FramePacer::pacing_summary()`). On teardown after at least one present,
   `XboxPresentation` logs a single `[rt] present: pacing summary ...` line on stderr, which `tools/boot_trace.py`
-  surfaces beside the D3D12 call counts. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
-  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode) and by
+  surfaces beside the D3D12 call counts. The intervals are between `PresentX` calls, not between frames shown: a frame
+  replaced in a full queue (see the latency limit above) still counts as a present with its real interval, so the
+  percentiles describe the title's present cadence, and a burst of presents between two waits shows up as short
+  intervals. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
+  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode, replaced frames) and by
   `tests/test_boot_trace.py`.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
@@ -3779,7 +3786,8 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   (placement, point/bilinear, alpha overlay, HDR10 and PQ conversions, refusals; against a CPU model), token errors,
   statistics, suspend/resume, `ImmediateThresholdPercent` with a late frame at several thresholds (immediate mode
   chosen, or not for 0, below the lateness, on time) and with `LEONIDA_PRESENT_NO_TEAR=1`, 30 frames at 60 Hz in real
-  time; skipped, exit 77, without a Vulkan device). `frame_pacer_test` also sweeps `decide_present_sync`.
+  time; skipped, exit 77, without a Vulkan device). `frame_pacer_test` also sweeps `decide_present_sync`, and checks
+  that 1000 presents between two waits leave at most `latency` frames in flight (latency 1, 2 and 3).
 
 ### 4.6 Queries
 
