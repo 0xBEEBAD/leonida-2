@@ -586,7 +586,7 @@ int check_title_memory(Context& c, int& checks, bool geometry) {
     list->SetComputeRootUnorderedAccessView(1, ring_va + 0x3000);
     list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + 2 * inc});
     list->Dispatch(1, 1, 1);
-    list->SetComputeRoot32BitConstant(0, 0xFFFFFFFBu, 1);
+    list->SetComputeRoot32BitConstant(0, 0xFFFFFFFAu, 1);  // cs_user_data's descriptor-word mode
     list->SetComputeRootUnorderedAccessView(1, out[3]->GetGPUVirtualAddress());
     list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu + 5 * inc});
     list->Dispatch(1, 1, 1);
