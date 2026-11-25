@@ -4344,6 +4344,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # Stateful indirect draw topology coverage and per-reason indirect_stats counters (no GPU or game data).
+    add_executable(indirect_topology_and_stats_test test/indirect_topology_and_stats_test.cpp)
+    target_link_libraries(indirect_topology_and_stats_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(indirect_topology_and_stats_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME indirect_topology_and_stats COMMAND indirect_topology_and_stats_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)

@@ -1931,11 +1931,11 @@ private:
             if (!terminal_only) return skip(stats::compound);
             if (!graphics_pipeline_) return skip(stats::pipeline);
             if (!graphics_.layout) return skip(stats::root_layout);
-            if (topology_ != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) return skip(stats::topology);
+            if (!stats::topology_supported(topology_)) return skip(stats::topology);
             if (indexed && (!index_.va || !index_.size ||
                             (index_.format != DXGI_FORMAT_R16_UINT && index_.format != DXGI_FORMAT_R32_UINT)))
                 return skip(stats::index_view);
-            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return skip(stats::viewport);
+            if (!any_nonempty_viewport()) return skip(stats::viewport);
             note_direct_heap_indexing(graphics_.layout);
             record_raster_draw(indexed, 0, 0, 0, 0, 0, &args);
             return;
