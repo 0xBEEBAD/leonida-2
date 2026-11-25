@@ -5,7 +5,7 @@
 // `python -I tools/xdxr_bvh.py check-build <out dir>` (ctest: xbox_bvh_builder + xbox_bvh_builder_check), which
 // checks the records and traces rays against brute force. Also checked: the shim's prebuild sizes are the layer's,
 // an element asking for offline statistics is skipped and leaves its destination untouched, a non-empty XDXR stream
-// is accepted, rehydration rebuilds or deserializes with S_OK, and builders are released.
+// is accepted, rehydration rebuilds from geometry with S_OK, and builders are released.
 //
 //   xbox_bvh_builder_test <out dir>        the shim
 //   xbox_bvh_builder_test --console        run with LEONIDA_BVH_BUILDER=console: nothing is registered
