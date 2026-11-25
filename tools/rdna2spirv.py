@@ -7350,7 +7350,10 @@ class Gen:
         if args[1].get("sext"):
             raise Unsupported("DPP sext")
         src = args[1]
-        src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
+        raw_src = dict(src)
+        raw_src.pop("neg", None)
+        raw_src.pop("abs", None)
+        src_val = self.src_u(raw_src)
 
         lane = self.wave_lane()
         group_bits = 7 if dpp8 is not None else 15
@@ -7521,6 +7524,7 @@ class Gen:
         zero = self.cu(0)
         src0 = self.tmp()
         self.emit(f"{src0} = OpSelect %uint {src_ok} {shuffled} {zero}")
+        src0 = self.modify(src0, src)
         if dpp8 is not None or bound:
             write = enabled
         else:
