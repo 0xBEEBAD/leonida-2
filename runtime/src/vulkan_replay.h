@@ -48,6 +48,7 @@
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_indirect_clamp.h"
 #include "xdxr_build.h"
+#include "pipeline_wait.h"
 
 #include <algorithm>
 #include <array>
@@ -61,8 +62,10 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -860,8 +863,9 @@ struct ComputePipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::uint64_t code_base = 0;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every dispatch; null: none
-    // A pipeline built on first use: with `pipeline` null, `build(build_context)` returns the handle (building it if
-    // nobody has yet), or null when it cannot be built. Null `build`: `pipeline` is final.
+    // A pipeline built on first use: with `pipeline` null, `build(build_context)` returns the handle, or null when it
+    // cannot be built or (async_build) is still being built - it never waits for a build another thread runs, since
+    // prepare calls it with the resource lock held. Null `build`: `pipeline` is final.
     VkPipeline (*build)(void*) = nullptr;
     void* build_context = nullptr;
     bool async_build = false;  // a null handle may be waiting for the compile worker
@@ -869,6 +873,11 @@ struct ComputePipeline {
     // first use is always built where prepare() meets it. Not used with async_build. See PipelineCompiles.
     VkPipeline (*built)(void*) = nullptr;
     bool large = false;        // compiled one after another with the other large ones (PipelineCompiles)
+    // With `build`: the submission's pre-pass (await_pipelines) asks for the pipeline and waits for it with no lock of
+    // the replay layer held, up to `until_ns` (pipeline_wait.h: probe, no_wait, a steady-clock time, forever). The
+    // handle, or null with `*pending` saying whether it is still to be built (false: it cannot be). Null: the pre-pass
+    // leaves the pipeline to `build`.
+    VkPipeline (*await)(void* context, std::int64_t until_ns, bool* pending) = nullptr;
     bool skipped = false;      // never built on request (LEONIDA_SKIP_COMPUTE): its dispatches are dropped
 };
 
@@ -888,6 +897,7 @@ struct GraphicsPipeline {
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
     bool viewport_with_count = false;     // pipeline uses VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT
+    bool depth_bounds = false;            // depthBoundsTestEnable: the bounds are dynamic (vkCmdSetDepthBounds)
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -900,10 +910,25 @@ struct GraphicsPipeline {
     // ComputePipeline::built.
     std::function<VkPipeline(std::uint32_t flags)> built;
     bool large = false;  // as ComputePipeline::large
+    // As ComputePipeline::await, for the variant with the `unbound` slots (unbound_slots). Null: left to `variant`.
+    std::function<VkPipeline(std::uint32_t unbound, std::int64_t until_ns, bool* pending)> await;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     bool async_build = false;
     bool nonunit_vertex_divisor = false;  // an actual instance divisor > 1, not a zero-stride emulation
 };
+
+// The slots a draw leaves unbound that `pipeline` has a format for: the variant prepare_draw builds the draw with
+// (GraphicsPipeline::variant). A render target or depth buffer that does not resolve drops the draw instead.
+inline std::uint32_t unbound_slots(const Draw& draw, const GraphicsPipeline& pipeline) {
+    std::uint32_t unbound = 0;
+    const std::uint32_t bound = draw.views ? draw.views->render_target_count : 0;
+    for (std::size_t slot = 0; slot < pipeline.color_formats.size() && slot < 8; ++slot)
+        if (pipeline.color_formats[slot] != VK_FORMAT_UNDEFINED &&
+            !(slot < bound && draw.views->render_targets[slot].resource))
+            unbound |= 1u << slot;
+    if (pipeline.depth_format != VK_FORMAT_UNDEFINED && !draw.depth.resource) unbound |= GraphicsPipeline::unbound_depth;
+    return unbound;
+}
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
 struct ShaderUserData {
@@ -1116,9 +1141,13 @@ struct ReplayFunctions {
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
+    PFN_vkCmdSetDepthBounds set_depth_bounds = nullptr;  // for depth-bounds pipelines only
     PFN_vkCmdDraw draw = nullptr;
     unsigned* mesh_draw_count = nullptr;  // opt-in count for this submission
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
+    // ExecuteIndirect with a DISPATCH_MESH signature. Its 12-byte record is VkDrawMeshTasksIndirectCommandEXT.
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -1192,6 +1221,7 @@ struct ReplayFunctions {
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t, std::uint32_t,
                        ClampedIndirect&)> prepare_indirect_clamp;
     std::function<void(VkCommandBuffer, const ClampedIndirect&)> emit_indirect_clamp;
+    bool external_graphics_scope = false;  // Caller supplies the rendering scope, pipeline and bindings for legacy draws.
     bool require_indirect_clamp = false;  // an enabled device refuses an indirect if scratch preparation fails
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
@@ -1296,7 +1326,7 @@ struct Prepared {
     PredicateCapture predicate;
     std::vector<PredicatedCopyDispatch> predicated_copy;
     CountedDispatch counted_dispatch;
-    ClampedIndirect indirect_clamp;  // ExecuteIndirect: the clamped arguments the command reads, or null
+    ClampedIndirect indirect_clamp;  // an indirect command's clamped arguments it reads, or null
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
@@ -2561,7 +2591,9 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
                           const ReplayFunctions& vk, PreparedDraw& p) {
     if (arguments) {
         const IndirectDrawArgs& arg = *arguments;
-        const VkDeviceSize record_size = draw.indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+        const VkDeviceSize record_size = draw.mesh      ? sizeof(VkDrawMeshTasksIndirectCommandEXT)
+                                         : draw.indexed ? sizeof(VkDrawIndexedIndirectCommand)
+                                                        : sizeof(VkDrawIndirectCommand);
         if (!arg.argument_buffer || !arg.max_count || arg.stride < record_size ||
             (arg.stride | arg.argument_offset | arg.count_offset) % 4 || (!arg.count_buffer && arg.count_offset))
             return ReplayResult::invalid_indirect_arguments;
@@ -2569,8 +2601,10 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         // independently of the supplied maxDrawCount. On a device with a smaller limit an
         // arbitrary D3D12 count requires a GPU clamp pass; keep that case guarded for now.
         const bool counted = arg.count_buffer != 0;
-        const bool entry_available = counted ? (draw.indexed ? vk.draw_indexed_indirect_count : vk.draw_indirect_count) != nullptr
-                                             : (draw.indexed ? vk.draw_indexed_indirect : vk.draw_indirect) != nullptr;
+        const bool entry_available =
+            draw.mesh ? (counted ? vk.draw_mesh_tasks_indirect_count != nullptr : vk.draw_mesh_tasks_indirect != nullptr)
+            : counted ? (draw.indexed ? vk.draw_indexed_indirect_count : vk.draw_indirect_count) != nullptr
+                      : (draw.indexed ? vk.draw_indexed_indirect : vk.draw_indirect) != nullptr;
         // The GPU supplies firstIndex/indexCount at execution (VUID-08798). A sized binding alone
         // does not guarantee a robust fetch, and the legacy binding covers the backing buffer's tail.
         const auto skip = [&](indirect_stats::Reason reason) {
@@ -2578,11 +2612,13 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
             p.skipped = true;
             return ReplayResult::success;
         };
-        if (draw.mesh) return skip(indirect_stats::mesh);
+        // A mesh draw has no topology, first instance or index buffer; its records go through the clamp pass,
+        // which bounds x and sets y = z = 1 (the console's mesh dispatch is one-dimensional), or it is not drawn.
+        if (draw.mesh && (!entry_available || !leonida::indirect_clamp_enabled())) return skip(indirect_stats::mesh);
         static_assert(indirect_stats::topology_supported(topology_rect_list) &&
                       !indirect_stats::topology_supported(topology_quad_list));
-        if (!indirect_stats::topology_supported(draw.topology)) return skip(indirect_stats::topology);
-        if (!vk.draw_indirect_first_instance) return skip(indirect_stats::first_instance);
+        if (!draw.mesh && !indirect_stats::topology_supported(draw.topology)) return skip(indirect_stats::topology);
+        if (!draw.mesh && !vk.draw_indirect_first_instance) return skip(indirect_stats::first_instance);
         if (!entry_available) return skip(indirect_stats::entry);
         if (draw.indexed && !vk.bind_robust_index_view) return skip(indirect_stats::robust_index);
         if (arg.max_count > vk.max_draw_indirect_count) return skip(indirect_stats::count_limit);
@@ -2626,6 +2662,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     if (draw.mesh && !vk.draw_mesh_tasks) return unsupported_at(__LINE__);
     if (pipeline->viewport_with_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
         return unsupported_at(__LINE__);
+    if (pipeline->depth_bounds && !vk.set_depth_bounds) return unsupported_at(__LINE__);
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
     if (pipeline->color_formats.size() > max_render_targets) return unsupported_at(__LINE__);
     p.graphics = pipeline;
@@ -2690,6 +2727,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
 
     // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
     // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
+    // The same mask as unbound_slots, which the submission's pre-pass asked for (await_pipelines).
     std::uint32_t unbound = 0;
     if (pipeline->rectangle_variant_topology && draw.topology == pipeline->rectangle_variant_topology)
         unbound |= GraphicsPipeline::rectangle_stage;
@@ -3241,6 +3279,114 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
         }
     }
     return false;
+}
+
+// A pipeline a submission needs that may still be in the making (ComputePipeline::await / GraphicsPipeline::await),
+// once per pipeline and variant: collected by collect_pipeline_awaits with the caller's resource lock held (the
+// lookups read the registry), waited for by await_pipelines after it is released. The pipeline states stay alive
+// meanwhile: the command lists that name them hold them (D3D12 lets them go only once the call has returned).
+struct PipelineAwait {
+    std::uintptr_t id = 0;
+    std::uint32_t unbound = 0;
+    VkPipeline (*compute)(void*, std::int64_t, bool*) = nullptr;
+    void* context = nullptr;
+    std::function<VkPipeline(std::uint32_t, std::int64_t, bool*)> graphics;
+    VkPipeline handle = VK_NULL_HANDLE;
+    bool pending = true;  // not built yet (false once built, or known not to build)
+    void call(std::int64_t until) {
+        handle = compute ? compute(context, until, &pending) : graphics(unbound, until, &pending);
+        if (handle) pending = false;
+    }
+};
+
+// The pipelines `lists` draw and dispatch with that are not built yet: every one whose handle replay asks for at
+// prepare time (ComputePipeline::build, GraphicsPipeline::variant), probed without starting anything. `seen` is the
+// caller's scratch (not a thread_local: one with a destructor in gta6rt.exe adds TLS callbacks to the image, which
+// the loader's TLS index-0 move must not have, pe_loader.cpp reserve_tls_index0).
+inline void collect_pipeline_awaits(std::span<const CommandList* const> lists, const ReplayFunctions& vk,
+                                    std::vector<PipelineAwait>& out, std::unordered_set<std::uint64_t>& seen) {
+    out.clear();
+    seen.clear();
+    if (!vk.compute_pipeline && !vk.graphics_pipeline) return;
+    std::uint64_t last = ~0ull;
+    const auto first_time = [&](std::uintptr_t id, std::uint32_t unbound) {
+        const std::uint64_t key = std::uint64_t(id) ^ (std::uint64_t(unbound) << 52);
+        if (key == last) return false;
+        last = key;
+        return seen.insert(key).second;
+    };
+    const auto compute = [&](std::uintptr_t id) {
+        if (!id || !vk.compute_pipeline || !first_time(id, 0)) return;
+        const ComputePipeline* pipeline = vk.compute_pipeline(id);
+        if (!pipeline || pipeline->pipeline || pipeline->skipped || !pipeline->await) return;
+        bool pending = false;
+        if (pipeline->await(pipeline->build_context, pipeline_wait::probe, &pending) || !pending) return;
+        PipelineAwait& a = out.emplace_back();
+        a.id = id;
+        a.compute = pipeline->await;
+        a.context = pipeline->build_context;
+    };
+    for (const CommandList* list : lists) {
+        for (const auto& command : list->commands()) {
+            if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+                compute(dispatch->pipeline);
+            } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
+                if (ind->kind == IndirectKind::dispatch) compute(ind->pipeline);
+            } else if (const auto* draw = draw_command(command).state) {  // direct and stateful indirect draws
+                if (!draw->pipeline || !vk.graphics_pipeline) continue;
+                const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw->pipeline);
+                if (!pipeline || !pipeline->await) continue;
+                const std::uint32_t unbound = unbound_slots(*draw, *pipeline);
+                if ((!unbound && pipeline->pipeline) || !first_time(draw->pipeline, unbound)) continue;
+                bool pending = false;
+                if (pipeline->await(unbound, pipeline_wait::probe, &pending) || !pending) continue;
+                PipelineAwait& a = out.emplace_back();
+                a.id = draw->pipeline;
+                a.unbound = unbound;
+                a.graphics = pipeline->await;
+            }
+        }
+    }
+}
+
+// Asks for every pipeline in `awaits` (a build each nobody has started: queued on the compile worker, or built here
+// when builds are not asynchronous), then waits for the ones still being built, together at most `budget_ns`
+// (negative: as long as they take) and what the frame's budget has left (pipeline_wait::take). Holds no lock while it
+// waits. The ones not built by then are skipped by replay. Returns how long it waited.
+inline std::int64_t await_pipelines(std::vector<PipelineAwait>& awaits, std::int64_t budget_ns) {
+    for (PipelineAwait& a : awaits) a.call(pipeline_wait::no_wait);
+    std::size_t pending = 0;
+    for (const PipelineAwait& a : awaits) pending += a.pending;
+    if (!pending || budget_ns == 0) return 0;
+    const pipeline_wait::Grant grant =
+        budget_ns < 0 ? pipeline_wait::Grant{pipeline_wait::forever, 0, false} : pipeline_wait::take(budget_ns);
+    if (grant.ns <= 0) return 0;
+    const std::int64_t start = pipeline_wait::now_ns();
+    const std::int64_t until = budget_ns < 0 ? pipeline_wait::forever : start + grant.ns;
+    auto& stats = pipeline_wait::stats();
+    for (PipelineAwait& a : awaits) {
+        if (!a.pending) continue;
+        if (until != pipeline_wait::forever && pipeline_wait::now_ns() >= until) {
+            stats.late.fetch_add(1, std::memory_order_relaxed);  // no time left for it
+            continue;
+        }
+        const std::int64_t began = pipeline_wait::now_ns();
+        a.call(until);
+        stats.waited.fetch_add(1, std::memory_order_relaxed);
+        stats.wait_ns.fetch_add(std::uint64_t(pipeline_wait::now_ns() - began), std::memory_order_relaxed);
+        if (a.pending) stats.late.fetch_add(1, std::memory_order_relaxed);
+    }
+    const std::int64_t waited = pipeline_wait::now_ns() - start;
+    if (grant.limited) pipeline_wait::give_back(grant, grant.ns - waited);
+    return waited;
+}
+
+// The budget for one submission (pipeline_wait.h): nanoseconds, negative for no limit. Strict replay waits for every
+// build, so nothing is skipped.
+inline std::int64_t pipeline_wait_budget_ns() {
+    if (strict_replay()) return -1;
+    const int ms = pipeline_wait::effective_submission_ms();
+    return ms < 0 ? -1 : std::int64_t(ms) * 1000000;
 }
 
 // Resolves and checks every command. Nothing is written to a command buffer.
@@ -3879,6 +4025,58 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::invalid_indirect_arguments;
                 p.source = *cnt;
             }
+            if (ind->kind != IndirectKind::dispatch && !vk.external_graphics_scope) continue;
+            // The clamp pass (vulkan_indirect_clamp.h): the arguments are copied on the GPU into scratch with their
+            // values bounded before the indirect command reads them, so a stale or garbage record left by a skipped or
+            // mistranslated compute pass cannot run for seconds and reset the display driver. A counted call has its
+            // count clamped to max_command_count too. It is a helper dispatch, so it needs the statistics segments of
+            // a pipeline-statistics query. Every clamp of this list shares one work budget: a list of many calls does
+            // not multiply the per-list limit.
+            const bool clamp_command_available =
+                ind->kind == IndirectKind::dispatch
+                    ? vk.dispatch_indirect != nullptr
+                    : ind->kind == IndirectKind::draw
+                          ? (ind->count_buffer ? vk.draw_indirect_count != nullptr : vk.draw_indirect != nullptr)
+                          : (ind->count_buffer ? vk.draw_indexed_indirect_count != nullptr
+                                               : vk.draw_indexed_indirect != nullptr);
+            const bool clamped =
+                leonida::indirect_clamp_enabled() && vk.prepare_indirect_clamp && vk.emit_indirect_clamp &&
+                clamp_command_available && !(statistics_active && !statistics_helpers) &&
+                vk.prepare_indirect_clamp(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
+                                          ind->count_buffer ? p.source.buffer : VK_NULL_HANDLE,
+                                          ind->count_buffer ? p.source.buffer_offset + ind->count_offset : 0,
+                                          static_cast<std::uint32_t>(ind->kind), ind->stride, ind->max_count,
+                                          p.indirect_clamp);
+            if (clamped) p.indirect_clamp.share_list_budget(indirect_list_budget);
+            // A device with the pass enabled refuses an indirect call whose clamp could not be prepared: reading the
+            // application's buffer is what the clamp exists to avoid. Otherwise the fallbacks below apply.
+            if (!clamped && vk.require_indirect_clamp) return unsupported_at(__LINE__);
+            // Nothing else to resolve when clamped: the clamp's scratch is the indirect buffer and its count word.
+            if (!clamped) {
+                if (ind->kind == IndirectKind::dispatch) {
+                    if (ind->count_buffer || indirect_group_budget()) {
+                        // Vulkan lacks vkCmdDispatchIndirectCount. Copy the GPU-visible commands to private scratch
+                        // and replace commands past min(count, max_count) with zero-group dispatches - or, with
+                        // LEONIDA_INDIRECT_GROUP_BUDGET and no count buffer, keep the whole batch inside its work
+                        // budget. `source` is the count binding, null without one.
+                        if (!ind->pipeline || !vk.dispatch_indirect || !vk.prepare_counted_dispatch ||
+                            !vk.emit_counted_dispatch || (statistics_active && !statistics_helpers) ||
+                            !vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
+                                                         p.source.buffer, p.source.buffer_offset + ind->count_offset,
+                                                         ind->stride, ind->max_count, p.counted_dispatch))
+                            return unsupported_at(__LINE__);
+                    } else if (!vk.dispatch_indirect) {
+                        return unsupported_at(__LINE__);
+                    }
+                } else if (!clamp_command_available) {
+                    // A legacy graphics indirect draw is still emitted (a caller that opened its own rendering scope
+                    // around the replay, as the tests do); without vkCmdDrawIndirect[Count] there is nothing to emit.
+                    return unsupported_at(__LINE__);
+                }
+            }
+            // Legacy graphics IR carries no graphics state of its own: the recorded, stateful graphics indirects are
+            // Draw commands (IndirectRasterDraw) and open their own rendering scope. A legacy one is emitted as it is
+            // - the clamp pass above is what keeps its arguments safe - and its dispatch-side work ends here.
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return unsupported_at(__LINE__);
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
@@ -3890,28 +4088,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!found) return unresolved_at(__LINE__);
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
             }
-            if (ind->kind == IndirectKind::dispatch && vk.require_indirect_clamp) {
-                if (!ind->pipeline || !vk.dispatch_indirect || !vk.prepare_indirect_clamp || !vk.emit_indirect_clamp ||
-                    (statistics_active && !statistics_helpers) ||
-                    !vk.prepare_indirect_clamp(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
-                        p.source.buffer, p.source.buffer_offset + ind->count_offset, indirect_clamp_dispatch,
-                        ind->stride, ind->max_count, p.indirect_clamp))
-                    return unsupported_at(__LINE__);
-                p.indirect_clamp.share_list_budget(indirect_list_budget);
-            } else if (ind->kind == IndirectKind::dispatch && (ind->count_buffer || indirect_group_budget())) {
-                // Vulkan lacks vkCmdDispatchIndirectCount. Copy the GPU-visible commands to private scratch
-                // and replace commands past min(count, max_count) with zero-group dispatches.
-                if (!ind->pipeline || !vk.dispatch_indirect || !vk.prepare_counted_dispatch ||
-                    !vk.emit_counted_dispatch || (statistics_active && !statistics_helpers) ||
-                    !vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
-                                                 p.source.buffer, p.source.buffer_offset + ind->count_offset,
-                                                 ind->stride, ind->max_count, p.counted_dispatch))
-                    return unsupported_at(__LINE__);
-            } else if (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect) {
-                return unsupported_at(__LINE__);
-            }
-            // Legacy graphics IR carries no graphics state. Validate its resource ranges above,
-            // but never emit it; stateful graphics indirects use Draw and its rendering scope.
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
             if (vk.xdxr_check) {
@@ -4052,19 +4228,49 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (const auto r = detail::prepare_quad_indices(*draw.state, vk, prepared_draw); r != ReplayResult::success)
                     return r;
             }
-            if (draw.arguments && !prepared_draw.skipped && vk.require_indirect_clamp) {
-                const auto& arg = *draw.arguments;
-                if (!vk.prepare_indirect_clamp || !vk.emit_indirect_clamp || (statistics_active && !statistics_helpers) ||
-                    !vk.prepare_indirect_clamp(prepared_draw.indirect_buffer, prepared_draw.indirect_offset,
-                        prepared_draw.indirect_count_buffer, prepared_draw.indirect_count_offset,
-                        draw.state->indexed ? indirect_clamp_draw_indexed : indirect_clamp_draw,
-                        arg.stride, arg.max_count, p.indirect_clamp))
+            // A stateful indirect draw takes the same clamp pass (vulkan_indirect_clamp.h) as a legacy ExecuteIndirect:
+            // the arguments it reads are copied and bounded on the GPU before its rendering scope opens, and the draw
+            // then reads that scratch. Recorded in this command's Prepared so the emit phase records the pass before
+            // vkCmdBeginRendering - outside the scope and outside a pipeline-statistics query. A draw that was already
+            // dropped, or whose indirect entry point or scratch is missing, keeps the application's argument buffer.
+            if (draw.arguments && !prepared_draw.skipped) {
+                const IndirectDrawArgs& arg = *draw.arguments;
+                const ResourceBinding* args_of = resolve(arg.argument_buffer);
+                const ResourceBinding* count = arg.count_buffer ? resolve(arg.count_buffer) : nullptr;
+                const bool indexed = draw.state->indexed;
+                const bool mesh = draw.state->mesh;
+                const bool clamp_command_available =
+                    mesh ? (arg.count_buffer ? vk.draw_mesh_tasks_indirect_count != nullptr
+                                             : vk.draw_mesh_tasks_indirect != nullptr)
+                    : arg.count_buffer
+                        ? (indexed ? vk.draw_indexed_indirect_count != nullptr : vk.draw_indirect_count != nullptr)
+                        : (indexed ? vk.draw_indexed_indirect != nullptr : vk.draw_indirect != nullptr);
+                const bool clamped =
+                    args_of && args_of->buffer && clamp_command_available && leonida::indirect_clamp_enabled() &&
+                    vk.prepare_indirect_clamp && vk.emit_indirect_clamp && !(statistics_active && !statistics_helpers) &&
+                    vk.prepare_indirect_clamp(args_of->buffer, args_of->buffer_offset + arg.argument_offset,
+                                              count ? count->buffer : VK_NULL_HANDLE,
+                                              count ? count->buffer_offset + arg.count_offset : 0,
+                                              static_cast<std::uint32_t>(mesh      ? IndirectKind::dispatch_mesh
+                                                                         : indexed ? IndirectKind::draw_indexed
+                                                                                   : IndirectKind::draw),
+                                              arg.stride, arg.max_count, p.indirect_clamp);
+                if (clamped) {
+                    // Clamped: p.indirect_clamp names the scratch this draw reads; nothing else to resolve. Its budget
+                    // is the list's (one per command list, shared with the legacy ExecuteIndirect clamps above), and
+                    // the prepared draw carries the clamped arguments too.
+                    p.indirect_clamp.share_list_budget(indirect_list_budget);
+                    prepared_draw.indirect_buffer = p.indirect_clamp.buffer;
+                    prepared_draw.indirect_offset = p.indirect_clamp.offset;
+                    prepared_draw.indirect_count_buffer = p.indirect_clamp.count_buffer;
+                    prepared_draw.indirect_count_offset = p.indirect_clamp.count_offset;
+                } else if (mesh) {
+                    // Unclamped, a mesh record's y and z are whatever the title left there: not drawn.
+                    indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::mesh);
+                    prepared_draw.skipped = true;
+                } else if (vk.require_indirect_clamp) {
                     return unsupported_at(__LINE__);
-                p.indirect_clamp.share_list_budget(indirect_list_budget);
-                prepared_draw.indirect_buffer = p.indirect_clamp.buffer;
-                prepared_draw.indirect_offset = p.indirect_clamp.offset;
-                prepared_draw.indirect_count_buffer = p.indirect_clamp.count_buffer;
-                prepared_draw.indirect_count_offset = p.indirect_clamp.count_offset;
+                }
             }
         }
     }
@@ -4387,13 +4593,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         // draw's own rendering scope begins. The index expansion of an indexed quad list runs here too: outside the
         // rendering scope, and between the segments so that no query counts its dispatch (D3D-162). It stays inside
         // the predicate, which skips it together with its draw.
-        if (p.indirect_clamp.buffer) {
-            end_statistics();
-            if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
-            vk.emit_indirect_clamp(command_buffer, p.indirect_clamp);
-            if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
-            begin_statistics();
-        } else if (!p.counted_dispatch.indirect && (raster.state || std::holds_alternative<ExecuteIndirect>(command))) {
+        if (!p.indirect_clamp.buffer && !p.counted_dispatch.indirect &&
+            (raster.state || std::holds_alternative<ExecuteIndirect>(command))) {
             end_statistics();
             if (raster.state && prepared.draws[p.draw].quad_indices.buffer)
                 vk.emit_quad_indices(command_buffer, prepared.draws[p.draw].quad_indices);
@@ -4998,17 +5199,64 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
-            if (ind->kind != IndirectKind::dispatch) {
+            if (ind->kind != IndirectKind::dispatch && !vk.external_graphics_scope) {
                 indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::stateless);
+                continue;
+            }
+            // The clamp pass (vulkan_indirect_clamp.h) runs before anything reads the indirect arguments, and before
+            // the drawing scope an indirect draw opens around itself. It is a helper dispatch: a pipeline-statistics
+            // query must not count it, and it runs even under a false predicate (the draw it feeds may be the one
+            // the predicate discards, and a later command may read the same scratch).
+            const bool clamped = p.indirect_clamp.buffer != VK_NULL_HANDLE;
+            if (clamped) {
+                end_statistics();
+                if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
+                vk.emit_indirect_clamp(command_buffer, p.indirect_clamp);
+                if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
+                begin_statistics();
+            }
+            // What the indirect command reads: the clamped scratch, the application's own buffer, or for a counted
+            // DISPATCH (Vulkan has no vkCmdDispatchIndirectCount, and LEONIDA_INDIRECT_GROUP_BUDGET packs a batch
+            // without one too) the zero-filled copy the replay made.
+            const bool counted_dispatch = !clamped && p.counted_dispatch.indirect;
+            const VkBuffer indirect_buffer = clamped  ? p.indirect_clamp.buffer
+                                             : counted_dispatch ? p.counted_dispatch.indirect
+                                                                : p.binding.buffer;
+            const VkDeviceSize arguments = clamped  ? p.indirect_clamp.offset
+                                           : counted_dispatch ? p.counted_dispatch.offset
+                                                              : p.binding.buffer_offset + ind->argument_offset;
+            const VkBuffer count_buffer = clamped ? p.indirect_clamp.count_buffer : p.source.buffer;
+            const VkDeviceSize count_offset = clamped ? p.indirect_clamp.count_offset : p.source.buffer_offset + ind->count_offset;
+            const std::uint32_t records = clamped ? p.indirect_clamp.records : ind->max_count;
+            const std::uint32_t stride = clamped ? p.indirect_clamp.stride
+                                      : counted_dispatch ? std::uint32_t(sizeof(VkDispatchIndirectCommand))
+                                                         : ind->stride;
+            // A legacy graphics indirect draw opens no rendering scope of its own: the caller has one open around the
+            // replay (the tests do), and the recorded, stateful graphics indirects are Draw commands instead.
+            if (ind->kind != IndirectKind::dispatch) {
+                if constexpr (Checkpoints) checkpoints->record(command_buffer, i, CheckpointKind::draw);
+                if (ind->count_buffer) {
+                    if (ind->kind == IndirectKind::draw)
+                        vk.draw_indirect_count(command_buffer, indirect_buffer, arguments, count_buffer, count_offset,
+                                               records, stride);
+                    else
+                        vk.draw_indexed_indirect_count(command_buffer, indirect_buffer, arguments, count_buffer,
+                                                       count_offset, records, stride);
+                } else if (ind->kind == IndirectKind::draw) {
+                    vk.draw_indirect(command_buffer, indirect_buffer, arguments, records, stride);
+                } else {
+                    vk.draw_indexed_indirect(command_buffer, indirect_buffer, arguments, records, stride);
+                }
                 continue;
             }
             if (ind->pipeline && !p.pipeline.pipeline && (p.pipeline.async_build || p.pipeline.skipped)) continue;
             if constexpr (Checkpoints)
                 checkpoints->dispatch(command_buffer, i, p.pipeline.pipeline, ind->pipeline, ind->user_data, {}, true,
-                                      ind->argument_buffer, ind->argument_offset, ind->count_buffer,
-                                      ind->count_offset, ind->max_count, ind->stride);
-            const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
-            if (p.counted_dispatch.indirect) {
+                                      reinterpret_cast<std::uintptr_t>(indirect_buffer),
+                                      clamped || counted_dispatch ? arguments : ind->argument_offset,
+                                      ind->count_buffer ? reinterpret_cast<std::uintptr_t>(count_buffer) : 0,
+                                      clamped ? count_offset : ind->count_offset, records, stride);
+            if (counted_dispatch) {
                 // No D3D12 query must count this internal compute pass as an application dispatch.
                 end_statistics();
                 vk.emit_counted_dispatch(command_buffer, p.counted_dispatch);
@@ -5028,13 +5276,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
                                   &data);
             }
-            for (std::uint32_t k = 0; k < ind->max_count; ++k) {
-                vk.dispatch_indirect(command_buffer,
-                    p.indirect_clamp.buffer ? p.indirect_clamp.buffer :
-                        p.counted_dispatch.indirect ? p.counted_dispatch.indirect : p.binding.buffer,
-                    (p.indirect_clamp.buffer ? p.indirect_clamp.offset + VkDeviceSize(k) * p.indirect_clamp.stride
-                     : p.counted_dispatch.indirect ? p.counted_dispatch.offset + VkDeviceSize(k) * 12
-                                       : arguments + VkDeviceSize(k) * ind->stride));
+            for (std::uint32_t k = 0; k < records; ++k) {
+                vk.dispatch_indirect(command_buffer, indirect_buffer, arguments + VkDeviceSize(k) * stride);
             }
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
@@ -5156,6 +5399,16 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             const Draw* draw = raster.state;
             const detail::PreparedDraw& d = prepared.draws[p.draw];
             if (d.skipped) continue;  // could not be resolved in prepare: dropped
+            // The clamp pass for a stateful indirect draw (vulkan_indirect_clamp.h) runs before vkCmdBeginRendering,
+            // because its copy and transfer barrier are not allowed inside a dynamic-rendering scope. It is a helper
+            // dispatch, so a pipeline-statistics query must not count it, and it runs even under a false predicate.
+            if (p.indirect_clamp.buffer != VK_NULL_HANDLE) {
+                end_statistics();
+                if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
+                vk.emit_indirect_clamp(command_buffer, p.indirect_clamp);
+                if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
+                begin_statistics();
+            }
             if constexpr (Checkpoints)
                 checkpoints->record(command_buffer, i, CheckpointKind::draw,
                                     d.pipeline, draw->pipeline);
@@ -5265,6 +5518,12 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+            if (graphics.depth_bounds) {
+                // Vulkan takes bounds in [0, 1] only (without VK_EXT_depth_range_unrestricted), as D3D12 does.
+                const float lo = std::clamp(draw->depth_bounds[0], 0.0f, 1.0f);
+                const float hi = std::clamp(draw->depth_bounds[1], 0.0f, 1.0f);
+                vk.set_depth_bounds(command_buffer, lo, hi);
+            }
             for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
                 if (!d.vertex_buffers[slot]) continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
@@ -5279,14 +5538,29 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     const VkDeviceSize bytes = draw->index.size - draw->index.size % width;
                     vk.bind_robust_index_view(command_buffer, d.index_buffer, d.index_offset, bytes, d.index_type);
                 }
-                const auto stride = p.indirect_clamp.buffer ? p.indirect_clamp.stride : arg.stride;
-                if (arg.count_buffer) {
+                // What the draw reads: the clamp pass's scratch (and its clamped count) when it ran, else the
+                // application's own buffer. Its records and stride are the clamp's then, not the signature's.
+                const bool clamped = p.indirect_clamp.buffer != VK_NULL_HANDLE;
+                const VkBuffer arguments_buffer = clamped ? p.indirect_clamp.buffer : d.indirect_buffer;
+                const VkDeviceSize arguments_offset = clamped ? p.indirect_clamp.offset : d.indirect_offset;
+                const VkBuffer count_buffer = clamped ? p.indirect_clamp.count_buffer : d.indirect_count_buffer;
+                const VkDeviceSize count_offset = clamped ? p.indirect_clamp.count_offset : d.indirect_count_offset;
+                const std::uint32_t records = clamped ? p.indirect_clamp.records : arg.max_count;
+                const std::uint32_t stride = clamped ? p.indirect_clamp.stride : arg.stride;
+                if (draw->mesh) {
+                    if (arg.count_buffer)
+                        vk.draw_mesh_tasks_indirect_count(command_buffer, arguments_buffer, arguments_offset, count_buffer,
+                                                          count_offset, records, stride);
+                    else
+                        vk.draw_mesh_tasks_indirect(command_buffer, arguments_buffer, arguments_offset, records, stride);
+                    if (vk.mesh_draw_count) ++*vk.mesh_draw_count;
+                } else if (arg.count_buffer) {
                     const auto emit_counted = draw->indexed ? vk.draw_indexed_indirect_count : vk.draw_indirect_count;
-                    emit_counted(command_buffer, d.indirect_buffer, d.indirect_offset, d.indirect_count_buffer,
-                                 d.indirect_count_offset, arg.max_count, stride);
+                    emit_counted(command_buffer, arguments_buffer, arguments_offset, count_buffer, count_offset,
+                                 records, stride);
                 } else {
                     const auto emit_fixed = draw->indexed ? vk.draw_indexed_indirect : vk.draw_indirect;
-                    emit_fixed(command_buffer, d.indirect_buffer, d.indirect_offset, arg.max_count, stride);
+                    emit_fixed(command_buffer, arguments_buffer, arguments_offset, records, stride);
                 }
             } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
