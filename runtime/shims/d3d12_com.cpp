@@ -534,6 +534,21 @@ public:
             stub("DispatchMesh(root signature larger than a mesh shader's root window)");
             return check(false);
         }
+        // The directly indexed heaps follow the arguments (graphics_user_data). The window shows a mesh shader push
+        // dwords 8..23 only (s16..s31), so a signature that fills it leaves a heap where the mesh stage cannot read.
+        {
+            constexpr std::uint32_t window_end = rt::rootsig::stage_base(rt::rootsig::Stage::Pixel) +
+                                                 rt::rootsig::kMaxUserSgprs -
+                                                 rt::rootsig::stage_base(rt::rootsig::Stage::Mesh);
+            const auto flags = graphics_.layout->flags;
+            const bool resource = flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+            const bool sampler = flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+            const std::uint32_t end = graphics_.layout->graphics_arguments_end;
+            if (resource && end >= window_end)
+                note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the resource heap");
+            if (sampler && end + (resource ? 1u : 0u) >= window_end)
+                note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the sampler heap");
+        }
         if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
@@ -1703,9 +1718,10 @@ private:
 
     // Graphics: vertex, pixel and geometry shaders share one user-data block and the s8 layout, so the heaps after
     // the explicit arguments serve every one of those stages (a pixel shader of a signature whose arguments end at
-    // s11 reads the resource heap from s11). A mesh shader reads its arguments from s16, which is not modelled
-    // (RootArgumentLayout, D3D-448): its pixel shader gets the heaps, the mesh stage does not.
-    // LEONIDA_GRAPHICS_DIRECT_HEAPS=0 restores the previous arguments.
+    // s11 reads the resource heap from s11). A mesh shader reads push dword d as s(d + 8) through its root window
+    // (RootArgumentLayout::mesh_ok), so the same dwords give it the heaps after its arguments from s16, where the
+    // console puts them (issue #14 comment 7143020922, RT-DIRECT-HEAP-GRAPHICS); DispatchMesh reports a heap that
+    // falls past the window. LEONIDA_GRAPHICS_DIRECT_HEAPS=0 restores the previous arguments.
     std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> graphics_user_data() const {
         constexpr UINT direct = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
                                 D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;

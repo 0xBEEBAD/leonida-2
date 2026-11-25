@@ -1763,10 +1763,17 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    only when the signature has its flag, snapshotted per draw. Vertex, pixel and geometry shaders share one
    user-data block and that layout, so one write serves all three; a signature whose explicit arguments take
    s8..s10 gives s11, one whose arguments take s8..s11 gives s12 (the two program reads above). A mesh shader reads
-   its arguments from s16, which is not modelled, so in a mesh pipeline only the pixel shader gets the heaps. A
-   signature that keeps the s0 graphics layout, or whose arguments fill s31, gets none (logged once).
-   `d3d12_graphics_direct_heaps_test` checks the recorded draws and what a vertex and a pixel shader read, with
-   and without the flags. Set `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` to restore the previous draw arguments.
+   push dword d as s(d + 8) through its root window (section 3.5), so `DispatchMesh` records the same dwords and
+   the mesh stage finds the resource heap at s(16 + end − 8), right after its arguments from s16, where DadaCap
+   reports every directly indexed program of the retail library reads it, for compute from s4, VS/PS/GS from s8
+   and mesh from s16 (issue #14, comment 7143020922, on a `boot-prototype` run; not reproduced in this
+   repository). A mesh signature that fills the window leaves no room there: a heap past s31 of the mesh shader
+   (push dword 24 or later) is logged once. A signature that keeps the s0 graphics layout, or whose arguments fill
+   s31, gets none (logged once). `d3d12_graphics_direct_heaps_test` checks the recorded draws and what a vertex
+   and a pixel shader read, with and without the flags; `d3d12_mesh_test` checks that a mesh draw records the
+   vertex draw's dwords, a resource-only rebind, a signature ending at s30 and one on the s0 layout (recorded
+   arguments only; no GPU read through a mesh shader). Set `LEONIDA_GRAPHICS_DIRECT_HEAPS=0` to restore the
+   previous draw arguments.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 
