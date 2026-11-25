@@ -145,22 +145,124 @@ void many_threads() {
     }
 }
 
-// Those that wait get in in the order they came: what came later and is small does not overtake the big one before it.
+// Those that wait get in in the order they came, but for what fits now and also beside the first in line: that one finds
+// its room when those that were in before it leave, whatever passed it.
 void order() {
     auto gate = fixed(10);
     Entrant first(gate, 8);
     CHECK(in(first));
     Entrant big(gate, 9);
     CHECK(waiting(gate, Work::demand, 1));
-    Entrant little(gate, 1);
+    Entrant in_the_way(gate, 2);  // it fits beside the first, and not beside the big one
     CHECK(waiting(gate, Work::demand, 2));
-    CHECK(stays_out(big));
-    CHECK(stays_out(little));  // it would fit beside the first
+    Entrant little(gate, 1);
+    CHECK(in(little));
+    Entrant next(gate, 1);  // beside the big one there is room for one of these
+    CHECK(waiting(gate, Work::demand, 3));
+    CHECK(stays_out(big) && stays_out(in_the_way) && stays_out(next));
+    little.leave();
+    little.join();
+    CHECK(stays_out(big) && stays_out(in_the_way) && stays_out(next));  // nor when the one that passed has left
     first.leave();
     CHECK(in(big));
-    CHECK(in(little));  // the place that the big one leaves free is the next one's
+    CHECK(in(next));  // the first in line is now in_the_way, which it can pass
+    CHECK(stays_out(in_the_way));
     big.leave();
+    CHECK(in(in_the_way));
+    in_the_way.leave();
+    next.leave();
+}
+
+// What passes the first in line is bounded: a stream of small ones does not keep it out.
+void a_stream_of_small_ones_does_not_keep_out() {
+    auto gate = fixed(100);
+    Entrant first(gate, 50);
+    CHECK(in(first));
+    Entrant big(gate, 70);
+    CHECK(waiting(gate, Work::demand, 1));
+    std::vector<std::unique_ptr<Entrant>> stream;
+    for (int i = 0; i < 3; ++i) {  // 30 beside the big one's 70, one after another
+        stream.push_back(std::make_unique<Entrant>(gate, 10));
+        CHECK(in(*stream.back()));
+        if (i < 2) {  // one of them stays in
+            stream.back()->leave();
+            stream.back()->join();
+        }
+    }
+    Entrant more(gate, 10);
+    CHECK(waiting(gate, Work::demand, 2));
+    CHECK(stays_out(more));  // it fits (70 of 100 with the rest), but the first in line has been passed enough
+    first.leave();
+    CHECK(in(big));  // 10 of the stream and 70
+    CHECK(in(more));
+    big.leave();
+    more.leave();
+    stream.back()->leave();
+}
+
+// Of those that can pass, the one that came first does.
+void those_that_pass_keep_their_order() {
+    for (int round = 0; round < 10; ++round) {
+        auto gate = fixed(20);
+        Entrant first(gate, 15), other(gate, 5);
+        CHECK(in(first) && in(other));
+        Entrant big(gate, 12);
+        CHECK(waiting(gate, Work::demand, 1));
+        Entrant a(gate, 4);
+        CHECK(waiting(gate, Work::demand, 2));
+        Entrant b(gate, 4);
+        CHECK(waiting(gate, Work::demand, 3));
+        other.leave();
+        CHECK(in(a));
+        CHECK(stays_out(b) && stays_out(big));  // 19 of 20
+        first.leave();
+        CHECK(in(big) && in(b));
+        big.leave();
+        a.leave();
+        b.leave();
+    }
+}
+
+// One that needs the machine for itself is not passed: what got in beside it would keep it out.
+void larger_than_the_budget_is_not_passed() {
+    auto gate = fixed(10);
+    Entrant first(gate, 5);
+    CHECK(in(first));
+    Entrant alone(gate, 25);
+    CHECK(waiting(gate, Work::demand, 1));
+    Entrant little(gate, 1);
+    CHECK(waiting(gate, Work::demand, 2));
+    CHECK(stays_out(little));
+    first.leave();
+    CHECK(in(alone));
+    CHECK(stays_out(little));
+    alone.leave();
+    CHECK(in(little));
     little.leave();
+}
+
+// The same for the speculative ones, within their quarter.
+void speculative_ones_pass_each_other() {
+    auto gate = fixed(100);
+    Entrant first(gate, 20, Work::speculative);
+    CHECK(in(first));
+    Entrant big(gate, 18, Work::speculative);
+    CHECK(waiting(gate, Work::speculative, 1));
+    Entrant little(gate, 5, Work::speculative);
+    CHECK(in(little));  // 25 of 25, and 23 with the big one
+    Entrant next(gate, 1, Work::speculative);
+    CHECK(waiting(gate, Work::speculative, 2));
+    little.leave();
+    little.join();
+    CHECK(in(next));  // 21 of 25, and 24 of what may pass
+    Entrant over(gate, 2, Work::speculative);
+    CHECK(waiting(gate, Work::speculative, 2));
+    CHECK(stays_out(over) && stays_out(big));  // it would be 26
+    first.leave();
+    CHECK(in(big) && in(over));
+    big.leave();
+    next.leave();
+    over.leave();
 }
 
 // The first in the queue leaves it, and the next one, which fits as well, gets in at once and not when something leaves.
@@ -409,6 +511,10 @@ int main() {
     bound_and_one_always();
     many_threads();
     order();
+    a_stream_of_small_ones_does_not_keep_out();
+    those_that_pass_keep_their_order();
+    larger_than_the_budget_is_not_passed();
+    speculative_ones_pass_each_other();
     one_admission_wakes_the_next();
     leaving_wakes_all_that_fit();
     demand_before_speculative();

@@ -2429,10 +2429,12 @@ Pipeline creation:
   byte of SPIR-V) fit a budget: three quarters of the smaller of the free RAM and the room under the commit limit, read
   again whenever a place at the gate (`runtime/src/large_module_gate.h`, one for the process) is given or returned. One
   always gets in when none is, so a pipeline larger than the budget compiles alone. An estimate counts in full until
-  the compile ends, although the driver has taken part of it by then. They get in in the order they came, the ones a
-  submission waits for (and those of `LEONIDA_ASYNC_PIPELINES`) before the warm-up's, which take a quarter of the
-  budget at most and none while a submission that has large ones is compiling on its workers. A thread that waits for
-  its place holds no PSO's lock, and one that has a place waits for none. `PipelineCompiles::build` gives a submission
+  the compile ends, although the driver has taken part of it by then. They get in in the order they came; while the
+  first in line does not fit, the next behind it that does may pass, as long as all that have passed it would fit the
+  budget together with it, so that a stream of small ones does not keep it out. The ones a submission waits for (and
+  those of `LEONIDA_ASYNC_PIPELINES`) go before the warm-up's, which take a quarter of the budget at most and none while
+  a submission that has large ones is compiling on its workers. A thread that waits for its place holds no PSO's lock,
+  and one that has a place waits for none. `PipelineCompiles::build` gives a submission
   as many jobs for large ones as its smallest could be in at once, largest first; where the next one does not fit, the
   job compiles small ones in the meantime. `LEONIDA_SERIAL_BIG_COMPILES=1` compiles them one after another instead, as
   before there was a budget, `=0` has no limit, `LEONIDA_BIG_COMPILE_BUDGET_MB` fixes the budget. Measured with

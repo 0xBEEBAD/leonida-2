@@ -153,10 +153,13 @@ inline void release_free_memory() {
 // when none is, so a module bigger than the whole budget still compiles (alone among the large ones).
 //
 // The second constructor is the runtime's: the budget is read again whenever a place is given or returned, and the
-// modules get in in the order they came, those a submission waits for (demand) before the others (speculative). A
-// speculative one gets in only while no demand waits and no submission has a Demand, and only within a quarter of the
-// budget, so that a demand finds the rest free. An estimate counts in full until its module leaves, although the driver
-// has allocated part of it by then and the budget is that much smaller: what is in has not taken all it is going to.
+// modules get in in the order they came, those a submission waits for (demand) before the others (speculative). While the
+// first in line does not fit, the next behind it that does may pass, as long as all that have passed it would fit the
+// budget together with it. So, with the budget as it is, it waits at most for those that were in when it became the first,
+// however many come after it, and one larger than the budget is not passed. A speculative one gets in only while no demand
+// waits and no submission has a Demand, and only within a quarter of the budget, so that a demand finds the rest free. An
+// estimate counts in full until its module leaves, although the driver has allocated part of it by then and the budget is
+// that much smaller: what is in has not taken all it is going to.
 class LargeModuleGate {
 public:
     enum class Work { demand, speculative };
@@ -168,19 +171,19 @@ public:
 
     bool admits(uint64_t estimate) const {
         std::lock_guard<std::mutex> g(mu_);
-        return admits_locked(estimate, Work::demand);
+        return admits_locked(estimate, budget());
     }
     void enter(uint64_t estimate, Work work = Work::demand) {
         std::unique_lock<std::mutex> l(mu_);
         if (!read_budget_) {
-            cv_.wait(l, [&] { return admits_locked(estimate, work); });
+            cv_.wait(l, [&] { return admits_locked(estimate, limit_for(work)); });
         } else {
             auto& queue = waiting_[work == Work::demand ? 0 : 1];
-            const auto me = queue.insert(queue.end(), 0);
+            const auto me = queue.insert(queue.end(), Waiter{estimate});
             cv_.wait(l, [&] {
-                return queue.begin() == me && (work == Work::demand || (waiting_[0].empty() && !demanded_)) &&
-                       admits_locked(estimate, work);
+                return (work == Work::demand || (waiting_[0].empty() && !demanded_)) && next_locked(work) == &*me;
             });
+            if (me != queue.begin()) queue.front().passed += estimate;
             queue.erase(me);
         }
         used_ += estimate;
@@ -255,10 +258,25 @@ public:
     };
 
 private:
-    bool admits_locked(uint64_t estimate, Work work) const {
-        if (inflight_ == 0) return true;
-        const uint64_t limit = work == Work::demand ? budget() : budget() / 4;
-        return inflight_ < max_inflight_ && used_ + estimate <= limit;
+    struct Waiter {
+        uint64_t estimate;
+        uint64_t passed = 0;   // the estimates of those that have passed it while it was the first in line
+    };
+
+    uint64_t limit_for(Work work) const { return work == Work::demand ? budget() : budget() / 4; }
+    bool admits_locked(uint64_t estimate, uint64_t limit) const {
+        return inflight_ == 0 || (inflight_ < max_inflight_ && used_ + estimate <= limit);
+    }
+    // The one in line that gets in now, if any: the first, or else the first that fits and may pass it.
+    const Waiter* next_locked(Work work) const {
+        const auto& queue = waiting_[work == Work::demand ? 0 : 1];
+        const uint64_t limit = limit_for(work);
+        for (const Waiter& w : queue) {
+            const Waiter& first = queue.front();
+            if (&w != &first && first.passed + w.estimate + first.estimate > limit) continue;
+            if (admits_locked(w.estimate, limit)) return &w;
+        }
+        return nullptr;
     }
 
     const uint64_t budget_;
@@ -266,7 +284,7 @@ private:
     const std::function<uint64_t()> read_budget_;
     mutable std::mutex mu_;
     std::condition_variable cv_;
-    std::list<char> waiting_[2];   // demand, speculative: one entry for each thread in enter(), in the order they came
+    std::list<Waiter> waiting_[2];   // demand, speculative: one for each thread in enter(), in the order they came
     uint64_t used_ = 0;
     unsigned inflight_ = 0;
     unsigned demanded_ = 0;   // the Demands
