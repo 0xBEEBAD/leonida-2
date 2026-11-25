@@ -17289,6 +17289,14 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     return nullptr;
 }
 
+leonida::VramBudget vulkan_vram_budget(ID3D12Device* device) {
+    const VulkanDeviceInfo* info = vulkan_device_info(device);
+    if (!info || !info->memory_budget || !info->get_instance_proc || !info->instance) return {};
+    const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+        info->get_instance_proc(info->instance, "vkGetPhysicalDeviceMemoryProperties2"));
+    return leonida::query_vram_budget(get, info->physical);
+}
+
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device) {
     auto* d = Device::from<Device>(device);
     if (!d) return 0;
@@ -18505,6 +18513,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.null_descriptor || info.robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // Optional: VK_EXT_memory_budget gives the GPU memory in use and the budget (vulkan_vram_budget, the title HUD).
+    info.memory_budget = has_device_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (info.memory_budget) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     leonida::DeviceFaultFeatures fault_features;
     const bool aftermath = leonida::aftermath::enable();  // already on, before the instance: see above
     char device_fault[2]{};
