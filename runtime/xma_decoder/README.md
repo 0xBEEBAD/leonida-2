@@ -26,3 +26,8 @@ The `xma2-decoder` workflow builds and runs the C++ smoke test with MSVC. It lin
 
 Without `cargo`, when that build fails, or with the cl.exe fallback of `scripts/build_runtime.ps1`, XMA voices output silence.
 Use `-DLEONIDA_REQUIRE_XMA2_DECODER=ON` to require the decoder in a CMake build, as the Windows runtime CI does.
+
+To link an already-built `leonida_xma2_decoder.lib` without invoking `cargo` during CMake configure (for offline builds
+or Linux cross-builds whose distribution `rustc` omits the `x86_64-pc-windows-msvc` standard library), pass
+`-DLEONIDA_XMA2_DECODER_LIB=<path>`. A value that does not name an existing file fails configure instead of falling
+back silently to muted XMA voices.
