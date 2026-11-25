@@ -33,24 +33,45 @@
 
 namespace {
 
-// The retail executable (1.0.2.1) runs a hang watchdog thread (function at RVA 0x2215a60): when the game's main loop
-// has not set its "kick" byte (RVA 0x71b6331) for 30 one-second ticks, it calls a crash callback and then writes to
-// address 0 (`movl $0, 0` at RVA 0x2215c35). Under the runtime the game thread can legitimately stall for longer than
-// that, e.g. while the driver compiles pipelines against a cold cache (first boot after a driver update), and the
-// title then kills itself. By default the watchdog stays armed, as on the console. With LEONIDA_TITLE_WATCHDOG=0, and
-// only when that exact trap instruction sits where it does in this build, a runtime thread sets the kick byte twice a
-// second so the title's watchdog never fires.
-constexpr std::uint32_t kWatchdogTrapRva = 0x2215c35;
-constexpr std::uint32_t kWatchdogKickRva = 0x71b6331;
+// The retail title runs a hang watchdog thread: when the game's main loop has not set its "kick" byte for 30
+// one-second ticks, it calls a crash callback and then writes to address 0 (`movl $0, 0`). Under the runtime the
+// game thread can legitimately stall for longer than that, e.g. while the driver compiles pipelines against a cold
+// cache (first boot after a driver update), and the title then kills itself. By default the watchdog stays armed, as
+// on the console. The two places are measured locally and not kept in the repository:
+// LEONIDA_TITLE_WATCHDOG_KICK="<trap RVA>,<kick RVA>" (hex) names them, and only when that exact trap instruction
+// sits at the first one does a runtime thread set the byte at the second twice a second, so the title's watchdog
+// never fires. Unset, or with LEONIDA_TITLE_WATCHDOG=1, the watchdog stays armed.
 constexpr unsigned char kWatchdogTrap[] = {0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0};  // movl $0, 0x0
 
+bool watchdog_rvas(std::uint32_t& trap_rva, std::uint32_t& kick_rva) {
+    char value[64]{};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG_KICK", value, sizeof(value));
+    if (!n || n >= sizeof(value)) return false;
+    char* rest = nullptr;
+    const unsigned long long trap = std::strtoull(value, &rest, 16);
+    if (!rest || *rest != ',') return false;
+    const unsigned long long kick = std::strtoull(rest + 1, &rest, 16);
+    if (!rest || *rest || !trap || !kick || trap > 0xFFFFFFFFull || kick > 0xFFFFFFFFull) return false;
+    trap_rva = static_cast<std::uint32_t>(trap);
+    kick_rva = static_cast<std::uint32_t>(kick);
+    return true;
+}
+
 void keep_title_watchdog_kicked(std::uint8_t* base) {
-    char value[4]{};
-    if (GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG", value, sizeof(value)) != 1 || value[0] != '0') return;
+    char keep[4]{};
+    const DWORD keep_length = GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG", keep, sizeof(keep));
+    if (keep_length == 1 && keep[0] == '1') return;
+    std::uint32_t kWatchdogTrapRva = 0, kWatchdogKickRva = 0;
+    if (!watchdog_rvas(kWatchdogTrapRva, kWatchdogKickRva)) {
+        if (keep_length == 1 && keep[0] == '0')
+            std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_WATCHDOG=0 needs LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,"
+                                 "<kick RVA> (hex); the title's hang watchdog stays armed\n");
+        return;
+    }
     MEMORY_BASIC_INFORMATION trap{}, kick{};
     if (!VirtualQuery(base + kWatchdogTrapRva, &trap, sizeof(trap)) || trap.State != MEM_COMMIT ||
         std::memcmp(base + kWatchdogTrapRva, kWatchdogTrap, sizeof(kWatchdogTrap)) != 0)
-        return;  // not the build this was measured on: leave the title's watchdog alone
+        return;  // not the trap the RVAs name: leave the title's watchdog alone
     const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     if (!VirtualQuery(base + kWatchdogKickRva, &kick, sizeof(kick)) || kick.State != MEM_COMMIT ||
         !(kick.Protect & writable))
@@ -68,11 +89,11 @@ void keep_title_watchdog_kicked(std::uint8_t* base) {
         const_cast<std::uint8_t*>(byte), 0, nullptr);
     if (thread) {
         CloseHandle(thread);
-        std::fprintf(stderr, "[rt] loader: keeping the title's hang watchdog kicked (LEONIDA_TITLE_WATCHDOG=0; unset or 1 keeps it armed)\n");
+        std::fprintf(stderr, "[rt] loader: keeping the title's hang watchdog kicked (LEONIDA_TITLE_WATCHDOG_KICK)\n");
     }
 }
 
-// LEONIDA_PEEK="0x9e1dac0:3,0x7446510,0x98f828c" (diagnostic): a thread prints the 8-byte values at these RVAs of the
+// LEONIDA_PEEK="<rva>:3,<rva>,<rva>" (diagnostic): a thread prints the 8-byte values at these RVAs of the
 // title's image (":n" = n consecutive values, at most 32; "RVA>OFF" reads through the pointer stored at the RVA, at
 // pointer + OFF, both hex) every LEONIDA_PEEK_SECONDS (default 10). For answering "what does this
 // global hold at run time" without a debugger: the reverse-engineering notes (docs/re/requests.md) ask for exactly

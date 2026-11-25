@@ -7691,10 +7691,19 @@ class Gen:
             d, x = a[0], a[1]
             wide_src = op == "s_quadmask_b64"
             wide_dst = op != "s_quadmask_b32"
+            mask_words = None
             if self.is_mask_op(x):
-                raise Unsupported(op + " on a lane mask")
+                # s_bitreplicate_b64_b32 of a 32-bit lane mask into plain scalar data (6 pipeline-library programs of
+                # 1.0.2.1): the wave's mask word as data, then replicated as any scalar (wave_mask, as s_ff1 reads it).
+                if op != "s_bitreplicate_b64_b32" or (d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc"))):
+                    raise Unsupported(op + " on a lane mask")
+                lo, hi = self.wave_mask(x)
+                half = self.mask_half(x) if self.wave64 else None
+                mask_words = [hi if half == "hi" else lo]
             if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
-                if op != "s_bitreplicate_b64_b32" or not (d["t"] == "exec" or (self.wave64 and d["t"] == "vcc")):
+                # VCC only in wave64: in wave32 its high word is data, which a lane mask cannot carry.
+                if (op != "s_bitreplicate_b64_b32" or not (d["t"] == "exec" or (self.wave64 and d["t"] == "vcc"))
+                        or mask_words is not None):
                     raise Unsupported(op + " on a lane mask")
                 # The mask bit for lane L comes from scalar-source bit L // 2.
                 shift, shifted, bit = (self.tmp() for _ in range(3))
@@ -7707,7 +7716,9 @@ class Gen:
                 self.emit(f"{mask} = OpISub %uint {self.cu(0)} {bit}")
                 self.mask_dst(d, mask)
                 return
-            if wide_src:
+            if mask_words is not None:
+                words = mask_words
+            elif wide_src:
                 lo, hi = self.src64_data(x, op)
                 words = [lo, hi]
             else:
@@ -17445,19 +17456,6 @@ def same_encoding(raw, printed, op, operand_count):
     return diff == 0
 
 
-def restore_dot4_inline_sel(ins, raw, printed):
-    """LLVM prints default op_sel_hi on a signed-byte dot with a replicated low inline integer half."""
-    if ins["op"] != "v_dot4_i32_i8" or len(raw) != 8 or len(printed) != 8:
-        return False
-    w0, w1 = struct.unpack("<II", raw)
-    if (w0 >> 8 != 0xCC1640 or w1 >> 27 != 1 or not 128 <= (w1 >> 9 & 511) <= 208 or
-            struct.pack("<II", w0, w1 | (1 << 28)) != printed):
-        return False
-    ins["mods"] = ["op_sel_hi:[1,0,1]"]
-    ins["enc"] = raw.hex()
-    return True
-
-
 def mix_literal(raw, printed, op):
     """The 32-bit literal of a v_fma_mix* when LLVM printed it cut to its low half, else None.
 
@@ -17549,6 +17547,48 @@ def restore_mix_inline_literal(ins, raw, literal):
             ins["args"][1 + i] = {"k": "imm", "v": literal, "neg": bool((w1 >> (29 + i)) & 1),
                                   "abs": bool((w0 >> (8 + i)) & 1)}
     ins["enc"] = raw.hex()
+
+
+def dot4_op_sel_fields(raw, printed, op):
+    """(op_sel, op_sel_hi) of a v_dot4_i32_i8 whose stored op_sel fields llvm-mc printed as the defaults, else None.
+
+    llvm-mc decodes a VOP3P v_dot4_i32_i8 (opcode 0x16) whose op_sel_hi is not [1,1,1] (while op_sel bit 1 is clear;
+    with it set the word is rejected and tools/shader_disasm.py prints it, docs/fspx.md) but prints and re-encodes it
+    with op_sel 0 and op_sel_hi 7, so its text names halves the instruction does not read. The fields are op_sel (word
+    0 bits 13:11) and op_sel_hi (word 1 bits 28:27 for sources 0 and 1, word 0 bit 14 for source 2). Accepted only when
+    the stored 8 bytes with just those two fields set to the defaults are the printed ones, so every other bit
+    (opcode, operands, neg, clamp) is what the text says. From luizwidmer/palmetto (GPL-3.0), which found such a
+    word in an FSPX program (op_sel_hi[1] clear, the rest of the word as printed)."""
+    if base_op(op) != "v_dot4_i32_i8" or len(raw) != 8 or len(printed) != 8 or raw[3] != 0xCC:
+        return None
+    w0, w1 = struct.unpack("<2I", raw)
+    if (w0 >> 16) & 0x7F != 0x16:
+        return None
+    op_sel = (w0 >> 11) & 7
+    op_sel_hi = ((w1 >> 27) & 3) | (((w0 >> 14) & 1) << 2)
+    if (op_sel, op_sel_hi) == (0, 7):
+        return None
+    if struct.pack("<2I", (w0 & ~(7 << 11)) | (1 << 14), w1 | (3 << 27)) != printed:
+        return None
+    return op_sel, op_sel_hi
+
+
+def restore_dot4_op_sel(ins, raw):
+    """Give ``ins`` the op_sel/op_sel_hi dot4_op_sel_fields reads from the stored bytes, and those bytes as its
+    encoding; False (``ins`` untouched) when it does not apply. The v_dot4_i32_i8 rule applies the fields as measured
+    on gfx1036 (docs/design.md, "Signed-byte dot products") and refuses a non-default S2 half."""
+    fields = dot4_op_sel_fields(raw, bytes.fromhex(ins["enc"]), ins["op"])
+    if fields is None:
+        return False
+    op_sel, op_sel_hi = fields
+    mods = [m for m in ins.get("mods", []) if not m.startswith(("op_sel:", "op_sel_hi:"))]
+    if op_sel:
+        mods.append("op_sel:[%s]" % ",".join(str((op_sel >> k) & 1) for k in range(3)))
+    if op_sel_hi != 7:
+        mods.append("op_sel_hi:[%s]" % ",".join(str((op_sel_hi >> k) & 1) for k in range(3)))
+    ins["mods"] = mods
+    ins["enc"] = raw.hex()
+    return True
 
 
 def skipped_form(ins, blob, at):
@@ -17862,8 +17902,6 @@ def check_printed_encodings(path, info):
                 restore_sdwa_source(ins, raw)
                 shift -= 4
                 continue
-            if restore_dot4_inline_sel(ins, raw, enc):
-                continue
             literal = mix_literal(raw, enc, base_op(ins["op"]))
             if literal is not None:
                 restore_mix_literal(ins, raw, literal)
@@ -17873,6 +17911,8 @@ def check_printed_encodings(path, info):
             if literal is not None:
                 restore_mix_inline_literal(ins, raw12, literal)
                 shift += 4
+                continue
+            if restore_dot4_op_sel(ins, raw):
                 continue
             raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
                               f"{enc.hex()} (a field the disassembler dropped)")
@@ -17973,6 +18013,8 @@ def translate(path):
                         if literal is not None:
                             restore_mix_inline_literal(ins, blob[pos:pos + 12], literal)
                             enc = blob[pos:pos + 12]
+                        elif restore_dot4_op_sel(ins, window):
+                            pass
                         elif pos + len(enc) > len(blob):
                             raise Unsupported("undecodable words (cannot re-anchor)")
                         else:
@@ -17982,8 +18024,6 @@ def translate(path):
                 continue
             skipped, at = 0, pos
             while not same_encoding(blob[at:at + len(enc)], enc, op, operand_count):
-                if restore_dot4_inline_sel(ins, blob[at:at + len(enc)], enc):
-                    break
                 literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
                 if literal is not None:
                     restore_mix_literal(ins, blob[at:at + len(enc)], literal)
@@ -17997,6 +18037,8 @@ def translate(path):
                 if literal is not None:
                     restore_mix_inline_literal(ins, blob[at:at + 12], literal)
                     enc = blob[at:at + 12]          # the 12 bytes the decoder read: the next one starts after them
+                    break
+                if restore_dot4_op_sel(ins, blob[at:at + len(enc)]):
                     break
                 at += 4
                 skipped += 4
