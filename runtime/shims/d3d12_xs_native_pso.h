@@ -17,7 +17,9 @@
 #include "../src/shader_library.h"
 
 #include <d3d12.h>
+#include <atomic>
 #include <climits>
+#include <cstring>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -30,8 +32,46 @@ namespace rt::d3d12_xs {
 namespace native_pipeline_detail {
 namespace np = leonida::native_pso;
 
+// The blend state of blob A's colour-target registers (RT-SLOT57-BLEND-STATE). Without it, or for a target this path
+// cannot express (np::d3d12_blend), every target keeps blending off and writes every component, as before.
+inline void fill_blend_state(const np::FixedState& s, D3D12_BLEND_DESC& out) {
+    for (auto& rt : out.RenderTarget) {
+        rt = {};
+        rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    out.AlphaToCoverageEnable = FALSE;
+    out.IndependentBlendEnable = FALSE;
+    const auto targets = s.blend ? np::d3d12_blend(*s.blend, s.rt_count) : std::nullopt;
+    if (!targets) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57: %s, so this pipeline keeps blending off (CB_BLEND0 %08x)\n",
+                         s.blend ? "a target's blend state is not one this path builds (dual-source or unknown factor)"
+                                 : "blob A is absent or not the measured shape",
+                         s.blend ? static_cast<unsigned>(s.blend->blend[0]) : 0u);
+        return;
+    }
+    for (unsigned i = 0; i < s.rt_count; ++i) {
+        const np::TargetBlend& t = (*targets)[i];
+        D3D12_RENDER_TARGET_BLEND_DESC& rt = out.RenderTarget[i];
+        rt.BlendEnable = t.enable;
+        rt.SrcBlend = static_cast<D3D12_BLEND>(t.src);
+        rt.DestBlend = static_cast<D3D12_BLEND>(t.dst);
+        rt.BlendOp = static_cast<D3D12_BLEND_OP>(t.op);
+        rt.SrcBlendAlpha = static_cast<D3D12_BLEND>(t.src_alpha);
+        rt.DestBlendAlpha = static_cast<D3D12_BLEND>(t.dst_alpha);
+        rt.BlendOpAlpha = static_cast<D3D12_BLEND_OP>(t.op_alpha);
+        rt.RenderTargetWriteMask = t.write_mask;
+        if (i && std::memcmp(&rt, &out.RenderTarget[0], sizeof(rt)) != 0) out.IndependentBlendEnable = TRUE;
+    }
+}
+
 inline void fill_fixed_state(const np::FixedState& s, D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc) {
-    for (auto& rt : pc.BlendState.RenderTarget) rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    fill_blend_state(s, pc.BlendState);
     pc.SampleMask = s.sample_mask ? s.sample_mask : UINT_MAX;
     pc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
