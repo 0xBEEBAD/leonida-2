@@ -13,6 +13,7 @@
 // The state and stage resolution are in native_pso.h. All stage bytecode handed to D3D12
 // comes from the user's carved DXBC containers and is translated by the normal Vulkan PSO path.
 #include "../src/native_pso.h"
+#include "d3d12_xs_native_pso_fallback.h"
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"
 
@@ -231,32 +232,21 @@ public:
             }
             HRESULT hr = create_pipeline(pc, mesh, code);
             // The decoded blend state can ask for something this device's layer does not do: blending a B4G4R4A4 target
-            // that is an RGBA8 stand-in, which the layer refuses (E_NOTIMPL) because the stand-in quantizes the shader
-            // output before blending. Turn blending off on those targets first, then on all of them (the state before
-            // blob A was read), rather than leave the pipeline to the PC description path.
+            // that is an RGBA8 stand-in (without_stand_in_blend). Only a pipeline that blends such a target is retried.
+            // E_NOTIMPL also stands for refusals that have nothing to do with blending (stream_unsupported: a rect list
+            // without its geometry stage, mesh limits, FullyCovered; a dual-source output that does not fit Location 0
+            // Index 1): those are returned as they are, never with a blend the title did not ask for.
             if (hr == E_NOTIMPL && plan.state.blend) {
-                bool changed = false;
-                for (unsigned i = 0; i < pc.NumRenderTargets; ++i)
-                    if (pc.RTVFormats[i] == DXGI_FORMAT_B4G4R4A4_UNORM && pc.BlendState.RenderTarget[i].BlendEnable) {
-                        pc.BlendState.RenderTarget[i].BlendEnable = FALSE;
-                        pc.BlendState.IndependentBlendEnable = TRUE;
-                        changed = true;
-                    }
-                if (changed) hr = create_pipeline(pc, mesh, code);
-                const char* how = "on its B4G4R4A4 targets";
-                if (hr == E_NOTIMPL) {
-                    D3D12_BLEND_DESC decoded = pc.BlendState;
-                    default_blend_state(pc.BlendState);
-                    if (std::memcmp(&decoded, &pc.BlendState, sizeof(decoded)) != 0) {
-                        hr = create_pipeline(pc, mesh, code);
-                        how = "on every target";
-                        changed = true;
-                    }
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC retry = pc;
+                const HRESULT again = without_stand_in_blend(retry) ? create_pipeline(retry, mesh, code) : hr;
+                if (SUCCEEDED(again)) {
+                    hr = again;
+                    static std::atomic<int> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                        std::fprintf(stderr, "[rt] d3d12_xs: slot 57: the device refused blending on this pipeline's "
+                                             "B4G4R4A4 stand-in targets, so it was built with blending off on those "
+                                             "targets\n");
                 }
-                static std::atomic<int> logged{0};
-                if (changed && logged.fetch_add(1, std::memory_order_relaxed) < 4)
-                    std::fprintf(stderr, "[rt] d3d12_xs: slot 57: the device refused this pipeline's blend state, so it "
-                                         "was built with blending off %s (0x%08x)\n", how, static_cast<unsigned>(hr));
             }
             return hr;
         } catch (const std::bad_alloc&) {
