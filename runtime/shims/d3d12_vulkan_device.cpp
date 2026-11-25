@@ -10247,6 +10247,37 @@ public:
                 return false;
             }
         }
+        // With Resizable BAR, keep the arena where its buffer may still use DEVICE_LOCAL | HOST_VISIBLE memory
+        // (arena_size.h, device_local_arena_bytes): a driver can leave that type out of a very large buffer.
+        if (leonida::resizable_bar(state_.memory)) {
+            const auto device_local = [&](std::uint32_t bits) {
+                constexpr VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                for (std::uint32_t i = 0; i < state_.memory.memoryTypeCount; ++i)
+                    if ((bits & (1u << i)) && (state_.memory.memoryTypes[i].propertyFlags & wanted) == wanted) return true;
+                return false;
+            };
+            const VkDeviceSize asked = info.size;
+            const VkDeviceSize fitted = leonida::device_local_arena_bytes(asked, [&](VkDeviceSize bytes) {
+                if (bytes == asked) return device_local(requirements.memoryTypeBits);
+                VkBufferCreateInfo probe = info;
+                probe.size = bytes;
+                VkBuffer buffer = VK_NULL_HANDLE;
+                if (vk.vkCreateBuffer(state_.info.device, &probe, nullptr, &buffer) != VK_SUCCESS) return false;
+                VkMemoryRequirements r{};
+                vk.vkGetBufferMemoryRequirements(state_.info.device, buffer, &r);
+                vk.vkDestroyBuffer(state_.info.device, buffer, nullptr);
+                return device_local(r.memoryTypeBits);
+            });
+            if (fitted != asked) {
+                vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+                info.size = fitted;
+                if (!create_buffer()) return false;
+                size.bytes = fitted;
+                size.capped |= leonida::arena_cap_bar;
+            }
+        }
         if (size.capped)
             std::fprintf(stderr, "[rt] d3d12: GPU address arena: %llu MiB of the %llu MiB asked for, capped by the "
                                  "device's %s\n",
