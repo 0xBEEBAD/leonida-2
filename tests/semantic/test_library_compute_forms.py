@@ -106,8 +106,8 @@ class LibraryComputeForms(unittest.TestCase):
         blob = bytes.fromhex("fa02287c014e4cff")
         row, = rdna2_decode.decode_bytes(blob, wave32=True)["insns"]
         self.assertEqual((row["op"], len(row["args"]), row["args"][0]["r"]), ("v_cmpx_gt_f32_dpp", 2, 1))
-        junk = {"pc": 4, "enc": blob[4:].hex()}
-        recovered, = rdna2spirv.restore_skipped_instructions([junk], blob, 0, len(blob))
+        junk = {"pc": 4, "enc": blob[4:].hex(), "op": "s_nop", "args": [{"k": "imm", "v": 0}], "mods": []}
+        recovered, = rdna2spirv.restore_vcc_tuples([junk], blob, 0, len(blob), wave32=True)
         self.assertEqual((recovered["pc"], recovered["enc"], recovered["op"]), (0, blob.hex(), "v_cmpx_gt_f32_dpp"))
 
     def test_vopc_dpp_reads_the_selected_lane(self):
