@@ -35,7 +35,7 @@ def translate(threads, emulate=True):
 
 def poison_missing_slots(spv):
     """The prologue's zero stores to the missing lanes' slots store POISON instead."""
-    spv, n = re.subn(r"(OpStore %x_yp\d+_\d+ )%\w+", rf"\1%x_poison", spv)
+    spv, n = re.subn(r"(OpAtomicStore %x_yp\d+_\d+ %\w+ %\w+ )%\w+", rf"\1%x_poison", spv)
     head = re.search(r"^%uint = OpTypeInt 32 0\n", spv, re.MULTILINE)
     return spv[:head.end()] + f"%x_poison = OpConstant %uint {POISON}\n" + spv[head.end():], n
 
