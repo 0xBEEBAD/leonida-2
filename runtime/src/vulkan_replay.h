@@ -831,6 +831,10 @@ struct QueryPool {
     bool precise = false;         // occlusionQueryPrecise: D3D12_QUERY_TYPE_OCCLUSION counts exact samples
     std::vector<bool> ended;
     std::unordered_map<std::uint32_t, OcclusionResult> occlusion;
+    // Transform-feedback streams the pool can query (D3D-302): 0 when it has no pool, otherwise the device's
+    // maxTransformFeedbackStreams clamped to D3D12's four. SO_STATISTICS_STREAMn with n at or above this runs nothing
+    // and resolves zero.
+    std::uint32_t streams = 0;
 };
 
 // A compute pipeline as replay needs it. code_base is the console VA of the shader's FSSM blob (push-constant
@@ -3254,6 +3258,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     VkDeviceAddress indirect_list_budget = 0;
     std::size_t ordinary_active = 0, binary_active = 0, statistics_active_count = 0;
     bool overlaps = false, statistics_overlaps = false, statistics_active = false;
+    // SO_STATISTICS queries active in a pool, by heap and stream (D3D-302): two on one stream would break
+    // VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753, so prepare refuses them.
+    std::map<std::pair<QueryHeapId, std::uint32_t>, bool> so_active;
     out.wrote_readback = false;
     out.readback_src_stages = 0;
 
@@ -3791,10 +3798,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     overlaps |= begin && (ordinary_active || binary_active);
                     if (begin) ++binary_active; else --binary_active;
                 } else if (is_so_statistics(range.type)) {
-                    // A real transform-feedback heap queries on a stream (D3D-302); without a pool (the feature is
-                    // off) it overlaps nothing and runs nothing. Both cases are handled; the indexed commands are
-                    // required when the heap has a pool.
-                    if (heap->pool && !so_queries) return unsupported_at(__LINE__);
+                    // A real transform-feedback heap queries on a stream (D3D-302). Stream n runs only when the
+                    // heap's pool covers it; then the indexed commands are required. Without a pool (the feature is
+                    // off or has no transformFeedbackQueries) or past maxTransformFeedbackStreams it runs nothing
+                    // and resolves zero. Two overlapping queries on one stream cannot both be active in one pool
+                    // (VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753), so a second Begin is refused.
+                    const std::uint32_t stream = range.type - d3d12_query::so_statistics_stream0;
+                    if (heap->pool && stream < heap->streams) {
+                        if (!so_queries) return unsupported_at(__LINE__);
+                        const auto key = std::make_pair(range.heap, stream);
+                        if (begin) {
+                            if (!so_active.emplace(key, true).second) return ReplayResult::invalid_query;
+                        } else {
+                            so_active.erase(key);
+                        }
+                    }
                 } else {
                     statistics_overlaps |= begin && statistics_active_count;
                     if (begin) ++statistics_active_count; else --statistics_active_count;
@@ -4108,12 +4126,16 @@ public:
                                        query.statistics_end != detail::PreparedQuery::no_segment;
                 const std::uint32_t size = query_result_size(resolve.type);
                 const auto offset = list.commands[query.command].binding.buffer_offset + resolve.offset;
+                // A stream past the pool's maxTransformFeedbackStreams ran nothing (D3D-302): its resolve is zeros.
+                const std::uint32_t so_stream =
+                    is_so_statistics(resolve.type) ? resolve.type - d3d12_query::so_statistics_stream0 : 0;
+                const bool so_runs = !is_so_statistics(resolve.type) || so_stream < query.heap->streams;
                 for (std::uint32_t i = 0; i < resolve.count; ++i) {
                     const auto index = resolve.first + i;
                     const auto value = lookup(*query.heap, index);
                     if (binary && value.ended && !uncounted) return unsupported_at(__LINE__);
                     needs_binary |= binary && value.ended;
-                    detail::QueryResolveRun run{value.ended ? query.heap->pool : VK_NULL_HANDLE,
+                    detail::QueryResolveRun run{value.ended && so_runs ? query.heap->pool : VK_NULL_HANDLE,
                                                 index, 1, offset + VkDeviceSize(i) * size};
                     if (value.occlusion.segments) {
                         if (resolve.type != d3d12_query::occlusion && !binary && !statistics)
@@ -4241,11 +4263,16 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
     // nothing for BeginQuery and EndQuery; its resolves were planned as zero fills.
     if (!heap.pool && !std::holds_alternative<ResolveQueries>(command)) return;
     // An SO_STATISTICS_STREAMn query begins/ends indexed on that stream (D3D-302): the query type's stream index is
-    // the `index` argument of vkCmdBeginQueryIndexedEXT / vkCmdEndQueryIndexedEXT.
+    // the `index` argument of vkCmdBeginQueryIndexedEXT / vkCmdEndQueryIndexedEXT. A stream past the pool's
+    // maxTransformFeedbackStreams runs nothing, like a heap without a pool: its resolves were planned as zero fills.
     const auto so_stream = [](std::uint32_t type) -> std::uint32_t {
         return is_so_statistics(type) ? type - d3d12_query::so_statistics_stream0 : 0;
     };
+    const auto so_runs = [&](std::uint32_t type) {
+        return !is_so_statistics(type) || so_stream(type) < heap.streams;
+    };
     if (const auto* begin = std::get_if<BeginQuery>(&command)) {
+        if (!so_runs(begin->type)) return;
         vk.reset_query_pool(cb, heap.pool, begin->index, 1);
         if (is_so_statistics(begin->type)) {
             vk.begin_query_indexed(cb, heap.pool, begin->index, so_stream(begin->type), 0);
@@ -4254,6 +4281,7 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
             vk.begin_query(cb, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         }
     } else if (const auto* end = std::get_if<EndQuery>(&command)) {
+        if (!so_runs(end->type)) return;
         if (end->type == d3d12_query::timestamp) {
             vk.reset_query_pool(cb, heap.pool, end->index, 1);
             vk.write_timestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, heap.pool, end->index);

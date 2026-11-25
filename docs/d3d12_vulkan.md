@@ -3742,14 +3742,18 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   output is then `E_UNEXPECTED`, not `S_FALSE`.
 - **Stream-output statistics** (D3D-302). The layer still refuses `StreamOutput` PSOs and does not implement
   `SOSetTargets`, so no primitive reaches a stream yet. With `VK_EXT_transform_feedback` enabled on the device
-  (`D3D-TRANSFORM-FEEDBACK-DEVICE`), an `SO_STATISTICS` heap is nonetheless a real
-  `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun and ended indexed on the stream
+  (`D3D-TRANSFORM-FEEDBACK-DEVICE`) and its `transformFeedbackQueries` property set, an `SO_STATISTICS` heap is a
+  real `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun and ended indexed on the stream
   (`vkCmdBeginQueryIndexedEXT` / `vkCmdEndQueryIndexedEXT`), and `ResolveQueryData` copies the two 64-bit results per
   query (16 bytes: `NumPrimitivesWritten`, `PrimitivesStorageNeeded`), in the same order; with no stream output they
-  are 0. Without the feature the heap is made without a `VkQueryPool`: `BeginQuery`/`EndQuery` run nothing in Vulkan
-  (D3D12's call rules are still kept, and the heap's queries track ended or not as the others do), they overlap no
-  other query, and `ResolveQueryData` writes zeros (`vkCmdFillBuffer`, 16 bytes per query), with no statistics split
-  since nothing is dispatched.
+  are 0. A stream at or above the device's `maxTransformFeedbackStreams` runs nothing and resolves zero, as if the
+  heap had no pool. Without the feature, the property, or a nonzero `maxTransformFeedbackStreams`, the heap is made
+  without a `VkQueryPool`: `BeginQuery`/`EndQuery` run nothing in Vulkan (D3D12's call rules are still kept, and the
+  heap's queries track ended or not as the others do), they overlap no other query, and `ResolveQueryData` writes
+  zeros (`vkCmdFillBuffer`, 16 bytes per query), with no statistics split since nothing is dispatched. Two
+  overlapping `SO_STATISTICS` queries on one stream would be two active indexed queries in one pool
+  (`VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753`), so `prepare()` refuses such a list
+  (`ReplayResult::invalid_query`); queries on different streams are fine.
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and

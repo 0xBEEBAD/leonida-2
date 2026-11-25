@@ -222,6 +222,13 @@ struct VulkanDeviceInfo {
     // VK_EXT_transform_feedback's geometryStreams feature is offered by the device. The device-enable chain requests
     // it when present so the pipeline cache key matches vk_pipeline_check; nothing rasterizes a stream other than 0.
     bool transform_feedback_geometry_streams = false;
+    // VK_EXT_transform_feedback's transformFeedbackQueries property (D3D-302): the device can begin/end a
+    // VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT query. Without it an SO_STATISTICS heap is made without a pool and
+    // every SO_STATISTICS query resolves zero, even when the transformFeedback feature is enabled.
+    bool transform_feedback_queries = false;
+    // The device's maxTransformFeedbackStreams property: an SO_STATISTICS_STREAMn query runs only for n below it.
+    // Streams from this count up (to the D3D12 maximum of four) run nothing and resolve zero.
+    std::uint32_t max_transform_feedback_streams = 0;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
