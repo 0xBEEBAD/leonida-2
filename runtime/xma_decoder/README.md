@@ -31,3 +31,19 @@ To link an already-built `leonida_xma2_decoder.lib` without invoking `cargo` dur
 or Linux cross-builds whose distribution `rustc` omits the `x86_64-pc-windows-msvc` standard library), pass
 `-DLEONIDA_XMA2_DECODER_LIB=<path>`. A value that does not name an existing file fails configure instead of falling
 back silently to muted XMA voices.
+
+Build that library yourself, from this checkout's `runtime/xma_decoder`, so that it matches the C ABI the runtime is
+compiled against. Configure checks only that the file exists, not which source, version or target it was built from,
+so don't use a library from another checkout, another project or a download:
+
+```sh
+rustup target add x86_64-pc-windows-msvc
+cargo build --manifest-path runtime/xma_decoder/Cargo.toml --release --locked --target x86_64-pc-windows-msvc
+```
+
+The library is then `runtime/xma_decoder/target/x86_64-pc-windows-msvc/release/leonida_xma2_decoder.lib`. Building a
+static library for that target needs only the Rust target, not the MSVC linker, so this also works on Linux.
+
+With the option set, CMake no longer builds the decoder: after a change under `runtime/xma_decoder/`, run the command
+again before building the runtime. A relative path given with `-D` on the command line is made absolute against the
+directory CMake runs in, so passing an absolute path avoids surprises.
