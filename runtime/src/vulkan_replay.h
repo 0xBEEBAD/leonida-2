@@ -2551,7 +2551,9 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
             return ReplayResult::success;
         };
         if (draw.mesh) return skip(indirect_stats::mesh);
-        if (draw.topology != 4) return skip(indirect_stats::topology);
+        static_assert(indirect_stats::topology_supported(topology_rect_list) &&
+                      !indirect_stats::topology_supported(topology_quad_list));
+        if (!indirect_stats::topology_supported(draw.topology)) return skip(indirect_stats::topology);
         if (!vk.draw_indirect_first_instance) return skip(indirect_stats::first_instance);
         if (!entry_available) return skip(indirect_stats::entry);
         if (draw.indexed && !vk.bind_robust_index_view) return skip(indirect_stats::robust_index);
@@ -2667,13 +2669,19 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
     if (unbound || !p.pipeline) {
-        if (vk.compiles && pipeline->variant && pipeline->built && !pipeline->async_build) {
+        const bool indirect_rect_variant = arguments && (unbound & GraphicsPipeline::rectangle_stage);
+        if (vk.compiles && pipeline->variant && pipeline->built && !pipeline->async_build && !indirect_rect_variant) {
             p.pipeline = pipeline->built(unbound);
             if (!p.pipeline) p.compile = vk.compiles->add(*pipeline, unbound);
         } else {
             p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
             if (!p.pipeline && pipeline->async_build && !strict_replay()) {
                 if (arguments) indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::pending_pipeline);
+                p.skipped = true;
+                return ReplayResult::success;
+            }
+            if (!p.pipeline && !pipeline->async_build && indirect_rect_variant) {
+                indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::topology);
                 p.skipped = true;
                 return ReplayResult::success;
             }
