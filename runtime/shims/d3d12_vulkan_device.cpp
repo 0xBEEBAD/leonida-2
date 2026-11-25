@@ -7354,6 +7354,15 @@ public:
                     std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
                     return stream_unsupported("mesh shader exceeds a device mesh limit");
                 }
+                // The graphics bind point lays root arguments out from push dword 8, which a mesh shader reads from
+                // its s16 only when translated with the graphics root window (index "root_window", D3D-448).
+                if (!stage.entry->graphics_root_window) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: mesh shader %s was translated before the graphics root window; translate "
+                                 "the shaders again (make_game.py --stages shaders)\n",
+                                 stage.entry->name.c_str());
+                    return E_INVALIDARG;
+                }
             }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
@@ -11889,8 +11898,8 @@ public:
             if (container_size != size) return E_INVALIDARG;
         }
         // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then pack
-        // the parameters into the 32 user-data dwords. pack() refuses what it cannot place (more than 32 dwords:
-        // the console spills those to memory, in a layout that is still open), and so does this.
+        // the parameters into the 32 user-data dwords in the console layout. pack_stage() refuses what it cannot
+        // place (past s31: the console spills those to memory, in a layout that is still open), and so does this.
         const rt::rootsig::DecodeResult parsed = rt::rootsig::parse_rts0(bytes, size);
         if (!parsed.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
@@ -11899,11 +11908,14 @@ public:
         // Two layouts, one per bind point (RootArgumentLayout): graphics takes the console layout of vertex and
         // pixel shaders (s8, one dword per table) where it fits without a spill and keeps pack() otherwise, compute
         // the console layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
+        // A mesh shader reads the same graphics block from its s16 (the translator's root window, push dword 8 = s16),
+        // so its 16-dword window only needs checking (D3D-448-GRAPHICS).
         const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
         // LEONIDA_GRAPHICS_STAGE_LAYOUT=0 keeps pack() for every graphics signature.
         const rt::rootsig::StagePackResult pixel =
             local_graphics_stage_layout() ? rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Pixel)
                                           : rt::rootsig::StagePackResult{};
+        const rt::rootsig::StagePackResult mesh = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Mesh);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
         if (!pixel.ok && packed.ok && local_graphics_stage_layout()) {
             static std::atomic<unsigned> kept{0};
@@ -11920,12 +11932,21 @@ public:
         }
         if (!graphics_ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
+        else if (pixel.ok && !mesh.ok) {
+            static std::atomic<unsigned> too_large{0};
+            const unsigned n = ++too_large;
+            if (n == 1 || (n & (n - 1)) == 0)
+                std::fprintf(stderr,
+                             "[rt] d3d12: root signature too large for a mesh shader's root window: %s (%u so far)\n",
+                             mesh.error.c_str(), n);
+        }
         if (!compute.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
         layout.flags = parsed.sig.flags;
         layout.graphics_console = pixel.ok;
         layout.graphics_ok = graphics_ok;
+        layout.mesh_ok = pixel.ok && mesh.ok;
         layout.compute_ok = compute.ok;
         if (compute.ok && !compute.spill_dwords) layout.compute_arguments_end = compute.end_sgpr;
         // Vertex, pixel and geometry shaders share the s8 layout and one user-data block (a non-compute stage
