@@ -4083,6 +4083,35 @@ DWORD WINAPI tear_reader(LPVOID) {
     return 0;
 }
 
+// Queue slot 31 (CopyPageMappingsBatchX) as the list-values tests see it: the hook records the last call and the
+// first batch, so a test can tell a remap of the proxy's copy (deferred behind queue work) from the caller's array.
+struct PageMappingRecord {
+    int count = 0;
+    const rt::xmem::PageBatch* batches = nullptr;
+    std::uintptr_t pool = 0;
+    std::uint32_t pages = 0, flags = 0;
+    std::uintptr_t first_destination = 0;
+    std::uint32_t first_count = 0;
+    rt::xmem::PageRange first_ranges[4]{};
+};
+static PageMappingRecord g_page_mapping;
+
+static bool record_page_mapping(std::uint32_t count, const rt::xmem::PageBatch* batches, std::uintptr_t pool,
+                                std::uint32_t pages, std::uint32_t flags) {
+    ++g_page_mapping.count;
+    g_page_mapping.batches = batches;
+    g_page_mapping.pool = pool;
+    g_page_mapping.pages = pages;
+    g_page_mapping.flags = flags;
+    if (count && batches) {
+        g_page_mapping.first_destination = batches[0].destination;
+        g_page_mapping.first_count = batches[0].count;
+        for (std::uint32_t i = 0; i < batches[0].count && i < 4 && batches[0].ranges; ++i)
+            g_page_mapping.first_ranges[i] = batches[0].ranges[i];
+    }
+    return true;
+}
+
 int check_list_values_more() {
     Mock* mock = nullptr;
     void* device = make_device(mock, 9, true, true, true);
