@@ -50,6 +50,7 @@
 #include "../src/pipeline_cache_store.h"
 #include "../src/pipeline_cache_journal.h"
 #include "../src/large_module_gate.h"
+#include "../src/dev_status.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/console_texture_layout.h"
@@ -7609,8 +7610,8 @@ public:
             // No host pointer: this is DEFAULT-heap arena memory the GPU may write, so its mapped bytes can be
             // stale. host_at() must not treat it as a CPU-written instance pointer list.
             // A default-heap AS resource is one of these ranges: a GENERIC acceleration structure covers it where
-            // it sits. It is named by its real device address (heap base + offset), as instance descriptors and
-            // BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
+            // it sits. It is named by its device address (heap base + offset, as the driver reports it), as instance
+            // descriptors and BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
             if (device_.info.ray_tracing &&
                 initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
                 vk.vkCreateAccelerationStructureKHR) {
@@ -7621,7 +7622,27 @@ public:
                 asci.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
                 if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
                     gpu_va_ = device_.arena.address + va_;
+                    // An instance names its BLAS by a value obtained from vkGetAccelerationStructureDeviceAddressKHR
+                    // (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-12281), so ask for it, as the committed path
+                    // below does. For GENERIC the spec only promises that these addresses keep the offsets between
+                    // the structures of one buffer; drivers return buffer address + offset (vkd3d-proton checks the
+                    // same). If one ever does not, the driver's address is the one instances must hold.
+                    if (vk.vkGetAccelerationStructureDeviceAddressKHR) {
+                        VkAccelerationStructureDeviceAddressInfoKHR dai{
+                            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+                        dai.accelerationStructure = accel_;
+                        const std::uint64_t as_va =
+                            vk.vkGetAccelerationStructureDeviceAddressKHR(device_.info.device, &dai);
+                        if (as_va && as_va != gpu_va_) {
+                            log_once("GENERIC acceleration structure address is not its buffer address + offset; "
+                                     "arena offset in KiB:", int(arena_offset_ / 1024));
+                            buffer_va_ = gpu_va_;
+                            gpu_va_ = as_va;
+                        }
+                    }
                     device_.context->register_acceleration_structure(gpu_va_, accel_);
+                    if (buffer_va_ && buffer_va_ != gpu_va_)
+                        device_.context->register_acceleration_structure(buffer_va_, accel_);
                 }
             }
             device_.context->add_resource(id(), binding);
@@ -10342,6 +10363,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     trace.begin(pipeline_info, device.info.pipeline_creation_feedback, trigger, entry->name.c_str(), 0, bytes, options.cache_key ? *options.cache_key : no_key);
     // Was it in the cache? Core feedback on a Vulkan 1.3 device; pipeline_cache_control implies one.
     if (journal.enabled() && device.info.pipeline_cache_control) trace.request_feedback(pipeline_info);
+    const leonida::dev_status::Build dev_build(entry->name.c_str());
     const leonida::pipeline_profile::DriverCall profile("cs", trigger, entry->name.c_str());
     // LOCAL DIAGNOSTIC (early device loss): a vkQueueSubmit was measured blocking 10 s and losing the device
     // while another thread sat in this call. Name what is building (once past the gate: in the driver), and log
@@ -10899,8 +10921,8 @@ public:
         if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
             (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
-            if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                          &link_error, device_.f16_half_top_location)) {
+            if (!link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
+                                 &link_error)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
@@ -11977,6 +11999,7 @@ private:
         }
         CompileTrace trace;
         trace.begin(info, device_.info.pipeline_creation_feedback, trigger, profile_shaders_.c_str(), unbound, bytes, cache_key_);
+        const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
         const auto result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info, nullptr, &pipeline);
@@ -12011,10 +12034,22 @@ private:
         return true;
     }
 
+    bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const leonida::ShaderEntry& vs_entry,
+                         std::vector<std::uint32_t>& ps_words, const leonida::ShaderEntry& ps_entry,
+                         std::string* error) const {
+        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error,
+                                        device_.f16_half_top_location);
+    }
+
+public:
     bool stage_words(std::vector<std::vector<std::uint32_t>>& words, std::string& why) const {
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) {
             why = "no shader library";
+            return false;
+        }
+        if (sources_.empty()) {
+            why = "not a lazy pipeline";
             return false;
         }
         words.assign(sources_.size(), {});
@@ -12036,7 +12071,7 @@ private:
         }
         if (f16_linked_) {
             if (vs == SIZE_MAX || ps == SIZE_MAX ||
-                !leonida::link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why))
+                !link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why))
                 return false;
         }
         for (std::size_t i = 0; i < sources_.size(); ++i) {
@@ -12059,6 +12094,7 @@ private:
         return true;
     }
 
+private:
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound, const char* trigger) {
         std::unique_lock lock(variants_mutex_, std::defer_lock);
@@ -13182,11 +13218,17 @@ public:
             break;
         }
         case h::so_statistics:
-            // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
-            // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
-            // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
-            // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
-            return register_pool(desc);
+            // D3D-302: with VK_EXT_transform_feedback enabled, an SO_STATISTICS heap is a real transform-feedback
+            // pool whose queries begin/end on a stream (vkCmdBeginQueryIndexedEXT); a resolve copies 16 bytes per
+            // query (NumPrimitivesWritten, PrimitivesStorageNeeded), in the same order. StreamOutput PSOs are still
+            // refused and SOSetTargets is still not implemented, so no primitive reaches a stream yet and every
+            // query counts 0. The pool needs the transformFeedbackQueries property and at least one stream; without
+            // them (or without the feature) the heap is made without a pool and every query resolves to zero.
+            if (!device_.info.transform_feedback || !device_.info.transform_feedback_queries ||
+                !device_.info.max_transform_feedback_streams)
+                return register_pool(desc);
+            info.queryType = VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+            break;
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
                 log_once("pipeline-statistics query heap: pipelineStatisticsQuery not enabled; type", desc.Type);
@@ -13215,6 +13257,9 @@ private:
         pool.count = desc.Count;
         pool.precise = device_.info.occlusion_query_precise;
         pool.ended.assign(desc.Count, false);
+        // D3D-302: a real transform-feedback pool queries streams below maxTransformFeedbackStreams; D3D12 has four.
+        if (pool_ && desc.Type == leonida::d3d12_query_heap::so_statistics)
+            pool.streams = std::min<std::uint32_t>(4, device_.info.max_transform_feedback_streams);
         device_.context->add_query_pool(id(), pool);
         registered_ = true;
         return S_OK;
@@ -13238,6 +13283,15 @@ private:
 std::timed_mutex exit_cache_mutex;
 std::vector<DeviceState*> exit_cache_devices;
 std::atomic<bool> exit_cache_saved{false};
+
+// VK_EXT_memory_budget read from a device's info: the reader a device publishes for the title HUD and the dev overlay
+// (src/memory_figures.h), and vulkan_vram_budget. Not available without the extension.
+leonida::VramBudget read_vram_budget(const VulkanDeviceInfo& info) {
+    if (!info.memory_budget || !info.get_instance_proc || !info.instance) return {};
+    const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties2"));
+    return leonida::query_vram_budget(get, info.physical);
+}
 
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
@@ -13269,6 +13323,11 @@ public:
             std::lock_guard lock(exit_cache_mutex);
             exit_cache_devices.push_back(&state_);
         }
+        // The GPU memory figure of the title HUD and the dev overlay: the newest device with VK_EXT_memory_budget.
+        if (info.memory_budget)
+            leonida::memory_figures::publish_vram_reader(
+                [](const void* context) { return read_vram_budget(static_cast<const DeviceState*>(context)->info); },
+                &state_);
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -13378,8 +13437,10 @@ public:
                     VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
-                state_.f16_half_top_location = leonida::f16_half_top_location(
-                    props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
+                state_.f16_half_top_location = info.f16_half_top_location != 0
+                    ? info.f16_half_top_location
+                    : leonida::f16_half_top_location(
+                          props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
@@ -14179,6 +14240,7 @@ public:
     }
 
     ~Device() override {
+        leonida::memory_figures::withdraw_vram_reader(&state_);  // waits for a read of this device in progress
         {
             // Before anything goes: an exit save in progress finishes with this device first.
             std::lock_guard lock(exit_cache_mutex);
@@ -19850,6 +19912,16 @@ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12Pi
     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
 }
 
+bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector<std::uint32_t>>& words,
+                          std::string& why) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p) {
+        why = "not a PipelineState";
+        return false;
+    }
+    return p->stage_words(words, why);
+}
+
 long live_pipeline_states() { return live_pipeline_state_count.load(); }
 
 bool write_placed_buffer_view(ID3D12Device* device, bool unordered, const void* view, std::uint64_t address,
@@ -19963,6 +20035,11 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (auto* d = Device::from<Device>(real ? real : device)) return &d->state().info;
     return nullptr;
+}
+
+leonida::VramBudget vulkan_vram_budget(ID3D12Device* device) {
+    const VulkanDeviceInfo* info = vulkan_device_info(device);
+    return info ? read_vram_budget(*info) : leonida::VramBudget{};
 }
 
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device) {
@@ -20601,6 +20678,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rq_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT transform_feedback_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback_properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
     {
         std::uint32_t extension_count = 0;
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
@@ -20625,10 +20706,28 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.mesh_shader = mesh_features.meshShader == VK_TRUE;
                 info.mesh_shader_queries = mesh_features.meshShaderQueries == VK_TRUE;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                                   &transform_feedback_features};
+                vkGetPhysicalDeviceFeatures2(info.physical, &features);
+                info.transform_feedback = transform_feedback_features.transformFeedback == VK_TRUE;
+                info.transform_feedback_geometry_streams = transform_feedback_features.geometryStreams == VK_TRUE;
+                // D3D-302: the queries and the stream count are properties, not features.
+                VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                                       &transform_feedback_properties};
+                vkGetPhysicalDeviceProperties2(info.physical, &properties);
+                info.transform_feedback_queries = transform_feedback_properties.transformFeedbackQueries == VK_TRUE;
+                info.max_transform_feedback_streams = transform_feedback_properties.maxTransformFeedbackStreams;
             }
         }
         if (!info.mesh_shader)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_mesh_shader: mesh-shader PSOs are unsupported\n");
+        if (!info.transform_feedback)
+            std::fprintf(stderr,
+                         "[rt] d3d12: the GPU has no VK_EXT_transform_feedback: SO_STATISTICS query pools read zero\n");
+        else if (!info.transform_feedback_queries || !info.max_transform_feedback_streams)
+            std::fprintf(stderr, "[rt] d3d12: the GPU has no transform-feedback queries (transformFeedbackQueries, "
+                                 "maxTransformFeedbackStreams): SO_STATISTICS query pools read zero\n");
         if (has_as && has_dho && has_rq && chosen12.bufferDeviceAddress) {
             as_features.pNext = &rq_features;
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
@@ -20664,10 +20763,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // The mesh-primitives query, which counts the primitives a mesh shader emits (D3D-MESH-CLIPPING-COUNTER).
     enable_mesh.meshShaderQueries = info.mesh_shader_queries ? VK_TRUE : VK_FALSE;
 
+    // D3D-302: real SO_STATISTICS queries need transformFeedback; geometryStreams is only requested when the device
+    // already offers it, so the enable chain matches vk_pipeline_check's (a driver keys the pipeline cache on it).
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT enable_transform_feedback{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    enable_transform_feedback.transformFeedback = VK_TRUE;
+    enable_transform_feedback.geometryStreams = info.transform_feedback_geometry_streams ? VK_TRUE : VK_FALSE;
+
     void* ext_chain = nullptr;
     if (info.mesh_shader) {
         enable_mesh.pNext = ext_chain;
         ext_chain = &enable_mesh;
+    }
+    if (info.transform_feedback) {
+        enable_transform_feedback.pNext = ext_chain;
+        ext_chain = &enable_transform_feedback;
     }
     if (info.ray_tracing) {
         enable_rq.pNext = ext_chain;
@@ -21173,6 +21283,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    if (info.transform_feedback) device_extensions.push_back(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
@@ -21183,6 +21294,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.null_descriptor || info.robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // Optional: VK_EXT_memory_budget gives the GPU memory in use and the budget (vulkan_vram_budget, the title HUD).
+    info.memory_budget = has_device_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (info.memory_budget) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     leonida::DeviceFaultFeatures fault_features;
     const bool aftermath = leonida::aftermath::enable();  // already on, before the instance: see above
     char device_fault[2]{};

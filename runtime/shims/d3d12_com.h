@@ -32,6 +32,7 @@
 
 #include "../src/root_signature.h"
 #include "../src/subgroup_size.h"
+#include "../src/vulkan_memory_budget.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -114,6 +115,8 @@ struct VulkanDeviceInfo {
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // Top location for relocated f16 halves (0: read from device limits; non-zero: override for testing low-limit devices).
+    std::uint32_t f16_half_top_location = 0;
     // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
     // the physical device when the D3D12 device is created; a test sets smaller ones to simulate a device.
     VkDeviceSize max_buffer_size = 0;
@@ -220,6 +223,20 @@ struct VulkanDeviceInfo {
     // VK_EXT_mesh_shader's meshShaderQueries feature is enabled on `device`, so the clipping invocations of a mesh
     // segment come from a mesh-primitives query (D3D-MESH-CLIPPING-COUNTER). Without it they read 0.
     bool mesh_shader_queries = false;
+    // VK_EXT_transform_feedback with its transformFeedback feature is enabled on `device` (D3D-302): an
+    // SO_STATISTICS heap is a real VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool, begun and ended indexed on the
+    // stream. StreamOutput PSOs are still refused and SOSetTargets is still not implemented.
+    bool transform_feedback = false;
+    // VK_EXT_transform_feedback's geometryStreams feature is offered by the device. The device-enable chain requests
+    // it when present so the pipeline cache key matches vk_pipeline_check; nothing rasterizes a stream other than 0.
+    bool transform_feedback_geometry_streams = false;
+    // VK_EXT_transform_feedback's transformFeedbackQueries property (D3D-302): the device can begin/end a
+    // VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT query. Without it an SO_STATISTICS heap is made without a pool and
+    // every SO_STATISTICS query resolves zero, even when the transformFeedback feature is enabled.
+    bool transform_feedback_queries = false;
+    // The device's maxTransformFeedbackStreams property: an SO_STATISTICS_STREAMn query runs only for n below it.
+    // Streams from this count up (to the D3D12 maximum of four) run nothing and resolve zero.
+    std::uint32_t max_transform_feedback_streams = 0;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
@@ -244,6 +261,9 @@ struct VulkanDeviceInfo {
     bool draw_indirect_count_enabled = false;
     // Both VK_KHR_maintenance5 and robustBufferAccess2 (with core robustBufferAccess) are enabled.
     bool robust_index_view = false;
+    // VK_EXT_memory_budget is enabled on `device`: vulkan_vram_budget reads the GPU memory in use and the budget
+    // from it (the title HUD's VRAM figure). Without it that figure is not available.
+    bool memory_budget = false;
     std::uint32_t max_draw_indirect_count = 1;
 };
 
@@ -294,6 +314,10 @@ leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t a
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
+// The GPU memory a device from create_vulkan_device* (or its Xbox-ABI proxy) uses and may use, from
+// VK_EXT_memory_budget, read now (src/vulkan_memory_budget.h). Not available without the extension or the device.
+// Any thread: the title HUD calls it from its own, at most once per refresh.
+leonida::VramBudget vulkan_vram_budget(ID3D12Device* device);
 // The device's pipeline workers (src/pipeline_workers.h) and what they have compiled; zeros without any. For tests.
 leonida::PipelineWorkers::Stats pipeline_worker_stats(ID3D12Device* device);
 // True when a slot-133 buffer is a shadow copied from the title's pages, false when they were imported. For tests.
@@ -567,6 +591,9 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
+// The linked SPIR-V stage modules for a lazy pipeline (in recipe stages order); false when not a lazy pipeline.
+bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector<std::uint32_t>>& words,
+                          std::string& why);
 // PSOs of any Vulkan device not yet deleted, counting one whose deletion waits for its running build (tests).
 long live_pipeline_states();
 
