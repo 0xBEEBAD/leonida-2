@@ -1547,6 +1547,86 @@ int check_placed_resource_x() {
     return 0;
 }
 
+// The same stand-in with LEONIDA_SLOT133_LAYOUT_WORD=1 (its own process: the switch is read once): the fourth word is
+// a D3D12_BARRIER_LAYOUT. A device without ID3D12Device10 gets the legacy state of that layout through
+// CreateCommittedResource; one with it gets CreateCommittedResource3 and the layout as given.
+int run_slot133_layout_word() {
+    g_label = "xs_proxy_mock --slot133-layout";
+    EXPECT(_putenv_s("LEONIDA_SLOT133_LAYOUT_WORD", "1") == 0);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    constexpr std::uint64_t kVa = 0x7f0000000000ull;
+    constexpr std::uint32_t kXboxFlag = 0x20000;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = 1 << 20;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    buffer.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kXboxFlag);
+    D3D12_RESOURCE_DESC target = buffer;
+    target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    target.Width = 64;
+    target.Height = 32;
+    target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    target.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | kXboxFlag);
+    const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {{0, 0, 0, 1}}};
+    void* resource = nullptr;
+
+    // A buffer is COMMON whatever word it came with.
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 2, word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(resource && mock->calls[27] == 1 && g_committed.state == D3D12_RESOURCE_STATE_COMMON && !g_committed.clear);
+    EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    EXPECT(release(resource) == 0);
+    // RENDER_TARGET (2) is that state, with the clear value.
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 2, word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(mock->calls[27] == 2 && g_committed.state == D3D12_RESOURCE_STATE_RENDER_TARGET && g_committed.clear == &clear);
+    EXPECT(g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET &&
+           g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+    EXPECT(release(resource) == 0);
+    // SHADER_RESOURCE (6) is the shader-resource states, not INDEX_BUFFER | RENDER_TARGET.
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 6, 0, word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(mock->calls[27] == 3 && g_committed.state == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    EXPECT(release(resource) == 0);
+    // UNORDERED_ACCESS (3), and the all-ones layout (UNDEFINED) as COMMON.
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 3, 0, word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(mock->calls[27] == 4 && g_committed.state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    EXPECT(release(resource) == 0);
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 0xFFFFFFFFu, 0, word(&kResourceIid), word(&resource))) ==
+           S_OK);
+    EXPECT(mock->calls[27] == 5 && g_committed.state == D3D12_RESOURCE_STATE_COMMON);
+    EXPECT(release(resource) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    // A PC device with ID3D12Device10: CreateCommittedResource3 with the layout as given, never CreateCommittedResource.
+    Mock* mock10 = nullptr;
+    void* device10 = make_device(mock10, 10, true);
+    EXPECT(device10);
+    g_committed3 = {};
+    EXPECT(hr_of(raw6(device10, 133, kVa, word(&target), 6, word(&clear), word(&kResourceIid), word(&resource))) ==
+           S_OK);
+    EXPECT(resource && g_committed3.calls == 1 && mock10->calls[27] == 0);
+    EXPECT(g_committed3.layout == 6 && g_committed3.clear == &clear && !g_committed3.session &&
+           g_committed3.castable_count == 0 && g_committed3.riid == &kResourceIid);
+    EXPECT(g_committed3.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET &&
+           g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN && g_committed3.desc.Width == 64);
+    EXPECT(release(resource) == 0);
+    // A buffer goes in UNDEFINED whatever word it came with, and without a clear value.
+    EXPECT(hr_of(raw6(device10, 133, kVa, word(&buffer), 2, word(&clear), word(&kResourceIid), word(&resource))) ==
+           S_OK);
+    EXPECT(g_committed3.calls == 2 && g_committed3.layout == 0xFFFFFFFFu && !g_committed3.clear);
+    EXPECT(release(resource) == 0);
+    EXPECT(release(device10) == 0 && mock10->refs == 0);
+#endif
+    std::printf("%s: with LEONIDA_SLOT133_LAYOUT_WORD=1 the stand-in reads the fourth word as a barrier layout\n",
+                g_label);
+    return 0;
+}
+
 // ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) and the retail title (41) ----
 //
 // A device that answers ID3D12Device11 (80 PC slots) is the Vulkan layer's shape: slots 78/79 are inside its table
@@ -3979,6 +4059,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
         if (std::strcmp(argv[1], "--env-slots-74") == 0) return run_env_slots(true, true);
         if (std::strcmp(argv[1], "--env-slots-70") == 0) return run_env_slots(true, false, true);
+        if (std::strcmp(argv[1], "--slot133-layout") == 0) return run_slot133_layout_word();
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
