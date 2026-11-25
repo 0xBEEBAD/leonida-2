@@ -92,7 +92,7 @@ with `0x20402000` and attributes `0x23`, then `XMemMapPhysicalPages` of those pa
 stops at `XMemVirtualAlloc`: since #6919 it accepts that attribute word and the reserve-only 64 KiB window.
 
 The host's own AWE functions need `SeLockMemoryPrivilege`, which an ordinary user does not hold, so the shim emulates
-the pool rather than forwarding (#6919): a pagefile-backed section in 64 KiB pages, committed at once and given
+the pool rather than forwarding (#6919): a pagefile-backed section in 64 KiB pages, committed at once on Wine (and on demand on native Windows) and given
 physical memory as it is touched, with views placed at the reserved range. Pages keep their contents while unmapped or
 mapped elsewhere, and one page can be mapped at several addresses. The attribute word is recorded, still not decoded,
 and every page is 64 KiB, which all four callers' arithmetic agrees with (`runtime/shims/xmem.cpp`).
