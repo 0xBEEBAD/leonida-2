@@ -1999,6 +1999,19 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vulkan_scratch COMMAND vulkan_scratch_test)
   endif()
+  if(WIN32)
+    # CPU-only: a completed GPU label is stored into a page the D3D12 layer watches (read-only until written) and
+    # dropped for a page that is read-only by the title's own doing (runtime/src/vulkan_gpu_labels.h).
+    add_executable(gpu_label_store_test test/gpu_label_store_test.cpp)
+    target_link_libraries(gpu_label_store_test PRIVATE Vulkan::Headers)
+    target_compile_definitions(gpu_label_store_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(gpu_label_store_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    if(BUILD_TESTING)
+      add_test(NAME gpu_label_store COMMAND gpu_label_store_test)
+    endif()
+  endif()
   if(WIN32 AND BUILD_TESTING)
     # Whole title-region import capability: one host allocation bound as a BDA buffer. The default case uses the
     # measured 185 MiB placeholder size. A machine that cannot import (no importable usage/handle, an import-budget

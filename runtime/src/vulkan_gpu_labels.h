@@ -18,6 +18,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "title_page_watch.h"
 #endif
 
 namespace leonida::label {
@@ -28,6 +29,51 @@ inline bool enabled() {
     }();
     return active;
 }
+// Stores a completed label into the title's memory: only into a committed, private, writable page of the allocation
+// the label was captured in, and only while that allocation's generation is the captured one (Memory::publish).
+//
+// A page the D3D12 layer watches for the title's writes is read-only while it waits (title_page_watch.h), and it is
+// writable as far as the title knows. Such a page is announced and opened the way a kernel write is
+// (kernel_writes::begin_write), so the label reaches it and the layer copies the page again; a page that stays
+// read-only after that is the title's own doing and the label is dropped, as before. Called with no shadow lock held.
+inline bool store_value(const Target &target, std::uint64_t value) {
+#ifdef _WIN32
+    return memory().publish(target, [&](std::uintptr_t address, unsigned width, std::uintptr_t allocation_base) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        const auto in_allocation = [&] {
+            return VirtualQuery(reinterpret_cast<const void *>(address), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+                   mbi.Type == MEM_PRIVATE && reinterpret_cast<std::uintptr_t>(mbi.AllocationBase) == allocation_base &&
+                   !(mbi.Protect & PAGE_GUARD);
+        };
+        if (!in_allocation()) return false;
+        std::uint64_t pin = 0;
+        if ((mbi.Protect & 0xff) == PAGE_READONLY) {
+            pin = kernel_writes::begin_write(reinterpret_cast<const void *>(address), width, nullptr);
+            if (!pin || !in_allocation()) {
+                kernel_writes::end_write(pin, false);
+                return false;
+            }
+        }
+        const auto begin = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        const bool writable = (mbi.Protect & 0xff) == PAGE_READWRITE || (mbi.Protect & 0xff) == PAGE_WRITECOPY;
+        const bool inside = address >= begin && address - begin <= mbi.RegionSize &&
+                            mbi.RegionSize - (address - begin) >= width;
+        if (writable && inside) {
+            if (width == 4)
+                InterlockedExchange(reinterpret_cast<volatile LONG *>(address), static_cast<LONG>(value));
+            else
+                InterlockedExchange64(reinterpret_cast<volatile LONG64 *>(address), static_cast<LONG64>(value));
+        }
+        kernel_writes::end_write(pin, false);
+        return writable && inside;
+    });
+#else
+    (void)target;
+    (void)value;
+    return false;
+#endif
+}
+
 // Each submitted Vulkan command buffer owns a fence and its query slots until the GPU finishes it.
 // The CPU destination is a generation-checked title data allocation. No guest pointer is a GPU command destination.
 class Completions {
@@ -85,30 +131,7 @@ class Completions {
             idle_pools_.push_back(p);
         if (b.fence) idle_fences_.push_back(b.fence);
     }
-    static bool store(const Target &target, std::uint64_t value) {
-#ifdef _WIN32
-        return memory().publish(target, [&](std::uintptr_t address, unsigned width, std::uintptr_t allocation_base) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (!VirtualQuery(reinterpret_cast<const void *>(address), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
-                mbi.Type != MEM_PRIVATE || reinterpret_cast<std::uintptr_t>(mbi.AllocationBase) != allocation_base ||
-                (mbi.Protect & PAGE_GUARD) ||
-                ((mbi.Protect & 0xff) != PAGE_READWRITE && (mbi.Protect & 0xff) != PAGE_WRITECOPY))
-                return false;
-            const auto begin = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
-            if (address < begin || address - begin > mbi.RegionSize || mbi.RegionSize - (address - begin) < width)
-                return false;
-            if (width == 4)
-                InterlockedExchange(reinterpret_cast<volatile LONG *>(address), static_cast<LONG>(value));
-            else
-                InterlockedExchange64(reinterpret_cast<volatile LONG64 *>(address), static_cast<LONG64>(value));
-            return true;
-        });
-#else
-        (void)target;
-        (void)value;
-        return false;
-#endif
-    }
+    static bool store(const Target &target, std::uint64_t value) { return store_value(target, value); }
     void publish(const Batch &batch) {
         for (std::size_t i = 0; i < batch.labels.size(); ++i) {
             const Write &op = batch.labels[i];
