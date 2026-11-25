@@ -16885,6 +16885,10 @@ bool stop_pipeline_compiles(unsigned wait_ms) {
     return idle;
 }
 
+// How long an exit save waits for the write itself (save_session_pipeline_cache): a 77 MiB cache was measured at about
+// 36 ms (fill and publish), so this only bounds a driver that blocks the read.
+constexpr unsigned kExitCacheWriteMs = 3000;
+
 bool save_pipeline_caches_at_exit(unsigned wait_ms) {
     if (exit_cache_saved.exchange(true)) return false;  // once: a crash during the normal exit's save does not redo it
     std::unique_lock lock(exit_cache_mutex, std::defer_lock);
@@ -16897,16 +16901,39 @@ bool save_pipeline_caches_at_exit(unsigned wait_ms) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
     for (DeviceState* d : exit_cache_devices) {
         if (!d->context || !d->pipeline_cache_handle) continue;
-        // A build that started on a title thread (not the compiler's, which stop_pipeline_compiles has stopped) is
-        // given until the deadline; past it the previous session file is kept, as at teardown.
+        // A build still running (a large one takes minutes; at a crash the faulting thread may be inside one) is
+        // given until the deadline, then the cache is written without it. Unlike at teardown, the previous file is
+        // not kept instead: the process is ending, so waiting longer is not possible and keeping the old file throws
+        // away everything this run compiled (measured: a 1,308 s boot that ended in a title fault with 2 builds
+        // running). The cache is not created EXTERNALLY_SYNCHRONIZED, so reading it during a build is valid; the
+        // snapshot holds the pipelines finished so far.
         while (d->active_compiles.load() && std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (const unsigned building = d->active_compiles.load()) {
-            std::fprintf(stderr, "[rt] d3d12: %u pipeline build(s) still running at exit; "
-                                 "pipeline_cache.session.bin not written\n", building);
-            continue;
+        if (const unsigned building = d->active_compiles.load())
+            std::fprintf(stderr, "[rt] d3d12: %u pipeline build(s) still running at exit; writing the pipelines "
+                                 "finished so far\n", building);
+        // On a thread of its own: a driver that holds the cache until a build ends would otherwise hold the ending
+        // process too. Past the deadline the process goes on ending; the file is published by a rename
+        // (CacheStagingFile), so a write cut off there leaves the previous file whole.
+        struct Write {
+            std::mutex mutex;
+            std::condition_variable done_cv;
+            bool done = false;
+        };
+        auto write = std::make_shared<Write>();
+        std::thread([write, d] {
+            save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false, "exit");
+            std::lock_guard done_lock(write->mutex);
+            write->done = true;
+            write->done_cv.notify_all();
+        }).detach();
+        std::unique_lock write_lock(write->mutex);
+        if (!write->done_cv.wait_for(write_lock, std::chrono::milliseconds(kExitCacheWriteMs),
+                                     [&] { return write->done; })) {
+            std::fprintf(stderr, "[rt] d3d12: pipeline cache still being written after %u ms at exit; the process "
+                                 "ends without waiting for it\n", kExitCacheWriteMs);
+            return wrote;  // the device list stays as it is: the write still uses this device
         }
-        save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false, "exit");
         wrote = true;
     }
     return wrote;
