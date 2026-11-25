@@ -1,5 +1,14 @@
 #pragma once
 
+// Source: adapted from enx/leonida, commit 5c175db901f8486bcdefd03746b578b657e3151f on the original author's git
+// mirror (https://git.notrexed.dev/enx/leonida), a fork of this project. Licence: GPL-3.0-or-later as a fork of this
+// project. That server could not be reached on 2026-11-25, when this file was merged, so the source and its licence
+// could not be read there; the maintainer accepted the file because the source is a fork of this same
+// GPL-3.0-or-later project (the README links the server as the original author's mirror) and because
+// tools/native_pso_hashes.py is adapted from the same commit. Changed, as the pull request that brought it describes
+// it (the source could not be compared): the state and stage resolution moved to runtime/src/native_pso.h, and the
+// stage bytecode handed on is read from the user's own carved DXBC containers, not from the description.
+//
 // Xbox native graphics pipeline state, adapted from enx/leonida's slot-57 implementation.
 // The state and stage resolution are in native_pso.h. All stage bytecode handed to D3D12
 // comes from the user's carved DXBC containers and is translated by the normal Vulkan PSO path.
