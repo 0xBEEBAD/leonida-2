@@ -1,7 +1,7 @@
 #pragma once
 // When the title last submitted, for the compute warm-ups (runtime/shims/d3d12_vulkan_device.cpp,
-// LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES): while the title submits, a warm-up of a big module is left to the pipeline's
-// first use, since a create holds the compile gate for its whole length and every submission waits behind it.
+// LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES, opt-in): while the title submits, a warm-up of a big module is left to the
+// pipeline's first use, since a create holds the compile gate for its whole length and every submission waits behind it.
 // No windows.h here: vulkan_backend.h includes this, and translation units without NOMINMAX include that.
 #include <atomic>
 #include <chrono>

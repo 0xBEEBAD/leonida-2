@@ -2602,10 +2602,11 @@ submitting thread; at the maintainers' decision it was replaced by this one when
 - **Warm-ups while the title submits.** A compute warm-up holds the compile gate for its whole create, and every
   submission waits behind it: a native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and
   past the story load the worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s
-  each) against 25 such builds a dispatch asked for. So a warm-up of a module over
-  `LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES` of SPIR-V (default 128 KiB; 0: no limit) is not started while the title
-  submits (a submission in the last second, `src/pipeline_wait.h`); the pipeline is built at its first use instead.
-  Smaller warm-ups, and every warm-up before the first submission, run as before.
+  each) against 25 such builds a dispatch asked for (measured with a 128 KiB limit). With
+  `LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=<n>` a warm-up of a module over n bytes of SPIR-V is not started while the
+  title submits (a submission in the last second, `src/pipeline_wait.h`); the pipeline is built at its first use
+  instead. Opt-in: unset or 0, every warm-up runs, as on `main`, and `LargeModuleGate` (#1889) orders them behind a
+  submission's compiles. Smaller warm-ups, and every warm-up before the first submission, run as before.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
