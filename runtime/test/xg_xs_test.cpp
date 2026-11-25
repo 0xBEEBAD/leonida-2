@@ -365,10 +365,8 @@ void test_models_agree() {
                             source[i] = uint8_t(i * 131 + (i >> 8) * 7 + level * 17 + slice * 29 + 1);
                         copy_elements<true>(t, level, slice, source.data(), tiled.data(), pitch, 0, columns);
                         back.assign(source.size(), uint8_t{0});
-                        const auto copied = l->walk(tiled.size(), level, slice, back.size(), pitch, 0,
-                                                    [&](size_t from, size_t to, size_t bytes) {
-                                                        std::memcpy(back.data() + to, tiled.data() + from, bytes);
-                                                    });
+                        const auto copied =
+                            l->detile(tiled.data(), tiled.size(), level, slice, back.data(), back.size(), pitch, 0);
                         if (copied != ct::Error::ok) differs = "the second model refuses the copy";
                         else if (back != source) differs = "element addresses";
                     }
