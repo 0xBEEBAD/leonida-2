@@ -2839,18 +2839,25 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(xbox_cbv_vector_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
     add_test(NAME xbox_cbv_vectors COMMAND xbox_cbv_vector_test)
     set_tests_properties(xbox_cbv_vectors PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    # With LEONIDA_CBV_RAW=1 a view made on the device itself keeps the byte-address form.
+    add_test(NAME xbox_cbv_vectors_raw COMMAND xbox_cbv_vector_test)
+    set_tests_properties(xbox_cbv_vectors_raw PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20 ENVIRONMENT "LEONIDA_CBV_RAW=1")
     add_executable(xbox_depth_storage_test test/xbox_depth_storage_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp)
     target_link_libraries(xbox_depth_storage_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(xbox_depth_storage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
     add_test(NAME xbox_depth_storage COMMAND xbox_depth_storage_test)
     add_test(NAME xbox_d16s8_storage COMMAND xbox_depth_storage_test)
-    set_tests_properties(xbox_d16s8_storage PROPERTIES ENVIRONMENT "LEONIDA_TEST_D16S8_UAV=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    # The console's D16S8 family keeps its own path where the GPU has no D24S8 attachment, and is the D24S8 family
+    # where it has one; LEONIDA_CONSOLE_D16S8=native asks for the D16/S8 path on every GPU (pc_format).
+    set_tests_properties(xbox_d16s8_storage PROPERTIES
+                         ENVIRONMENT "LEONIDA_TEST_D16S8_UAV=1;LEONIDA_CONSOLE_D16S8=native" SKIP_RETURN_CODE 77 TIMEOUT 30)
     set_tests_properties(xbox_depth_storage PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_executable(xbox_d16s8_surface_test test/xbox_d16s8_surface_test.cpp)
     target_link_libraries(xbox_d16s8_surface_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(xbox_d16s8_surface_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     add_test(NAME xbox_d16s8_surface COMMAND xbox_d16s8_surface_test)
-    set_tests_properties(xbox_d16s8_surface PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+    set_tests_properties(xbox_d16s8_surface PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20
+                         ENVIRONMENT "LEONIDA_CONSOLE_D16S8=native")
     add_executable(xbox_gpu_label_test test/xbox_gpu_label_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp)
     target_link_libraries(xbox_gpu_label_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(xbox_gpu_label_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)

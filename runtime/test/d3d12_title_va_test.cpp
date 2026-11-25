@@ -638,8 +638,11 @@ int check_rebound_tables(Context& c, ID3D12RootSignature* narrow, bool mirror, b
         std::memcpy(words.data(), reinterpret_cast<const void*>(src.ptr), sizeof(words));
         leonida::gfx10::Buffer reference_cbv{};
         EXPECT(leonida::gfx10::decode(words, reference_cbv));
-        EXPECT(reference_cbv.stride == (xbox_cbv ? 16u : 0u));
-        EXPECT(reference_cbv.num_records == (xbox_cbv ? kBytes / 16u : kBytes));
+        // The device writes the console's 16-byte rows for both producers unless LEONIDA_CBV_RAW=1.
+        wchar_t raw_env[2]{};
+        const bool rows = xbox_cbv || !(GetEnvironmentVariableW(L"LEONIDA_CBV_RAW", raw_env, 2) == 1 && raw_env[0] == L'1');
+        EXPECT(reference_cbv.stride == (rows ? 16u : 0u));
+        EXPECT(reference_cbv.num_records == (rows ? kBytes / 16u : kBytes));
         const void* copy_from = reinterpret_cast<const void*>(src.ptr);
         if (api_copy) {
             // Write to a shader-visible slot outside the bound table. The game copies from its CPU backing.

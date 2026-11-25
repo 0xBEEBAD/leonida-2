@@ -45,14 +45,19 @@ int main(int argc, char **argv) {
     CHECK(cb.BufferLocation && cb.BufferLocation < (8ull << 20));
     xbox->CreateConstantBufferView(&cb, dst);
     dev->CreateConstantBufferView(&cb, {dst.ptr + stride});
+    // The device writes every constant-buffer V# in the console's form of sixteen-byte rows; with LEONIDA_CBV_RAW=1
+    // only a view made through the console device has rows and one made on the device itself is a byte-address view.
+    wchar_t raw_env[2]{};
+    const bool raw_cbv = GetEnvironmentVariableW(L"LEONIDA_CBV_RAW", raw_env, 2) == 1 && raw_env[0] == L'1';
     for (unsigned variant = 0; variant < 2; ++variant) {
         leonida::gfx10::BufferWords words{};
         std::memcpy(words.data(), reinterpret_cast<const void *>(dst.ptr + variant * stride), sizeof(words));
         leonida::gfx10::Buffer decoded{};
         CHECK(leonida::gfx10::decode(words, decoded) && decoded.address == cb.BufferLocation);
-        CHECK(decoded.stride == (variant ? 0u : 16u) && decoded.num_records == (variant ? 256u : 16u));
+        const bool bytes = variant && raw_cbv;
+        CHECK(decoded.stride == (bytes ? 0u : 16u) && decoded.num_records == (bytes ? 256u : 16u));
         CHECK(decoded.oob_select ==
-              (variant ? leonida::gfx10::OobSelect::raw : leonida::gfx10::OobSelect::structured_with_offset));
+              (bytes ? leonida::gfx10::OobSelect::raw : leonida::gfx10::OobSelect::structured_with_offset));
         if (argc == 3) {
             std::vector<std::uint8_t> image(static_cast<std::size_t>(cb.BufferLocation) + 256);
             std::memcpy(image.data() + 64, words.data(), sizeof(words));
@@ -66,6 +71,7 @@ int main(int argc, char **argv) {
         }
     }
     CHECK(!vk.validation_errors());
-    std::puts("Xbox CBV has sixteen complete 16-byte rows; byte-address view retains 256 bytes");
+    std::puts(raw_cbv ? "Xbox CBV has sixteen complete 16-byte rows; byte-address view retains 256 bytes"
+                      : "Xbox CBV and device CBV both have sixteen complete 16-byte rows");
     return 0;
 }
