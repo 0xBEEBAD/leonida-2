@@ -257,6 +257,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       shims/registry.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
+      shims/d3d12_xs_pso_stream.cpp
     )
     target_link_libraries(root_sig_public_flags_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY})
     target_compile_definitions(root_sig_public_flags_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
