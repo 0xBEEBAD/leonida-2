@@ -149,18 +149,12 @@ def code_range(code: bytes):
     """(start, end) of the instructions in a kind-6 program: after the 36- or 24-byte prologue when it is there, through
     the first s_endpgm. end is None when the program has no s_endpgm."""
     words = struct.unpack_from(f"<{len(code) // 4}I", code)
-    def vop3_180(ks):
-        return all(words[k] >> 16 == 0xD580 for k in ks)
-
-    def literal_src2(ks):
-        # each hash word carries its hash as the literal of its third source (SRC2 = 0xff), as #984's fixture shows
-        return all((words[k + 1] >> 18) & 0x1FF == 0xFF for k in ks)
-    if len(words) > 8 and vop3_180(PROLOGUE_WORDS):
-        start = PROLOGUE_SIZE
-    elif len(words) > 6 and vop3_180(SHORT_PROLOGUE_WORDS) and literal_src2(SHORT_PROLOGUE_WORDS):
+    start = PROLOGUE_SIZE if len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in PROLOGUE_WORDS) else 0
+    # Some pipeline programs have only the two hash carriers. Both must be literal-bearing
+    # VOP3 NOPs of the form in fspx_prologue_probe; the first body instruction starts at byte 24.
+    if not start and len(words) >= 6 and all(
+            words[k] >> 16 == 0xD580 and words[k + 1] & 0xFFFE0100 == 0x03FE0100 for k in SHORT_PROLOGUE_WORDS):
         start = SHORT_PROLOGUE_SIZE
-    else:
-        start = 0
     pos = code.find(ENDPGM, start)
     while pos >= 0 and pos % 4:
         pos = code.find(ENDPGM, pos + 1)

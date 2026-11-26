@@ -145,13 +145,17 @@ class Kind0AndCode(unittest.TestCase):
         self.assertEqual(fspx_unpack.code_range(program(endpgm=False))[1], None)
 
     def test_short_prologue(self):
-        # Two VOP3 opcode-0x180 words (0 and 3), then code: the 24-byte prologue of some pipeline-library programs.
-        code = prologue()[:24] + V_MOV * 3 + ENDPGM
+        # The 24-byte prologue of some pipeline-library programs: hash carriers at words 0 and 3 only, each a VOP3
+        # opcode-0x180 word with a literal in the form tools/fspx_prologue_probe.py checks, then the code at word 6.
+        carrier = struct.pack("<III", 0xD5800000, 0x03FE0100, 0x12345678)
+        code = carrier * 2 + V_MOV * 3 + ENDPGM
         self.assertEqual(fspx_unpack.code_range(code), (24, 24 + 12 + 4))
-        # Only word 0 is not a prologue.
-        code = prologue()[:12] + V_MOV * 6 + ENDPGM
-        self.assertEqual(fspx_unpack.code_range(code)[0], 0)
-        # The long one still wins when word 6 is a prologue word too.
+        # Only word 0 is a carrier: no prologue.
+        self.assertEqual(fspx_unpack.code_range(carrier + V_MOV * 6 + ENDPGM)[0], 0)
+        # Opcode-0x180 words whose second dword is not the literal form: no short prologue.
+        loose = struct.pack("<III", 0xD5800000, 0x03FF0000, 0x12345678)
+        self.assertEqual(fspx_unpack.code_range(loose * 2 + V_MOV * 3 + ENDPGM)[0], 0)
+        # The 36-byte form still wins when word 6 is a prologue word too.
         self.assertEqual(fspx_unpack.code_range(program())[0], 36)
 
     def test_code_range_last(self):
