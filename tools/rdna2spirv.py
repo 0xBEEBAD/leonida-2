@@ -18885,11 +18885,19 @@ def translate(path):
 
     A workgroup barrier has to be reached by every invocation. NVIDIA waits for every thread, so one that
     an invocation never reaches stands the group until the driver resets the card (Xid 109, device lost).
-    A program that hangs costs a whole run; re-translating it costs one more pass offline."""
+    A program that hangs costs a whole run; re-translating it costs one more pass offline.
+
+    Only a multi-wave plan falls back. A single-wave workgroup (`inline_all`, `x_lanes == 64`) is one wave:
+    its barriers sit at the top level or under `%pc` guards, and `%pc` between blocks comes from scalar state
+    and votes read back from `%x_buf`, so all invocations take the same path; lane-local `%pc` exists only in
+    `emit_folded_region`'s `if (%active)` bodies, which emit no exchange and no barrier. The round loop is
+    also what drives RADV/ACO's spiller to tens of GB and the program 10-100 times slower (docs/design.md,
+    "Wave64 emulation: single-wave barrier fallback")."""
     global WAVE64_PLAN
     asm = _translate(path)
     gen = _translate.last_gen
-    if (gen is not None and getattr(gen, "emulate_plan", None) is not None
+    plan = getattr(gen, "emulate_plan", None) if gen is not None else None
+    if (plan is not None and plan.get("mode") != "inline_all"
             and barriers_under_control_flow(asm)):
         WAVE64_PLAN = False
         try:
