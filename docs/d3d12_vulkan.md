@@ -1756,6 +1756,15 @@ The copies:
   write-fault handler waits for the trackers' locks while the faulting thread may hold the process heap's lock (the
   title's `XMemAlloc` blocks are `_aligned_malloc`'s), so the state changed under those locks allocates from a heap of
   the runtime's own (`leonida::host_heap`), never the process heap.
+- **What the GPU wrote into a copy stays** until the title changes the bytes under it. Some pages are copied at
+  every refresh without a sign that the title wrote them (mapped at two addresses, left writable, reopened with the
+  64 KiB around a written page, write-watched or pinned); copied whole, they overwrote a value a compute program had
+  stored in the copy for the next frame with the title's unchanged bytes, so it read back as the title's old value
+  every other frame. `ShadowPages` keeps a 64-bit sum per 256-byte piece of the bytes it copied last
+  (`runtime/src/shadow_keep.h`) and copies a piece only when the title's bytes differ; a piece zeroed because its page
+  went away is copied again in full once it comes back. Limit: a title that writes the same bytes again to reset a
+  value the GPU changed is not seen (that needs the GPU's writes to reach the title's pages). `LEONIDA_SHADOW_KEEP=0`
+  copies every page as before.
 - **Only the title's memory** gets a copy: the blocks and ranges the xmem shims hand the title (`XMemAlloc`,
   `XMemAllocDefault`, `XMemVirtualAlloc`, the title's `VirtualAlloc`). An address anywhere else, the runtime's or a
   host DLL's memory included, is left as it was and counted, as is an arena VA or a buffer the layer made.

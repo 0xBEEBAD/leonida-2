@@ -3907,6 +3907,12 @@ if(TARGET Vulkan::Headers)
       # The same return copy for a slot-133 buffer's shadow (the write-back of a compute result the title reads again).
       add_test(NAME d3d12_placed_write_back COMMAND d3d12_title_va_test --placed-writeback)
       set_tests_properties(d3d12_placed_write_back PROPERTIES SKIP_RETURN_CODE 77)
+      # Two shadows over one page share their sums: a newly filled one must still follow the title's bytes, with
+      # LEONIDA_SHADOW_KEEP on and off (review by lixonik).
+      add_test(NAME d3d12_shadow_keep_refill COMMAND d3d12_title_va_test --shadow-keep-refill)
+      set_tests_properties(d3d12_shadow_keep_refill PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_SHADOW_KEEP=1")
+      add_test(NAME d3d12_shadow_keep_refill_off COMMAND d3d12_title_va_test --shadow-keep-refill)
+      set_tests_properties(d3d12_shadow_keep_refill_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_SHADOW_KEEP=0")
       add_test(NAME d3d12_api_descriptor_copy COMMAND d3d12_title_va_test --api-descriptor-copy)
       set_tests_properties(d3d12_api_descriptor_copy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
       add_test(NAME d3d12_api_descriptor_copy_off COMMAND d3d12_title_va_test --api-descriptor-copy-off)
@@ -4684,6 +4690,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(console_heap_vsharp_slots_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME console_heap_vsharp_slots COMMAND console_heap_vsharp_slots_test)
+    # A slot-133 shadow keeps a GPU write until the title's bytes under it change (src/shadow_keep.h).
+    add_executable(shadow_keep_test test/shadow_keep_test.cpp)
+    if(WIN32 AND MSVC)
+      target_compile_options(shadow_keep_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME shadow_keep COMMAND shadow_keep_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
