@@ -2577,10 +2577,16 @@ struct DeviceState {
     std::uint64_t unbacked_requests = 0;      // title addresses no backing could be made for (zero-size views)
 
     rt::d3d12::GeometryViews geometry;
-    static void forget_geometry_alias(std::uintptr_t source, std::size_t, VkDeviceSize va) {
+    // A retired geometry view: its alias ranges go, and so does every answer made through it without one
+    // (vsharp_address and placed views take geometry_va() directly), by its CPU and its GPU-twin address.
+    static void forget_geometry_alias(std::uintptr_t source, std::size_t size, VkDeviceSize va) {
         auto& aliases = leonida::title_va_aliases();
         aliases.remove(source, va);
-        if (const auto twin = leonida::title_gpu_views::other_view(source)) aliases.remove(twin, va);
+        aliases.forget_copy(source, size, va);
+        if (const auto twin = leonida::title_gpu_views::other_view(source)) {
+            aliases.remove(twin, va);
+            aliases.forget_copy(twin, size, va);
+        }
     }
     // Before the submission's console heap slots are translated (refresh_shadows): a view retired here is answered
     // by nothing from now on. It is freed only after every replay in progress has recorded its submissions and those
