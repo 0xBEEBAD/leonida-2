@@ -2062,7 +2062,11 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    arguments for direct and indirect compute dispatches with an inline signature. Bound console descriptor heap
    base addresses are remapped through `console_descriptor_table_va` so that user SGPRs receive the arena copy's
    shader virtual address (where GPU descriptor reads land, preventing `READ_INVALID` device loss during world
-   load), while unshadowed host heaps remain unchanged. An unbound heap contributes
+   load), while unshadowed host heaps remain unchanged. The CPU reads that copy too (the release sweep of
+   `LEONIDA_CONSOLE_RELEASE_FILTER=1`), uncached across PCIe when it is in ReBAR memory. `LEONIDA_HEAP_MIRROR=1`
+   gives those reads a host-RAM mirror of the copy (`src/console_heap_copy.h`). It is off by default: with it, a
+   world run on the RX 7900 XTX (RADV) hung in a library compute program about a minute in and lost the device,
+   and without it the same run went on for more than five minutes. Why is not known yet. An unbound heap contributes
    zero, and rebinding affects later commands. A heap that cannot fit in the inline user data is reported once,
    and a signature whose compute arguments spill gets nothing written (logged once). Set
    `LEONIDA_COMPUTE_DIRECT_HEAPS=0` to restore the previous compute arguments.
