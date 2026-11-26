@@ -3384,6 +3384,16 @@ struct DeviceState {
     std::atomic<uint64_t> backing_generation{};  // every add and release
     std::mutex backing_mutex;
     leonida::BufferVaIndex<uint64_t> gpu_backings;
+    // A title-window or geometry-copy block was destroyed (TitleBufferWindows::destroy_block; its GPU work completed):
+    // as for a released backing, the backed table cuts it and the key entries and heap slots answering into it go at
+    // the next refresh, so no table names the freed memory.
+    void title_block_gone(VkDeviceAddress address, VkDeviceSize bytes) {
+        std::lock_guard lock(backing_mutex);
+        if (filter_heap_releases()) backing_changes.record(address, bytes);
+        backing_generation.fetch_add(1, std::memory_order_relaxed);
+        released_backings.fetch_add(1, std::memory_order_release);
+        if (heap_gpu) released_ranges.emplace_back(address - arena.address, bytes);
+    }
     void backing(VkDeviceAddress address, uint64_t bytes, uint64_t id, bool add) {
         std::lock_guard lock(backing_mutex);
         if (filter_heap_releases()) backing_changes.record(address, bytes);
@@ -4614,7 +4624,7 @@ struct DeviceState {
     std::vector<leonida::ConsoleHeapRange> gpu_ranges;
     leonida::ConsoleHeapSpans gpu_backed, gpu_ask;
     std::uint64_t gpu_backed_generation = ~0ull, gpu_ask_generation = ~0ull;
-    std::size_t gpu_backed_blocks = ~std::size_t(0);
+    std::uint64_t gpu_backed_blocks = ~0ull;  // the title-window blocks' layout generations at the last rebuild
     std::chrono::steady_clock::time_point gpu_backed_at{};
     std::vector<std::uint32_t> gpu_queue_scratch;
     bool gpu_rescan = false, gpu_rescan_after_resolve = false;
@@ -5247,7 +5257,7 @@ struct DeviceState {
     void update_gpu_backed(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& gone) {
         const auto start = std::chrono::steady_clock::now();
         const std::uint64_t generation = backing_generation.load(std::memory_order_relaxed);
-        const std::size_t blocks = geometry.pool().block_count() + external_windows.block_count();
+        const std::uint64_t blocks = geometry.pool().layout_generation() + external_windows.layout_generation();
         const bool changed = generation != gpu_backed_generation || blocks != gpu_backed_blocks;
         if (changed && (gpu_backed_generation == ~0ull || start - gpu_backed_at >= std::chrono::milliseconds(100))) {
             gpu_backed_generation = generation;

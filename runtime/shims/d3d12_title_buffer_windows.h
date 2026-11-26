@@ -39,46 +39,58 @@ class TitleBufferWindows {
     bool failed_ = false;
     bool local_refused_ = false;  // device-local blocks refused once: host memory from then on
     std::uint64_t quick_refusals_ = 0;
-    // The blocks' (device address, capacity), readable without the owner's lock: published in order, never removed
-    // before release().
+    // The blocks' (device address, capacity), readable without the owner's lock: published in order, a slot never
+    // reused before release(). A destroyed block's slot keeps its other fields and only its address goes to 0 (the
+    // readers skip it), so a reader never sees a slot half rewritten. Blocks are destroyed only once their last
+    // range was freed, which GeometryViews does after the GPU work that used them completed.
     static constexpr std::size_t kPublished = 4096;
     struct Published {
-        VkDeviceAddress address;
-        VkDeviceSize capacity;
-        std::uint8_t* mapped;
-        VkBuffer buffer;
+        std::atomic<VkDeviceAddress> address{0};
+        VkDeviceSize capacity{};
+        std::uint8_t* mapped{};
+        VkBuffer buffer{};
     };
     std::array<Published, kPublished> published_{};
     std::atomic<std::size_t> published_count_{0};
+    std::atomic<std::uint64_t> layout_generation_{0};  // bumped by every block made or destroyed
 
     template<class Device>
     void destroy_block(Device& d, std::vector<Block>::iterator it) {
+        // Unpublished first, so no lock-free reader picks it up again; then the owner is told, so tables built from
+        // for_each_block (the console heap pass's backed table) cut it before the next submission.
+        for (std::size_t i = 0, n = published_count_.load(std::memory_order_relaxed); i < n; ++i)
+            if (published_[i].buffer == it->buffer && published_[i].address.load(std::memory_order_relaxed)) {
+                published_[i].address.store(0, std::memory_order_release);
+                break;
+            }
+        layout_generation_.fetch_add(1, std::memory_order_release);
+        if constexpr (requires { d.title_block_gone(VkDeviceAddress{}, VkDeviceSize{}); })
+            d.title_block_gone(it->address, it->capacity);
         d.context->vk.vkUnmapMemory(d.info.device, it->memory);
         d.context->vk.vkDestroyBuffer(d.info.device, it->buffer, nullptr);
         d.context->vk.vkFreeMemory(d.info.device, it->memory, nullptr);
-        // Unpublish the block so for_each_block/find_mapped stop naming it.
-        for (std::size_t i = 0, n = published_count_.load(std::memory_order_relaxed); i < n; ++i)
-            if (published_[i].buffer == it->buffer) {
-                published_[i] = {};
-                break;
-            }
         reserved_ -= it->reserved_bytes;
         blocks_.erase(it);
     }
 
 public:
     VkDeviceSize reserved() const { return reserved_; }
-    // f(device address, capacity) for each block made so far; from any thread.
+    // f(device address, capacity) for each live block; from any thread.
     template <class F>
     void for_each_block(F&& f) const {
         const std::size_t n = published_count_.load(std::memory_order_acquire);
-        for (std::size_t i = 0; i < n; ++i) f(published_[i].address, published_[i].capacity);
+        for (std::size_t i = 0; i < n; ++i)
+            if (const VkDeviceAddress address = published_[i].address.load(std::memory_order_acquire))
+                f(address, published_[i].capacity);
     }
+    // Changes whenever a block is made or destroyed; from any thread.
+    std::uint64_t layout_generation() const { return layout_generation_.load(std::memory_order_acquire); }
     // The block whose mapping holds [p, p + bytes): its buffer and the offset of p in it. From any thread.
     bool find_mapped(const std::uint8_t* p, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset) const {
         const std::size_t n = published_count_.load(std::memory_order_acquire);
         for (std::size_t i = 0; i < n; ++i) {
             const Published& b = published_[i];
+            if (!b.address.load(std::memory_order_acquire)) continue;
             if (p >= b.mapped && p - b.mapped < std::ptrdiff_t(b.capacity) &&
                 bytes <= std::size_t(b.capacity) - std::size_t(p - b.mapped)) {
                 buffer = b.buffer;
@@ -197,9 +209,13 @@ public:
                 b.reserved_bytes = req.size;
                 b.free_ranges.emplace(0, b.capacity);
                 if (const std::size_t n = published_count_.load(std::memory_order_relaxed); n < kPublished) {
-                    published_[n] = {b.address, b.capacity, b.mapped, b.buffer};
+                    published_[n].capacity = b.capacity;
+                    published_[n].mapped = b.mapped;
+                    published_[n].buffer = b.buffer;
+                    published_[n].address.store(b.address, std::memory_order_relaxed);
                     published_count_.store(n + 1, std::memory_order_release);
                 }
+                layout_generation_.fetch_add(1, std::memory_order_release);
                 blocks_.push_back(std::move(b));
                 reserved_ += req.size;
                 if (blocks_.size() == 1 || !(blocks_.size() & (blocks_.size() - 1)))
@@ -281,7 +297,10 @@ public:
             d.context->vk.vkFreeMemory(d.info.device, b.memory, nullptr);
         }
         blocks_.clear();
+        for (std::size_t i = 0, n = published_count_.load(std::memory_order_relaxed); i < n; ++i)
+            published_[i].address.store(0, std::memory_order_relaxed);
         published_count_.store(0, std::memory_order_release);
+        layout_generation_.fetch_add(1, std::memory_order_release);
         reserved_ = 0;
     }
 };
