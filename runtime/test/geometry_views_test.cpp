@@ -12,7 +12,11 @@
 //   9. overflowing the release queue (65537 disjoint ranges) collapses to one covering range and retires covered views;
 //  10. reaping the last view in a standard 4 MiB block keeps it as a spare and the next view reuses it;
 //  11. under a cap, an unfitting 4 MiB spare is destroyed so a larger request can succeed (or fail if still over cap);
-//  12. one note_released reaches every GeometryViews instance, and a destroyed instance unsubscribes cleanly.
+//  12. one note_released reaches every GeometryViews instance, and a destroyed instance unsubscribes cleanly;
+//  13. a submission's sequence on an idle GPU (completed == submitted): a view retired by the drain in before_execute_
+//      (kAfterExecutes) is freed only after every replay begun before the retirement recorded its submissions and those
+//      completed (a ticket read in the drain reaps it at once); its answers made without an alias are invalidated
+//      (forget_copy); its destroyed block leaves the lock-free block list and is reported to the device.
 #include <windows.h>
 
 #include <cstdint>
@@ -24,6 +28,7 @@
 #include <vector>
 
 #include "../shims/d3d12_geometry_views.h"
+#include "../src/title_va_alias.h"
 
 namespace {
 
@@ -38,6 +43,7 @@ void check(bool condition, const char* what) {
 
 // The Vulkan calls TitleBufferWindows::allocate makes, over host memory.
 int g_live_buffers = 0;
+int g_gone_blocks = 0;  // FakeDevice::title_block_gone calls
 int g_live_allocs = 0;
 int g_total_allocs = 0;
 struct FakeBuffer {
@@ -101,6 +107,7 @@ struct FakeDevice {
         VkDeviceAddress address = 0;
     } arena;
     void share(VkBufferCreateInfo&) {}
+    void title_block_gone(VkDeviceAddress, VkDeviceSize) { ++g_gone_blocks; }
     VkDeviceMemory allocate(const VkMemoryRequirements& r, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen, bool) {
         if (chosen) *chosen = required | preferred;
@@ -432,6 +439,76 @@ int main() {
     }
     check(g_live_buffers == 0 && g_live_allocs == 0, "multi-instance teardown frees all blocks");
     VirtualFree(shared_title, 0, MEM_RELEASE);
+
+    // 13. DeviceState's order for one submission: execute_begin, drain_geometry_releases (kAfterExecutes) and the
+    // console heaps in before_execute_, the replay records its submission, execute_end. Another queue's replay began
+    // before the release (its heap slots may already name the view); one more begins after the retirement.
+    auto* fly_title = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kView, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!fly_title) return 1;
+    for (std::size_t i = 0; i < kView; ++i) fly_title[i] = std::uint8_t(i * 13 + 1);
+    const auto flybase = reinterpret_cast<std::uintptr_t>(fly_title);
+    {
+        const auto fly_owner = std::make_unique<rt::d3d12::GeometryViews>(2 * kView);
+        auto& fly = *fly_owner;
+        const auto named_blocks = [&] {
+            std::size_t n = 0;
+            fly.pool().for_each_block([&](VkDeviceAddress address, VkDeviceSize) { n += address != 0; });
+            return n;
+        };
+        const std::uint64_t va_f = fly.resolve(device, flybase, kView, copy);
+        check(va_f != 0 && fly.live_views() == 1 && named_blocks() == 1, "a view in its own block, published");
+        const std::uint64_t layout = fly.pool().layout_generation();
+        const int gone = g_gone_blocks;
+
+        std::uint64_t submitted = 7;  // completed == submitted below: the GPU is idle
+        const std::uint64_t other = fly.execute_begin();
+        const std::uint64_t own = fly.execute_begin();
+        leonida::TitleVaAliases aliases;
+        aliases.record_removals(true);
+        std::uint64_t cursor = 0;
+        {
+            leonida::DescriptorRanges skip;
+            aliases.changed_ranges(cursor, skip);
+        }
+        const std::uint64_t invalidations = aliases.invalidations();
+        leonida::geometry_writes::note_released(flybase, flybase + kView);
+        fly.drain_released(device, rt::d3d12::GeometryViews::kAfterExecutes, submitted,
+                           [&](std::uintptr_t source, std::size_t size, VkDeviceSize va) {
+                               aliases.forget_copy(source, size, va);
+                           });
+        check(fly.live_views() == 0 && fly.find(flybase, kView) == 0 && fly.retired_count() == 1 &&
+                  fly.bytes() == kView && g_gone_blocks == gone,
+              "a view retired in before_execute_ is not reaped there, though the GPU is idle");
+
+        leonida::DescriptorRanges changed;
+        const bool read = aliases.changed_ranges(cursor, changed);
+        changed.merge();
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> removed;
+        aliases.take_removed(removed);
+        check(read && aliases.invalidations() != invalidations && changed.overlaps(flybase, kView) &&
+                  removed.size() == 1 && removed[0].first == va_f && removed[0].second == kView,
+              "the retirement invalidates the heap slots and key answers made through the view without an alias");
+
+        submitted = 8;  // this replay's submission
+        fly.execute_end(own, [&] { return submitted; });
+        check(fly.reap(device, 8) == 0 && fly.retired_count() == 1 && fly.bytes() == kView,
+              "not freed while a replay begun before the retirement is still in progress");
+
+        const std::uint64_t later = fly.execute_begin();
+        submitted = 9;  // the other queue's submission
+        fly.execute_end(other, [&] { return submitted; });
+        check(fly.reap(device, 8) == 0 && fly.retired_count() == 1,
+              "once those replays recorded theirs, the view waits for the last of their tickets");
+        check(fly.reap(device, 9) == 1 && fly.retired_count() == 0 && fly.bytes() == 0,
+              "freed once that ticket completed; a replay begun after the retirement does not hold it");
+        fly.execute_end(later, [&] { return submitted; });
+
+        check(named_blocks() == 0 && fly.pool().layout_generation() != layout && g_gone_blocks == gone + 1 &&
+                  g_live_buffers == 0,
+              "the destroyed block leaves the lock-free block list and the device is told");
+        fly.release(device);
+    }
+    VirtualFree(fly_title, 0, MEM_RELEASE);
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
