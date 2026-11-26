@@ -2840,6 +2840,32 @@ struct UploadArena {
 
 constexpr std::size_t kUploadChunkMin = 8 << 20;  // one chunk serves a title's whole frame of uploads
 
+// LEONIDA_UPLOAD_LOG=1 (diagnostic): each upload chunk (its CPU base, device address and size), and the first 96 and
+// then every 8192nd AllocateUploadMemory result as an offset into its chunk, so the addresses the title builds
+// descriptors from can be matched with the memory it was handed.
+inline bool upload_log() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_UPLOAD_LOG");
+        return v && *v == '1';
+    }();
+    return on;
+}
+inline void log_upload_result(const UploadChunk* chunk, std::uint64_t result, std::uint64_t size,
+                              std::uint64_t alignment) {
+    if (!upload_log() || !chunk) return;
+    static std::atomic<std::uint64_t> calls{0};
+    const std::uint64_t n = ++calls;
+    if (n > 96 && (n % 8192)) return;
+    const std::uint64_t base = reinterpret_cast<std::uint64_t>(chunk->cpu_base);
+    std::fprintf(stderr,
+                 "[rt] upload-log: #%llu result 0x%llx = chunk 0x%llx + offset 0x%llx (size %llu, alignment %llu; "
+                 "chunk device address 0x%llx)\n",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(result),
+                 static_cast<unsigned long long>(base), static_cast<unsigned long long>(result - base),
+                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment),
+                 static_cast<unsigned long long>(chunk->gpu_base));
+}
+
 UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
     auto* chunk = new (std::nothrow) UploadChunk{};
     if (!chunk) return nullptr;
@@ -2912,7 +2938,9 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
         const std::size_t aligned = (chunk->used + (alignment - 1)) & ~(static_cast<std::size_t>(alignment) - 1);
         if (aligned >= chunk->used && aligned <= chunk->size && need <= chunk->size - aligned) {
             chunk->used = aligned + need;
-            return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+            const std::uint64_t result = reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+            log_upload_result(chunk, result, size, alignment);
+            return result;
         }
     }
     const std::size_t chunk_size = need + alignment > kUploadChunkMin ? need + alignment : kUploadChunkMin;
@@ -2926,7 +2954,14 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
     arena->chunks = chunk;
     const std::size_t aligned = (alignment - 1) & ~(static_cast<std::size_t>(alignment) - 1);  // 0-based
     chunk->used = aligned + need;
-    return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+    if (upload_log())
+        std::fprintf(stderr, "[rt] upload-log: new chunk at 0x%llx, device address 0x%llx, %llu bytes (%s)\n",
+                     static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(chunk->cpu_base)),
+                     static_cast<unsigned long long>(chunk->gpu_base), static_cast<unsigned long long>(chunk->size),
+                     chunk->resource ? "mapped upload buffer" : "VirtualAlloc fallback");
+    const std::uint64_t result = reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+    log_upload_result(chunk, result, size, alignment);
+    return result;
 }
 
 // An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
