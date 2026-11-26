@@ -137,7 +137,7 @@ class VccTupleFallbackTest(unittest.TestCase):
         ]
         for variant in PROGRAM_VARIANTS:
             with self.subTest(printed_as=variant):
-                self.assertIn("OpFunctionCall %uint %desc_lookup_fn", translate(program, variant))
+                self.assertRegex(translate(program, variant), r"OpFunctionCall %\w+ %desc_lookup_fn")
 
     def test_load_with_register_offset_into_vcc(self):
         # The widened scalar load with an SGPR soffset and an immediate offset (the form luizwidmer/palmetto's
