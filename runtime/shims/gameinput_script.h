@@ -7,10 +7,11 @@
 //
 // Each entry is button@seconds[:hold], the seconds counted from the shim's first update. A press is held for `hold`
 // seconds (kHoldSeconds when the entry has none), then released: a longer hold reaches a title that reads its pad
-// only every few seconds, as the retail title does at world-start frame rates. Buttons: a b x y start back lb rb up down left right; rsup and rsdown throw the right stick fully up
-// or down for the same time (they replay the stick throws the press log writes). Spaces around an entry are allowed;
-// empty entries, unknown buttons, invalid times (negative, non-finite, trailing text) and invalid holds (zero,
-// negative, non-finite, more than kMaxHoldSeconds) are counted as rejected.
+// only every few seconds, as the retail title does at world-start frame rates. Buttons: a b x y start back lb rb
+// up down left right; rsup and rsdown throw the right stick fully up or down for the same time (they replay the
+// stick throws the press log writes). Spaces around an entry are allowed; empty entries, unknown buttons, invalid
+// times (negative, non-finite, trailing text) and invalid holds (zero, negative, non-finite, more than
+// kMaxHoldSeconds) are counted as rejected.
 #pragma once
 #include <algorithm>
 #include <cctype>
