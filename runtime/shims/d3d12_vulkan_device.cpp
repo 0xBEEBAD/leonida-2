@@ -396,6 +396,43 @@ public:
     ShadowPages(const ShadowPages&) = delete;
     ShadowPages& operator=(const ShadowPages&) = delete;
 
+    // What the GPU writes into the copies of [from, to) goes back to the title's pages: the pages are made writable
+    // first (the tracker guards them) and every target is copied from its shadow. Returns the bytes written. Called
+    // before the next refresh, so a page the title writes again is copied forward over the result, as on a GPU that
+    // shares the memory.
+    std::size_t write_back(std::uintptr_t from, std::uintptr_t to) {
+        from = std::max(from, first_), to = std::min(to, last_);
+        if (from >= to) return 0;
+        AcquireSRWLockExclusive(&lock_);
+        // A page the title wrote since it was last copied holds the newer bytes already: its GPU result is dropped and
+        // the refresh's own copy carries the title's. A guarded page (read-only since that copy) or one asked about and
+        // found unchanged takes the GPU's.
+        const auto held = [&](std::size_t i) {
+            const std::uint8_t s = state_[i];
+            return (s & kZero) || (!(s & kProtected) && !(s & kClean));
+        };
+        std::size_t written = 0;
+        for (std::uintptr_t at = from & ~(kPage - 1); at < ((to + kPage - 1) & ~(kPage - 1));) {
+            std::size_t pages = 0;
+            while (at + (pages + 1) * kPage <= ((to + kPage - 1) & ~(kPage - 1)) &&
+                   held((at - first_) / kPage + pages) == held((at - first_) / kPage))
+                ++pages;
+            if (!held((at - first_) / kPage)) {
+                const std::uintptr_t a = std::max(at, from), b = std::min(at + pages * kPage, to);
+                reopen_locked(at, at + pages * kPage);
+                for (const Target& t : targets_) {
+                    const std::uintptr_t x = std::max(a, t.begin), y = std::min(b, t.end);
+                    if (x >= y || !t.shadow) continue;
+                    std::memcpy(reinterpret_cast<void*>(x), t.shadow + (x - t.begin), y - x);
+                    written += y - x;
+                }
+            }
+            at += pages * kPage;
+        }
+        ReleaseSRWLockExclusive(&lock_);
+        return written;
+    }
+
     // The bytes of all targets, and how many there are.
     std::size_t size() const { return target_bytes_; }
     std::size_t targets() const { return targets_.size(); }
@@ -2648,6 +2685,7 @@ struct DeviceState {
         if (!pages) return;
         const leonida::submit_phases::Scope timed(leonida::submit_phases::shadows);
         std::lock_guard lock(shadow_mutex);
+        write_back_titles();  // what the last submission wrote in the copies, before the forward copy below
         if (shadows.empty()) return;
         const auto start = clock::now();
         // LEONIDA_SHADOW_ALIAS_MS (0 by default: every submission): pages xmem maps at two addresses, which no guard
@@ -2774,6 +2812,21 @@ struct DeviceState {
     std::atomic<std::size_t> title_window_count{0};  // title_windows.size(), read without the mutex
     std::uint64_t title_window_bytes = 0;
     std::uint64_t title_window_cap = 64ull << 20;
+    // What the GPU wrote into a copy of the title's memory goes back to the title's pages: the ranges reached since
+    // the last submission (title_va_alias.h note_reached), copied back at the next refresh before the forward copy.
+    // A window is a read-side mirror, so without this a UAV or a raw write lands in the copy and the title never sees
+    // it (#1537, the WRITE_INVALID stop at the world start).
+    std::mutex title_write_back_mutex;  // its own: taken under shadow_mutex, never the other way round
+    std::map<std::uint64_t, std::uint64_t> title_write_back;  // start -> end, of the submission about to run
+    std::deque<std::pair<std::uint64_t, std::map<std::uint64_t, std::uint64_t>>> title_write_back_pending;  // by ticket
+    std::uint64_t title_write_back_refused = 0;               // ranges past the caps, logged once
+    std::uint64_t title_write_back_bytes = 0;                 // queued for this submission
+    std::uint64_t title_write_back_total = 0;                 // copied back, all submissions
+    std::uint64_t title_write_back_calls = 0;                 // log line count
+    std::uint64_t title_write_back_unfenced = 0;
+    static constexpr std::size_t kTitleWriteBackBatches = 64; // pending batches before the oldest goes back unfenced
+    static constexpr std::size_t kTitleWriteBackRanges = 8192;         // ranges kept per submission
+    static constexpr std::uint64_t kTitleWriteBackBytes = 64ull << 20; // bytes copied back per submission
     // The stream pools' mappings (title_gpu_views): one per readable run of a pool. A window is kept for the device's
     // life; a geometry copy goes when its view is retired (the pages were freed, unmapped or remapped:
     // drain_geometry_releases), and the next request for those pages makes a new one.
@@ -2981,6 +3034,93 @@ struct DeviceState {
                          static_cast<unsigned long long>(size >> 10), title_windows.size(),
                          static_cast<unsigned long long>(title_window_bytes >> 10));
         return offset;
+    }
+
+    // A binding of the title's memory reached for the coming submission: keep its range for the copy back after it.
+    // Over-inclusive on purpose (a read-only view costs a copy, a write is never missed: a V# has no read/write bit).
+    void note_title_write(std::uint64_t va, std::uint64_t bytes) {
+        static const bool on = [] {
+            char value[2] = {};
+            std::size_t length = 0;
+            return getenv_s(&length, value, sizeof(value), "LEONIDA_TITLE_WRITEBACK") != 0 || value[0] != '0';
+        }();
+        if (!on || !va || !bytes) return;
+        std::uint64_t lo = 0, hi = 0;
+        if (!leonida::title_va_aliases().title_memory(va, lo, hi) || va >= hi) return;
+        const std::uint64_t end = va + std::min(bytes, hi - va);
+        std::lock_guard lock(title_write_back_mutex);
+        auto it = title_write_back.lower_bound(va);
+        if (it != title_write_back.begin()) {
+            auto previous = std::prev(it);
+            if (previous->second >= va) {
+                if (previous->second < end) previous->second = end;
+                return;
+            }
+        }
+        if (it != title_write_back.end() && it->first <= end) {
+            it->second = std::max(it->second, end);
+            return;
+        }
+        if (title_write_back.size() >= kTitleWriteBackRanges || title_write_back_bytes >= kTitleWriteBackBytes) {
+            if (!title_write_back_refused++)
+                log_once("past LEONIDA_TITLE_WRITEBACK's caps: reached ranges are not copied back this submission; "
+                         "ranges refused:",
+                         1);
+            return;
+        }
+        title_write_back_bytes += end - va;
+        title_write_back.emplace(va, end);
+    }
+
+    // What the GPU wrote into those copies goes back to the title's pages, so a later read by the title or the next
+    // forward copy sees it. Only once the submission that wrote them has completed: a batch carries the ticket of the
+    // submission after it (a submission's commands are recorded before it exists), and is copied back when the
+    // context reports that ticket done. Runs at the start of a refresh, under shadow_mutex and before the forward
+    // copies, so a page the title wrote again is copied forward over the result.
+    void write_back_titles() {
+        if (!&context) return;
+        const std::uint64_t done = context->completed_retire_ticket();
+        std::vector<std::pair<uint64_t, std::uint64_t>> finished;  // one entry per range, collected under the lock
+        {
+            std::lock_guard lock(title_write_back_mutex);
+            if (!title_write_back.empty()) {
+                // The ranges of the submission about to execute, which is the next ticket.
+                title_write_back_pending.push_back({context->submitted_retire_ticket() + 1,
+                                                    std::move(title_write_back)});
+                title_write_back.clear();
+                title_write_back_bytes = 0;
+            }
+            bool forced = false;
+            while (!title_write_back_pending.empty() &&
+                   (title_write_back_pending.front().first <= done ||
+                    title_write_back_pending.size() > kTitleWriteBackBatches)) {
+                forced = forced || title_write_back_pending.front().first > done;
+                for (const auto& [begin, end] : title_write_back_pending.front().second)
+                    finished.push_back({begin, end});
+                title_write_back_pending.pop_front();
+            }
+            // A queue held deep (console ordering) can leave batches waiting: the oldest go back anyway, once each.
+            if (forced && !title_write_back_unfenced++)
+                log_once("more than 64 title write-back batches wait on their submissions: the oldest are copied "
+                         "back without their ticket; batches:",
+                         1);
+        }
+        if (finished.empty()) return;
+        std::uint64_t written = 0, ranges = 0;
+        for (const auto& [begin, end] : finished)
+            for (const ShadowPagesPtr& s : shadows)
+                if (end > s->first() && begin < s->last()) {
+                    const std::uint64_t bytes = s->write_back(begin, end);
+                    written += bytes;
+                    ranges += bytes != 0;
+                }
+        title_write_back_total += written;
+        if (!written) return;
+        if (++title_write_back_calls <= 4 || !(title_write_back_calls & (title_write_back_calls - 1)))
+            std::fprintf(stderr, "[rt] d3d12: %llu KiB of the GPU's writes in %llu reached range(s) went back to the "
+                                 "title's pages (%llu KiB so far)\n",
+                         static_cast<unsigned long long>(written >> 10), static_cast<unsigned long long>(ranges),
+                         static_cast<unsigned long long>(title_write_back_total >> 10));
     }
 
     // A stream pool's address (a CPU view paired with a GPU-only alias). Rule B
@@ -14216,6 +14356,9 @@ public:
             [](void* device, std::uint64_t table, std::uint32_t descriptors) {
                 static_cast<DeviceState*>(device)->scan_title_table(table, descriptors);
             });
+        leonida::title_va_aliases().set_noter([](void* device, std::uint64_t va, std::uint64_t bytes) {
+            static_cast<DeviceState*>(device)->note_title_write(va, bytes);
+        });
         state_.image_memory = std::make_unique<leonida::ImageMemory>(
             [device = info.device, make = state_.context->vk.vkAllocateMemory](std::uint32_t type, std::uint64_t bytes) {
                 VkMemoryAllocateInfo block{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -18403,7 +18546,7 @@ public:
     // imported, or a shadow copied from them before every submission) and kept until the device goes, up to
     // LEONIDA_TITLE_BUFFERS_MB (512 by default).
     void make_title_buffer(std::uint64_t va, std::uint64_t bytes) {
-        if (!state_.context) return;
+        if (!&context()) return;
         static const bool check_size = [] {
             wchar_t flag[2]{};
             return !(GetEnvironmentVariableW(L"LEONIDA_TITLE_BUFFER_COVERAGE", flag, 2) == 1 && flag[0] == L'0');

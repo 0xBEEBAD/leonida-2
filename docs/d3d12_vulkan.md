@@ -1698,6 +1698,18 @@ The copies:
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
+- **What the GPU wrote goes back.** The same return copy serves slot-133 shadows (a buffer the driver would not
+  import, a compute result the title reads again): the ranges are recorded through the alias of the buffer's pages and
+  the tracker there carries them back. `d3d12_placed_write_back` covers it. A copy is a read-side mirror, so a UAV or a raw write into a window would land in
+  the copy and the title would never see it ([#1537](https://github.com/ubiquitarianism/leonida/issues/1537), the
+  `WRITE_INVALID` stop at the world start). Every title range a submission's bindings reach is kept, and the next
+  refresh copies those ranges from the copy to the title's pages *before* it copies the pages forward, so a page the
+  title itself wrote in between keeps the title's newer bytes and its GPU result is dropped. Up to 8,192 ranges and
+  64 MiB a submission (a V# has no read/write bit, so a read-only view costs a copy too; past the caps the ranges are
+  left behind, logged once). `LEONIDA_TITLE_WRITEBACK=0` turns it off. A batch is fenced: it is kept with the ticket
+  of the submission that will use it and copied back only when the context reports that ticket retired, so a range
+  another submission is still writing is never read half done. A queue held deep (console ordering) can leave batches
+  waiting: past 64 of them the oldest go back without their ticket, logged once.
 - A **window that is refused** (the budget is spent, the arena is full, or the pages are not committed yet) is backed
   by a persistent geometry copy of exactly the requested range (`LEONIDA_GEOMETRY_MB`) instead; when no copy can be
   made either, the view is written with **no base and no records** — loads return 0 and stores are dropped. A raw
