@@ -391,6 +391,12 @@ def _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte):
     return ins
 
 
+def _cond_flag_writer(ins):
+    """A shift or rotate by cl: x86 changes no flag when its masked count is 0, so it writes its
+    flags only on some runs. Flag analysis treats it as a writer that may leave them alone."""
+    return ins.kind == "shift" and len(ins.ops) >= 2 and ins.ops[1][0] == "r"
+
+
 def _classify(ins, mnem, cc_index, state):
     cc = cc_index
     if mnem == "jcc":
@@ -1260,7 +1266,8 @@ class FunctionTranslator:
                     out |= live_in[s]
                 live = set(out)
                 for ins in reversed(b):
-                    live -= set(ins.flags_w)
+                    if not _cond_flag_writer(ins):
+                        live -= set(ins.flags_w)
                     live |= set(ins.flags_r)
                 if out != live_out[key]:
                     live_out[key] = out
@@ -1277,10 +1284,12 @@ class FunctionTranslator:
             live = set(live_out[b[0].addr])
             for ins in reversed(b):
                 self.needed[ins.addr] = set(live) & set(ins.flags_w)
-                live -= set(ins.flags_w)
+                if not _cond_flag_writer(ins):
+                    live -= set(ins.flags_w)
                 live |= set(ins.flags_r)
 
-        # materialize: writer whose written flags are live at block end stores the ctx word
+        # materialize: writer whose written flags are live at block end stores the ctx word.
+        # A shift by cl may leave the flags alone, so the writer before it stores them too.
         self.mat = set()
         for b in self.blocks:
             pending = set(live_out[b[0].addr])
@@ -1290,35 +1299,38 @@ class FunctionTranslator:
                 hit = pending & set(ins.flags_w)
                 if hit:
                     self.mat.add(ins.addr)
-                    pending -= hit
+                    if not _cond_flag_writer(ins):
+                        pending -= hit
                 if not pending:
                     break
 
         # per-consumer producer: the arm-NZCV path is allowed only when ONE writer is
         # the nearest producer of every flag the consumer reads. Otherwise the flag
-        # word must come from ctx, so each contributing writer is materialized.
+        # word must come from ctx, so each contributing writer is materialized. A shift
+        # by cl on the way writes the flags only when its count is not 0, so the consumer
+        # reads ctx, the shift stores its word, and the search goes on past it: the writer
+        # before it stores its word too, or the flags come into the block through ctx.
         self.arm_path = {}
-        self.shift_prev_c = {}
         for b in self.blocks:
             writers = []
             for ins in b:
-                if ins.kind == "shift" and ins.ops and len(ins.ops) >= 2 and ins.ops[1][0] == "r":
-                    self.shift_prev_c[ins.addr] = next(
-                        (w for w in reversed(writers) if "C" in w.flags_w), None
-                    )
                 if ins.flags_r:
                     need = set(ins.flags_r)
                     nearest = {}
+                    passed = set()
                     for w in reversed(writers):
                         for f in need - set(nearest):
                             if f in w.flags_w:
-                                nearest[f] = w
+                                if _cond_flag_writer(w):
+                                    passed.add(w)
+                                else:
+                                    nearest[f] = w
                     prods = set(nearest.values())
-                    if len(prods) == 1 and set(nearest) == need:
+                    if not passed and len(prods) == 1 and set(nearest) == need:
                         self.arm_path[ins.addr] = next(iter(prods))
                     else:
                         self.arm_path[ins.addr] = None
-                        for w in prods:
+                        for w in prods | passed:
                             self.mat.add(w.addr)
                 if ins.flags_w:
                     writers.append(ins)
@@ -1938,26 +1950,10 @@ class FunctionTranslator:
         a.mov(T1, GMAP[1], sf=0)
         a.and_i(T1, T1, 0x3F if width == 64 else 0x1F, sf=0)
         skip = self._skip_lbl()
-        prev_c = self.shift_prev_c.get(ins.addr)
-        prev_c_in_sub = prev_c is not None and prev_c.mnem in SUB_KIND
-        if need_c and prev_c_in_sub:
-            do_shift = self._skip_lbl()
-            a.cbnz(T1, do_shift, sf=0)
-            a.mrs_nzcv(GTMP)
-            a.eor_i(GTMP, GTMP, 0x20000000)
-            a.msr_nzcv(GTMP)
-            a.b(skip)
-            a.label(do_shift)
-        elif need_c and prev_c is None:
-            do_shift = self._skip_lbl()
-            a.cbnz(T1, do_shift, sf=0)
-            a.ldur(T3, CTX_REG, CTX_EFLAGS, size=8)
-            a.and_i(T3, T3, EF_CF, sf=0)
-            self._set_cf(T3)
-            a.b(skip)
-            a.label(do_shift)
-        else:
-            a.cbz(T1, skip, sf=0)
+        # A count of 0 skips the whole shift, its flag word included: _flag_analysis makes every
+        # consumer behind a shift by cl read ctx and has the writer before it store its word, so
+        # ctx still holds the flags x86 leaves untouched.
+        a.cbz(T1, skip, sf=0)
         if m in ("shl", "sal"):
             a.lslv(T0, T0, T1, sf)
         elif m == "shr":
@@ -1977,8 +1973,8 @@ class FunctionTranslator:
             if need_c:
                 self._shift_cf_var(ins, m, width)
         self._stash_res(ins, T0)
-        a.label(skip)
         self._maybe_mkflags(ins)
+        a.label(skip)
 
     def _set_cf(self, bit_reg):
         """Insert bit0 of bit_reg into arm C, keeping N/Z/V."""

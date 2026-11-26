@@ -180,37 +180,35 @@ class ShiftCarryAnalysisTests(unittest.TestCase):
         setc_ins = next(i for i in insns if i.mnem == "setcc")
         self.assertEqual(tr.arm_path[setc_ins.addr].mnem, "cmp")
 
-    def test_var_shift_sub_kind_producer_inversion(self):
+    def test_var_shift_consumer_reads_ctx_and_the_writer_before_stores(self):
         # cmp r8d, 2; mov cl, 0; shl eax, cl; setc dl; ret
         code = asm("41 83 f8 02", "b1 00", "d3 e0", "0f 92 c2", "c3")
         insns = list(x.disasm(code, 0x1000))
         tr = x.FunctionTranslator(insns)
         tr.translate()
+        setc_ins = next(i for i in insns if i.mnem == "setcc")
+        cmp_ins = next(i for i in insns if i.mnem == "cmp")
         shl_ins = next(i for i in insns if i.mnem == "shl")
-        self.assertEqual(tr.shift_prev_c[shl_ins.addr].mnem, "cmp")
-        # eor x17, x17, #0x20000000 flips bit 29 of NZCV
-        self.assertIn(0xd2630231, tr.asm.words)
+        self.assertIsNone(tr.arm_path[setc_ins.addr])
+        self.assertIn(cmp_ins.addr, tr.mat)
+        self.assertIn(shl_ins.addr, tr.mat)
 
-    def test_var_shift_add_kind_producer_no_inversion(self):
-        # add eax, 1; mov cl, 0; shl eax, cl; setc dl; ret
-        code = asm("83 c0 01", "b1 00", "d3 e0", "0f 92 c2", "c3")
-        insns = list(x.disasm(code, 0x1000))
-        tr = x.FunctionTranslator(insns)
-        tr.translate()
-        shl_ins = next(i for i in insns if i.mnem == "shl")
-        self.assertEqual(tr.shift_prev_c[shl_ins.addr].mnem, "add")
-        self.assertNotIn(0xd2630231, tr.asm.words)
-
-    def test_var_shift_block_start_loads_ctx_eflags(self):
-        # shl eax, cl; setc dl; ret
+    def test_var_shift_keeps_the_carry_live_into_its_block(self):
+        # shl eax, cl; setc dl; ret: the carry may come from before the block
         code = asm("d3 e0", "0f 92 c2", "c3")
         insns = list(x.disasm(code, 0x1000))
         tr = x.FunctionTranslator(insns)
         tr.translate()
-        shl_ins = next(i for i in insns if i.mnem == "shl")
-        self.assertIsNone(tr.shift_prev_c[shl_ins.addr])
-        # ldur x3, [x19, #0] (CTX_EFLAGS)
-        self.assertIn(0xf8400383, tr.asm.words)
+        self.assertIn("C", tr.live_in[insns[0].addr])
+
+    def test_var_shift_has_the_writer_in_the_block_before_store(self):
+        # cmp r8d, 2; jmp +0; mov cl, 0; shl eax, cl; setc dl; ret
+        code = asm("41 83 f8 02", "eb 00", "b1 00", "d3 e0", "0f 92 c2", "c3")
+        insns = list(x.disasm(code, 0x1000))
+        tr = x.FunctionTranslator(insns)
+        tr.translate()
+        cmp_ins = next(i for i in insns if i.mnem == "cmp")
+        self.assertIn(cmp_ins.addr, tr.mat)
 
 
 def run(code):
@@ -521,6 +519,25 @@ class ExecTests(unittest.TestCase):
         # mov eax, 0x80000000; mov cl, 1; shl eax, cl; setc dl; movzx edi, dl; ret -> CF=1
         r, _ = run(asm("b8 00 00 00 80", "b1 01", "d3 e0", "0f 92 c2", "0f b6 fa", "c3"))
         self.assertEqual(r, 1)
+
+    def test_shift_zero_count_cl_keeps_carry_from_an_earlier_block(self):
+        # cmp r8d, 2; jmp +0 (a block boundary); mov cl, 0; shl eax, cl; setc dl; movzx edi, dl; ret
+        # The carry comes from the cmp in the block before: a shift by cl = 0 must leave it alone.
+        for r8d, want in ((1, 1), (3, 0)):
+            r, _ = run(asm(f"41 b8 {r8d:02x} 00 00 00", "41 83 f8 02", "eb 00", "b1 00", "d3 e0", "0f 92 c2",
+                           "0f b6 fa", "c3"))
+            self.assertEqual(r, want, f"r8d={r8d}")
+
+    def test_shift_nonzero_count_cl_after_an_earlier_block_takes_its_own_carry(self):
+        # mov eax, 0x80000000; cmp r8d, 2 (CF=0); jmp +0; mov cl, 1; shl eax, cl (CF=1); setc dl; movzx edi, dl; ret
+        r, _ = run(asm("b8 00 00 00 80", "41 b8 03 00 00 00", "41 83 f8 02", "eb 00", "b1 01", "d3 e0", "0f 92 c2",
+                       "0f b6 fa", "c3"))
+        self.assertEqual(r, 1)
+
+    def test_shift_zero_count_cl_keeps_the_carry_a_logic_op_cleared(self):
+        # stc; test eax, eax (CF=0); mov cl, 0; shl eax, cl; setc dl; movzx edi, dl; ret -> 0
+        r, _ = run(asm("f9", "85 c0", "b1 00", "d3 e0", "0f 92 c2", "0f b6 fa", "c3"))
+        self.assertEqual(r, 0)
 
 
 if __name__ == "__main__":
