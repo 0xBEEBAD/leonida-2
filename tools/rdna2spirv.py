@@ -128,6 +128,19 @@ OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pas
 # the guard off. A refused load reads the zero area, a refused store or atomic writes the dump area; both are in the
 # arena's reserved first 512 KiB. Shared with runtime/src/address_guard.h.
 ADDRESS_GUARD = False
+# --address-guard (diagnostics): the module's id, FNV-1a of its file stem, which a refused access stores in the header
+# (+28) next to its offset, so the runtime's refusal line names the module. Set by _translate for each file.
+GUARD_MODULE_ID = 0
+
+
+def fnv1a32(text):
+    """32-bit FNV-1a of a UTF-8 string (the address guard's module id; tools/address_guard.py --module maps names)."""
+    h = 0x811C9DC5
+    for b in text.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
 GUARD_HEADER = 0x70000
 GUARD_ZERO = 0x71000
 GUARD_DUMP = 0x78000
@@ -231,6 +244,9 @@ def guard_function(cl, cu):
           "OpStore %ga_lp %ga_lo Aligned 4",
           f"%ga_hq = OpAccessChain %_ptr_PSB_uint %ga_hp {cu(9)}",
           "OpStore %ga_hq %ga_hi Aligned 4",
+          # The refusing module's id (+28, diagnostics): GUARD_MODULE_ID, FNV-1a of the translated file's stem.
+          f"%ga_ip = OpAccessChain %_ptr_PSB_uint %ga_hp {cu(7)}",
+          f"OpStore %ga_ip {cu(GUARD_MODULE_ID)} Aligned 4",
           "OpBranch %ga_rm",
           "%ga_rm = OpLabel",
           "OpBranch %ga_m",
@@ -18377,6 +18393,8 @@ def barriers_under_control_flow(text):
 
 
 def _translate(path):
+    global GUARD_MODULE_ID
+    GUARD_MODULE_ID = fnv1a32(os.path.splitext(os.path.basename(path))[0])
     info = parse_file(path)
     stage = stage_of(info["name"], path)
     if stage not in ("vs", "ps", "cs", "ms", "gs"):

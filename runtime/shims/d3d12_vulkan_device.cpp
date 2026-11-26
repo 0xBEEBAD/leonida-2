@@ -5578,9 +5578,10 @@ struct DeviceState {
         if (refused != guard.refused_logged && now - guard.logged >= std::chrono::seconds(1)) {
             guard.logged = now;
             std::fprintf(stderr, "[rt] d3d12: address guard: %u access(es) refused so far (+%u), the last at heap "
-                                 "offset 0x%llx; %llu table update(s), %llu word(s) written\n",
+                                 "offset 0x%llx by module 0x%08x; %llu table update(s), %llu word(s) written\n",
                          refused, refused - guard.refused_logged,
                          static_cast<unsigned long long>(header->last_refused),
+                         std::atomic_ref(header->last_module).load(std::memory_order_relaxed),
                          static_cast<unsigned long long>(guard.updates),
                          static_cast<unsigned long long>(guard.words_written));
             guard.refused_logged = refused;

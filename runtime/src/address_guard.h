@@ -42,7 +42,7 @@ struct AddressGuardHeader {
     std::uint64_t limit;         // the arena's size: an access below it passes without a lookup
     std::uint64_t table;         // the page table's device address minus heap_base (mod 2^64)
     std::uint32_t refused;       // the shaders add 1 per refused access
-    std::uint32_t reserved;
+    std::uint32_t last_module;   // the last refusing module's id: FNV-1a of its file stem (shaders write it; diagnostics)
     std::uint64_t last_refused;  // the last refused access's heap offset (written by the shaders, not atomically)
     std::uint8_t pad[24];
 };
