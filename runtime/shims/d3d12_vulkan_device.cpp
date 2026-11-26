@@ -2569,7 +2569,9 @@ struct DeviceState {
     std::atomic<std::size_t> title_window_count{0};  // title_windows.size(), read without the mutex
     std::uint64_t title_window_bytes = 0;
     std::uint64_t title_window_cap = 64ull << 20;
-    // The stream pools' mappings (title_gpu_views): one per readable run of a pool, kept for the device's life.
+    // The stream pools' mappings (title_gpu_views): one per readable run of a pool. A window is kept for the device's
+    // life; a geometry copy goes when its view is retired (the pages were freed, unmapped or remapped:
+    // drain_geometry_releases), and the next request for those pages makes a new one.
     struct PoolSpan {
         std::uint64_t source;     // the readable side of the pair the copy is made from
         std::uint64_t twin;       // the extent's address in the pair's other view (0 when there is none)
@@ -2580,6 +2582,7 @@ struct DeviceState {
     std::vector<PoolSpan> pool_spans;
     std::atomic<std::size_t> pool_span_count{0};
     std::uint64_t pool_span_bytes = 0;
+    std::uint64_t pool_spans_retired = 0;  // geometry-copy extents whose view was retired (forget_pool_span)
     std::uint64_t title_window_refusals = 0;  // windows neither the budget nor the arena allowed
     std::uint64_t unbacked_requests = 0;      // title addresses no backing could be made for (zero-size views)
 
@@ -2601,11 +2604,29 @@ struct DeviceState {
     // another queue's replay that translated its slots before this retirement may still name it. A ticket read here
     // would be one short of this submission, which records its own only after before_execute_ (and with an idle GPU
     // the view would be reaped in this very call).
+    // A retired view's last copy is made here from the title's pages as they are now (GeometryViews::retire_range): a
+    // range the title remapped (xmem's RemapReleases) holds its new bytes, which the refresh below would have copied.
+    // A stream-pool extent it backed leaves pool_spans: the next request for those pages makes a new mapping.
     void drain_geometry_releases() {
         if (!context || !geometry.has_pending_reclaim()) return;
         const std::uint64_t completed_ticket = geometry.has_retired() ? context->completed_retire_ticket() : 0;
-        geometry.drain_released(*this, rt::d3d12::GeometryViews::kAfterExecutes, completed_ticket,
-                                forget_geometry_alias);
+        geometry.drain_released(
+            *this, rt::d3d12::GeometryViews::kAfterExecutes, completed_ticket,
+            [this](std::uintptr_t source, std::size_t size, VkDeviceSize va) {
+                forget_geometry_alias(source, size, va);
+                forget_pool_span(va);
+            },
+            copy_geometry);
+    }
+    void forget_pool_span(VkDeviceSize va) {
+        std::lock_guard windows(title_window_mutex);
+        const auto it = std::find_if(pool_spans.begin(), pool_spans.end(),
+                                     [&](const PoolSpan& span) { return span.geometry && span.shader_va == va; });
+        if (it == pool_spans.end()) return;
+        pool_span_bytes -= it->size;
+        pool_spans.erase(it);
+        pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
+        ++pool_spans_retired;
     }
     // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
     static std::vector<std::uint64_t>& geometry_execute_serials() {
@@ -3726,13 +3747,13 @@ struct DeviceState {
                                                       [](const PoolSpan& span) { return span.geometry; });
             std::fprintf(stderr,
                          "[rt] d3d12: title memory: %zu windows (%llu KiB of a %llu MiB budget, %llu refused), %zu "
-                         "stream-pool extents (one mapping each, %llu KiB; %lld by geometry copy), %llu addresses "
-                         "given a zero-size view\n",
+                         "stream-pool extents (one mapping each, %llu KiB; %lld by geometry copy, %llu retired with "
+                         "their copy), %llu addresses given a zero-size view\n",
                          title_windows.size(), static_cast<unsigned long long>(title_window_bytes >> 10),
                          static_cast<unsigned long long>(title_window_cap >> 20),
                          static_cast<unsigned long long>(title_window_refusals), pool_spans.size(),
                          static_cast<unsigned long long>(pool_span_bytes >> 10),
-                         static_cast<long long>(geometry_spans),
+                         static_cast<long long>(geometry_spans), static_cast<unsigned long long>(pool_spans_retired),
                          static_cast<unsigned long long>(unbacked_requests));
         }
     }
