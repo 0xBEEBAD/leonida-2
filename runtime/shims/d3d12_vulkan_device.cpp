@@ -3086,8 +3086,8 @@ struct DeviceState {
             for (auto& t : b.triangles) {
                 const std::uint64_t triangles = (t.index_type ? t.index_count : t.vertex_count) / 3;
                 if (!triangles) continue;
-                // Unindexed: three vertices a triangle. Indexed: the VertexCount the title declared (indices past
-                // it read past the buffer, as on the console).
+                // Unindexed: three vertices a triangle. Indexed: the VertexCount the title declared (an index past
+                // it is not read: xdxr_build.comp vertex() makes its triangle inactive).
                 const std::uint64_t vertices = t.index_type ? t.vertex_count : 3 * triangles;
                 const std::uint64_t element = t.vertex_format == VK_FORMAT_R32G32_SFLOAT ? 8 : 12;
                 const std::uint64_t vertex_bytes = vertices ? (vertices - 1) * t.vertex_stride + element : 0;
