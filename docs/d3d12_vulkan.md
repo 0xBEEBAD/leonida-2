@@ -2641,8 +2641,9 @@ Pipeline creation:
   `pipelineCreationCacheControl` feature unless `LEONIDA_PIPELINE_COMPILE=cache-only` asks for it. A cache-only create
   (`cache-only`) is left as it is.
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching
-  compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
-  It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
+  compute programs at play and drops their dispatches, direct and indirect; the first dropped dispatch of each is
+  logged. It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
+  `--precompile-pipelines` (below) builds them anyway unless it is given `--skip-listed`.
   `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` also schedules a snapshot after a successful pipeline build,
   at most once per 120 seconds. It starts on the compile worker when queued builds have drained and the device
   has no active builds. The driver fills a mapped staging
@@ -2681,7 +2682,8 @@ Pipeline creation:
   folders can share one; the file names and the driver's checks keep a pipeline from one build from being taken
   for another's.
   `gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--all] [--smallest-first] [--limit N]
-  [--min-bytes N] [--max-bytes N] [--filter PART]... [--list]` fills the journal ahead of play, with no game: it
+  [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list]` fills the journal ahead of play, with
+  no game: it
   creates the Vulkan device as `--run` does (so the same environment gives the same journal names and driver keys:
   LEONIDA_SHADERS, LEONIDA_PIPELINE_CACHE_DIR, and LEONIDA_DEVICE_FAULT/LEONIDA_AFTERMATH, whose diagnostics config
   makes other pipelines) and builds every compute entry of the library through the dispatch path
@@ -2691,6 +2693,19 @@ Pipeline creation:
   4 threads: modules of 3.6-5.8 MB took 46-145 s each, 12 in 312 s, about 3.5 GB of host memory each while in the
   driver (14.5 GB peak for four). Graphics pipelines are not covered: they are built at a title's draw from its PSO
   description and the bound formats, and take milliseconds.
+  `LEONIDA_SKIP_COMPUTE` does not narrow the build: it is a play-time setting, players run the pre-compile with the
+  game's environment, and a program left out here would stay out of the journal after the list is shortened. The run
+  says how many entries the list names and builds them; `--skip-listed` leaves them out on purpose. The last line
+  counts what was built (compiled, or found in a cache), what was journaled already or being built by another
+  process, what failed, and what was left out and why: by `--skip-listed`, not buildable on this device (no SPIR-V,
+  set-0 bindings without a bindless set, workgroup memory over the limit), or filtered out (`--filter`, the size
+  bounds, `--limit`). The 89-167 s per program behind the skip list of the large `library/` programs came from
+  wave64-emulated packs. Measured with a native wave64 pack on an RX 7900 XTX (RADV, Mesa 26.3.1, Wine): all 721
+  programs of 2 MiB or more built, 360 of them in 170 s on 32 threads, 2.5-32 s each, the largest (13 MiB) in 28.5 s
+  alone, at a peak of 14 GiB of RAM for the process. With all of them in the journal and no skip list, two world runs
+  took them all from the journal (none built in the game) and ended as runs with the skip list do, in an idle-queue
+  device loss or a stop with the GPU idle ([running.md](running.md#settings-every-platform-needs)); whether their
+  output is correct is not measured.
   `LEONIDA_COMPILE_HELPER=1` (`shims/d3d12_compile_helper.h`) keeps first-ever compiles out of the title's process:
   the driver's locks, which a long `vkCreateComputePipelines` holds and a `vkQueueSubmit` of the same process waits
   for, are per process. A compute build of `LEONIDA_COMPILE_HELPER_MIN_BYTES` or more (128 KiB) with no journal file

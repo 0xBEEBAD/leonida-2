@@ -4363,6 +4363,18 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com user32)  # user32: the PresentX window
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
 
+      # gta6rt --precompile-pipelines builds the programs LEONIDA_SKIP_COMPUTE names unless --skip-listed is given,
+      # and its last line counts both (shims/d3d12_precompile.h). Two synthetic compute modules, three runs.
+      if(TARGET gta6rt_compute_journal_shader)
+        add_dependencies(gta6rt gta6rt_indirect_count_shader gta6rt_compute_journal_shader)
+        add_test(NAME precompile_skip_list COMMAND ${CMAKE_COMMAND}
+          "-DGTA6RT=$<TARGET_FILE:gta6rt>" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+          "-DSPV_A=${_indirect_count_spv}" "-DSPV_B=${_journal_second_spv}"
+          "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/precompile_skip_list"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_precompile_skip_list.cmake")
+        set_tests_properties(precompile_skip_list PROPERTIES TIMEOUT 240 SKIP_REGULAR_EXPRESSION "SKIP: ")
+      endif()
+
       # A stand-in title that imports d3d12_xs.dll!D3D12XboxCreateDevice and runs a clear and a readback on the
       # device it gets, mapped and run by `gta6rt --run` with LEONIDA_D3D12=vulkan: the loader, the game thread, the
       # proxies and the Vulkan device in one process. check_tiny_frame.py reads the verdict, the binding and the
