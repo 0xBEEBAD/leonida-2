@@ -24,6 +24,7 @@ R11G11B10_FLOAT and R9G9B9E5_SHAREDEXP previews clamp RGB to [0, 1] and use opaq
 R11G11B10_FLOAT.
 R8G8_SNORM previews map the signed red and green values from [-1, 1] to [0, 255]; blue is zero and alpha is opaque.
 R8G8_UINT previews use their channel bytes directly; R8G8_SINT offsets each signed channel by 128 for display.
+R8_SNORM previews map the signed value range [-1, 1] to [0, 255] in red, with opaque alpha.
 
 Usage:
     python -I tools/dds_png.py <in.dds> --info
@@ -102,6 +103,7 @@ _DXGI_MAP: dict[int, str] = {
     51: "RG8_SNORM",
     50: "RG8_UINT",
     52: "RG8_SINT",
+    63: "R8_SNORM",
     65: "A8_UNORM",
     67: "R9G9B9E5_FLOAT",
     85: "B5G6R5_UNORM",
@@ -391,6 +393,7 @@ _TEXEL_BYTES = {
     "B5G6R5_UNORM": 2, "B5G5R5A1_UNORM": 2,
     "RG8_SNORM": 2,
     "RG8_UINT": 2, "RG8_SINT": 2,
+    "R8_SNORM": 1,
     **{fmt: layout[0] for fmt, layout in _HALF_FLOAT_LAYOUT.items()},
 }
 
@@ -1149,6 +1152,10 @@ def _decode_channels(payload: memoryview, width: int, height: int, pitch: int, f
             for channel in range(bpp):
                 rgba[dst + channel:dst + width * 4:4] = row[channel::bpp]
             dst += width * 4
+        elif fmt == "R8_SNORM":
+            for (v,) in struct.iter_unpack("<b", row):
+                rgba[dst] = int(round((max(-127, v) / 127.0 * 0.5 + 0.5) * 255.0))
+                dst += 4
         elif fmt == "R16_UNORM":
             for (v,) in struct.iter_unpack("<H", row):
                 rgba[dst] = (v * 255 + 32767) // 65535
@@ -1449,7 +1456,7 @@ def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _Dd
         rgba = _decode_rg8_integer(payload, width, height, pitch, fmt)
     elif fmt == "R9G9B9E5_FLOAT":
         rgba = _decode_r9g9b9e5(payload, width, height, pitch)
-    elif fmt in ("R8_UNORM", "R8G8_UNORM", "R16_UNORM", "R32_FLOAT", "A8_UNORM"):
+    elif fmt in ("R8_UNORM", "R8G8_UNORM", "R8_SNORM", "R16_UNORM", "R32_FLOAT", "A8_UNORM"):
         rgba = _decode_channels(payload, width, height, pitch, fmt)
     elif fmt == "BC7":
         rgba = _decode_bc7(payload, 0, width, height)
