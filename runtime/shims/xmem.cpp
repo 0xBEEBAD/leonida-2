@@ -2024,6 +2024,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
             return scatter_refused(ScatterFailure::unaligned, address, ERROR_INVALID_PARAMETER);
         }
         const uint64_t page = page_array ? page_array[i] : 0;
+        const UnmapCause cause(page ? "XMemMapPhysicalPagesScatter (remap)" : "XMemMapPhysicalPagesScatter (unmap)");
         if (page == 0) {
             if (!unmap_page(address)) return scatter_refused(ScatterFailure::unmap, address, GetLastError());
             continue;
@@ -2046,6 +2047,34 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
 // calls with the same page make them. Every source page is looked up before any destination page changes, so a source
 // range that overlaps the destination maps what was there before the call. A destination in a GPU-only range is mapped
 // at its paired CPU range too (title_gpu_views), and a source page missing at a GPU-only address is looked up there.
+// A page of that CPU range the title mapped itself is the title's (title_mapped_twin): the copy leaves it as it is.
+
+// With g_phys_mutex held. True when the paired CPU page at `address` holds a mapping of the title's own: its
+// XMemMapPhysicalPages or XMemMapPhysicalPagesScatter call, or a slot-31 copy onto that address. The console's
+// CopyPageMappingsBatchX changes only the GPU-only range's page table, so such a page keeps what the title put
+// there; only a page the copy mirrored there itself (MapOwner::mirror), a zero plant, or a page with no mapping
+// follows the GPU-only range. Each page kept is counted, and the first ones logged.
+bool title_mapped_twin(uintptr_t address, uintptr_t gpu, bool unmap) {
+    MapOwner owner;
+    {
+        const FaultLockShared faults;
+        uintptr_t base = 0;
+        const View* const view = covering_view(address, base);
+        if (!view || view->zero || view->owner == MapOwner::mirror) return false;
+        owner = view->owner;
+    }
+    static std::atomic<uint64_t> kept{0};
+    const uint64_t n = kept.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n & (n - 1)) == 0)
+        std::fprintf(stderr,
+                     "[rt] xmem: slot-31 %s at 0x%llx left the title's %s mapping at its paired CPU page 0x%llx "
+                     "(%llu such pages so far)\n",
+                     unmap ? "unmap" : "copy", static_cast<unsigned long long>(gpu),
+                     owner == MapOwner::scatter ? "scatter" : owner == MapOwner::slot31 ? "slot-31" : "physical",
+                     static_cast<unsigned long long>(address), static_cast<unsigned long long>(n));
+    return true;
+}
+
 bool copy_page_mappings(void* destination, const void* source, uint64_t pages, bool repeat_first) {
     const uintptr_t to = reinterpret_cast<uintptr_t>(destination);
     const uintptr_t from = reinterpret_cast<uintptr_t>(source);
@@ -2067,8 +2096,14 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     const Window* const cpu_window = cpu_to != to ? find_window(cpu_to, pages * kPhysicalPageSize) : nullptr;
     if (!source) {
         for (uint64_t i = 0; i < pages; ++i) {
-            if (!unmap_page(to + i * kPhysicalPageSize)) return false;
-            if (cpu_window && !unmap_page(cpu_to + i * kPhysicalPageSize)) return false;
+            const uintptr_t gpu = to + i * kPhysicalPageSize, cpu = cpu_to + i * kPhysicalPageSize;
+            {
+                const UnmapCause cause("CopyPageMappingsBatchX (unmap)");
+                if (!unmap_page(gpu)) return false;
+            }
+            if (!cpu_window || title_mapped_twin(cpu, gpu, true)) continue;
+            const UnmapCause cause("CopyPageMappingsBatchX (unmap paired CPU page)");
+            if (!unmap_page(cpu)) return false;
         }
         return true;
     }
@@ -2091,8 +2126,11 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     const DWORD cpu_protect = cpu_window ? view_protect(*cpu_window) : 0;
     for (uint64_t i = 0; i < pages; ++i) {
         const uint64_t page = found[static_cast<size_t>(i)];
-        if (!map_page(to + i * kPhysicalPageSize, page, protect, MapOwner::slot31)) return false;
-        if (cpu_window && !map_page(cpu_to + i * kPhysicalPageSize, page, cpu_protect, MapOwner::mirror)) return false;
+        const uintptr_t gpu = to + i * kPhysicalPageSize, cpu = cpu_to + i * kPhysicalPageSize;
+        const UnmapCause cause(page ? "CopyPageMappingsBatchX (remap)" : "CopyPageMappingsBatchX (hole)");
+        if (!map_page(gpu, page, protect, MapOwner::slot31)) return false;
+        if (cpu_window && !title_mapped_twin(cpu, gpu, false) && !map_page(cpu, page, cpu_protect, MapOwner::mirror))
+            return false;
     }
     return true;
 }

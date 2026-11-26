@@ -814,7 +814,19 @@ void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
     check(readable(other) && page_holds(other, 0x7300u),
           "a GPU-only source page unmapped there is looked up at its CPU range");
 
-    // A null source unmaps both ranges.
+    // A CPU page the title mapped itself is the title's: a copy onto its GPU-only page, or an unmap of it, changes the
+    // GPU-only page alone (the console's CopyPageMappingsBatchX edits only that range's page table).
+    check(copy(gpu + 2 * kPage64k, pool + kPage64k, 1, false), "a copy onto a GPU-only page whose CPU page is the title's");
+    check(readable(gpu + 2 * kPage64k) && page_holds(gpu + 2 * kPage64k, 0x7301u),
+          "the GPU-only page shows the copied pool page");
+    check(readable(cpu + 2 * kPage64k) && page_holds(cpu + 2 * kPage64k, 0x7300u),
+          "the title's own mapping at the paired CPU page is kept, not replaced by the copy");
+    check(copy(gpu + 2 * kPage64k, nullptr, 1, false), "a null source unmaps a GPU-only page whose CPU page is the title's");
+    check(!readable(gpu + 2 * kPage64k), "the GPU-only page is unmapped");
+    check(readable(cpu + 2 * kPage64k) && page_holds(cpu + 2 * kPage64k, 0x7300u),
+          "the title's own mapping at the paired CPU page survives the unmap");
+
+    // A null source unmaps both ranges where the CPU pages are the copy's own.
     check(copy(gpu, nullptr, kPool, false), "a null source unmaps the GPU-only range");
     check(!readable(gpu) && !readable(cpu) && !readable(cpu + kPage64k), "the paired CPU range is unmapped with it");
 
