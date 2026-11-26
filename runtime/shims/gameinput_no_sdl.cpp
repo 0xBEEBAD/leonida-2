@@ -16,9 +16,11 @@
 //     title waits at its first "press A" prompt forever. The pad is an Xbox One gamepad that is connected from the
 //     first GameInputCreate on: device enumeration through RegisterDeviceCallback (blocking, async, and through a
 //     dispatcher), GetCurrentReading, GetNextReading and GetPreviousReading, and readings whose GetGamepadState and
-//     GetUiNavigationState follow the script. A clock thread advances the script every 8 ms and stores each state
-//     change so GetNextReading can observe edges while the title waits between reads; reading callbacks, aggregate
-//     devices, rumble and every other device still need SDL3. Controllers and the keyboard pad need SDL3 too.
+//     GetUiNavigationState follow the script. Readings are taken when the title asks for one, so no thread runs,
+//     but each one first adds a reading for every change the script made since the last, stamped with the script's
+//     own time: a press that starts and ends between two reads still reaches the history for GetNextReading.
+//     Reading callbacks, aggregate devices, rumble and every other device still need SDL3. Controllers and the
+//     keyboard pad need SDL3 too.
 #include <windows.h>
 
 #include <algorithm>
@@ -390,6 +392,7 @@ struct State {
     std::atomic<DWORD> delivering_thread{0};
     script::Script script;
     uint64_t origin_us = 0;      // the script's clock starts at the first GameInputCreate
+    double updated_s = -1;       // the script time of the last update; its changes up to here are in the history
     bool log_presses = true;     // LEONIDA_INPUT_LOG
     bool trace_reads = false;    // LEONIDA_INPUT_TRACE
     uint32_t logged_held = 0;    // what log_scripted saw last
@@ -409,10 +412,9 @@ State& g() {
     return *s;
 }
 
-// Takes a reading when the script's state at `now` differs from the current one. Under g().mu.
-void update(uint64_t now) {
+// Takes a reading when the script's state `seconds` into it differs from the current one. Under g().mu.
+void take_reading(double seconds, uint64_t timestamp) {
     State& s = g();
-    const double seconds = now > s.origin_us ? (now - s.origin_us) / 1e6 : 0.0;
     const script::Held held = script::held_at(s.script, seconds);
     GameInputGamepadState state{};
     state.buttons = held.buttons;
@@ -424,12 +426,32 @@ void update(uint64_t now) {
     if (s.log_presses && last)
         script::log_presses(state.buttons & ~last->state().buttons, last->state().rightThumbstickY,
                             state.rightThumbstickY, seconds, kPadName);
-    s.history.push_back(new Reading(state, ++s.seq, now));
+    s.history.push_back(new Reading(state, ++s.seq, timestamp));
     while (s.history.size() > kHistoryCap) {
         s.evicted_seq = s.history.front()->seq();
         s.history.front()->Release();
         s.history.pop_front();
     }
+}
+
+// Brings the history up to `now`: one reading for every start and end of a press the script made since the last
+// update, at the time the script made it, then the state at `now`. The title may read its pad only every few seconds
+// (at world-start frame rates it does); a press that began and ended in between is still in the history, where
+// GetNextReading finds it, and the readings are the same however often the title reads. Under g().mu.
+void update(uint64_t now) {
+    State& s = g();
+    const double seconds = now > s.origin_us ? (now - s.origin_us) / 1e6 : 0.0;
+    if (seconds > s.updated_s) {
+        std::vector<double> edges;
+        for (const script::Press& p : s.script.presses)
+            for (const double edge : {p.at, p.at + p.hold})
+                if (edge > s.updated_s && edge < seconds) edges.push_back(edge);
+        std::sort(edges.begin(), edges.end());
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+        for (const double edge : edges) take_reading(edge, s.origin_us + static_cast<uint64_t>(edge * 1e6 + 0.5));
+        s.updated_s = seconds;
+    }
+    take_reading(seconds, now);
 }
 
 void trace_reading(State& s, const char* api, uint32_t kind, const Reading* reading) {
@@ -744,20 +766,6 @@ ScriptedInput* scripted() {
         s.wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         s.origin_us = now_us();
         update(s.origin_us);  // the first reading: nothing held unless the script presses at 0 s
-        // Advance timed presses even when the title is waiting between GameInput queries. Keep each edge in the
-        // reading history so GetNextReading can observe it; GetCurrentReading still returns the state at query time.
-        try {
-            std::thread([] {
-                for (;;) {
-                    Sleep(8);
-                    State& state = g();
-                    std::lock_guard lock(state.mu);
-                    update(now_us());
-                }
-            }).detach();
-        } catch (...) {
-            std::fprintf(stderr, "[rt] gameinput: could not start the scripted input clock; updates will follow title reads\n");
-        }
         std::fprintf(stderr,
                      "[rt] gameinput: served without SDL3: one scripted pad for LEONIDA_INPUT_SCRIPT (%zu scripted "
                      "press(es), %zu rejected); controllers and the keyboard pad need SDL3\n",
