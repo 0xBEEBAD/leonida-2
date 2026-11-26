@@ -87,7 +87,9 @@ _DXGI_MAP: dict[int, str] = {
     93: "BGRX8",
     26: "R11G11B10_FLOAT",
     41: "R32_FLOAT",
+    49: "R8G8_UNORM",
     56: "R16_UNORM",
+    61: "R8_UNORM",
     65: "A8_UNORM",
     70: "BC1",
     71: "BC1",
@@ -368,7 +370,7 @@ class _Plane(NamedTuple):
 _TEXEL_BYTES = {
     "RGBA8": 4, "BGRA8": 4, "BGRX8": 4, "RGBX8": 4, "R11G11B10_FLOAT": 4,
     "BGR8": 3, "RGB8": 3, "R16_UNORM": 2, "A8_UNORM": 1,
-    "R32_FLOAT": 4,
+    "R32_FLOAT": 4, "R8_UNORM": 1, "R8G8_UNORM": 2,
     **{fmt: layout[0] for fmt, layout in _HALF_FLOAT_LAYOUT.items()},
 }
 
@@ -1055,8 +1057,8 @@ def _decode_r11g11b10(payload: memoryview, width: int, height: int, pitch: int) 
     return bytes(rgba)
 
 
-def _decode_single_channel(payload: memoryview, width: int, height: int, pitch: int, fmt: str) -> bytes:
-    """Red-only R16_UNORM/R32_FLOAT and alpha-only A8_UNORM."""
+def _decode_channels(payload: memoryview, width: int, height: int, pitch: int, fmt: str) -> bytes:
+    """Preview R, RG and alpha-only texels with zero for absent color channels."""
     bpp = _TEXEL_BYTES[fmt]
     row_bytes = width * bpp
     pitch = pitch or row_bytes
@@ -1072,7 +1074,11 @@ def _decode_single_channel(payload: memoryview, width: int, height: int, pitch: 
     dst = 0
     for start in range(0, height * pitch, pitch):
         row = payload[start:start + row_bytes]
-        if fmt == "R16_UNORM":
+        if fmt in ("R8_UNORM", "R8G8_UNORM"):
+            for channel in range(bpp):
+                rgba[dst + channel:dst + width * 4:4] = row[channel::bpp]
+            dst += width * 4
+        elif fmt == "R16_UNORM":
             for (v,) in struct.iter_unpack("<H", row):
                 rgba[dst] = (v * 255 + 32767) // 65535
                 dst += 4
@@ -1269,8 +1275,8 @@ def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _Dd
         rgba = _decode_bc5(payload, 0, width, height, signed=True)
     elif fmt == "R11G11B10_FLOAT":
         rgba = _decode_r11g11b10(payload, width, height, pitch)
-    elif fmt in ("R16_UNORM", "R32_FLOAT", "A8_UNORM"):
-        rgba = _decode_single_channel(payload, width, height, pitch, fmt)
+    elif fmt in ("R8_UNORM", "R8G8_UNORM", "R16_UNORM", "R32_FLOAT", "A8_UNORM"):
+        rgba = _decode_channels(payload, width, height, pitch, fmt)
     elif fmt == "BC7":
         rgba = _decode_bc7(payload, 0, width, height)
     else:
