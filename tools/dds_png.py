@@ -3,7 +3,7 @@
 Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
 (BGRA8, RGBA8, BGRX8, RGBX8, R10G10B10A2_UNORM, and arbitrary 32-bit RGB/RGBA bitmasks), the
 legacy 24-bit RGB layouts (BGR8/RGB8, e.g. the D3DFMT_R8G8B8 byte order),
-DX10 B5G6R5_UNORM and B5G5R5A1_UNORM,
+DX10 B5G6R5_UNORM and B5G5R5A1_UNORM, DX10 R8G8_SNORM,
 and block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
 BC7 covers all eight modes. Decoding DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB)
@@ -22,6 +22,7 @@ R16G16B16A16_SNORM (13) maps its signed normalized channels from [-1, 1] to [0, 
 with both -32768 and -32767 representing -1.0.
 R11G11B10_FLOAT and R9G9B9E5_SHAREDEXP previews clamp RGB to [0, 1] and use opaque alpha; NaN maps to zero for
 R11G11B10_FLOAT.
+R8G8_SNORM previews map the signed red and green values from [-1, 1] to [0, 255]; blue is zero and alpha is opaque.
 
 Usage:
     python -I tools/dds_png.py <in.dds> --info
@@ -97,6 +98,7 @@ _DXGI_MAP: dict[int, str] = {
     61: "R8_UNORM",
     11: "RGBA16_UNORM",
     13: "RGBA16_SNORM",
+    51: "RG8_SNORM",
     65: "A8_UNORM",
     67: "R9G9B9E5_FLOAT",
     85: "B5G6R5_UNORM",
@@ -384,6 +386,7 @@ _TEXEL_BYTES = {
     "R32_FLOAT": 4, "R8_UNORM": 1, "R8G8_UNORM": 2,
     "RGBA16_UNORM": 8, "RGBA16_SNORM": 8,
     "B5G6R5_UNORM": 2, "B5G5R5A1_UNORM": 2,
+    "RG8_SNORM": 2,
     **{fmt: layout[0] for fmt, layout in _HALF_FLOAT_LAYOUT.items()},
 }
 
@@ -1202,6 +1205,30 @@ def _decode_rgba16_snorm(payload: memoryview, width: int, height: int, pitch: in
     return bytes(rgba)
 
 
+def _decode_rg8_snorm(payload: memoryview, width: int, height: int, pitch: int) -> bytes:
+    """Decode DXGI R8G8_SNORM to red/green preview channels with opaque alpha."""
+    row_bytes = width * 2
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid R8G8_SNORM row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated R8G8_SNORM payload: {len(payload)} bytes (need {expected})")
+
+    def to_u8(value: int) -> int:
+        return int(round((max(-127, value) / 127.0 * 0.5 + 0.5) * 255.0))
+
+    rgba = bytearray(width * height * 4)
+    rgba[3::4] = b"\xff" * (width * height)
+    dst = 0
+    for start in range(0, height * pitch, pitch):
+        row = payload[start:start + row_bytes]
+        for red, green in struct.iter_unpack("<bb", row):
+            rgba[dst:dst + 2] = bytes((to_u8(red), to_u8(green)))
+            dst += 4
+    return bytes(rgba)
+
+
 def _bc7_read_indices(bits: int, index_bits: int, is_anchor: tuple[int, ...]) -> tuple[list[int], int]:
     """Read 16 LSB-first pixel indices; anchor pixels omit their implicit zero MSB."""
     indices = []
@@ -1388,6 +1415,8 @@ def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _Dd
         rgba = _decode_bc5(payload, 0, width, height, signed=True)
     elif fmt == "R11G11B10_FLOAT":
         rgba = _decode_r11g11b10(payload, width, height, pitch)
+    elif fmt == "RG8_SNORM":
+        rgba = _decode_rg8_snorm(payload, width, height, pitch)
     elif fmt == "R9G9B9E5_FLOAT":
         rgba = _decode_r9g9b9e5(payload, width, height, pitch)
     elif fmt in ("R8_UNORM", "R8G8_UNORM", "R16_UNORM", "R32_FLOAT", "A8_UNORM"):
