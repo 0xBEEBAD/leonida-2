@@ -63,6 +63,19 @@ class SingleChannelTests(unittest.TestCase):
         self.assertEqual((width, height), (4, 2))
         self.assertEqual(rgba, b"".join(bytes((r, 0, 0, 255)) for r in (0, 0, 128, 64, 255, 255, 0, 0)))
 
+    def test_byte_unorm_masks_respect_pitch_and_channel_order(self):
+        for dxgi, fmt, payload, expected in (
+            (61, "R8_UNORM", bytes([1, 2, 99, 99, 3, 4]), bytes([1,0,0,255, 2,0,0,255, 3,0,0,255, 4,0,0,255])),
+            (49, "R8G8_UNORM", bytes([1,2,3,4, 99,99, 5,6,7,8]), bytes([1,2,0,255, 3,4,0,255, 5,6,0,255, 7,8,0,255])),
+        ):
+            with self.subTest(fmt=fmt):
+                data = _dx10(2, 2, dxgi, payload, pitch=4 if dxgi == 61 else 6)
+                self.assertEqual(dds.parse_dds_header(data)["format"], fmt)
+                self.assertEqual(dds.decode_dds(data), (2, 2, expected))
+                self.assertEqual(dds.dds_to_png_bytes(data), dds.encode_png(2, 2, expected))
+                with self.assertRaises(dds.DdsError):
+                    dds.decode_dds(data[:-1])
+
     def test_r16_unorm_red_opaque(self):
         px = struct.pack("<HHHH", 0, 65535, 32768, 257)
         _, _, rgba = dds.decode_dds(_dx10(2, 2, 56, px))
