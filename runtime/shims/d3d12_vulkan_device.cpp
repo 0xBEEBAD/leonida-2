@@ -7102,6 +7102,12 @@ struct DeviceState {
         return nullptr;
     }
 };
+// TitleBufferWindows::system_memory_types reads the memory types through these (LEONIDA_GEOMETRY_HOST): without them
+// it would leave every type allowed, the BAR included.
+static_assert(requires(const DeviceState& d) {
+    d.memory.memoryTypes[0].propertyFlags;
+    d.memory.memoryTypeCount;
+});
 
 // The Vulkan format for a texture this layer can create, with the D24 fallback; VK_FORMAT_UNDEFINED, after a log
 // line, when it cannot. Committed and placed textures share it so both refuse the same formats for the same reason.
