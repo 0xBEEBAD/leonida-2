@@ -791,12 +791,39 @@ public:
                 kind = classify(region);
             }
             const std::uintptr_t from = std::max(at, begin), to = std::min(next, end);
-            if (kind == Kind::zero)
+            if (kind == Kind::zero) {
                 std::memset(shadow + (from - begin), 0, to - from);
-            else
-                copy_run(shadow + (from - begin), reinterpret_cast<const std::uint8_t*>(from), to - from,
-                         (region.Protect & PAGE_WRITECOMBINE) != 0);
+            } else {
+                const bool streaming = (region.Protect & PAGE_WRITECOMBINE) != 0;
+                copy_run(shadow + (from - begin), reinterpret_cast<const std::uint8_t*>(from), to - from, streaming);
+                // The sums stand for what every target holds. The new target now holds the title's current bytes, so
+                // the pieces where those differ from the sums are brought to the other targets too, and the sums
+                // follow; otherwise a title that later writes the old bytes back would leave the new target behind.
+                // Whole pieces (inside this page, so this region) up to the targets' ends, as a refresh sums them: a
+                // piece cut at the new target's edge would be summed short and copied again at the next refresh.
+                constexpr std::uintptr_t kPiece = leonida::shadow_keep::kPiece;
+                if (keep_gpu_writes())
+                    reconcile(std::max(from & ~(kPiece - 1), begin_), std::min((to + kPiece - 1) & ~(kPiece - 1), end_),
+                              streaming);
+            }
             at = next;
+        }
+    }
+
+    // [from, to), readable title pages: the pieces whose bytes differ from the sums are copied to every target over
+    // them and their sums updated, as a refresh does.
+    void reconcile(std::uintptr_t from, std::uintptr_t to, bool streaming) {
+        alignas(64) std::uint8_t page[kPage];
+        for (std::uintptr_t va = from; va < to;) {
+            const std::size_t n = std::min<std::size_t>(to - va, kPage - (va & (kPage - 1)));
+            copy_run(page, reinterpret_cast<const std::uint8_t*>(va), n, streaming);
+            leonida::shadow_keep::copy_changed(
+                page, va, n, sums_.data(), first_, [&](std::uintptr_t a, std::uintptr_t b, const std::uint8_t* source) {
+                    for_each_target(a, b, [&](const Target& t, std::uintptr_t lo, std::uintptr_t hi) {
+                        std::memcpy(t.shadow + (lo - t.begin), source + (lo - a), hi - lo);
+                    });
+                });
+            va += n;
         }
     }
 
