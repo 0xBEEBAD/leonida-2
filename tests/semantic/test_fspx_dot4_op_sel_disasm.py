@@ -81,7 +81,7 @@ def translate_fspx(name, listing, code):
             f.write(STUB_DXBC)
         with open(os.path.join(tmp, "fspx", name + ".code"), "wb") as f:
             f.write(code)
-        with open(os.path.join(tmp, "fspx", name + ".json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(tmp, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump({}, f)
         src = os.path.join(tmp, "disasm", name + ".s")
         with open(src, "w", encoding="utf-8", newline="\n") as f:

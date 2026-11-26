@@ -110,7 +110,7 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
         fixed = with_vopc_dpp(code, mcpu, err, wave32)
         if fixed:
             return fixed
-        fixed = with_dot4_op_sel(code, mcpu, bad, err)
+        fixed = with_dot4_op_sel(code, mcpu, bad, err, wave32)
         if fixed:
             return fixed
     return asm, bad, err
@@ -221,7 +221,7 @@ def dot4_op_sel_words(code: bytes, offsets) -> dict:
     return found
 
 
-def with_dot4_op_sel(code: bytes, mcpu: str, bad: int, err: str):
+def with_dot4_op_sel(code: bytes, mcpu: str, bad: int, err: str, wave32: bool = True):
     """The listing of `code` with each rejected v_dot4_i32_i8 op_sel 2 / op_sel_hi 5 word printed as the instruction
     it is, or None when there is none. llvm-mc rejects the pair, so it is decoded with the two fields at their
     defaults (op_sel 0, op_sel_hi 7), and each such line gets the real fields and the real encoding back: the
@@ -233,7 +233,7 @@ def with_dot4_op_sel(code: bytes, mcpu: str, bad: int, err: str):
         patched = bytearray(code)
         for at, (w0, w1) in words.items():
             struct.pack_into("<2I", patched, at, w0 & ~(7 << 11), w1 | (2 << 27))
-        asm, bad2, err2 = run_mc(bytes(patched), mcpu)
+        asm, bad2, err2 = run_mc(bytes(patched), mcpu, wave32)
         if not asm.strip():
             return None
         invalid, pos, hit, lines = invalid_offsets(err2), 0, set(), []
@@ -256,6 +256,8 @@ def with_dot4_op_sel(code: bytes, mcpu: str, bad: int, err: str):
             return "\n".join(lines), bad2, err2
         words = {at: w for at, w in words.items() if at in hit}
     return None
+
+
 MAX_DATA_DWORDS = 1 << 16
 
 
