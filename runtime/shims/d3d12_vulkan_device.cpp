@@ -2582,12 +2582,33 @@ struct DeviceState {
         aliases.remove(source, va);
         if (const auto twin = leonida::title_gpu_views::other_view(source)) aliases.remove(twin, va);
     }
+    // Before the submission's console heap slots are translated (refresh_shadows): a view retired here is answered
+    // by nothing from now on. It is freed only after every replay in progress has recorded its submissions and those
+    // have completed (GeometryViews::kAfterExecutes, execute_end): this submission's own lists, recorded before, and
+    // another queue's replay that translated its slots before this retirement may still name it. A ticket read here
+    // would be one short of this submission, which records its own only after before_execute_ (and with an idle GPU
+    // the view would be reaped in this very call).
     void drain_geometry_releases() {
         if (!context || !geometry.has_pending_reclaim()) return;
-        const std::uint64_t retire_ticket = context->submitted_retire_ticket();
-        const std::uint64_t completed_ticket =
-            geometry.has_retired() || geometry.has_released() ? context->completed_retire_ticket() : 0;
-        geometry.drain_released(*this, retire_ticket, completed_ticket, forget_geometry_alias);
+        const std::uint64_t completed_ticket = geometry.has_retired() ? context->completed_retire_ticket() : 0;
+        geometry.drain_released(*this, rt::d3d12::GeometryViews::kAfterExecutes, completed_ticket,
+                                forget_geometry_alias);
+    }
+    // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
+    static std::vector<std::uint64_t>& geometry_execute_serials() {
+        thread_local std::vector<std::uint64_t> serials;
+        return serials;
+    }
+    void geometry_execute_begin() {
+        if (!geometry.cap()) return;
+        geometry_execute_serials().push_back(geometry.execute_begin());
+    }
+    void geometry_execute_end() {
+        auto& serials = geometry_execute_serials();
+        if (!geometry.cap() || serials.empty()) return;
+        const std::uint64_t serial = serials.back();
+        serials.pop_back();
+        geometry.execute_end(serial, [this] { return context->submitted_retire_ticket(); });
     }
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {
         using Result = rt::d3d12::GeometryCopy;
@@ -13522,6 +13543,7 @@ public:
         }
         if (async_texture_refresh()) start_title_filler();
         state_.setup_console_heap_gpu(get_device);  // LEONIDA_CONSOLE_HEAP_GPU: the context's prelude
+        state_.context->set_after_execute([this] { state_.geometry_execute_end(); });
         state_.context->set_before_execute([this] {
             namespace phases = leonida::submit_phases;
             // LEONIDA_REFRESH_PER_FRAME (for runs that only need the title to go on): 1 = the slot-133 shadows, title
@@ -13534,13 +13556,14 @@ public:
                 const char* v = std::getenv("LEONIDA_REFRESH_PER_FRAME");
                 return v && *v ? std::atoi(v) : 0;
             }();
+            state_.geometry_execute_begin();
             bool full = true;
             if (per_frame) {
                 const std::uint64_t serial = phases::totals().present_serial.load(std::memory_order_relaxed);
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
-            state_.refresh_shadows(full || per_frame < 2, full);
             state_.drain_geometry_releases();
+            state_.refresh_shadows(full || per_frame < 2, full);
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
             // up to date on a worker of ours, started here and not waited for, instead of on the title's GPU submit
             // thread (speed-27: 230-330 ms a refresh after the load, a VirtualQuery and VirtualProtect per written

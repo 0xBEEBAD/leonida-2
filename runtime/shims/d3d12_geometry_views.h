@@ -52,7 +52,8 @@ class GeometryViews {
     struct Retired {
         VkDeviceSize va{};
         std::size_t size{};
-        std::uint64_t ticket{};
+        std::uint64_t ticket{};  // kAfterExecutes until execute_end() stamps it
+        std::uint64_t epoch{};   // the last execute begun when it was retired (kAfterExecutes only)
     };
     std::uint64_t cap_override_{};
     mutable std::mutex mutex_;
@@ -108,6 +109,14 @@ class GeometryViews {
     std::map<Address, Tile> tiles_;
     std::vector<Retired> retired_;
     std::atomic<std::size_t> retired_count_{0};
+    // The ExecuteCommandLists replays in progress (execute_begin/execute_end), by the serial each began with. A view
+    // retired at kAfterExecutes may be named by any of them: by a list recorded before the retirement, or by a console
+    // heap slot their before_execute_ translated. It gets its retire ticket only once all of them have recorded their
+    // submissions, so a ticket read then covers them, however many tickets a replay records and on whichever queue.
+    std::mutex execute_mutex_;  // a leaf lock
+    std::uint64_t execute_serial_{};
+    std::vector<std::uint64_t> executing_;
+    std::atomic<bool> unstamped_{false};
     leonida::geometry_writes::ReleaseQueue releases_;
     std::atomic<std::uint64_t> free_generation_{0};
     std::uint64_t serial_{}, bytes_{}, cap_refusals_{}, allocation_failures_{}, ready_{}, uploads_{}, uploaded_{};
@@ -345,8 +354,45 @@ public:
         return va;
     }
 
+    // retire_range's ticket for a view that work already in flight may name: the ticket is taken by execute_end()
+    // once every ExecuteCommandLists replay begun by then has recorded its submissions.
+    static constexpr std::uint64_t kAfterExecutes = UINT64_MAX;
+
+    // An ExecuteCommandLists replay starts (before its before_execute_ work): its serial, for execute_end().
+    std::uint64_t execute_begin() {
+        std::lock_guard lock(execute_mutex_);
+        executing_.push_back(++execute_serial_);
+        return execute_serial_;
+    }
+    // The replay that began with `serial` has recorded its submissions. Views retired while only replays now finished
+    // were in progress get submitted() (the context's submitted_retire_ticket(), read here, after those replays
+    // recorded theirs) as their retire ticket. Lock order: mutex_ -> execute_mutex_, as in retire_range.
+    template<class Submitted>
+    void execute_end(std::uint64_t serial, Submitted&& submitted) {
+        {
+            std::lock_guard lock(execute_mutex_);
+            std::erase(executing_, serial);
+        }
+        if (!unstamped_.load(std::memory_order_acquire)) return;
+        std::lock_guard lock(mutex_);
+        std::uint64_t oldest = kAfterExecutes;
+        {
+            std::lock_guard execute(execute_mutex_);
+            for (const auto s : executing_) oldest = (std::min)(oldest, s);
+        }
+        const std::uint64_t ticket = submitted();
+        bool left = false;
+        for (auto& r : retired_) {
+            if (r.ticket != kAfterExecutes) continue;
+            if (r.epoch < oldest) r.ticket = ticket;
+            else left = true;
+        }
+        unstamped_.store(left, std::memory_order_release);
+    }
+
     // Retires every live view overlapping [begin, end), unlinking it from lookup/refresh/watch immediately and
-    // deferring its backing storage reclamation until GPU submissions through `retire_ticket` have completed.
+    // deferring its backing storage reclamation until GPU submissions through `retire_ticket` have completed
+    // (kAfterExecutes: through the submissions of every replay in progress now, see execute_end).
     template<class OnRetire = NoopRetire>
     std::size_t retire_range(Address begin, Address end, std::uint64_t retire_ticket = 0,
                              OnRetire&& on_retire = {}) {
@@ -374,7 +420,9 @@ public:
                 if (begin < key.first + key.second) stale_refused.push_back(key);
             }
             if (ids.empty() && stale_refused.empty()) return 0;
+            if (retire_ticket == kAfterExecutes && !ids.empty()) unstamped_.store(true, std::memory_order_release);
             callbacks.reserve(ids.size());
+            const std::size_t first_retired = retired_.size();
             for (const auto id : ids) {
                 View& v = views_[id];
                 detach_tiles_locked(id, v.source, v.size);
@@ -383,7 +431,7 @@ public:
                     v.ready = false;
                 }
                 callbacks.push_back({v.source, v.size, v.va});
-                retired_.push_back({v.va, v.size, retire_ticket});
+                retired_.push_back({v.va, v.size, retire_ticket, 0});
             }
             if (!ids.empty()) {
                 std::unique_lock structure(structure_mutex_);
@@ -398,6 +446,16 @@ public:
                 std::unique_lock fast(fast_mutex_);
                 for (const auto id : ids) fast_.erase({views_[id].source, views_[id].size});
                 for (const auto& k : stale_refused) fast_.erase(k);
+            }
+            // No resolve() or find() answers these views from here on, so a replay that begins now cannot name them:
+            // they wait only for the replays begun so far.
+            if (retire_ticket == kAfterExecutes && !ids.empty()) {
+                std::uint64_t epoch = 0;
+                {
+                    std::lock_guard execute(execute_mutex_);
+                    epoch = execute_serial_;
+                }
+                for (std::size_t i = first_retired; i < retired_.size(); ++i) retired_[i].epoch = epoch;
             }
             for (const auto& k : stale_refused) refused_.erase(k);
             for (const auto id : ids) {
@@ -421,7 +479,7 @@ public:
         std::size_t keep = 0;
         for (std::size_t i = 0; i < retired_.size(); ++i) {
             const Retired& r = retired_[i];
-            if (r.ticket <= completed_ticket) {
+            if (r.ticket != kAfterExecutes && r.ticket <= completed_ticket) {
                 pool_.free(device, r.va, r.size);
                 bytes_ -= r.size;
                 ++reaped_;
@@ -646,6 +704,7 @@ public:
         free_ids_.clear();
         retired_.clear();
         retired_count_.store(0, std::memory_order_release);
+        unstamped_.store(false, std::memory_order_release);
         live_views_ = 0;
         bytes_ = 0;
         ready_ = 0;
