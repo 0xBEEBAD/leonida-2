@@ -174,8 +174,9 @@ Each item was a stop on at least one of the machines. Tests named in the pull re
 
 On 2026-11-26 a Linux machine with an RX 7900 XTX (and a Ryzen 9 7950X3D's RDNA2 iGPU), Mesa 26.3.1 (RADV) and Wine
 drew the first world frames: the opening night street and a sunset street with palms, cars and a character, over
-eight minutes in the world without a GPU hang, at about one frame per six seconds. The runtime was `main` plus several
-open D3D12-layer pull requests. Each step below removed a stop that ended every earlier run; they are in the order
+eight minutes in the world without a GPU hang, at about one frame per six seconds. The runtime was `main` `a73a57e13`
+with #1914, #1957, #1972, #2044, #2097, #2124, #2129, #2144, #2162, #2195 and #2240 merged; all but #1972 went into
+`main` together with this section. Each step below removed a stop that ended every earlier run; they are in the order
 they were found.
 
 1. **Raise amdgpu's GPU timeout.** `modinfo amdgpu -p` shows `lockup_timeout` with a default of 2000 ms: the kernel
