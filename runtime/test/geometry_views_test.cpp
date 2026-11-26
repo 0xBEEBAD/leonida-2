@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <utility>
+#include <memory>
 #include <vector>
 
 #include "../shims/d3d12_geometry_views.h"
@@ -138,7 +139,8 @@ int main() {
     const auto base = reinterpret_cast<std::uintptr_t>(title);
 
     FakeDevice device;
-    rt::d3d12::GeometryViews views;
+    const auto views_owner = std::make_unique<rt::d3d12::GeometryViews>();
+    auto& views = *views_owner;
     g_copies.clear();
     const std::uint64_t va = views.resolve(device, base, kView, copy);
     check(va != 0 && g_copies.size() == 1 && g_copies[0] == kView, "a new 1 MiB view is copied whole");
@@ -194,7 +196,9 @@ int main() {
     const auto range_b = sbase + kView;
     const auto range_c = sbase + 2 * kView;
 
-    rt::d3d12::GeometryViews capped(2 * kView);
+    const auto capped_owner = std::make_unique<rt::d3d12::GeometryViews>(2 * kView);
+
+    auto& capped = *capped_owner;
     const std::uint64_t va_a = capped.resolve(device, range_a, kView, copy);
     const std::uint64_t va_b = capped.resolve(device, range_b, kView, copy);
     check(va_a != 0 && va_b != 0 && capped.bytes() == 2 * kView && capped.reserved() == 2 * kView &&
@@ -270,7 +274,8 @@ int main() {
     const auto pbase = reinterpret_cast<std::uintptr_t>(pool_title);
 
     // 8. note_released outside [watched_lo, watched_hi) is ignored; inside is queued.
-    rt::d3d12::GeometryViews watched(6 * kView);
+    const auto watched_owner = std::make_unique<rt::d3d12::GeometryViews>(6 * kView);
+    auto& watched = *watched_owner;
     const std::uint64_t va_w1 = watched.resolve(device, pbase, kView, copy);
     const std::uint64_t va_w2 = watched.resolve(device, pbase + kView, kView, copy);
     check(va_w1 != 0 && va_w2 != 0 && watched.live_views() == 2 && watched.block_count() == 1 &&
@@ -322,7 +327,8 @@ int main() {
     check(g_live_buffers == 0 && g_live_allocs == 0, "watched teardown frees its block");
 
     // 10. Spare 4 MiB block: retiring and reaping the sole view keeps the block empty and the next view reuses it.
-    rt::d3d12::GeometryViews spare(6 * kView);
+    const auto spare_owner = std::make_unique<rt::d3d12::GeometryViews>(6 * kView);
+    auto& spare = *spare_owner;
     const std::uint64_t va_s1 = spare.resolve(device, pbase, kView, copy);
     const int allocs_after_first = g_total_allocs;
     check(va_s1 != 0 && spare.block_count() == 1 && spare.empty_blocks() == 0 && spare.reserved() == 4 * kView &&
@@ -350,7 +356,9 @@ int main() {
     spare.release(device);
     check(g_live_buffers == 0 && g_live_allocs == 0, "spare teardown frees its block");
 
-    rt::d3d12::GeometryViews tight(9 * kView);
+    const auto tight_owner = std::make_unique<rt::d3d12::GeometryViews>(9 * kView);
+
+    auto& tight = *tight_owner;
     const std::uint64_t va_t1 = tight.resolve(device, pbase, 3 * kView, copy);
     const std::uint64_t va_t2 = tight.resolve(device, pbase + 3 * kView, 2 * kView, copy);
     check(va_t1 != 0 && va_t2 != 0 && tight.block_count() == 2 && tight.reserved() == 8 * kView,
@@ -380,8 +388,10 @@ int main() {
     const auto shbase = reinterpret_cast<std::uintptr_t>(shared_title);
 
     {
-        rt::d3d12::GeometryViews dev_a(2 * kView);
-        rt::d3d12::GeometryViews dev_b(2 * kView);
+        const auto dev_a_owner = std::make_unique<rt::d3d12::GeometryViews>(2 * kView);
+        auto& dev_a = *dev_a_owner;
+        const auto dev_b_owner = std::make_unique<rt::d3d12::GeometryViews>(2 * kView);
+        auto& dev_b = *dev_b_owner;
         const std::uint64_t va_a1 = dev_a.resolve(device, shbase, kView, copy);
         const std::uint64_t va_b1 = dev_b.resolve(device, shbase, kView, copy);
         check(va_a1 != 0 && va_b1 != 0 && dev_a.live_views() == 1 && dev_b.live_views() == 1 &&
@@ -405,7 +415,8 @@ int main() {
         check(va_keep != 0 && dev_a.live_views() == 1 && dev_a.bytes() == kView,
               "surviving instance resolves a second range");
         {
-            rt::d3d12::GeometryViews ephemeral(2 * kView);
+            const auto ephemeral_owner = std::make_unique<rt::d3d12::GeometryViews>(2 * kView);
+            auto& ephemeral = *ephemeral_owner;
             const std::uint64_t va_eph = ephemeral.resolve(device, shbase + kView, kView, copy);
             check(va_eph != 0 && ephemeral.live_views() == 1, "scoped instance resolves the same range");
             ephemeral.release(device);
