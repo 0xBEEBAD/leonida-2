@@ -1821,6 +1821,159 @@ fit on smaller PC GPUs. This is a product requirement, not something the layer c
 compatible single-mip RGBA8 2D textures (section 4.2). Other descriptions have fully allocated backing. Wider
 texture coverage and the game's use of tile streaming remain open.
 
+#### Address guard (`LEONIDA_ADDRESS_GUARD=1`, `rdna2spirv.py --address-guard`)
+
+**Prototype, off by default.**
+
+**Why.** The layer rewrites the addresses it can see: root views, the V#s it writes, and the V#s the title writes into
+shader-visible heaps. It writes an empty V# when nothing backs an address (above). The translator checks a V#'s
+record count but not its base. Any other address becomes `heap_base` plus an arbitrary value:
+- a V# a shader builds in SGPRs from data;
+- a raw `global_`/`flat_` address (530 of the 26,503 shaders of package 1.0.2.1, 69 of the 2,684 pipeline-library
+  programs);
+- a stale or offset-like value.
+
+On RADV such an access page-faults. Two RX 7900 XTX runs (Mesa 26.3.1, under Wine) ended with the same sequence:
+- a `gfxhub` fault from client TCP with PERMISSION_FAULTS 0x3;
+- a compute-ring timeout and "MES failed to respond";
+- a MODE1 reset ("VRAM is lost").
+
+Both faults were 4.8 GiB and 20 GiB above `heap_base`, past the arena's end.
+
+"Inside the arena" is not the right bound. Several buffers are legitimately outside it, at a positive offset from
+`heap_base` (a negative one with `LEONIDA_IMPORT_BELOW_ARENA=1`):
+- geometry copies;
+- upload and readback buffers;
+- imported title memory;
+- separate window buffers.
+
+The guard checks each access against what the runtime actually backs. An access that fails reads 0 and drops its
+store, so a wild address never reaches the GPU. The overall process follows VIctory
+([`crates/victory-gpu/src/memory.rs`](https://github.com/marvisak/victory), GPL-3.0). Its page table of 64 KiB pages
+routes every computed address, and memory no copy holds reads 0 and takes no writes. The structure below is our own:
+VIctory's table names descriptor views, this one is a bitmap over device addresses.
+
+**Structure: a two-level page table of 4 KiB pages over the 48-bit offset space, behind an arena compare.** The
+check works on the heap offset, the sign-extended 48-bit value `Gen.host_addr` adds to `heap_base`:
+- **Level 1:** 65,536 words indexed by offset bits 47..32. Each word names the level-2 block of one 4 GiB chunk.
+- **Level 2:** blocks of 32,768 words, one bit per 4 KiB page (bits 31..12).
+- **Two fixed blocks:** block 0 is empty and block 1 is full; allocated blocks start at 2.
+- **Size:** the table is a host-visible buffer of its own, 256 KiB plus 128 KiB per block (8.25 MiB for 62 blocks).
+
+Why this structure:
+- **Pages of 4 KiB** are the GPU's own mapping granularity. A page any byte of a backing touches is mapped as a whole,
+  so marking pages outward is exact for faults. A 64 KiB page would mark memory that may not be mapped.
+- **Level 1 by 4 GiB chunk** covers the whole signed 48-bit space (negative offsets index from 0x8000 up). A real run
+  touches a handful of chunks, so the table stays small.
+- **Other structures cost more per access.** A sorted range table needs a binary search: about 10 dependent loads for
+  a thousand backings, against 2 here. A coarse region bitmap plus a fine range table needs a search in the fine part.
+- **The arena needs no lookup.** It is one fully bound `VkBuffer`, so any offset below its size passes on a compare.
+  That is the common case: descriptor heaps, default-heap buffers and windows in the arena.
+
+**The header.** It sits at arena offset `0x70000`, after the zero page and the quad indices, and holds:
+- a 64-bit magic (`"LGUARD01"`);
+- the arena's size (the compare's limit);
+- the table's address minus `heap_base`;
+- a refusal count and the last refused offset, which the shaders write.
+
+Two sinks follow the header: `0x71000` (zero area, what refused loads read) and `0x78000` (dump area, where refused
+stores and atomics go). None of `[0x70000, 0x80000)` is handed out. With `LEONIDA_ARENA_NULL_MB` the range lies in the
+null region, so its offset never moves. `runtime/src/address_guard.h` and `tools/address_guard.py` (the Python
+reference) hold the format.
+
+**Each access.** `Gen.host_addr` takes the access kind (load, store or atomic) and its span. Under `--address-guard`
+it calls one function per module, `%guard_fn`, which is straight-line at the call site, so no caller's block
+structure changes. The function computes `end = offset + span - 1` and then decides:
+- **Passes on a compare:** the runtime's guard is off (no magic), or `offset` and `end` are both below the limit. The
+  result is `heap_base + offset`. The cost is a 64-bit add, two 64-bit compares and a select.
+- **Otherwise, a lookup:** the bits of the pages of `offset` and of `end`. That is two independent pairs of dependent
+  32-bit loads (level 1, then level 2).
+- **Refused:** an access whose bits are not both set adds 1 to the header's count, writes its offset, and goes to the
+  zero area (a load) or the dump area (a store or atomic), at its offset within its page. Alignment is kept, and every
+  span fits inside a sink.
+- **Atomics** run on the dump area, and their returned value is replaced by 0 (`Gen.guard_zero`). The CAS loops (float
+  min/max, inc/dec) end there too, as on any other memory.
+
+The entry block reads the header's first six dwords once per invocation, from the arena, so that read is always
+backed. When the base is uniform, as for `s_load`, `s_buffer_load` and a V# from SGPRs plus a uniform offset, the
+compiler keeps the whole check scalar: one check per instruction, not per lane. A per-lane address (`global_` with a
+VGPR address, `offen`/`idxen`) is checked per lane, and the slow path runs only for lanes outside the arena.
+
+**What is checked.** Every `heap_base` access goes through `host_addr`:
+- buffer loads and stores (dword, sub-dword, typed, format; swizzled spans are computed at run time);
+- `global_` loads, stores, sub-dword and atomics;
+- buffer atomics, `_x2` included;
+- `s_load` and `s_buffer_load`;
+- the BVH node reads of `image_bvh*_intersect_ray` (span by node type).
+
+These are not checked:
+- images (T#s go through the hash table, not an address);
+- LDS;
+- the `--mesh-compute` output buffer (a runtime address);
+- `s_getpc` code reads.
+
+The translator does not translate `flat_` instructions (they raise `Unsupported`), so none reaches memory today. A
+translation added later must go through `host_addr` like `global_` does.
+
+**Keeping the table current.** The spans are the same backings the console heap pass's backed table uses
+(`update_gpu_backed`):
+- every `gpu_backings` entry outside the arena (upload and readback buffers, imports, slot-133 buffers, windows
+  outside the arena);
+- the geometry copies' blocks;
+- the separate window buffers' blocks.
+
+`update_address_guard` runs in the queue's `before_execute`, after the heap refresh, the windows and the geometry
+copies. It differs from that table in four ways:
+- It rebuilds whenever `backing_generation` or a block layout changed, with no 100 ms limit, because a backing made
+  since the last submission must not read 0.
+- It writes only the words that changed, level 2 before level 1.
+- A chunk keeps its block for good, so a submission still in flight never reads a block that now means another chunk.
+- When the 62 blocks run out, a new chunk gets the full block (unchecked, as without the guard), and that is logged.
+
+A release clears its bits at the next submission. D3D12 forbids releasing memory the GPU still uses, so only a wild
+access in flight at that moment could still pass.
+
+**Cost per access:**
+- **Fast path:** about 8 scalar or vector ALU operations.
+- **Outside the arena:** about 40 operations and 4 loads, from a table small enough to stay in cache.
+- **Per invocation:** 6 uniform header loads.
+- **Per submission (runtime):** nothing until a backing changes, then a rebuild of the used blocks (128 KiB each)
+  and a diff.
+
+**Switches.**
+- `--address-guard` records `"address_guard": true` in `index.json`.
+- `LEONIDA_ADDRESS_GUARD=1` makes the runtime reserve the range, create the table and write the header.
+- Either alone does nothing: a guarded module on a runtime without the guard finds no magic, and every access passes
+  after one compare.
+- Without the flag the module is byte for byte what it was.
+
+**What a run with the guard shows.**
+- One line when the device is made: `[rt] d3d12: address guard on ...`.
+- At most one line a second: `[rt] d3d12: address guard: N access(es) refused so far (+k), the last at heap offset
+  0x...`. Each refusal is a wild access that would have reached the GPU. The offset says where to look (above the
+  arena's end, as in the two faults).
+- A run that reset the GPU before should keep going, with wrong pixels where a refused access mattered.
+
+**Risks and open points.**
+- A refused access that mattered (a backing the layer never registered) now reads 0 instead of faulting. That is
+  silent apart from the count.
+- An access is checked as a whole. A multi-dword load whose first dwords are inside a V# and a backing, but whose
+  last dword is past both on an unbacked page, reads 0 in full.
+- The table is read through the GPU's caches. A page whose bit changes while a submission is in flight can be seen
+  either way by that submission.
+- Sparse buffers outside the arena are guarded only if they are registered as backings.
+
+**Checked:**
+- `tests/semantic/test_address_guard.py`: the fixture `cs_address_guard` with the guard on, with it off at run time
+  and without the flag, through `spirv_mini_interp`; the kind and span of each instruction family; the table model;
+  the constants shared by the translator, the runtime and `tools/address_guard.py`.
+- `runtime/test/address_guard_test.cpp`: the page table, incremental writes, negative offsets, wrap, chunks and
+  overflow.
+- `scripts/run_address_guard_gpu_test.py`: the fixture on a 2 MiB heap whose table backs one page outside the
+  "arena". Every address it touches is inside the buffer, so no run can fault. With the guard on, the refused loads
+  read 0 although memory is there, the store and the atomic land in the dump area and the count is 6. With the guard
+  off, the same module reads that memory. It passed on lavapipe (Mesa 26.3.1).
+
 ### 3.4 Descriptor heaps and the bindless model
 
 The game can use D3D12 descriptors in three ways, and the layer must handle all of them:

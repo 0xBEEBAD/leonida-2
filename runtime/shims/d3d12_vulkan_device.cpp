@@ -32,6 +32,7 @@
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
 #include "../src/value_write_sink.h"
+#include "../src/address_guard.h"
 #include "../src/arena_blocks.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -128,6 +129,8 @@ constexpr VkDeviceSize kZeroPage = 64 * 1024;  // zeroed: what unbound vertex an
 constexpr auto kQuadIndicesPerQuad = std::uint32_t(leonida::quad_triangle_indices.size());
 constexpr std::uint32_t kQuadIndexCount = 16 * 1024 * kQuadIndicesPerQuad;
 constexpr VkDeviceSize kArenaReserved = kZeroPage + VkDeviceSize(kQuadIndexCount) * sizeof(std::uint32_t);
+// LEONIDA_ADDRESS_GUARD's header and sinks follow the quad indices (src/address_guard.h).
+static_assert(kArenaReserved <= leonida::address_guard::kGuardHeader);
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 // pipeline_cache_store.h reads this layout without vulkan.h (D3D-704); remember the two.
 static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == leonida::pipeline_cache_store::header_bytes);
@@ -158,6 +161,18 @@ enum class TitleImageOrigin { ordinary, placed, streamed, pending_stream };
 
 void log_once(const char* what, int value) {
     if (first_diagnostic(what, value)) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+}
+
+// LEONIDA_ADDRESS_GUARD=1: the address guard (docs/d3d12_vulkan.md, "Address guard"). The arena keeps its guard
+// header and sinks at heap_base + 0x70000..0x80000 and a page table of every backing outside it is kept current
+// before each submission, so shaders translated with `rdna2spirv.py --address-guard` read 0 from, and drop stores
+// to, an address nothing backs. Without it those shaders find no header and check nothing.
+bool address_guard_enabled() {
+    static const bool on = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"LEONIDA_ADDRESS_GUARD", value, 2) == 1 && value[0] == L'1';
+    }();
+    return on;
 }
 
 // Matches the offset interpretation of the selected shader pack.
@@ -5447,6 +5462,129 @@ struct DeviceState {
             ++gpu_counts.backed_cuts;
         }
         gpu_counts.backed_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+
+    // LEONIDA_ADDRESS_GUARD=1 (docs/d3d12_vulkan.md, "Address guard"): the page table the guarded shaders read, a
+    // host-visible buffer of its own whose address minus heap_base is in the guard header at arena offset
+    // kGuardHeader. Built from the same backings as the console heap pass's backed table (gpu_backings, the
+    // geometry copies' blocks and the separate window buffers), but whole and at once: a backing made since the last
+    // submission must not read 0.
+    struct AddressGuard {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint32_t* words = nullptr;
+        std::unique_ptr<leonida::address_guard::AddressGuardTable> table;
+        std::uint64_t generation = ~0ull, blocks = ~0ull;
+        std::uint32_t refused_logged = 0, overflow_logged = 0;
+        std::uint64_t updates = 0, words_written = 0;
+        std::chrono::steady_clock::time_point logged{};
+        std::mutex mutex;
+    } guard;
+
+    // Make the page table and write the header (called once the arena is mapped). False leaves the guard off: the
+    // header keeps no magic, so guarded shaders check nothing.
+    bool create_address_guard() {
+        namespace ag = leonida::address_guard;
+        if (!context || !arena.mapped || arena.size < ag::kGuardEnd) return false;
+        auto& vk = context->vk;
+        guard.table = std::make_unique<ag::AddressGuardTable>();
+        VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        create.size = guard.table->bytes();
+        create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vk.vkCreateBuffer(info.device, &create, nullptr, &guard.buffer) != VK_SUCCESS) {
+            guard.buffer = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(info.device, guard.buffer, &requirements);
+        guard.memory = allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true);
+        void* mapped = nullptr;
+        if (!guard.memory || vk.vkBindBufferMemory(info.device, guard.buffer, guard.memory, 0) != VK_SUCCESS ||
+            vk.vkMapMemory(info.device, guard.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+            destroy_address_guard();
+            return false;
+        }
+        guard.words = static_cast<std::uint32_t*>(mapped);
+        std::memcpy(guard.words, guard.table->words().data(), guard.table->bytes());
+        VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        address.buffer = guard.buffer;
+        const VkDeviceAddress table = vk.vkGetBufferDeviceAddress(info.device, &address);
+        auto* header = reinterpret_cast<ag::AddressGuardHeader*>(arena.mapped + ag::kGuardHeader);
+        std::memset(arena.mapped + ag::kGuardHeader, 0, std::size_t(ag::kGuardEnd - ag::kGuardHeader));
+        header->limit = arena.size;
+        header->table = table - arena.address;
+        std::atomic_thread_fence(std::memory_order_release);
+        header->magic = ag::magic();  // last: a shader that sees it sees the rest
+        std::fprintf(stderr, "[rt] d3d12: address guard on (LEONIDA_ADDRESS_GUARD): %llu KiB page table, header at "
+                             "heap_base + 0x%llx; shaders translated with --address-guard read 0 from memory nothing "
+                             "backs and drop their stores there\n",
+                     static_cast<unsigned long long>(guard.table->bytes() >> 10),
+                     static_cast<unsigned long long>(ag::kGuardHeader));
+        return true;
+    }
+    void destroy_address_guard() {
+        if (!context) return;
+        auto& vk = context->vk;
+        if (guard.buffer) vk.vkDestroyBuffer(info.device, guard.buffer, nullptr);
+        if (guard.memory) vk.vkFreeMemory(info.device, guard.memory, nullptr);
+        guard.buffer = VK_NULL_HANDLE;
+        guard.memory = VK_NULL_HANDLE;
+        guard.words = nullptr;
+    }
+
+    // Before each submission: the page table says exactly what is backed now, and refusals since the last line are
+    // logged (at most once a second). Rebuilt only when a backing came or went; only changed words are written.
+    void update_address_guard() {
+        namespace ag = leonida::address_guard;
+        if (!guard.words) return;
+        std::lock_guard lock(guard.mutex);
+        const std::uint64_t generation = backing_generation.load(std::memory_order_relaxed);
+        const std::uint64_t blocks = geometry.pool().layout_generation() + external_windows.layout_generation();
+        if (generation != guard.generation || blocks != guard.blocks) {
+            guard.generation = generation;
+            guard.blocks = blocks;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+            {
+                std::lock_guard backing_lock(backing_mutex);
+                gpu_backings.for_each([&](std::uint64_t va, std::uint64_t bytes) {
+                    const std::uint64_t offset = va - arena.address;
+                    // The arena's own ranges pass on the limit compare; only what lies outside needs pages.
+                    if (bytes && !(offset < arena.size && bytes <= arena.size - offset))
+                        spans.emplace_back(offset, offset + bytes);
+                });
+            }
+            const auto block = [&](VkDeviceAddress address, VkDeviceSize bytes) {
+                const std::uint64_t offset = address - arena.address;
+                if (address && bytes) spans.emplace_back(offset, offset + bytes);
+            };
+            geometry.pool().for_each_block(block);
+            external_windows.for_each_block(block);
+            guard.words_written += guard.table->assign(spans, [&](std::size_t i, std::uint32_t v) {
+                std::atomic_ref(guard.words[i]).store(v, std::memory_order_relaxed);
+            });
+            ++guard.updates;
+            if (guard.table->overflowed() != guard.overflow_logged) {
+                guard.overflow_logged = guard.table->overflowed();
+                std::fprintf(stderr, "[rt] d3d12: address guard: %u 4 GiB chunk(s) of backings past the page table's "
+                                     "%u blocks are not checked\n",
+                             guard.overflow_logged, guard.table->blocks_used());
+            }
+        }
+        auto* header = reinterpret_cast<ag::AddressGuardHeader*>(arena.mapped + ag::kGuardHeader);
+        const std::uint32_t refused = std::atomic_ref(header->refused).load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        if (refused != guard.refused_logged && now - guard.logged >= std::chrono::seconds(1)) {
+            guard.logged = now;
+            std::fprintf(stderr, "[rt] d3d12: address guard: %u access(es) refused so far (+%u), the last at heap "
+                                 "offset 0x%llx; %llu table update(s), %llu word(s) written\n",
+                         refused, refused - guard.refused_logged,
+                         static_cast<unsigned long long>(header->last_refused),
+                         static_cast<unsigned long long>(guard.updates),
+                         static_cast<unsigned long long>(guard.words_written));
+            guard.refused_logged = refused;
+        }
     }
 
     // The ask table: the title's memory and both addresses of its GPU-window pairs. A V# base outside them that the
@@ -13789,6 +13927,8 @@ public:
                 const phases::Scope timed(phases::geometry);
                 state_.geometry.refresh(DeviceState::copy_geometry);
             }
+            // Last, once the heap refresh, the windows and the geometry copies have made what this submission reads.
+            state_.update_address_guard();
             const phases::Scope timed(phases::textures);
             if (async_texture_refresh()) {
                 if (!t_in_title_textures) {
@@ -14457,14 +14597,20 @@ public:
             // Under the arena's lock: an insert rebalances the tree and rewrites child links, which a walk on
             // another thread must not see half done.
             std::lock_guard lock(arena.mutex);
-            arena.blocks.reset(null_bytes + kArenaReserved, arena.size);
-            arena.first = null_bytes + kArenaReserved;
+            // LEONIDA_ADDRESS_GUARD: the guard header and sinks at [0x70000, 0x80000) are never handed out either
+            // (inside the null region when there is one, else just past the quad indices).
+            arena.first = std::max<VkDeviceSize>(null_bytes + kArenaReserved,
+                                                 address_guard_enabled() ? leonida::address_guard::kGuardEnd : 0);
+            arena.blocks.reset(arena.first, arena.size);
             char check[2] = {};
             size_t check_length = 0;
             arena.check_all = getenv_s(&check_length, check, "LEONIDA_ARENA_CHECK") == 0 && check_length > 1 &&
                               check[0] != '0';
         }
-        arena.peak_end = null_bytes + kArenaReserved;
+        arena.peak_end = arena.first;
+        if (address_guard_enabled() && !state_.create_address_guard())
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ADDRESS_GUARD=1 but the address guard could not be set up; "
+                                 "guarded shaders check nothing\n");
         char log[4] = {};
         length = 0;
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
@@ -14571,6 +14717,7 @@ public:
             state_.bindless.reset();
         }
         state_.report_arena();
+        state_.destroy_address_guard();
         if (state_.context && state_.arena.buffer) {
             leonida::fsdraw::forget_arena(state_.arena.mapped);
             auto& vk = state_.context->vk;
