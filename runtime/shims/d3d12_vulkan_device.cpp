@@ -3471,6 +3471,45 @@ struct DeviceState {
     static constexpr unsigned kVsharpPathCount = 6;
     std::array<std::atomic<std::uint64_t>, kVsharpPathCount> vsharp_paths{};
 
+    // LEONIDA_UNBACKED_VSHARP=1 (diagnostic): the buffer V#s fix_vsharp writes empty because nothing backs their base.
+    // One line for each of the first 120 distinct bases (span and stride), and every 8192 such V#s a summary by 4 GiB
+    // range of the base, so the address ranges the world's data comes from can be compared with the title memory.
+    static void note_unbacked_vsharp(uint64_t base, uint64_t span, uint32_t stride, const uint32_t* w) {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_UNBACKED_VSHARP");
+            return v && *v == '1';
+        }();
+        if (!on) return;
+        static std::mutex mutex;
+        static std::unordered_map<uint64_t, uint64_t> seen;  // base -> span
+        static std::map<uint64_t, uint64_t> by_range;         // base >> 32 -> distinct bases
+        static uint64_t count = 0;
+        std::lock_guard lock(mutex);
+        ++count;
+        if (seen.emplace(base, span).second) {
+            ++by_range[base >> 32];
+            if (seen.size() <= 120)
+                std::fprintf(stderr,
+                             "[rt] unbacked-vsharp: #%zu base 0x%llx span %llu stride %u words %08x %08x %08x %08x\n",
+                             seen.size(), static_cast<unsigned long long>(base), static_cast<unsigned long long>(span),
+                             stride, w[0], w[1], w[2], w[3]);
+        }
+        if (!(count % 8192)) {
+            std::vector<std::pair<uint64_t, uint64_t>> top;
+            for (const auto& [range, n] : by_range) top.emplace_back(n, range);
+            std::sort(top.rbegin(), top.rend());
+            std::string text;
+            char item[64];
+            for (std::size_t i = 0; i < top.size() && i < 10; ++i) {
+                std::snprintf(item, sizeof(item), "%s0x%llx00000000 x%llu", i ? "; " : "",
+                              static_cast<unsigned long long>(top[i].second), static_cast<unsigned long long>(top[i].first));
+                text += item;
+            }
+            std::fprintf(stderr, "[rt] unbacked-vsharp: %llu empty V#s, %zu distinct bases; by 4 GiB range: %s\n",
+                         static_cast<unsigned long long>(count), seen.size(), text.c_str());
+        }
+    }
+
     VsharpResult fix_vsharp(uint32_t* w, VsharpPath path) {
         if ((w[3] >> 30) || !w[2]) return VsharpResult::unchanged; // image, empty slot or raw pointer
         const uint64_t base = uint64_t(w[0]) | (uint64_t(w[1] & 0xffff) << 32);
@@ -3490,6 +3529,7 @@ struct DeviceState {
                 std::fprintf(stderr, "[rt] d3d12: %s V# at 0x%llx (%llu bytes) has no GPU backing; zero records\n",
                              where, (unsigned long long)base, (unsigned long long)span);
             }
+            note_unbacked_vsharp(base, span, stride, w);
             w[0] = w[1] = w[2] = 0;
             return VsharpResult::empty;
         }
@@ -12923,6 +12963,9 @@ void note_unknown_tsharp(const leonida::gfx10::ImageWords& words, const leonida:
                          "[rt] unknown-tsharp: #%zu base 0x%llx fmt %u type %u sw %u %ux%ux%u mips %u layers %u%s\n",
                          seen.size(), static_cast<unsigned long long>(image.address), s.format, s.type, s.sw, s.width,
                          s.height, s.depth, s.mips, s.layers, title ? " (title memory)" : " (not title memory)");
+        if (seen.size() <= 24)
+            std::fprintf(stderr, "[rt] unknown-tsharp: #%zu words %08x %08x %08x %08x %08x %08x %08x %08x\n", seen.size(),
+                         words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
     }
     if (!(lookups % 8192)) {
         std::vector<std::pair<std::uint64_t, std::string>> top;
