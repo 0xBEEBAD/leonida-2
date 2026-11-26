@@ -75,6 +75,10 @@ A press is logged when the title reads it, so a press the title never reads is n
 turns the `press` lines off. Without `LEONIDA_INPUT_SCRIPT`, the shim serves no devices and answers `E_NOTIMPL` for
 every slot past `Release`, as before.
 
+`LEONIDA_INPUT_FILE=<path>` drives a run whose display takes no keyboard input (a headless session): every line
+appended to that file names one button of the script's table (`a`, `down`, ...) and becomes a press at once, held
+like a scripted one. The file is read again at most every 250 ms. It is for local runs only.
+
 `scripts/build_runtime.ps1` (what `make_game.py` runs) builds the shim only on its CMake path, when Visual Studio's
 C++ CMake tools are installed. Its direct-`cl.exe` fallback compiles a fixed file list without the shim and warns
 about it.

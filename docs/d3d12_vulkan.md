@@ -1834,6 +1834,19 @@ fit on smaller PC GPUs. This is a product requirement, not something the layer c
 compatible single-mip RGBA8 2D textures (section 4.2). Other descriptions have fully allocated backing. Wider
 texture coverage and the game's use of tile streaming remain open.
 
+**Diagnostics for descriptors the title builds itself** (all off by default, logging only unless said otherwise):
+
+- `LEONIDA_UNKNOWN_TSHARP=1`: one line for each distinct base address a title-written T# names with no texture there
+  (its shape, the tiling bits and whether the address is title memory), up to 300 addresses, and every 8192 such
+  lookups a summary by format, type and tiling.
+- `LEONIDA_UNBACKED_VSHARP=1`: the buffer V#s `fix_vsharp` writes empty because nothing backs their base; one line for
+  each of the first 120 distinct bases and every 8192 a summary by 4 GiB range of the base.
+- `LEONIDA_UPLOAD_LOG=1` (`d3d12_xs_device.cpp`): each upload chunk (CPU base, device address, size) and the first 96,
+  then every 8192nd, `AllocateUploadMemory` result as an offset into its chunk.
+- `LEONIDA_UPLOAD_ALIAS=1` (an experiment, changes behaviour): enters each upload chunk's CPU range in the title VA
+  table, so a V# the title wrote with the CPU pointer `AllocateUploadMemory` handed it is rewritten to the chunk
+  instead of left empty. A chunk below the arena needs `LEONIDA_IMPORT_BELOW_ARENA=1` as well.
+
 #### Address guard (`LEONIDA_ADDRESS_GUARD=1`, `rdna2spirv.py --address-guard`)
 
 **Prototype, off by default.**
