@@ -2,9 +2,10 @@
 
 Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
 (BGRA8, RGBA8, BGRX8, RGBX8, R10G10B10A2_UNORM/UINT/TYPELESS, and arbitrary 32-bit RGB/RGBA bitmasks), the
-legacy 24-bit RGB layouts (BGR8/RGB8, e.g. the D3DFMT_R8G8B8 byte order),
-DX10 B5G6R5_UNORM and B5G5R5A1_UNORM, DX10 R8G8_SNORM, DX10 R8G8_UINT and R8G8_SINT,
-and block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
+legacy 24-bit RGB layouts (BGR8/RGB8, e.g. the D3DFMT_R8G8B8 byte order), the DX10 16-bit packed
+B5G6R5_UNORM and B5G5R5A1_UNORM (5- and 6-bit channels widened by bit replication, as for BC1 endpoints),
+the DX10 8-bit R8 and R8G8 formats (UNORM, SNORM, UINT, SINT), the 64-bit R16G16B16A16 UNORM, SNORM and
+FLOAT formats, and block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
 BC7 covers all eight modes. Decoding DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB)
 preserves the stored RGBA8 values. The reserved mode (no mode bit in the first
@@ -20,12 +21,11 @@ and NaN map to 0. The single-channel formats fill red, with green and blue 0 and
 R16G16B16A16_FLOAT keeps its own alpha.
 R16G16B16A16_SNORM (13) maps its signed normalized channels from [-1, 1] to [0, 255],
 with both -32768 and -32767 representing -1.0.
-R11G11B10_FLOAT and R9G9B9E5_SHAREDEXP previews clamp RGB to [0, 1] and use opaque alpha; NaN maps to zero for
-R11G11B10_FLOAT.
-R8G8_SNORM previews map the signed red and green values from [-1, 1] to [0, 255]; blue is zero and alpha is opaque.
-R8G8_UINT previews use their channel bytes directly; R8G8_SINT offsets each signed channel by 128 for display.
-R8_SNORM previews map the signed value range [-1, 1] to [0, 255] in red, with opaque alpha.
-R8_UINT previews preserve the byte value; R8_SINT maps its signed byte range to [0, 255].
+R11G11B10_FLOAT and R9G9B9E5_SHAREDEXP (67, mantissa * 2^(exponent - 24) per channel) previews clamp RGB
+to [0, 1] and use opaque alpha; NaN maps to zero for R11G11B10_FLOAT.
+R8 and R8G8 previews fill red (and green), with blue 0 and alpha 255. SNORM maps [-1, 1] to [0, 255] like
+BC4/BC5 SNORM (-128 and -127 are both -1.0); UINT keeps the byte; SINT adds 128 for display.
+R10G10B10A2_UINT and _TYPELESS are shown like R10G10B10A2_UNORM: each field scaled from its bit width.
 
 Usage:
     python -I tools/dds_png.py <in.dds> --info
