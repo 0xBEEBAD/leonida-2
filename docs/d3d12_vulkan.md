@@ -2590,6 +2590,24 @@ Pipeline creation:
   Replacing part of the previous file would corrupt it.
   `LEONIDA_PIPELINE_CACHE_BYTES` caps what a session adds, at a checkpoint or at teardown (an offline `pipeline_cache.bin` seed, which the driver hands back as part of the union, is not counted; 4 GiB by default, zero disables
   the session file).
+  The session file can't keep a crashed run's compiles: it is written at teardown and at the optional checkpoints
+  below only. The heavy pipeline cache (RT-HEAVY-PIPELINE-CACHE, `runtime/src/heavy_pipeline_cache.h`) keeps the graphics ones; compute pipelines go to the per-pipeline journal
+  described below. Every graphics build first asks the corpus cache with
+  `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`. A pipeline the corpus doesn't have is built against a
+  second cache, seeded from `pipeline_cache.heavy.bin` next to `pipeline_cache.bin`, so that cache holds only the
+  corpus's misses.
+  A build that takes at least `LEONIDA_HEAVY_PIPELINE_CACHE_MS` (500 by default) marks the heavy cache for writing.
+  A thread of its own writes it whole: 3 s after the newest slow build, and no later than 20 s after the first unwritten
+  one, through the same staging file and rename as the session cache. A crash therefore loses at most the last 20 s
+  of slow builds, and the next launch starts with the rest. A write that fails, or whose
+  `vkGetPipelineCacheData` returns anything but `VK_SUCCESS` (`VK_INCOMPLETE` means the cache grew after the size
+  query, so the blob is truncated), leaves the previous file in place and the cache dirty: it is tried again 5 s
+  later, the delay doubling with each failure in a row up to 2 min, so the cache is not left unsaved until teardown
+  and a write that keeps failing does not spin. At device teardown the thread stops, and the cache is
+  written if any build went into it. Fast builds are kept that way: without an offline seed every build is a miss,
+  so they no longer reach `pipeline_cache.session.bin`. `LEONIDA_HEAVY_PIPELINE_CACHE_MS=0` turns the heavy cache off, and with it the
+  `pipelineCreationCacheControl` feature unless `LEONIDA_PIPELINE_COMPILE=cache-only` asks for it. A cache-only create
+  (`cache-only`) is left as it is.
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching
   compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
   It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
