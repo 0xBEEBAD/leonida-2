@@ -12890,6 +12890,54 @@ void DeviceState::drain_titles_gone() {
 // these words, as write_image_descriptor does. Every field the layer does not encode (tiling, compression,
 // performance hints) only makes the key differ, so a title-built T# still finds its texture. Checked against the
 // texture first: a view of mips, layers or a dimension it lacks would be an invalid Vulkan view.
+// LEONIDA_UNKNOWN_TSHARP=1 (diagnostic): one line for each distinct base address a title-written T# names with no
+// texture there (its shape, the tiling bits SW_MODE = dword 3 bits 20..24 by the GFX10 layout, unverified, and whether
+// the address is title memory), up to 300 addresses, and every 8192 such lookups a summary by format, type and tiling.
+// What a texture made from the T# on its first read would have to create.
+void note_unknown_tsharp(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image) {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_UNKNOWN_TSHARP");
+        return v && *v == '1';
+    }();
+    if (!on) return;
+    struct Shape {
+        std::uint32_t format, type, sw, width, height, depth, mips, layers;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Shape> seen;
+    static std::map<std::string, std::uint64_t> by_shape;
+    static std::uint64_t lookups = 0, in_title = 0;
+    const Shape s{image.format, std::uint32_t(image.type), (words[3] >> 20) & 0x1f, image.width, image.height,
+                  image.depth, image.resource_mips, image.layer_count};
+    std::uint64_t lo = 0, hi = 0;
+    const bool title = leonida::title_va_aliases().title_memory(image.address, lo, hi);
+    std::lock_guard lock(mutex);
+    ++lookups;
+    if (seen.emplace(image.address, s).second) {
+        in_title += title;
+        char key[64];
+        std::snprintf(key, sizeof(key), "fmt %u type %u sw %u", s.format, s.type, s.sw);
+        ++by_shape[key];
+        if (seen.size() <= 300)
+            std::fprintf(stderr,
+                         "[rt] unknown-tsharp: #%zu base 0x%llx fmt %u type %u sw %u %ux%ux%u mips %u layers %u%s\n",
+                         seen.size(), static_cast<unsigned long long>(image.address), s.format, s.type, s.sw, s.width,
+                         s.height, s.depth, s.mips, s.layers, title ? " (title memory)" : " (not title memory)");
+    }
+    if (!(lookups % 8192)) {
+        std::vector<std::pair<std::uint64_t, std::string>> top;
+        for (const auto& [k, n] : by_shape) top.emplace_back(n, k);
+        std::sort(top.rbegin(), top.rend());
+        std::string text;
+        for (std::size_t i = 0; i < top.size() && i < 10; ++i)
+            text += (i ? "; " : "") + top[i].second + " x" + std::to_string(top[i].first);
+        std::fprintf(stderr,
+                     "[rt] unknown-tsharp: %llu lookups, %zu distinct addresses (%llu in title memory); by shape: %s\n",
+                     static_cast<unsigned long long>(lookups), seen.size(), static_cast<unsigned long long>(in_title),
+                     text.c_str());
+    }
+}
+
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why) {
     namespace g = leonida::gfx10;
     const auto refuse = [why](const char* reason) {
@@ -12923,6 +12971,7 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         }
         if (!owner) {
             if (why) *why = "no texture at T# address";
+            note_unknown_tsharp(words, image);
             return TitleImage::unknown;
         }
         const Resource& r = *owner;
