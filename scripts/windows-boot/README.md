@@ -73,7 +73,14 @@ states only, which is what goes into a RESULT on the board; the logs, traces, ca
 and stay on your machine ([AGENTS.md](../../AGENTS.md), "No game data").
 
 How to read the states: game state goes 1, 2 (init), 3 (running); session state goes 0, 1, 3 (landing
-screen waiting for A), `d` after A. `docs/linux_proton.md` (the same stages apply natively)
+screen waiting for A), `d` after A.
+
+**Changed: the states need two variables now.** The script used to set `LEONIDA_PEEK` to the game-state and
+session-state RVAs by default. Those addresses of the retail executable are no longer kept in the repository, so set
+`LEONIDA_GAME_STATE_RVA` and `LEONIDA_SESSION_STATE_RVA` (hex, measured locally) in the shell before the boot.
+Without them the script warns, sets no `LEONIDA_PEEK`, and the `states:` line and the RESULT show `game=?
+session=?`. A `LEONIDA_PEEK` of your own still works for the log, but the digest reads only the two RVAs those
+variables name. `docs/linux_proton.md` (the same stages apply natively)
 section 2 has the healthy sequence with times and section 3 "which blank do you have".
 
 ## One game at a time

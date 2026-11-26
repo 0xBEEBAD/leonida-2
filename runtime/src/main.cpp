@@ -44,10 +44,11 @@ namespace {
 // one-second ticks, it calls a crash callback and then writes to address 0 (`movl $0, 0`). Under the runtime the
 // game thread can legitimately stall for longer than that, e.g. while the driver compiles pipelines against a cold
 // cache (first boot after a driver update), and the title then kills itself. By default the watchdog stays armed, as
-// on the console. The two places are measured locally and not kept in the repository:
-// LEONIDA_TITLE_WATCHDOG_KICK="<trap RVA>,<kick RVA>" (hex) names them, and only when that exact trap instruction
-// sits at the first one does a runtime thread set the byte at the second twice a second, so the title's watchdog
-// never fires. Unset, or with LEONIDA_TITLE_WATCHDOG=1, the watchdog stays armed.
+// on the console. LEONIDA_TITLE_WATCHDOG=0 asks to keep it from firing, as before. The two places that takes are
+// measured locally and not kept in the repository: LEONIDA_TITLE_WATCHDOG_KICK="<trap RVA>,<kick RVA>" (hex) names
+// them, and only with both variables, and only when that exact trap instruction sits at the first RVA, does a
+// runtime thread set the byte at the second twice a second, so the title's watchdog never fires. Either variable
+// alone leaves the watchdog armed and says so once.
 constexpr unsigned char kWatchdogTrap[] = {0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0};  // movl $0, 0x0
 
 bool watchdog_rvas(std::uint32_t& trap_rva, std::uint32_t& kick_rva) {
@@ -66,13 +67,18 @@ bool watchdog_rvas(std::uint32_t& trap_rva, std::uint32_t& kick_rva) {
 
 void keep_title_watchdog_kicked(std::uint8_t* base) {
     char keep[4]{};
-    const DWORD keep_length = GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG", keep, sizeof(keep));
-    if (keep_length == 1 && keep[0] == '1') return;
+    const bool disarm = GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG", keep, sizeof(keep)) == 1 && keep[0] == '0';
     std::uint32_t kWatchdogTrapRva = 0, kWatchdogKickRva = 0;
-    if (!watchdog_rvas(kWatchdogTrapRva, kWatchdogKickRva)) {
-        if (keep_length == 1 && keep[0] == '0')
-            std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_WATCHDOG=0 needs LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,"
-                                 "<kick RVA> (hex); the title's hang watchdog stays armed\n");
+    const bool named = watchdog_rvas(kWatchdogTrapRva, kWatchdogKickRva);
+    if (!disarm) {
+        if (named)
+            std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_WATCHDOG_KICK is set but LEONIDA_TITLE_WATCHDOG is not 0;"
+                                 " the title's hang watchdog stays armed\n");
+        return;
+    }
+    if (!named) {
+        std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_WATCHDOG=0 needs LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,"
+                             "<kick RVA> (hex); the title's hang watchdog stays armed\n");
         return;
     }
     MEMORY_BASIC_INFORMATION trap{}, kick{};
@@ -96,7 +102,7 @@ void keep_title_watchdog_kicked(std::uint8_t* base) {
         const_cast<std::uint8_t*>(byte), 0, nullptr);
     if (thread) {
         CloseHandle(thread);
-        std::fprintf(stderr, "[rt] loader: keeping the title's hang watchdog kicked (LEONIDA_TITLE_WATCHDOG_KICK)\n");
+        std::fprintf(stderr, "[rt] loader: keeping the title's hang watchdog kicked (LEONIDA_TITLE_WATCHDOG=0; unset or 1 keeps it armed)\n");
     }
 }
 

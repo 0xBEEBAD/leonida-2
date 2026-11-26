@@ -247,6 +247,11 @@ if ($InputScript) { $defaults["LEONIDA_KEYBOARD_PAD"] = "always" }
 $gameStateRva = "$env:LEONIDA_GAME_STATE_RVA".ToLowerInvariant() -replace '^0x', ''
 $sessionStateRva = "$env:LEONIDA_SESSION_STATE_RVA".ToLowerInvariant() -replace '^0x', ''
 if ($gameStateRva -and $sessionStateRva) { $defaults["LEONIDA_PEEK"] = "0x$gameStateRva,0x$sessionStateRva" }
+else {
+    # The two RVAs were built in until they were taken out of the repository; say so rather than report "?" silently.
+    Write-Warning ("LEONIDA_GAME_STATE_RVA and LEONIDA_SESSION_STATE_RVA are not both set: no LEONIDA_PEEK by default, " +
+                   "so the RESULT game and session states read '?' (scripts/windows-boot/README.md)")
+}
 # Per-run values: always this script's (from its parameters), whatever the shell has.
 $perRun = [ordered]@{
     LEONIDA_CAPTURE      = $(if ($NoCapture) { "" } else { $Capture })
