@@ -2891,6 +2891,24 @@ UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
         chunk->resource = resource;
         chunk->cpu_base = static_cast<std::uint8_t*>(cpu);
         chunk->gpu_base = resource->GetGPUVirtualAddress();
+        // LEONIDA_UPLOAD_ALIAS=1 (experiment): the title takes the pointer AllocateUploadMemory hands it for a GPU
+        // address too (the console's memory is unified) and writes it into the descriptors it builds itself. Entered in
+        // the title VA table, the chunk's CPU range answers with the chunk's console VA (its device address minus
+        // heap_base), so a V# the title wrote with such a pointer is rewritten to the chunk instead of left empty. A
+        // chunk below the arena has a negative console VA, usable in a V# only with LEONIDA_IMPORT_BELOW_ARENA=1.
+        static const bool alias = [] {
+            const char* v = std::getenv("LEONIDA_UPLOAD_ALIAS");
+            return v && *v == '1';
+        }();
+        if (alias) {
+            const bool added = leonida::title_va_aliases().add(reinterpret_cast<std::uint64_t>(chunk->cpu_base),
+                                                               chunk->size, chunk->gpu_base);
+            std::fprintf(stderr, "[rt] d3d12_xs: upload chunk 0x%llx (%llu bytes) entered as an alias of console VA "
+                                 "0x%llx: %s\n",
+                         static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(chunk->cpu_base)),
+                         static_cast<unsigned long long>(chunk->size), static_cast<unsigned long long>(chunk->gpu_base),
+                         added ? "ok" : "refused");
+        }
         return chunk;
     }
     if (resource) resource->Release();
@@ -2984,6 +3002,9 @@ void destroy_upload_state(void* upload_state) {
     for (UploadChunk* chunk = arena->chunks; chunk;) {
         UploadChunk* next = chunk->next;
         if (chunk->resource) {
+            const char* alias = std::getenv("LEONIDA_UPLOAD_ALIAS");
+            if (alias && *alias == '1')
+                leonida::title_va_aliases().remove(reinterpret_cast<std::uint64_t>(chunk->cpu_base), chunk->gpu_base);
             chunk->resource->Unmap(0, nullptr);
             chunk->resource->Release();
         } else {
