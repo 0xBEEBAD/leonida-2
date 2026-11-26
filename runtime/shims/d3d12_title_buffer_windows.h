@@ -1,6 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <utility>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -36,18 +39,55 @@ class TitleBufferWindows {
     bool failed_ = false;
     bool local_refused_ = false;  // device-local blocks refused once: host memory from then on
     std::uint64_t quick_refusals_ = 0;
+    // The blocks' (device address, capacity), readable without the owner's lock: published in order, never removed
+    // before release().
+    static constexpr std::size_t kPublished = 4096;
+    struct Published {
+        VkDeviceAddress address;
+        VkDeviceSize capacity;
+        std::uint8_t* mapped;
+        VkBuffer buffer;
+    };
+    std::array<Published, kPublished> published_{};
+    std::atomic<std::size_t> published_count_{0};
 
     template<class Device>
     void destroy_block(Device& d, std::vector<Block>::iterator it) {
         d.context->vk.vkUnmapMemory(d.info.device, it->memory);
         d.context->vk.vkDestroyBuffer(d.info.device, it->buffer, nullptr);
         d.context->vk.vkFreeMemory(d.info.device, it->memory, nullptr);
+        // Unpublish the block so for_each_block/find_mapped stop naming it.
+        for (std::size_t i = 0, n = published_count_.load(std::memory_order_relaxed); i < n; ++i)
+            if (published_[i].buffer == it->buffer) {
+                published_[i] = {};
+                break;
+            }
         reserved_ -= it->reserved_bytes;
         blocks_.erase(it);
     }
 
 public:
     VkDeviceSize reserved() const { return reserved_; }
+    // f(device address, capacity) for each block made so far; from any thread.
+    template <class F>
+    void for_each_block(F&& f) const {
+        const std::size_t n = published_count_.load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < n; ++i) f(published_[i].address, published_[i].capacity);
+    }
+    // The block whose mapping holds [p, p + bytes): its buffer and the offset of p in it. From any thread.
+    bool find_mapped(const std::uint8_t* p, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset) const {
+        const std::size_t n = published_count_.load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < n; ++i) {
+            const Published& b = published_[i];
+            if (p >= b.mapped && p - b.mapped < std::ptrdiff_t(b.capacity) &&
+                bytes <= std::size_t(b.capacity) - std::size_t(p - b.mapped)) {
+                buffer = b.buffer;
+                offset = VkDeviceSize(p - b.mapped);
+                return true;
+            }
+        }
+        return false;
+    }
     std::size_t block_count() const { return blocks_.size(); }
     std::size_t empty_blocks() const {
         std::size_t count = 0;
@@ -156,6 +196,10 @@ public:
                 b.mapped = static_cast<std::uint8_t*>(host);
                 b.reserved_bytes = req.size;
                 b.free_ranges.emplace(0, b.capacity);
+                if (const std::size_t n = published_count_.load(std::memory_order_relaxed); n < kPublished) {
+                    published_[n] = {b.address, b.capacity, b.mapped, b.buffer};
+                    published_count_.store(n + 1, std::memory_order_release);
+                }
                 blocks_.push_back(std::move(b));
                 reserved_ += req.size;
                 if (blocks_.size() == 1 || !(blocks_.size() & (blocks_.size() - 1)))
@@ -237,6 +281,7 @@ public:
             d.context->vk.vkFreeMemory(d.info.device, b.memory, nullptr);
         }
         blocks_.clear();
+        published_count_.store(0, std::memory_order_release);
         reserved_ = 0;
     }
 };
