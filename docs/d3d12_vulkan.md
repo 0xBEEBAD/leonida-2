@@ -1973,6 +1973,12 @@ access in flight at that moment could still pass.
   "arena". Every address it touches is inside the buffer, so no run can fault. With the guard on, the refused loads
   read 0 although memory is there, the store and the atomic land in the dump area and the count is 6. With the guard
   off, the same module reads that memory. It passed on lavapipe (Mesa 26.3.1).
+- Corpus (package 1.0.2.1, 2026-11-26):
+  - `--shard 0/8` of the shaders: 3,313 translated and 3,313 `spirv-val`-valid, with the guard and without.
+  - The pipeline library: 2,683 of 2,684 translated and valid, with the guard and without (the same one fails
+    either way).
+  - Without the flag, every module is byte for byte the same as before the change.
+  - With it, the SPIR-V grows by 1.8% (shaders) and 1.6% (library).
 
 ### 3.4 Descriptor heaps and the bindless model
 
