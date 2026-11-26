@@ -5107,6 +5107,40 @@ int check_console_null_barrier_and_clear() {
     EXPECT(real->calls[48] == 5 && real->args[48][0] == rtv_copy + kMockDescriptorInc);
     EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
 
+    // Releasing an RTV heap drops the marks in its real range, so a heap made later at the same address starts
+    // unmarked; a mark outside that range stays.
+    g_heap_hook.next_ptr = nullptr;  // a plain PC heap even if a descriptor-heap hook is registered: real handles
+    D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{};
+    rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtv_heap_desc.NumDescriptors = 4;
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    void* rtv_heap = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&rtv_heap_desc), word(&heap_iid), word(&rtv_heap)))));
+    EXPECT(rtv_heap && xs::is_heap_proxy(rtv_heap) && raw(rtv_heap, 9) == kMockHeapCpuStart);
+    const SIZE_T in_heap = kMockHeapCpuStart + 2 * kMockDescriptorInc;
+    raw(device, 20, 0, 0, in_heap);
+    const unsigned clears = real->calls[48];
+    raw(list, 52, in_heap, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears);  // marked while the heap lives: skipped
+    EXPECT(raw(rtv_heap, 2) == 0);
+    raw(list, 52, in_heap, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears + 1 && real->args[48][0] == in_heap);  // the mark went with the heap
+    real->list_error = false;  // the mock list still takes its own view there as invalid
+    raw(list, 52, rtv_none, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears + 1);  // outside the released heap: still skipped
+    // A second RTV heap at the same address: the view made there with a resource is cleared, and a view made with
+    // no resource is marked again for as long as that heap lives.
+    void* rtv_heap2 = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&rtv_heap_desc), word(&heap_iid), word(&rtv_heap2)))));
+    raw(device, 20, word(resource_a), 0, in_heap);
+    raw(list, 52, in_heap, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears + 2 && !real->list_error);
+    raw(device, 20, 0, 0, in_heap);
+    raw(list, 52, in_heap, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears + 2);
+    EXPECT(raw(rtv_heap2, 2) == 0);
+    EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
+
     // The marks are the device's own: another device's clear at a handle marked on the first is forwarded (its mock
     // list then takes the view as invalid, which is what that device was told).
     Mock* other_mock = nullptr;

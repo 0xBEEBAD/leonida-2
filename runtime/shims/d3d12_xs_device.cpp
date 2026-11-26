@@ -203,6 +203,10 @@ struct HeapProxy {
     SIZE_T custom_byte_size;
     SIZE_T real_cpu_start;
     DescriptorHeapBackingFree custom_free;
+    // An RTV heap's real CPU range, [rtv_real_start, +rtv_real_bytes): the null-view marks in it
+    // (DeviceProxy::null_rtvs) are dropped when the heap goes, so a later heap at the same address starts unmarked.
+    SIZE_T rtv_real_start = 0;
+    SIZE_T rtv_real_bytes = 0;
 };
 
 struct DescriptorRange {
@@ -457,6 +461,16 @@ void copy_null_rtv_marks(DeviceProxy* device, UINT num_dest, const D3D12_CPU_DES
         }
     } catch (const std::bad_alloc&) {
     }
+    device->null_rtv_count.store(device->null_rtvs.size(), std::memory_order_release);
+}
+
+// An RTV heap was released: its real handles can name another heap's views from now on, so no mark may outlive it.
+void drop_null_rtv_marks(DeviceProxy* device, SIZE_T start, SIZE_T bytes) {
+    if (!device || !start || !bytes || device->null_rtv_count.load(std::memory_order_acquire) == 0) return;
+    const SIZE_T end = start > (std::numeric_limits<SIZE_T>::max)() - bytes ? (std::numeric_limits<SIZE_T>::max)()
+                                                                             : start + bytes;
+    std::lock_guard lock(device->null_rtv_lock);
+    device->null_rtvs.erase(device->null_rtvs.lower_bound(start), device->null_rtvs.lower_bound(end));
     device->null_rtv_count.store(device->null_rtvs.size(), std::memory_order_release);
 }
 
@@ -898,6 +912,7 @@ unsigned long heap_release(HeapProxy* self) {
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
         if (self->custom_cpu_start != 0) unregister_descriptor_range(self);
+        drop_null_rtv_marks(self->device, self->rtv_real_start, self->rtv_real_bytes);
         void* const backing = reinterpret_cast<void*>(self->custom_cpu_start);
         const DescriptorHeapBackingFree free_fn = self->custom_free;
         ID3D12DescriptorHeap* real = self->real;
@@ -4714,6 +4729,15 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 
     hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
                            custom_cpu_start ? free_fn : nullptr, stride);
+    if (SUCCEEDED(hr) && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && is_heap_proxy(*out)) {
+        // The null-view marks are kept by real handle (mark_null_rtv); heap_release drops those in this range.
+        const UINT inc = self->real->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        auto* proxy = static_cast<HeapProxy*>(*out);
+        proxy->rtv_real_start =
+            real_cpu_start ? real_cpu_start : raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr;
+        if (inc && desc->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc)
+            proxy->rtv_real_bytes = static_cast<SIZE_T>(desc->NumDescriptors) * inc;
+    }
     if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC (fsdraw): which CPU start the title gets for this heap
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 32)
