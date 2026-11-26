@@ -5474,7 +5474,7 @@ struct DeviceState {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::uint32_t* words = nullptr;
         std::unique_ptr<leonida::address_guard::AddressGuardTable> table;
-        std::uint64_t generation = ~0ull, blocks = ~0ull;
+        std::uint64_t generation = ~0ull, blocks = ~0ull, heaps = ~0ull;  // heaps: the console heaps' ranges, hashed
         std::uint32_t refused_logged = 0, overflow_logged = 0;
         std::uint64_t updates = 0, words_written = 0;
         std::chrono::steady_clock::time_point logged{};
@@ -5539,13 +5539,31 @@ struct DeviceState {
     void update_address_guard() {
         namespace ag = leonida::address_guard;
         if (!guard.words) return;
+        // A console descriptor heap whose GPU copy lies outside the arena (an import of the title's pages, which
+        // shaders read at shader_va = its device address minus heap_base) is read through heap_base + VA like a
+        // buffer, but no gpu_backing names it: its bytes and the null guard after them are entered here. Without
+        // this the guard refused every descriptor-table load from such a heap (run 28: a 38 MB imported heap at
+        // shader VA 0x87e00000, past a 2 GiB arena). Collected before guard.mutex, in console_heap_mutex's order.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> heap_spans;
+        std::uint64_t heap_signature = 0xcbf29ce484222325ull;
+        {
+            std::lock_guard heaps(console_heap_mutex);
+            for (const auto& h : console_heaps) {
+                if (!h || !h->bytes) continue;
+                const std::uint64_t begin = h->shader_va, end = h->shader_va + h->bytes + h->guard;
+                heap_signature = (heap_signature ^ begin) * 0x100000001b3ull;
+                heap_signature = (heap_signature ^ end) * 0x100000001b3ull;
+                if (!(begin < arena.size && end <= arena.size)) heap_spans.emplace_back(begin, end);
+            }
+        }
         std::lock_guard lock(guard.mutex);
         const std::uint64_t generation = backing_generation.load(std::memory_order_relaxed);
         const std::uint64_t blocks = geometry.pool().layout_generation() + external_windows.layout_generation();
-        if (generation != guard.generation || blocks != guard.blocks) {
+        if (generation != guard.generation || blocks != guard.blocks || heap_signature != guard.heaps) {
             guard.generation = generation;
             guard.blocks = blocks;
-            std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+            guard.heaps = heap_signature;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> spans = heap_spans;
             {
                 std::lock_guard backing_lock(backing_mutex);
                 gpu_backings.for_each([&](std::uint64_t va, std::uint64_t bytes) {
