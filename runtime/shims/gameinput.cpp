@@ -1887,7 +1887,9 @@ void update_keyboard_pad() {
     clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
-    // pad, in seconds since the pad's first update, each held 300 ms. For unattended boots: the title's first prompt
+    // pad, in seconds since the pad's first update, each held 300 ms or its own button@seconds:hold, and then until the
+    // title has read the pads kReads times since it began (never past kMaxHold seconds, or the hold if it is longer, so
+    // a title that stops reading does not keep the button). For unattended boots: the title's first prompt
     // waits for a button with no timeout (docs/re/notes/firstframe.md, step 5). The parser, the timeline and the
     // button names are gameinput_script.h's, shared with the scripted pad of a build without SDL3.
     namespace script = rt::gameinput::script;
@@ -1961,12 +1963,12 @@ void update_keyboard_pad() {
         for (std::size_t i = 0; i < scripted.presses.size(); ++i) {
             const auto& press = scripted.presses[i];
             bool active = false;
-            if (now >= press.at && now < press.at + kMaxHold) {
+            if (now >= press.at && now < press.at + std::max(press.hold, kMaxHold)) {
                 if (!started[i]) {
                     started[i] = 1;
                     began[i] = calls;
                 }
-                active = now < press.at + 0.3 || calls - began[i] < kReads;
+                active = now < press.at + press.hold || calls - began[i] < kReads;
             }
             if (!active) continue;
             if (press.stick) held.stick = press.stick;
